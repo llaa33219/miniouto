@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import coreouto as co
+from rich.console import Console
 
 from ..storage import sessions as session_store
 from ..storage.sessions import MessageRecord
 from .runtime import ChatOverrides, build_runtime, resolve_runtime_from_settings
+
+_hook_console = Console(stderr=True, soft_wrap=False, highlight=False)
 
 
 @dataclass
@@ -94,10 +97,10 @@ def _log_tool_call(name: str, arguments: dict[str, Any]) -> None:
     if name == "call_subagent":
         msg = arguments.get("message") or arguments.get("task") or ""
         preview = msg if len(msg) < 160 else msg[:157] + "..."
-        print(f"\n[subagent] {preview}", flush=True)
+        _hook_console.print(f"subagent: {preview}", style="dim", markup=False)
     elif name in ("Bash", "Write", "Edit", "Delete"):
         preview = _short_arg_summary(name, arguments)
-        print(f"  [subagent:{name}] {preview}", flush=True)
+        _hook_console.print(f"  subagent:{name} {preview}", style="dim", markup=False)
 
 
 def _short_arg_summary(name: str, args: dict[str, Any]) -> str:

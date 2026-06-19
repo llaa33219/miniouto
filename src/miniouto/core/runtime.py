@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import coreouto as co
+from rich.console import Console
 
 from ..paths_runtime import INVOCATION_CWD
 from ..storage import providers as provider_store
@@ -17,6 +18,8 @@ from ..tools import registry as tool_registry
 from .providers import build_coreouto_provider, clear_coreouto_state
 
 ALL_TOOLS = ["Write", "Edit", "Delete", "Bash", "call_subagent"]
+
+_hook_console = Console(stderr=True, soft_wrap=False, highlight=False)
 
 
 @dataclass
@@ -91,7 +94,10 @@ def build_runtime(
         tools=ALL_TOOLS,
     )
 
-    co.register_tool("call_subagent", description=_subagent_description())(_subagent_handler)
+    subagent_tool = co.agent_as_tool("subagent", description=_subagent_description())
+    co.register_tool(subagent_tool.name, description=subagent_tool.description)(
+        subagent_tool.handler
+    )
 
     if on_tool_call is not None:
         co.register_hook(co.BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
@@ -121,7 +127,7 @@ def _make_response_logger():
             content = response.content
             if len(content) > 200:
                 content = content[:197] + "..."
-            print(f"  [outo] {content}", flush=True)
+            _hook_console.print(f"  outo: {content}", style="dim", markup=False)
 
     return hook
 
@@ -130,18 +136,10 @@ def _subagent_description() -> str:
     return (
         "Delegate a self-contained task to the subagent. The subagent "
         "has its own tool access (Write/Edit/Delete/Bash) and a fresh "
-        "context. Pass full context inside the message. The tool waits "
-        "for the subagent to finish before returning the result."
+        "context. Pass the full brief in the `task` argument. The tool "
+        "blocks until the subagent terminates the loop (a turn with no "
+        "tool calls) and returns the subagent's final text as the result."
     )
-
-
-async def _subagent_handler(message: str) -> str:
-    import coreouto as co
-
-    preset = co.get_agent_preset("subagent")
-    agent = co.Agent(preset.to_config())
-    response = await agent.call(message)
-    return response.content
 
 
 def _resolve_both_styles(
@@ -221,11 +219,16 @@ def _fallback_style(name: str) -> str:
     if name == "subagent":
         return (
             "You are subagent. Execute the brief directly using your tools. "
-            "Wrap your final reply in <finish>...</finish> tags."
+            "To finish, respond with text and no tool call — that text becomes "
+            "the final answer returned to the parent. Use the `continue_loop` "
+            "tool if you need to send text to the parent while still planning "
+            "more tool calls."
         )
     return (
         f"You are {name}. Use the call_subagent tool for non-trivial work. "
-        "Wrap your final reply in <finish>...</finish> tags."
+        "To finish, respond with text and no tool call — that text becomes "
+        "the final answer returned to the user. Use the `continue_loop` tool "
+        "if you need to share progress while still planning more tool calls."
     )
 
 

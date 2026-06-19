@@ -14,7 +14,7 @@ from .paths import SESSION_DIR, ensure_dirs
 @dataclass
 class MessageRecord:
     role: str
-    content: str
+    content: str | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None

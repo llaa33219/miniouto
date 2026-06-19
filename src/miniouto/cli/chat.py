@@ -44,4 +44,4 @@ def chat_cmd(
     except Exception as exc:
         console.print(f"[red]✗[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    console.print(reply)
+    console.print(reply, style="dark_orange3")

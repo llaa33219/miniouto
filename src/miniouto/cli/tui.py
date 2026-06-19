@@ -110,7 +110,7 @@ class ChatTUI(App):
     def _post_assistant(self, text: str) -> None:
         if self._log is None:
             return
-        self._log.write(Text(text))
+        self._log.write(Text(text, style="dark_orange3"))
 
     def _post_system(self, text: str) -> None:
         if self._log is None:
