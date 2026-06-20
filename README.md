@@ -1,11 +1,19 @@
 # miniouto
 
+<p align="center">
+  <img src="logo.svg" alt="miniouto logo" width="800">
+</p>
+
 A minimal, file-driven CLI agent harness built on [coreouto](https://github.com/llaa33219/coreouto).
 
 Three principles:
 1. **Minimalism** — No bloat. Extend with styles.
 2. **Automation-friendly** — Full CLI; TUI is optional.
 3. **Fluidity** — Adapts to any environment.
+
+## License
+
+[Apache License 2.0](./LICENSE)
 
 ## Install
 
