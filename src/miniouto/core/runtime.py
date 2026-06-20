@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,92 @@ from .providers import build_coreouto_provider, clear_coreouto_state
 ALL_TOOLS = ["Write", "Edit", "Delete", "Bash", "call_subagent"]
 
 _hook_console = Console(stderr=True, soft_wrap=False, highlight=False)
+
+# Tracks how deep we are inside a `call_subagent` invocation. 0 = outo (or
+# after `build_runtime` has just been called), >=1 = inside a subagent.
+# Read by `core.chat._log_tool_call` to decide whether a tool call came
+# from outo (no prefix) or a nested subagent (indented `subagent:` prefix).
+# Mutated only by the wrapper installed around `call_subagent`'s handler.
+_SUBAGENT_DEPTH: ContextVar[int] = ContextVar("miniouto_subagent_depth", default=0)
+
+
+def current_subagent_depth() -> int:
+    """Return how many subagent layers we're currently nested inside."""
+
+    return _SUBAGENT_DEPTH.get()
+
+
+def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap `call_subagent`'s handler so the depth ContextVar tracks nesting.
+
+    coreouto's `BEFORE_TOOL_CALL` hook is global and does not carry agent
+    context, so without this we cannot tell whether a Bash/Write/etc. call
+    came from outo or from a subagent. Setting/resetting the ContextVar
+    around the inner handler gives the hook the information it needs.
+    """
+
+    async def wrapped(task: str) -> str:
+        token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
+        try:
+            return await inner(task)
+        finally:
+            _SUBAGENT_DEPTH.reset(token)
+
+    return wrapped
+
+
+def _build_subagent_tool(
+    preset_name: str,
+    *,
+    description: str,
+    provider_config: dict[str, Any],
+) -> Any:
+    """Build the subagent tool with a non-empty provider_config.
+
+    coreouto's `agent_as_tool` calls `preset.to_config()` and silently
+    drops any provider_config we might want to inject — meaning the
+    subagent runs with `max_tokens` unset, and Anthropic's 1024 hard
+    default silently truncates any Write call longer than ~4KB. We
+    rebuild the same `Tool` shape here, but with our own Agent instance
+    built from a config whose `provider_config` carries the cap.
+    """
+
+    preset = co.get_agent_preset(preset_name)
+    config = preset.to_config()
+    if provider_config:
+        config.provider_config.update(provider_config)
+    sub_agent = co.Agent(config)
+
+    tool_name = f"call_{preset_name}"
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "The task description to pass to the sub-agent.",
+            }
+        },
+        "required": ["task"],
+    }
+
+    async def handler(task: str) -> str:
+        return (await sub_agent.call(task)).content
+
+    return co.Tool(
+        name=tool_name,
+        description=description,
+        parameters=parameters,
+        handler=handler,
+    )
+
+    async def wrapped(task: str) -> str:
+        token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
+        try:
+            return await inner(task)
+        finally:
+            _SUBAGENT_DEPTH.reset(token)
+
+    return wrapped
 
 
 @dataclass
@@ -83,7 +170,7 @@ def build_runtime(
         provider=sub_provider_name,
         system_prompt=subagent_prompt,
         tools=ALL_TOOLS,
-        max_iterations=40,
+        max_iterations=None,
     )
 
     co.register_agent_preset(
@@ -92,11 +179,30 @@ def build_runtime(
         provider=runtime.provider_name,
         system_prompt=outo_prompt,
         tools=ALL_TOOLS,
+        max_iterations=None,
     )
 
-    subagent_tool = co.agent_as_tool("subagent", description=_subagent_description())
+    # Subagent runs the same model (or its override) and must share the
+    # output-token cap, otherwise Write calls it issues get truncated at
+    # the provider's low default (1024 for Anthropic) and we end up with
+    # a half-written file and an "I cut off mid-function" loop. We pull
+    # the cap from the same lcw-api as outo so it tracks the subagent's
+    # model when one is configured.
+    from .context import get_max_output_tokens
+
+    subagent_model = runtime.subagent_model or runtime.model
+    subagent_provider_config = dict(provider_config or {})
+    subagent_provider_config.setdefault(
+        "max_tokens", get_max_output_tokens(subagent_model)
+    )
+
+    subagent_tool = _build_subagent_tool(
+        "subagent",
+        description=_subagent_description(),
+        provider_config=subagent_provider_config,
+    )
     co.register_tool(subagent_tool.name, description=subagent_tool.description)(
-        subagent_tool.handler
+        _wrap_subagent_handler(subagent_tool.handler)
     )
 
     if on_tool_call is not None:
@@ -111,6 +217,10 @@ def build_runtime(
     outo_config = co.get_agent_preset("outo").to_config()
     if provider_config:
         outo_config.provider_config.update(provider_config)
+
+    subagent_config = co.get_agent_preset("subagent").to_config()
+    subagent_config.provider_config.update(subagent_provider_config)
+
     return co.Agent(outo_config)
 
 

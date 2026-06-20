@@ -54,7 +54,12 @@ def _write_description() -> str:
         "Create a new file with the given content. Refuses to overwrite "
         "an existing file — use the Edit tool for changes to existing files. "
         "Parent directories are created automatically. Pass an absolute path, "
-        "or a path relative to the directory miniouto was invoked from."
+        "or a path relative to the directory miniouto was invoked from. "
+        "Content is capped at 50,000 characters: large inline content is "
+        "likely to be silently truncated at the model layer, producing a "
+        "partial file. For large or generated content, compose it with "
+        "Bash (heredoc, printf, seq loop, or a short Python one-liner) "
+        "and have Bash write the file directly."
     )
 
 

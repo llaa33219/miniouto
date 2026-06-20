@@ -35,6 +35,18 @@ def edit(
 
     if not edits:
         raise EditError("No edits provided. Pass at least one {oldText, newText} pair.")
+    if not file_path or not isinstance(file_path, str) or not file_path.strip():
+        raise EditError(
+            f"file_path is required and must be a non-empty string, got "
+            f"{file_path!r}. Re-emit the call with file_path set to the "
+            "absolute target path (or a path relative to the directory "
+            "miniouto was invoked from)."
+        )
+    if not isinstance(edits, list):
+        raise EditError(
+            f"edits must be a list of {{oldText, newText}} pairs, got "
+            f"{type(edits).__name__}."
+        )
 
     path = Path(file_path)
     if not path.is_absolute():
