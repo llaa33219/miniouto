@@ -6,6 +6,7 @@ import typer
 from rich.console import Console
 
 from ..storage import paths
+from . import lma as lma_module
 from . import provider as provider_module
 from . import skill as skill_module
 from . import style as style_module
@@ -22,6 +23,7 @@ app = typer.Typer(
 app.add_typer(provider_module.app, name="provider")
 app.add_typer(style_module.app, name="style")
 app.add_typer(skill_module.app, name="skill")
+app.add_typer(lma_module.app, name="lma")
 app.command("chat", help="Run a single chat turn.")(chat_cmd)
 
 console = Console()

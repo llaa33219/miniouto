@@ -15,6 +15,7 @@ This directory contains a complete reference for the project. Read [`architectur
 | [`tools.md`](./tools.md) | The Write / Edit / Delete / Bash tools — handlers, schemas, edit rules, fuzzy fallback. |
 | [`styles.md`](./styles.md) | Style document format, `<outo>` / `<subagent>` tags, the six bundled templates. |
 | [`skills.md`](./skills.md) | Skill discovery from `~/.agents/skills/`, frontmatter schema. |
+| [`lma.md`](./lma.md) | lma (llm-model-api) integration: provider/model discovery, context caps, the `lma` CLI subcommand, TUI add flows. |
 | [`development.md`](./development.md) | Install, build, lint, release, contributing notes, known issues. |
 
 ## Source map
@@ -31,17 +32,19 @@ src/miniouto/
 │   ├── provider.py          # provider add/list/remove/default
 │   ├── style.py             # style list/set/add/show
 │   ├── skill.py             # skill list/show
-│   └── tui.py               # StatusBar, ChatTUI, run_tui()
+│   ├── lma.py               # lma providers/models/add    → see lma.md
+│   └── tui.py               # ChatTUI, run_tui(), model/provider pickers
 ├── core/                    # Chat loop + runtime assembly   → see core.md
-│   ├── __init__.py          # re-exports chat, providers, runtime
+│   ├── __init__.py          # re-exports chat, lma, providers, runtime
 │   ├── chat.py              # ChatOptions, run_chat, ToolCallArgsError, diagnostics
-│   ├── context.py           # lcw-api fetcher, make_summarize_hook
-│   ├── providers.py         # SUPPORTED_FORMATS, build_coreouto_provider
+│   ├── context.py           # lma fetcher, make_summarize_hook   → see lma.md
+│   ├── lma.py               # lma REST client + slugify          → see lma.md
+│   ├── providers.py         # SUPPORTED_FORMATS, sdk_to_format, build_coreouto_provider
 │   └── runtime.py           # RuntimeConfig, build_runtime, subagent tool
 ├── storage/                 # Filesystem persistence         → see storage.md
 │   ├── __init__.py
 │   ├── paths.py             # ROOT, PROVIDERS_FILE, …, ensure_dirs()
-│   ├── providers.py         # Provider dataclass + TOML CRUD
+│   ├── providers.py         # Provider dataclass + TOML CRUD (now with `source` field)
 │   ├── sessions.py          # MessageRecord + JSON CRUD
 │   ├── settings.py          # Settings dataclass + TOML CRUD
 │   ├── skills.py            # Skill dataclass + ~/.agents/skills/ discovery

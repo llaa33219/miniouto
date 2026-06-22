@@ -99,15 +99,6 @@ def _build_subagent_tool(
         handler=handler,
     )
 
-    async def wrapped(task: str) -> str:
-        token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
-        try:
-            return await inner(task)
-        finally:
-            _SUBAGENT_DEPTH.reset(token)
-
-    return wrapped
-
 
 @dataclass
 class RuntimeConfig:
@@ -186,14 +177,14 @@ def build_runtime(
     # output-token cap, otherwise Write calls it issues get truncated at
     # the provider's low default (1024 for Anthropic) and we end up with
     # a half-written file and an "I cut off mid-function" loop. We pull
-    # the cap from the same lcw-api as outo so it tracks the subagent's
-    # model when one is configured.
+    # the cap from the same lma endpoint as outo so it tracks the
+    # subagent's model when one is configured.
     from .context import get_max_output_tokens
 
     subagent_model = runtime.subagent_model or runtime.model
     subagent_provider_config = dict(provider_config or {})
     subagent_provider_config.setdefault(
-        "max_tokens", get_max_output_tokens(subagent_model)
+        "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
     )
 
     subagent_tool = _build_subagent_tool(
@@ -209,7 +200,9 @@ def build_runtime(
         co.register_hook(co.BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
 
     from .context import make_summarize_hook
-    summarize_hook = make_summarize_hook(runtime.model, runtime.session or "default")
+    summarize_hook = make_summarize_hook(
+        runtime.model, runtime.session or "default", runtime.provider_name
+    )
     co.register_hook(co.ON_ITERATION, summarize_hook)
 
     co.register_hook(co.AFTER_LLM_CALL, _make_response_logger())
@@ -356,7 +349,7 @@ def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> Run
     if provider is None:
         raise RuntimeError(f"Provider {provider_name!r} is not configured.")
 
-    model = overrides.model or provider.default_model
+    model = overrides.model or s.model or provider.default_model
     if not model:
         raise RuntimeError(
             f"No model specified for provider {provider_name!r}. "

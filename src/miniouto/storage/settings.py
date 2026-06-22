@@ -12,6 +12,7 @@ from .paths import SETTINGS_FILE, ensure_dirs
 @dataclass
 class Settings:
     provider: str = ""
+    model: str = ""
     style: str = "default"
     session: str = "default"
 

@@ -25,11 +25,16 @@ uv tool install --editable . --force   # or `uv tool install .` for a pinned bui
 ## Quick start
 
 ```bash
+# Either add a provider by hand:
 miniouto provider add \
   --name openai \
   --api-key sk-... \
   --base-url https://api.openai.com/v1 \
   --default-model gpt-5.5            # optional; used when chat --model is not given
+
+# Or browse the lma (llm-model-api) catalog and add from there:
+miniouto lma providers               # see all 144 providers
+miniouto lma add Anthropic --api-key sk-ant-...   # adds it with the first lma model
 
 miniouto provider default openai
 miniouto style set default
@@ -42,8 +47,9 @@ miniouto                              # TUI mode
 The active model is chosen by the first match in:
 
 1. `miniouto chat --model <name>` (per-call override)
-2. `miniouto provider add --default-model <name>` (provider-level default)
-3. error — no model can be inferred
+2. `settings.model` (legacy per-session override; cleared whenever the TUI model picker saves)
+3. `miniouto provider add --default-model <name>` (provider-level default)
+4. error — no model can be inferred
 
 ## Commands
 
@@ -54,6 +60,7 @@ The active model is chosen by the first match in:
 | `miniouto status` | Show current configuration |
 | `miniouto provider add/list/remove/default` | Manage providers |
 | `miniouto style list/set/add/show` | Manage style documents |
+| `miniouto lma providers/models/add` | Browse the lma (llm-model-api) catalog and add providers from it |
 
 ### `chat` flags
 

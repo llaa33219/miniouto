@@ -4,15 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
+from . import lma as lma_api
 
-CONTEXT_WINDOW_API = "https://lcw-api.blp.sh/context-window?model={model}"
-# One cache keyed by model; the API returns both `contextWindow` and
-# `maxOutputTokens` in a single response, so we fetch and stash both
-# rather than making two HTTP calls. The cache also remembers the case
-# where the API returned 0 / null for either field, so a transient
-# failure doesn't re-hit the endpoint on every turn.
-_MODEL_CACHE: dict[str, dict[str, int]] = {}
 SUMMARIZE_THRESHOLD = 0.8
 
 # Hard floor for max_output_tokens. Some providers (Anthropic in particular)
@@ -23,69 +16,67 @@ SUMMARIZE_THRESHOLD = 0.8
 # least this many tokens unless the API tells us the real cap is lower.
 DEFAULT_MAX_OUTPUT_TOKENS = 16384
 
-# Hard ceiling. The lcw-api sometimes reports `maxOutputTokens` values
-# far above what the upstream API will actually accept in a single
-# request — Anthropic's Messages API rejects very large `max_tokens`
-# with "Streaming is required for operations that may take longer than
-# 10 minutes." We cap at 16K, which is plenty for the Write tool
-# (≈64KB of code) and stays within every provider's per-request limit.
+# Hard ceiling. lma sometimes reports `maxOutputTokens` values far above
+# what the upstream API will actually accept in a single request —
+# Anthropic's Messages API rejects very large `max_tokens` with
+# "Streaming is required for operations that may take longer than 10
+# minutes." We cap at 16K, which is plenty for the Write tool (≈64KB
+# of code) and stays within every provider's per-request limit.
 MAX_OUTPUT_TOKENS_CEILING = 16384
 
+# Cache: (model, provider) → {contextWindow, maxOutputTokens}. A cached
+# `{}` is meaningful — it means "lma had no info for this key" and we
+# should not re-hit it every turn.
+_MODEL_CACHE: dict[tuple[str, str], dict[str, int]] = {}
 
-def _fetch_model_caps(model: str) -> dict[str, int]:
-    """Fetch context + max-output caps from lcw-api; cache per-model."""
 
-    if model in _MODEL_CACHE:
-        return _MODEL_CACHE[model]
+def _fetch_model_caps(model: str, provider_name: str | None = None) -> dict[str, int]:
+    key = (model or "", (provider_name or "").lower())
+    cached = _MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
     result: dict[str, int] = {}
     try:
-        url = CONTEXT_WINDOW_API.format(model=model)
-        with httpx.Client(timeout=10.0) as client:
-            r = client.get(url)
-            r.raise_for_status()
-            data = r.json()
-        payload = data.get("data") or {}
-        window = payload.get("contextWindow")
-        max_out = payload.get("maxOutputTokens")
-        if isinstance(window, int) and window > 0:
-            result["contextWindow"] = window
-        if isinstance(max_out, int) and max_out > 0:
-            result["maxOutputTokens"] = max_out
+        info = lma_api.get_model(model, provider_name)
+        if info:
+            cw = info.get("context_window")
+            mo = info.get("max_output_tokens")
+            if isinstance(cw, int) and cw > 0:
+                result["contextWindow"] = cw
+            if isinstance(mo, int) and mo > 0:
+                result["maxOutputTokens"] = mo
     except Exception:
         pass
-    _MODEL_CACHE[model] = result
+    _MODEL_CACHE[key] = result
     return result
 
 
-def get_context_window(model: str) -> int | None:
-    """Get the context window size for a model from the API."""
-
-    return _fetch_model_caps(model).get("contextWindow")
+def get_context_window(model: str, provider_name: str | None = None) -> int | None:
+    return _fetch_model_caps(model, provider_name).get("contextWindow")
 
 
-def get_max_output_tokens(model: str) -> int:
-    """Get the model's max output token cap, bounded for safety.
+def get_max_output_tokens(model: str, provider_name: str | None = None) -> int:
+    """Returns the model's max output token cap, bounded for safety.
 
     Order of preference:
-    1. lcw-api's `maxOutputTokens` for the model.
-    2. lcw-api's `contextWindow` (most APIs cap output at the context
-       window; if a separate `maxOutputTokens` isn't published, this is
-       a reasonable proxy).
+    1. lma's `max_output_tokens` for the (model, provider) pair.
+    2. lma's `context_window` (most APIs cap output at the context
+       window; if a separate cap isn't published, this is a proxy).
     3. `DEFAULT_MAX_OUTPUT_TOKENS` (16K) — a hard floor because some
        providers (Anthropic) default to 1024 otherwise, which silently
        truncates Write tool calls and corrupts files.
 
     The result is also clamped to `MAX_OUTPUT_TOKENS_CEILING` because
-    lcw-api's `maxOutputTokens` can be the *theoretical* streaming cap
+    lma's `max_output_tokens` can be the *theoretical* streaming cap
     (e.g. 512K), not the per-request non-streaming cap that we send.
     """
 
-    caps = _fetch_model_caps(model)
+    caps = _fetch_model_caps(model, provider_name)
     raw = caps.get("maxOutputTokens") or caps.get("contextWindow") or DEFAULT_MAX_OUTPUT_TOKENS
     return min(raw, MAX_OUTPUT_TOKENS_CEILING)
 
 
-def make_summarize_hook(model: str, session_name: str) -> Any:
+def make_summarize_hook(model: str, session_name: str, provider_name: str | None = None) -> Any:
     """Create a hook that summarizes when context window is 80% full.
 
     Calls the LLM to produce a structured summary of the conversation:
@@ -102,7 +93,7 @@ def make_summarize_hook(model: str, session_name: str) -> Any:
     real list, so a single buggy summarizer can't destroy a turn.
     """
 
-    window = get_context_window(model)
+    window = get_context_window(model, provider_name)
     if not window:
         return lambda **kwargs: None
 

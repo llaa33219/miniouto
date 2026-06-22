@@ -69,11 +69,12 @@ CLI flag bag → ChatOptions (core/chat.py)
 | Add/modify a tool | `src/miniouto/tools/` | [`docs/tools.md`](./docs/tools.md) |
 | Edit/create a style prompt | `~/.miniouto/style/*.md` or `src/miniouto/default_style/` | [`docs/styles.md`](./docs/styles.md) |
 | Add/modify a skill | `~/.agents/skills/<name>/SKILL.md` | [`docs/skills.md`](./docs/skills.md) |
+| Browse lma providers/models or change SDK mapping | `core/lma.py`, `core/providers.py:sdk_to_format`, `cli/lma.py` | [`docs/lma.md`](./docs/lma.md) |
 | Set up dev environment / release | `pyproject.toml`, `uv.lock` | [`docs/development.md`](./docs/development.md) |
 
 ---
 
-## The 10 invariants (do NOT break these)
+## The 13 invariants (do NOT break these)
 
 These rules hold throughout the codebase. Breaking any of them silently degrades or breaks the system. **If your change seems to require breaking one, stop and ask.**
 
@@ -97,12 +98,12 @@ The final prompt the outo model sees, top to bottom:
 Subagent mirrors this with `<subagent>` content and a different cwd preamble. The cwd preamble is regenerated on every call (not persisted).
 
 ### 4. Context-window safety
-`core/context.py` enforces a **16K-token output cap** by calling `https://lcw-api.blp.sh/context-window?model=...` and clamping the result:
+`core/context.py` enforces a **16K-token output cap** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`) and clamping the result:
 
 - **Floor**: `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates Write tool calls.
-- **Ceiling**: `MAX_OUTPUT_CEILING = 16384`. Some lcw-api entries report theoretical streaming caps (e.g. 512K) that the non-streaming API rejects.
+- **Ceiling**: `MAX_OUTPUT_CEILING = 16384`. Some lma entries report theoretical streaming caps (e.g. 512K) that the non-streaming API rejects.
 
-If you touch `get_max_output_tokens`, you must preserve both bounds.
+If you touch `get_max_output_tokens`, you must preserve both bounds. Always thread the `provider_name` argument through so the lma lookup is scoped to the active provider (otherwise lma returns matches across every provider and we only see the first hit).
 
 ### 5. Subagent is a re-implemented `agent_as_tool`
 `core/runtime.py:_build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()` — that means subagent `Write` calls inherit the provider's low hard cap (1024 for Anthropic → silent truncation). This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
@@ -134,6 +135,20 @@ The fuzzy fallback normalizes smart quotes, dashes, NBSP, BOM, CRLF, zero-width 
 ### 10. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention), NOT from `~/.miniouto/`. Skills are portable content, not per-installation config. **Do not move them into `~/.miniouto/`.**
 
+### 11. TUI model editor manages `Provider.default_model`, not `Settings.model`
+In the TUI, picking or typing a model always writes to `provider.default_model` (via `dataclasses.replace(p, default_model=...)` + `provider_store.upsert`) and clears any prior `settings.model`. The model chip displays `provider.default_model` only — `settings.model` is reserved for the `chat --model` CLI flag. Legacy `settings.model` values from older sessions keep working at the runtime layer (`resolve_runtime_from_settings` still treats them as priority 2) but are invisible in the TUI. **Do not reintroduce a `settings.model`-as-TUI-override path.**
+
+### 12. lma-backed vs custom providers
+`storage/providers.py:Provider` carries a `source: str` field, one of `SOURCE_CUSTOM` (default) or `SOURCE_LMA`. lma-backed providers are added via `miniouto lma add …` or the TUI `+ add from lma…` wizard; custom providers come from `provider add` or the TUI `+ add custom…` wizard. The TUI model picker dispatches on `source`:
+
+- `source == "lma"` → `cli/tui.py:_lma_model_picker_flow` (fetches `/model-list` and shows a `SelectionModal`).
+- `source == "custom"` → `cli/tui.py:_open_custom_model_editor` (free-text `TextInputModal`).
+
+The CLI command `miniouto lma providers` filters its "Addable?" column through `core.providers.sdk_to_format(sdk, api)`. Providers whose SDK cannot be hosted by any of the four coreouto builtins (openai / openai-response / anthropic / google) return `(None, None)` and are skipped by both the CLI and the TUI wizard.
+
+### 13. lma cache lives in `core.lma._CACHE`
+`core/lma.py` mirrors lma's 10-minute server-side TTL with a module-level dict. Cache keys are explicit (`"providers"`, `f"models:{provider}"`, `f"model:{provider}:{model}"`); a cached `None` payload is meaningful (means "lma returned 404"). `core.lma.clear_cache()` exists for tests / manual refresh. **Do not cache anything other than `None` and successful payloads** — a transient transport error must not pollute the cache for 10 minutes.
+
 ---
 
 ## File-by-file cheat sheet
@@ -161,15 +176,17 @@ The fuzzy fallback normalizes smart quotes, dashes, NBSP, BOM, CRLF, zero-width 
 | `cli/provider.py` | `provider add/list/remove/default` |
 | `cli/style.py` | `style list/set/add/show` |
 | `cli/skill.py` | `skill list/show` (read-only) |
-| `cli/tui.py` | `StatusBar`, `ChatTUI` (Textual App), `run_tui()`, `tui_summary()` |
-| `core/__init__.py` | Re-exports `chat`, `providers`, `runtime` (NOT `context`) |
+| `cli/lma.py` | `lma providers/models/add` (browse lma catalog from CLI) |
+| `cli/tui.py` | `StatusBar`, `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; provider add wizards + lma model picker |
+| `core/__init__.py` | Re-exports `chat`, `lma`, `providers`, `runtime` (NOT `context`) |
 | `core/chat.py` | `ChatOptions`, `run_chat`, `ToolCallArgsError`, failure diagnostics, tool-call logger |
-| `core/context.py` | lcw-api fetcher, `make_summarize_hook` (the diverged `auto_summarize_hook`) |
-| `core/providers.py` | `SUPPORTED_FORMATS`, `build_coreouto_provider`, `clear_coreouto_state` |
+| `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
+| `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
+| `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
 | `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, subagent tool, hooks |
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
 | `storage/paths.py` | Path constants + `ensure_dirs()` (also seeds bundled styles) |
-| `storage/providers.py` | `Provider` dataclass + TOML CRUD |
+| `storage/providers.py` | `Provider` dataclass + TOML CRUD (now with `source: SOURCE_CUSTOM \| SOURCE_LMA`) |
 | `storage/sessions.py` | `MessageRecord` + JSON CRUD |
 | `storage/settings.py` | `Settings` + TOML CRUD |
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
@@ -203,6 +220,7 @@ The fuzzy fallback normalizes smart quotes, dashes, NBSP, BOM, CRLF, zero-width 
 | `docs/tools.md` | Write/Edit/Delete/Bash tool internals |
 | `docs/styles.md` | Style document system & bundled templates |
 | `docs/skills.md` | Skills system from `~/.agents/skills/` |
+| `docs/lma.md` | lma (llm-model-api) integration: provider/model discovery, context caps, CLI + TUI flows |
 | `docs/development.md` | Dev setup, build, lint, contributing notes |
 
 ---
@@ -229,7 +247,8 @@ See `docs/tools.md` § "Adding a new tool". TL;DR:
 ### "Add a new provider format"
 1. `core/providers.py`: add to `SUPPORTED_FORMATS`, add an `_instantiate` branch.
 2. `cli/provider.py`: update `FORMAT_HELP`.
-3. Document in `docs/cli.md` and `docs/core.md`.
+3. If the new format is reachable via an lma SDK, also extend `_SDK_TO_FORMAT` in `core/providers.py` so the TUI "add from lma…" wizard and the `lma providers` CLI both surface it as addable.
+4. Document in `docs/cli.md`, `docs/core.md`, and `docs/lma.md`.
 
 ### "Change the storage root"
 Only one place: `src/miniouto/storage/paths.py`. Update the `ROOT` constant.

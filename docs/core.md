@@ -9,8 +9,9 @@ The `core/` subpackage is where the agent loop is wired together. It is a thin o
 | File | LOC | Purpose |
 |---|---|---|
 | `chat.py` | ~230 | Per-turn chat runner, history persistence, failure diagnostics |
-| `context.py` | ~190 | Context-window monitoring (lcw-api), auto-summarization hook |
-| `providers.py` | ~80 | Maps `Provider` records → coreouto provider classes; clears global state |
+| `context.py` | ~190 | Context-window monitoring (lma `/model`), auto-summarization hook |
+| `lma.py` | ~140 | `lma.blp.sh` REST client: list_providers, list_models, get_model, find_provider, slugify |
+| `providers.py` | ~120 | Maps `Provider` records → coreouto provider classes; clears global state; maps lma SDKs to coreouto formats |
 | `runtime.py` | ~370 | `RuntimeConfig`, `build_runtime`, subagent tool, hooks |
 
 ## Data flow at the core layer
@@ -132,32 +133,30 @@ Per-tool one-liner:
 
 ### Constants
 
-- `CONTEXT_WINDOW_API = "https://lcw-api.blp.sh/context-window?model={model}"` — external API.
-- `_MODEL_CACHE: dict[str, dict[str, int]]` — per-model cache. Stores empty `{}` on failure so we don't re-hit on every turn.
 - `SUMMARIZE_THRESHOLD = 0.8` — summarization fires at 80% of context window.
-- `DEFAULT_MAX_OUTPUT_TOKENS = 16384` — hard floor. Rationale: Anthropic defaults to 1024 otherwise, silently truncating Write outputs.
-- `MAX_OUTPUT_TOKENS_CEILING = 16384` — hard ceiling. Some lcw-api entries report theoretical streaming caps (e.g. 512K) that the non-streaming API rejects.
+- `DEFAULT_MAX_OUTPUT_TOKENS = 16384` — hard floor. Rationale: Anthropic defaults to 1024 if you don't set it explicitly, silently truncating Write outputs.
+- `MAX_OUTPUT_TOKENS_CEILING = 16384` — hard ceiling. Some lma entries report theoretical streaming caps (e.g. 512K) that the non-streaming API rejects.
 
-### `_fetch_model_caps(model) -> dict[str, int]`
+### `_fetch_model_caps(model, provider_name=None) -> dict[str, int]`
 
-`httpx.Client(timeout=10.0).get(...)`. Parses `data.contextWindow` and `data.maxOutputTokens`. On any exception (including non-2xx), stores an empty dict and returns it (fail-soft, never raises).
+Calls `lma.get_model(model, provider_name)`. Parses `info.context_window` and `info.max_output_tokens`. On any exception (network, JSON, etc.), stores an empty dict and returns it (fail-soft, never raises).
 
-### `get_context_window(model) -> int | None`
+### `get_context_window(model, provider_name=None) -> int | None`
 
-Returns the model's context window in tokens, or `None` if unknown.
+Returns the model's context window in tokens, or `None` if unknown. Passing `provider_name` scopes the lma lookup (recommended — otherwise lma returns matches across every provider and we only see the first).
 
-### `get_max_output_tokens(model) -> int`
+### `get_max_output_tokens(model, provider_name=None) -> int`
 
 Resolution order:
 1. `caps["maxOutputTokens"]`
 2. `caps["contextWindow"]` (fallback proxy)
 3. `DEFAULT_MAX_OUTPUT_TOKENS` (16K hard floor)
 
-Then clamps to `MAX_OUTPUT_TOKENS_CEILING` (16K).
+Then clamps to `MAX_OUTPUT_CEILING` (16K).
 
-### `make_summarize_hook(model, session_name) -> Callable`
+### `make_summarize_hook(model, session_name, provider_name=None) -> Callable`
 
-Returns the `ON_ITERATION` hook. The `session_name` argument is captured but currently unused in the body.
+Returns the `ON_ITERATION` hook. The `session_name` argument is captured but currently unused in the body. `provider_name` (optional) is threaded into `get_context_window` for a more accurate lookup.
 
 - If no context window is known, returns a no-op hook.
 - Otherwise returns a closure with two parts:
@@ -183,6 +182,14 @@ SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")
 ```
 
 Whitelist of `Provider.api_format` values. Validated by `cli/provider.py:add` and by `_instantiate`.
+
+### `sdk_to_format(sdk, api) -> (api_format, base_url)`
+
+Maps an lma provider's `sdk`/`api` pair to a `(api_format, base_url)` tuple. Returns `(None, None)` when the SDK cannot be hosted by any supported coreouto builtin (e.g. `amazon-bedrock`, `bedrock`, anything else without an `api` URL). Unknown SDKs with a non-null `api` URL fall back to `("openai", api)` — the universal gateway shape. Used by `cli/lma.py` and the TUI `_lma_add_flow` to filter `lma list_providers` output to addable entries. See `docs/lma.md` for the full mapping table.
+
+### `add_provider_from_lma(name, api_key, sdk, api, default_model="") -> Provider`
+
+Builds a `storage.providers.Provider` from lma metadata + a user-supplied API key, with `source="lma"` set. Raises `ValueError` when `sdk_to_format` returns `(None, None)`. Used by `cli/lma.py:add` and `cli/tui.py:_lma_add_flow`.
 
 ### `build_coreouto_provider(provider: Provider) -> None`
 
@@ -304,7 +311,8 @@ Returns a `RuntimeConfig`. Subagent-related fields (`subagent_model`, `subagent_
 
 | Source | Target | Purpose | Failure mode |
 |---|---|---|---|
-| `core/context.py` | `https://lcw-api.blp.sh/context-window?model={model}` (GET, 10s timeout, `httpx`) | Fetch `contextWindow` + `maxOutputTokens` for a model | Caught, caches `{}`, returns 16K default |
+| `core/lma.py` | `https://lma.blp.sh/{provider,model-list,model}` (GET, 15s timeout, `httpx`) | Discover providers, list models, fetch context + max-output caps | `list_*` / `get_model` propagate `httpx.HTTPError`; `find_provider` swallows and returns `None`; 10-minute in-process cache |
+| `core/context.py` | (via `core.lma.get_model`) | Fetch `context_window` + `max_output_tokens` for a model | Caught, caches `{}`, returns 16K default |
 | `core/providers.py` | `co.register_provider`, `co.clear_*` | coreouto global registry I/O | None caught |
 | `core/runtime.py` | `tool_registry.register_all`, `co.register_agent_preset`, `co.register_tool`, `co.register_hook` | coreouto global registry I/O | None caught |
 | `core/chat.py` | `session_store.append`, `session_store.load` | JSON session persistence | Propagated to caller |

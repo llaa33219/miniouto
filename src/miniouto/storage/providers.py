@@ -8,6 +8,10 @@ from typing import Any
 from . import toml_io
 from .paths import PROVIDERS_FILE, ensure_dirs
 
+SOURCE_CUSTOM = "custom"
+SOURCE_LMA = "lma"
+VALID_SOURCES = (SOURCE_CUSTOM, SOURCE_LMA)
+
 
 @dataclass
 class Provider:
@@ -16,6 +20,7 @@ class Provider:
     base_url: str = ""
     api_key: str = ""
     default_model: str = ""
+    source: str = SOURCE_CUSTOM
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -24,10 +29,20 @@ class Provider:
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> Provider:
-        known = {"name", "api_format", "base_url", "api_key", "default_model"}
+        known = {"name", "api_format", "base_url", "api_key", "default_model", "source"}
         extra = {k: v for k, v in data.items() if k not in known}
-        clean = {k: data.get(k, "") for k in ("api_format", "base_url", "api_key", "default_model")}
-        return cls(name=name, extra=extra, **clean)
+        source = data.get("source") or SOURCE_CUSTOM
+        if source not in VALID_SOURCES:
+            source = SOURCE_CUSTOM
+        return cls(
+            name=name,
+            api_format=data.get("api_format", "openai"),
+            base_url=data.get("base_url", ""),
+            api_key=data.get("api_key", ""),
+            default_model=data.get("default_model", ""),
+            source=source,
+            extra=extra,
+        )
 
 
 def load_all() -> dict[str, Provider]:

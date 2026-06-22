@@ -26,9 +26,13 @@ miniouto [--version]
    │    ├─ set <name>
    │    ├─ add <repo_url> [--name NAME]
    │    └─ show <name>
-   └─ skill
-        ├─ list
-        └─ show <name>
+   ├─ skill
+   │    ├─ list
+   │    └─ show <name>
+   └─ lma                        ← NEW: lma (llm-model-api) browser
+        ├─ providers                          → list all 144 lma providers
+        ├─ models <provider-name>             → list models for a provider
+        └─ add <provider-name> --api-key ...  → add a provider from lma
 ```
 
 ## Root callback behavior
@@ -50,13 +54,44 @@ Delegates to `cli/tui.py:run_tui()`, which constructs a `ChatTUI` (Textual `App`
 Layout (top to bottom):
 - `Header(show_clock=False)`
 - `Vertical(RichLog(id="chat", wrap=True), Input(placeholder="…", id="input"))`
-- `StatusBar` (height 1, `$boost` background)
+- `BottomPanel` (height 2):
+  - Row 1: four clickable `StatusChip`s — `provider`, `model`, `style`, `session`
+  - Row 2: keyboard/click hint
 - `Footer`
 
+### Clickable chips
+
+Each `StatusChip` is a focusable widget. Click it (or focus it with `Tab` and press `Enter`) to open a modal:
+
+| Chip | Modal | Notes |
+|---|---|---|
+| `provider` | `SelectionModal` — list of configured providers + `+ add from lma…` + `+ add custom…` sentinels | selecting a sentinel opens the LMA add wizard or the custom-add wizard; selecting an existing provider writes `settings.provider` |
+| `model` | `SelectionModal` (lma-backed provider) **or** `TextInputModal` (custom provider) | the picker is the lma model list when `provider.source == "lma"`, otherwise a free-text input. Saving writes to `provider.default_model` and clears any prior `settings.model` override |
+| `style` | `SelectionModal` — list of installed styles | writes `settings.style` |
+| `session` | `SelectionModal` — list of sessions + `+ new session…` sentinel | selecting the sentinel opens a `TextInputModal` for the new name |
+
+The provider picker modal also accepts two sentinels (rendered as `extra_options` rows at the bottom of the list):
+
+- `+ add from lma…` — runs the LMA add wizard: fetches `https://lma.blp.sh/provider`, filters to entries whose `sdk` maps to a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="lma"` and the first model returned by lma as `default_model`. See `core/lma.py` and `core/providers.py:sdk_to_format`.
+- `+ add custom…` — runs a five-step wizard (name → api_format → base_url → api_key → default_model), saving with `source="custom"`.
+
+Modal results are persisted via `storage.settings.update(...)` (for provider/style/session) or `storage.providers.upsert(replace(...))` (for model changes), and the chip row re-renders.
+
+### Model resolution order
+
+`resolve_runtime_from_settings` (core/runtime.py) resolves the active model in this order:
+1. `ChatOptions.model` (per-call `--model` flag)
+2. `Settings.model` (legacy per-session override; cleared whenever the TUI model picker saves)
+3. `Provider.default_model` (set by `provider add --default-model`, `lma add --default-model`, or the TUI model chip)
+
+In the TUI, the model chip always shows `Provider.default_model` — the `Settings.model` field is reserved for the `chat --model` CLI override and is no longer surfaced through the UI.
+
 Keybindings:
-- `Ctrl+C` — quit
+- `Tab` / `Shift+Tab` — cycle chip focus
+- `Enter` — open focused chip's modal
+- `Esc` — cancel current modal
 - `Ctrl+L` — clear log
-- `Ctrl+S` — settings (re-renders the status into the log)
+- `Ctrl+C` — quit
 
 Submission flow: each submitted prompt is dispatched via `self.run_worker(..., exclusive=True)` to `_dispatch(prompt)`, which calls `core.chat.run_chat(opts)` inside `asyncio.to_thread` so the Textual event loop stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output is posted back into the RichLog; user prompts in normal text, assistant replies in `dark_orange3`, errors prefixed with `[error: …]`.
 
@@ -229,6 +264,28 @@ Otherwise prints a rich `Table` with columns `Name | Description`, truncating de
 
 ---
 
+## `miniouto lma ...`
+
+File: `cli/lma.py`. Sub-app `app = typer.Typer(help="Browse the lma (llm-model-api) provider and model catalog.")`.
+
+Thin CLI over `core/lma.py`, which wraps `https://lma.blp.sh` (a re-shaped view of `models.dev/api.json` deployed on Cloudflare Workers). The same client is used by the TUI provider add flow and by `core/context.py` for per-model context / max-output-token lookups. See `docs/lma.md` for the full endpoint reference.
+
+### `lma providers`
+
+Calls `GET https://lma.blp.sh/provider`. Prints a rich table with columns `Name | SDK | API URL | miniouto format | Addable?`. The "Addable?" column is `✓` when `core.providers.sdk_to_format(sdk, api)` returns a non-`None` format (i.e. the entry can be added by the TUI wizard or `lma add`). Transport failure → red ✗ + `typer.Exit(1)`.
+
+### `lma models <provider-name>`
+
+Calls `GET https://lma.blp.sh/model-list?provider-name=<name>` (lma does case-/whitespace-insensitive fuzzy match). Prints a table `ID | Name`. Empty result → yellow "No models returned for `<name>`" + `typer.Exit(1)`. Transport failure → red ✗ + `typer.Exit(1)`.
+
+### `lma add <provider-name> --api-key <key> [--default-model <id>]`
+
+Resolves `<provider-name>` via `core.lma.find_provider`. If found, derives `name = core.lma.slugify(...)`, calls `core.providers.add_provider_from_lma(...)`, and stores the resulting `Provider` with `source="lma"`. If `--default-model` is empty, fetches the provider's model list from lma and uses the first entry as `default_model`. Existing providers are overwritten (yellow warning printed first).
+
+The endpoint data is cached for 10 minutes (matching lma's server TTL); the cache lives in `core.lma._CACHE` and can be cleared with `core.lma.clear_cache()` (used by tests).
+
+---
+
 ## Error handling & exit codes
 
 | Scenario | Behavior | Exit code |
@@ -242,6 +299,10 @@ Otherwise prints a rich `Table` with columns `Name | Description`, truncating de
 | `style add` fetch failure | `[red]✗[/red] Failed to fetch styles: {exc}` + `typer.Exit(1) from exc` | 1 |
 | `style show` on missing style | `[red]✗[/red] ... is not installed.` + `typer.Exit(1)` | 1 |
 | `skill show` on missing skill | `[red]✗[/red] ... not found.` + `typer.Exit(1)` | 1 |
+| `lma providers` / `lma models` network failure | `[red]✗[/red] Failed to reach lma: ...` + `typer.Exit(1)` | 1 |
+| `lma add` for an unknown provider name | `[red]✗[/red] No lma provider matched ...` + `typer.Exit(1)` | 1 |
+| `lma add` for an unmappable SDK | `[red]✗[/red] Cannot map lma provider ...` + `typer.Exit(1)` | 1 |
+| `lma add` overwriting an existing provider | `[yellow]![/yellow] ... already exists; overwriting.` | 0 |
 | `--version` | print version + `raise typer.Exit()` (no code → 0) | 0 |
 | Typer argument parsing errors | Typer default (red error to stderr) | 2 |
 
@@ -261,8 +322,9 @@ Otherwise prints a rich `Table` with columns `Name | Description`, truncating de
 cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.providers
                   ├─→ cli/style.py    ─→ storage.paths, storage.settings, storage.styles
                   ├─→ cli/skill.py    ─→ storage.skills
-                  ├─→ cli/tui.py      ─→ core.chat, storage.{providers,settings,styles}
+                  ├─→ cli/lma.py      ─→ core.lma, core.providers, storage.{paths,providers}
+                  ├─→ cli/tui.py      ─→ core.{chat,lma}, core.providers, storage.{paths,providers,settings,styles,sessions}
                   └─→ cli/chat.py     ─→ core.chat, storage.settings
 ```
 
-External libs the CLI directly imports: `typer`, `rich.console`, `rich.table`, `textual.app`, `textual.containers`, `textual.binding`, `textual.reactive`, `textual.widgets`, `rich.text`, `asyncio`.
+External libs the CLI directly imports: `typer`, `rich.console`, `rich.table`, `textual.app`, `textual.containers`, `textual.binding`, `textual.reactive`, `textual.widgets`, `rich.text`, `asyncio`, `dataclasses.replace`.

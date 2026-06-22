@@ -11,9 +11,59 @@ from typing import Any
 
 import coreouto as co
 
-from ..storage.providers import Provider
+from ..storage.providers import SOURCE_LMA, Provider
 
 SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")
+
+# `None` in the second tuple slot means "do not pin a base_url".
+_SDK_TO_FORMAT: dict[str, tuple[str, str | None]] = {
+    "openai": ("openai", None),
+    "openai-responses": ("openai-response", None),
+    "openai-compatible": ("openai", None),
+    "anthropic": ("anthropic", None),
+    "google-generative-ai": ("google", None),
+    "google-vertex": ("google", None),
+}
+
+
+def sdk_to_format(sdk: str | None, api: str | None) -> tuple[str | None, str | None]:
+    """Returns `(None, None)` when the SDK has no supported host."""
+
+    if not sdk:
+        return (None, None)
+    if sdk in _SDK_TO_FORMAT:
+        fmt, _ = _SDK_TO_FORMAT[sdk]
+        return (fmt, api or None)
+    if api:
+        return ("openai", api)
+    return (None, None)
+
+
+def add_provider_from_lma(
+    *,
+    name: str,
+    api_key: str,
+    sdk: str | None,
+    api: str | None,
+    default_model: str = "",
+) -> Provider:
+    """Build a Provider from lma metadata. Raises ValueError on unsupported SDK."""
+
+    fmt, base_url = sdk_to_format(sdk, api)
+    if fmt is None:
+        raise ValueError(
+            f"Cannot map lma provider {name!r} (sdk={sdk!r}) to a supported "
+            f"api_format. Supported SDKs: {', '.join(sorted(_SDK_TO_FORMAT))}, "
+            "or any SDK with a non-empty api URL (OpenAI-compatible fallback)."
+        )
+    return Provider(
+        name=name,
+        api_format=fmt,
+        base_url=base_url or "",
+        api_key=api_key,
+        default_model=default_model,
+        source=SOURCE_LMA,
+    )
 
 
 def build_coreouto_provider(provider: Provider) -> None:

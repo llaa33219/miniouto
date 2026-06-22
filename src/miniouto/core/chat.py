@@ -58,7 +58,9 @@ def run_chat(opts: ChatOptions) -> str:
         # Default to the model's real cap so the LLM can emit multi-KB
         # Write tool calls without hitting Anthropic's 1024 hard default
         # and silently truncating the file content mid-line.
-        provider_config["max_tokens"] = get_max_output_tokens(runtime.model)
+        provider_config["max_tokens"] = get_max_output_tokens(
+            runtime.model, runtime.provider_name
+        )
     if opts.temperature is not None:
         provider_config["temperature"] = opts.temperature
 
