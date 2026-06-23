@@ -20,16 +20,19 @@ import asyncio
 from dataclasses import replace
 from typing import Any, ClassVar
 
+from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, RichLog, Static
 
 from ..core import lma as lma_api
 from ..core.chat import ChatOptions, run_chat
+from ..core.events import LoopEvent
 from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
 from ..storage import paths
 from ..storage import providers as provider_store
@@ -41,6 +44,13 @@ from ..storage.sessions import MessageRecord
 
 SENTINEL_LMA_ADD = "__lma_add__"
 SENTINEL_CUSTOM_ADD = "__custom_add__"
+
+# Braille spinner frames. The status line reads e.g. "⠧ Write…" and the
+# glyph rotates through this set at ~12.5fps so the bottom of the screen
+# shows the agent is alive even between tool calls.
+_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_SPINNER_INTERVAL = 0.08
+_SPINNER_DEFAULT_TEXT = "Working…"
 
 # ─── Clickable chip ──────────────────────────────────────────────────────────
 
@@ -302,12 +312,16 @@ HELP_TEXT = (
 
 
 class BottomPanel(Static):
-    """The 2-row panel under the input: chips on top, help hint below."""
+    """The 3-row panel under the input: spinner on top, chips, help hint."""
 
     DEFAULT_CSS = """
     BottomPanel {
-        height: 2;
+        height: 3;
         background: $boost;
+    }
+    #spinner-row {
+        height: 1;
+        padding: 0 1;
     }
     #chip-row {
         height: 1;
@@ -322,8 +336,10 @@ class BottomPanel(Static):
     def __init__(self) -> None:
         super().__init__()
         self._chips: dict[str, StatusChip] = {}
+        self._spinner_row: Static | None = None
 
     def compose(self) -> ComposeResult:
+        yield Static("", id="spinner-row")
         with Horizontal(id="chip-row"):
             self._chips["provider"] = StatusChip("provider", "-", id="chip-provider")
             self._chips["model"] = StatusChip("model", "-", id="chip-model")
@@ -339,6 +355,88 @@ class BottomPanel(Static):
 
     def get_chip(self, kind: str) -> StatusChip | None:
         return self._chips.get(kind)
+
+    def render_spinner(self, frame: str, text: str) -> None:
+        if self._spinner_row is None:
+            try:
+                self._spinner_row = self.query_one("#spinner-row", Static)
+            except Exception:
+                return
+        if not frame:
+            self._spinner_row.update("")
+            return
+        self._spinner_row.update(
+            Text.assemble((frame, "bold cyan"), (f" {text}", "white"))
+        )
+
+
+class TUIEventSink:
+    """Sink that posts chat events to a running `ChatTUI` app.
+
+    The agent loop runs on a worker thread (via `asyncio.to_thread`), so
+    every callback must hop to the main thread with `call_from_thread`
+    before touching widgets. The spinner is driven by a Textual `Timer`
+    that ticks on the main thread — `start_spin` / `stop_spin` only need
+    to enable/disable it; `tick_spin` runs in the main loop already.
+    """
+
+    def __init__(self, app: ChatTUI) -> None:
+        self._app = app
+        self._frame_idx = 0
+        self._activity = _SPINNER_DEFAULT_TEXT
+        self._timer: Timer | None = None
+
+    def begin_working(self) -> None:
+        self._app.call_from_thread(self._start_spin)
+
+    def _start_spin(self) -> None:
+        if self._timer is not None:
+            return
+        self._frame_idx = 0
+        self._timer = self._app.set_interval(_SPINNER_INTERVAL, self._tick_spin)
+
+    def _tick_spin(self) -> None:
+        frame = _SPINNER_FRAMES[self._frame_idx % len(_SPINNER_FRAMES)]
+        self._frame_idx += 1
+        self._app._render_spinner(frame, self._activity)
+
+    def update_activity(self, text: str) -> None:
+        self._activity = text or _SPINNER_DEFAULT_TEXT
+
+    def end_working(self) -> None:
+        self._app.call_from_thread(self._stop_spin)
+
+    def _stop_spin(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self._app._render_spinner("", "")
+
+    def emit_loop_event(self, event: LoopEvent) -> None:
+        self._app.call_from_thread(self._post_loop_event, event)
+
+    def _post_loop_event(self, event: LoopEvent) -> None:
+        log = self._app._log
+        if log is None:
+            return
+        line = Text.assemble(
+            (f"{event.actor}:", "orange3"),
+            (f" {event.text}", "white"),
+        )
+        log.write(line)
+
+    def emit_final_answer(self, content: str, session_name: str) -> None:
+        self._app.call_from_thread(self._post_final_answer, content, session_name)
+
+    def _post_final_answer(self, content: str, session_name: str) -> None:
+        log = self._app._log
+        if log is None:
+            return
+        if content:
+            log.write(Markdown(content))
+        else:
+            log.write(Text("(empty response)", style="dim"))
+        log.write(Text(""))
 
 
 # ─── Main app ────────────────────────────────────────────────────────────────
@@ -804,28 +902,26 @@ class ChatTUI(App):
             return
         self._log.write(Text(f"[{text}]", style="yellow"))
 
+    def _render_spinner(self, frame: str, text: str) -> None:
+        if self._panel is not None:
+            self._panel.render_spinner(frame, text)
+
     async def _dispatch(self, prompt: str) -> None:
         assert self._log is not None
         s = settings_store.load()
         self._busy = True
-        self._post_system("thinking…")
+        sink = TUIEventSink(self)
         try:
             opts = ChatOptions(
                 prompt=prompt,
                 session=s.session or "default",
                 model=s.model or None,
             )
-            reply = await asyncio.to_thread(run_chat, opts)
+            await asyncio.to_thread(run_chat, opts, sink)
         except Exception as exc:
             self._post_system(f"error: {exc}")
             self._busy = False
             return
-        if not reply:
-            self._post_system("(empty response)")
-        else:
-            self._log.write(Text(""))
-            self._post_assistant(reply)
-            self._log.write(Text(""))
         self._busy = False
         self._refresh_chips()
 

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import coreouto as co
-from rich.console import Console
 
 from ..paths_runtime import INVOCATION_CWD
 from ..storage import providers as provider_store
@@ -19,8 +18,6 @@ from ..tools import registry as tool_registry
 from .providers import build_coreouto_provider, clear_coreouto_state
 
 ALL_TOOLS = ["Write", "Edit", "Delete", "Bash", "call_subagent"]
-
-_hook_console = Console(stderr=True, soft_wrap=False, highlight=False)
 
 # Tracks how deep we are inside a `call_subagent` invocation. 0 = outo (or
 # after `build_runtime` has just been called), >=1 = inside a subagent.
@@ -123,6 +120,8 @@ def build_runtime(
     style_overrides: dict[str, str] | None = None,
     provider_config: dict[str, Any] | None = None,
     on_tool_call: Callable[[str, dict[str, Any]], None] | None = None,
+    on_response: Callable[[str, bool], None] | None = None,
+    on_iteration: Callable[..., None] | None = None,
 ) -> co.Agent:
     """Construct the outo Agent with the active style and subagent wired in.
 
@@ -131,6 +130,11 @@ def build_runtime(
     normalizer without us having to mutate the config after construction.
     `on_tool_call` is called for every tool invocation (outo and subagent)
     with `(tool_name, arguments)`. Pass None to skip.
+    `on_response` is called after each LLM response with `(content, has_tool_calls)`
+    so the caller can stream intermediate model text. Pass None to skip.
+    `on_iteration` is called after each agent-loop iteration with the same
+    kwargs coreouto passes to ON_ITERATION (iteration, messages, response),
+    letting the caller stream loop-progress signals. Pass None to skip.
     """
 
     clear_coreouto_state()
@@ -205,7 +209,11 @@ def build_runtime(
     )
     co.register_hook(co.ON_ITERATION, summarize_hook)
 
-    co.register_hook(co.AFTER_LLM_CALL, _make_response_logger())
+    if on_response is not None:
+        co.register_hook(co.AFTER_LLM_CALL, _make_response_logger(on_response))
+
+    if on_iteration is not None:
+        co.register_hook(co.ON_ITERATION, _make_iteration_logger(on_iteration))
 
     outo_config = co.get_agent_preset("outo").to_config()
     if provider_config:
@@ -224,13 +232,37 @@ def _make_tool_call_logger(callback: Callable[[str, dict[str, Any]], None]):
     return hook
 
 
-def _make_response_logger():
+def _make_iteration_logger(callback: Callable[..., None]):
+    """Build an ON_ITERATION hook that forwards coreouto's kwargs verbatim.
+
+    coreouto fires ON_ITERATION after each agent-loop iteration with
+    `(iteration, messages, response)`. Forwarding them as-is lets the
+    caller stream loop-progress signals without us binding the public
+    hook signature to a particular coreouto version.
+    """
+
+    def hook(*, iteration: int, messages: Any, response: Any, **kwargs: Any) -> None:
+        callback(iteration=iteration, messages=messages, response=response)
+
+    return hook
+
+
+def _make_response_logger(
+    callback: Callable[[str, bool], None],
+):
+    """Build the AFTER_LLM_CALL hook that streams intermediate model text.
+
+    `callback(content, has_tool_calls)` receives the full response text and
+    a flag indicating whether the model emitted tool calls in this turn.
+    Final responses (no tool calls) are flagged so the caller can skip them
+    — the terminal answer is rendered separately by the sink.
+    """
+
     def hook(*, response: Any, messages: Any, **kwargs: Any) -> None:
-        if response and hasattr(response, "content") and response.content:
-            content = response.content
-            if len(content) > 200:
-                content = content[:197] + "..."
-            _hook_console.print(f"  outo: {content}", style="dim", markup=False)
+        if not response or not hasattr(response, "content") or not response.content:
+            return
+        tool_calls = getattr(response, "tool_calls", None) or []
+        callback(response.content, bool(tool_calls))
 
     return hook
 

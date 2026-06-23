@@ -13,6 +13,7 @@ from rich.console import Console
 from ..storage import sessions as session_store
 from ..storage.sessions import MessageRecord
 from .context import get_max_output_tokens
+from .events import EventSink, LoopEvent, NullSink
 from .runtime import (
     ChatOverrides,
     build_runtime,
@@ -20,15 +21,17 @@ from .runtime import (
     resolve_runtime_from_settings,
 )
 
-_hook_console = Console(stderr=True, soft_wrap=False, highlight=False)
+# Failure diagnostics still go straight to stderr so a sink-aware caller
+# (e.g. the TUI) doesn't have to opt in to error rendering.
+_fail_console = Console(stderr=True, soft_wrap=False, highlight=False)
 
-# Per-turn diagnostics: the last tool call observed (if any) and the index of
-# the iteration that produced it. When `agent.call_sync` raises, we print
-# these to stderr so the user can see which tool was the proximate cause —
-# most "'NoneType' object is not iterable" / "list index out of range" /
-# "tool not found" errors fire on the *next* operation after a malformed
-# tool call, and without this trail the traceback alone often points into
-# coreouto internals with no clue about the offending input.
+# Per-turn diagnostics: the last tool call observed (if any). When
+# `agent.call_sync` raises, we print these to stderr so the user can see
+# which tool was the proximate cause — most "'NoneType' object is not
+# iterable" / "list index out of range" / "tool not found" errors fire
+# on the *next* operation after a malformed tool call, and without this
+# trail the traceback alone often points into coreouto internals with
+# no clue about the offending input.
 _tool_trace: list[dict[str, Any]] = []
 _tool_trace_lock = threading.Lock()
 
@@ -45,8 +48,15 @@ class ChatOptions:
     continue_session: bool = False
 
 
-def run_chat(opts: ChatOptions) -> str:
-    """Build the runtime, run a single turn, return the final reply."""
+def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
+    """Build the runtime, run a single turn, return the final reply.
+
+    `sink` receives every internal-loop event (tool calls, intermediate
+    model text) and the final answer. Pass `None` (or omit) for a
+    `NullSink` that swallows everything — useful for tests.
+    """
+
+    sink = sink if sink is not None else NullSink()
 
     runtime = resolve_runtime_from_settings(
         ChatOverrides(provider=opts.provider, model=opts.model, style=opts.style)
@@ -64,10 +74,14 @@ def run_chat(opts: ChatOptions) -> str:
     if opts.temperature is not None:
         provider_config["temperature"] = opts.temperature
 
+    on_tool_call = _make_tool_call_dispatcher(sink)
+
     agent = build_runtime(
         runtime,
         provider_config=provider_config,
-        on_tool_call=_log_tool_call,
+        on_tool_call=on_tool_call,
+        on_response=_make_response_dispatcher(sink),
+        on_iteration=_make_iteration_dispatcher(sink),
     )
 
     session_name = opts.session or runtime.session
@@ -78,11 +92,16 @@ def run_chat(opts: ChatOptions) -> str:
     with _tool_trace_lock:
         _tool_trace.clear()
 
+    sink.begin_working()
     try:
-        response = agent.call_sync(opts.prompt, history=core_msgs)
-    except Exception as exc:
-        _dump_failure_diagnostics(exc, session_name)
-        raise
+        try:
+            response = agent.call_sync(opts.prompt, history=core_msgs)
+        except Exception as exc:
+            sink.end_working()
+            _dump_failure_diagnostics(exc, session_name)
+            raise
+    finally:
+        sink.end_working()
 
     final = response.content
 
@@ -99,7 +118,90 @@ def run_chat(opts: ChatOptions) -> str:
         session_name,
         MessageRecord(role="assistant", content=final, tool_calls=tool_calls),
     )
+    sink.emit_final_answer(final, session_name)
     return final
+
+
+def _make_tool_call_dispatcher(sink: EventSink):
+    """Build the per-tool-call callback wired into the BEFORE_TOOL_CALL hook."""
+
+    def on_tool_call(name: str, arguments: dict[str, Any]) -> None:
+        _validate_tool_call_args(name, arguments)
+        nested = current_subagent_depth() > 0
+        actor = "subagent" if nested else "outo"
+
+        with _tool_trace_lock:
+            _tool_trace.append({"name": name, "arguments": dict(arguments or {})})
+
+        if name == "call_subagent":
+            msg = arguments.get("message") or arguments.get("task") or ""
+            sink.emit_loop_event(
+                LoopEvent(
+                    actor=actor,
+                    kind="tool",
+                    text=f"call_subagent {msg}",
+                    tool_name=name,
+                )
+            )
+            sink.update_activity("subagent")
+        elif name in ("Bash", "Write", "Edit", "Delete"):
+            preview = _short_arg_summary(name, arguments)
+            sink.emit_loop_event(
+                LoopEvent(
+                    actor=actor,
+                    kind="tool",
+                    text=f"{name} {preview}",
+                    tool_name=name,
+                )
+            )
+            sink.update_activity(name)
+
+    return on_tool_call
+
+
+def _make_response_dispatcher(sink: EventSink):
+    """Build the per-LLM-response callback wired into the AFTER_LLM_CALL hook.
+
+    Only intermediate responses (those followed by a tool call) are emitted.
+    The terminal response is rendered separately via `sink.emit_final_answer`
+    so we don't print the answer twice.
+    """
+
+    def on_response(content: str, has_tool_calls: bool) -> None:
+        if not content or not has_tool_calls:
+            return
+        nested = current_subagent_depth() > 0
+        actor = "subagent" if nested else "outo"
+        sink.emit_loop_event(LoopEvent(actor=actor, kind="response", text=content))
+
+    return on_response
+
+
+def _make_iteration_dispatcher(sink: EventSink):
+    """Build the per-iteration callback wired into the ON_ITERATION hook.
+
+    Emits a `context` loop event with the iteration number and cumulative
+    token usage so the user sees the agent is making progress even between
+    tool calls. Without this, the loop is silent from the moment the prompt
+    is sent until the first tool call or terminal answer — there's no signal
+    that work is happening at all.
+    """
+
+    cumulative: list[int] = [0]
+
+    def on_iteration(*, iteration: int, messages: Any, response: Any, **_kwargs: Any) -> None:
+        usage = getattr(response, "usage", None) if response else None
+        tokens = getattr(usage, "total_tokens", None) if usage else None
+        if isinstance(tokens, int) and tokens > 0:
+            cumulative[0] = tokens
+        nested = current_subagent_depth() > 0
+        actor = "subagent" if nested else "outo"
+        text = f"iter {iteration}"
+        if cumulative[0]:
+            text += f" · {cumulative[0]} tokens"
+        sink.emit_loop_event(LoopEvent(actor=actor, kind="context", text=text))
+
+    return on_iteration
 
 
 def _dump_failure_diagnostics(exc: BaseException, session_name: str) -> None:
@@ -114,26 +216,26 @@ def _dump_failure_diagnostics(exc: BaseException, session_name: str) -> None:
     with _tool_trace_lock:
         recent = list(_tool_trace)
 
-    Console(stderr=True).print(
+    _fail_console.print(
         f"\n[red]✗ {type(exc).__name__}:[/red] {exc}",
         highlight=False,
     )
     if recent:
-        Console(stderr=True).print(
+        _fail_console.print(
             f"[red]Last tool call before failure ({len(recent)} total this turn):[/red]"
         )
         for entry in recent[-5:]:
             name = entry.get("name")
             args = entry.get("arguments") or {}
             summary = _short_arg_summary(name, args) if name in _LOGGABLE_TOOL_NAMES else repr(args)[:160]
-            Console(stderr=True).print(f"  - {name}: {summary}")
+            _fail_console.print(f"  - {name}: {summary}")
     else:
-        Console(stderr=True).print(
+        _fail_console.print(
             "[red]No tool call was observed before the failure — the error "
             "fired during model setup, provider call, or response parsing.[/red]"
         )
-    Console(stderr=True).print("[red]Traceback:[/red]")
-    Console(stderr=True).print(traceback.format_exc(), highlight=False)
+    _fail_console.print("[red]Traceback:[/red]")
+    _fail_console.print(traceback.format_exc(), highlight=False)
 
 
 def _load_history(session: str, continue_session: bool) -> list[MessageRecord]:
@@ -161,24 +263,6 @@ def _to_coreouto_history(messages: list[MessageRecord]) -> list[co.Message]:
 
 
 _LOGGABLE_TOOL_NAMES = ("Bash", "Write", "Edit", "Delete", "call_subagent")
-
-
-def _log_tool_call(name: str, arguments: dict[str, Any]) -> None:
-    _validate_tool_call_args(name, arguments)
-    nested = current_subagent_depth() > 0
-    if name in _LOGGABLE_TOOL_NAMES:
-        with _tool_trace_lock:
-            _tool_trace.append({"name": name, "arguments": dict(arguments or {})})
-    if name == "call_subagent":
-        msg = arguments.get("message") or arguments.get("task") or ""
-        preview = msg if len(msg) < 160 else msg[:157] + "..."
-        _hook_console.print(f"subagent: {preview}", style="dim", markup=False)
-    elif name in ("Bash", "Write", "Edit", "Delete"):
-        preview = _short_arg_summary(name, arguments)
-        if nested:
-            _hook_console.print(f"  subagent:{name} {preview}", style="dim", markup=False)
-        else:
-            _hook_console.print(f"  outo:{name} {preview}", style="dim", markup=False)
 
 
 def _validate_tool_call_args(name: str, arguments: Any) -> None:
@@ -221,7 +305,7 @@ class ToolCallArgsError(Exception):
 def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
     if name == "Bash":
         cmd = (args.get("command") or "").replace("\n", " ")
-        return cmd if len(cmd) < 160 else cmd[:157] + "..."
+        return cmd
     if name == "Write":
         path = args.get("file_path", "?")
         size = len(args.get("content") or "")

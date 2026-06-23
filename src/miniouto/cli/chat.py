@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import datetime
+import uuid
+
 import typer
-from rich.console import Console
 
 from ..core.chat import ChatOptions, run_chat
+from ..core.events import ConsoleEventSink
 from ..storage import settings as settings_store
-
-console = Console()
 
 
 def chat_cmd(
     prompt: str = typer.Argument(..., help="Prompt to send to the agent."),
-    name: str | None = typer.Option(None, "--name", help="Session name (default: from settings)."),
+    name: str | None = typer.Option(
+        None, "--name", help="Session name. Without --name and --continue, a fresh session is generated each call."
+    ),
     provider: str | None = typer.Option(None, "--provider", help="Override the active provider."),
     model: str | None = typer.Option(None, "--model", help="Override the default model."),
     style: str | None = typer.Option(None, "--style", help="Override the active style."),
@@ -25,9 +28,18 @@ def chat_cmd(
 ) -> None:
     """Run one prompt and print the agent's reply."""
 
-    session_name = name or settings_store.load().session or "default"
-    if name is not None or continue_session:
-        settings_store.update(session=session_name)
+    if continue_session:
+        session_name = name or settings_store.load().session or "default"
+    elif name is not None:
+        session_name = name
+    else:
+        # Fresh session each call: timestamp + short UUID keeps names
+        # unique even within the same second and sortable by recency,
+        # so the previous chat's `settings.session` doesn't bleed in.
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        suffix = uuid.uuid4().hex[:6]
+        session_name = f"chat-{ts}-{suffix}"
+    settings_store.update(session=session_name)
 
     opts = ChatOptions(
         prompt=prompt,
@@ -39,9 +51,9 @@ def chat_cmd(
         temperature=temperature,
         continue_session=continue_session,
     )
-    try:
-        reply = run_chat(opts)
-    except Exception as exc:
-        console.print(f"[red]✗[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-    console.print(reply, style="dark_orange3")
+    # The sink handles all output: braille spinner + loop events share
+    # stdout (Rich's Live display owns one channel and keeps them
+    # vertically separated). The final answer is wrapped between
+    # `------finish------` / `------<session>------` so callers can pipe
+    # it verbatim with grep-friendly markers.
+    run_chat(opts, sink=ConsoleEventSink())
