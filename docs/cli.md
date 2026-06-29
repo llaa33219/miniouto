@@ -17,7 +17,10 @@ miniouto [--version]
    ├─ status                     → show current configuration
    ├─ chat <prompt> [options]    → one-shot chat turn
    ├─ provider
-   │    ├─ add   --name --format --base-url --api-key --default-model
+   │    ├─ providers                          → list all catalog (lma) providers
+   │    ├─ models <provider-name>             → list models for a catalog provider
+   │    ├─ add <provider-name> --api-key …    → add a provider from the catalog
+   │    ├─ custom add  --name --format --base-url --api-key --default-model
    │    ├─ list
    │    ├─ remove <name>
    │    └─ default <name>
@@ -26,20 +29,18 @@ miniouto [--version]
    │    ├─ set <name>
    │    ├─ add <repo_url> [--name NAME]
    │    └─ show <name>
-   ├─ skill
-   │    ├─ list
-   │    └─ show <name>
-   └─ lma                        ← NEW: lma (llm-model-api) browser
-        ├─ providers                          → list all 144 lma providers
-        ├─ models <provider-name>             → list models for a provider
-        └─ add <provider-name> --api-key ...  → add a provider from lma
+   └─ skill
+        ├─ list
+        └─ show <name>
 ```
+
+> **Naming note:** the catalog commands (`providers`, `models`, `add`) source their data from `https://lma.blp.sh` (the "lma" service). The codebase and UI call these **"catalog"** providers (see `cli/provider.py` importing `core.lma as catalog_api` and the `+ add from catalog…` TUI sentinel), but the underlying `Provider.source` field value remains the literal string `"lma"` (`SOURCE_LMA = "lma"`).
 
 ## Root callback behavior
 
 `@app.callback()` in `cli/__init__.py` runs before any subcommand. It:
 
-1. Calls `storage.paths.ensure_dirs()` to guarantee `~/.miniouto/{style,sessions,logs}` exist.
+1. Calls `storage.paths.ensure_dirs()` to guarantee `~/.miniouto/` and its `style/`, `sessions/`, `logs/` subdirs exist (also seeds bundled styles on first run).
 2. If `--version` was passed: prints `miniouto {__version__}` and exits 0.
 3. If no subcommand was invoked (`ctx.invoked_subcommand is None`): calls `tui.run_tui()` which launches the Textual TUI.
 
@@ -54,9 +55,11 @@ Delegates to `cli/tui.py:run_tui()`, which constructs a `ChatTUI` (Textual `App`
 Layout (top to bottom):
 - `Header(show_clock=False)`
 - `Vertical(RichLog(id="chat", wrap=True), Input(placeholder="…", id="input"))`
-- `BottomPanel` (height 2):
-  - Row 1: four clickable `StatusChip`s — `provider`, `model`, `style`, `session`
-  - Row 2: keyboard/click hint
+- `BottomPanel` (height 4) with four rows:
+  1. spinner row (a `rich.status`-driven spinner shown while a chat turn is in flight)
+  2. chip row with **three** clickable `StatusChip`s — `model`, `provider`, `style`
+  3. session row — a plain `Static` label showing the active session name (not clickable)
+  4. help-hint row
 - `Footer`
 
 ### Clickable chips
@@ -65,35 +68,34 @@ Each `StatusChip` is a focusable widget. Click it (or focus it with `Tab` and pr
 
 | Chip | Modal | Notes |
 |---|---|---|
-| `provider` | `SelectionModal` — list of configured providers + `+ add from lma…` + `+ add custom…` sentinels | selecting a sentinel opens the LMA add wizard or the custom-add wizard; selecting an existing provider writes `settings.provider` |
-| `model` | `SelectionModal` (lma-backed provider) **or** `TextInputModal` (custom provider) | the picker is the lma model list when `provider.source == "lma"`, otherwise a free-text input. Saving writes to `provider.default_model` and clears any prior `settings.model` override |
+| `model` | `SelectionModal` (catalog provider, `source == "lma"`) **or** `TextInputModal` (custom provider, `source == "custom"`) | dispatched via `_open_model_editor` → `_catalog_model_picker_flow` or `_open_custom_model_editor`. Saving writes to `provider.default_model` and clears any prior `settings.model` override |
+| `provider` | `SelectionModal` — list of configured providers + `+ add from catalog…` + `+ add custom…` sentinels | selecting a sentinel opens `_catalog_add_flow` or `_open_custom_add_wizard`; selecting an existing provider writes `settings.provider` |
 | `style` | `SelectionModal` — list of installed styles | writes `settings.style` |
-| `session` | `SelectionModal` — list of sessions + `+ new session…` sentinel | selecting the sentinel opens a `TextInputModal` for the new name |
+
+There is **no** session chip — the session label in row 3 is a plain `Static`. To change sessions, use the command palette (`Ctrl+P`) → "Pick session" / "New session".
 
 The provider picker modal also accepts two sentinels (rendered as `extra_options` rows at the bottom of the list):
 
-- `+ add from lma…` — runs the LMA add wizard: fetches `https://lma.blp.sh/provider`, filters to entries whose `sdk` maps to a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="lma"` and the first model returned by lma as `default_model`. See `core/lma.py` and `core/providers.py:sdk_to_format`.
-- `+ add custom…` — runs a five-step wizard (name → api_format → base_url → api_key → default_model), saving with `source="custom"`.
+- `+ add from catalog…` — runs `_catalog_add_flow`: fetches `https://lma.blp.sh/provider`, filters to entries whose `sdk` maps to a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="lma"` and the first model returned by lma as `default_model`. See `core/lma.py` and `core/providers.py:sdk_to_format`.
+- `+ add custom…` — runs `_open_custom_add_wizard`: a five-step wizard (name → api_format → base_url → api_key → default_model), saving with `source="custom"`.
 
-Modal results are persisted via `storage.settings.update(...)` (for provider/style/session) or `storage.providers.upsert(replace(...))` (for model changes), and the chip row re-renders.
+Modal results are persisted via `storage.settings.update(...)` (for provider/style/session) or `storage.providers.upsert(replace(...))` (for model changes), and the chip row re-renders. The active Textual theme is persisted to `settings.theme` and restored on launch.
 
 ### Model resolution order
 
 `resolve_runtime_from_settings` (core/runtime.py) resolves the active model in this order:
 1. `ChatOptions.model` (per-call `--model` flag)
 2. `Settings.model` (legacy per-session override; cleared whenever the TUI model picker saves)
-3. `Provider.default_model` (set by `provider add --default-model`, `lma add --default-model`, or the TUI model chip)
+3. `Provider.default_model` (set by `provider add --default-model`, `provider custom add --default-model`, or the TUI model chip)
 
 In the TUI, the model chip always shows `Provider.default_model` — the `Settings.model` field is reserved for the `chat --model` CLI override and is no longer surfaced through the UI.
 
 Keybindings:
-- `Tab` / `Shift+Tab` — cycle chip focus
-- `Enter` — open focused chip's modal
-- `Esc` — cancel current modal
-- `Ctrl+L` — clear log
-- `Ctrl+C` — quit
+- App-level (registered on `ChatTUI`): `Ctrl+L` — clear log; `Ctrl+C` — quit.
+- `Ctrl+P` — open the Textual system command palette (customized via `get_system_commands`) — new session, pick session, change model/provider/style/theme, clear log. The splash text on boot explicitly says "Press Ctrl+P for commands."
+- Widget-level (inside modals / chips): `Tab` / `Shift+Tab` — cycle focus; `Enter` — confirm; `Esc` — cancel.
 
-Submission flow: each submitted prompt is dispatched via `self.run_worker(..., exclusive=True)` to `_dispatch(prompt)`, which calls `core.chat.run_chat(opts)` inside `asyncio.to_thread` so the Textual event loop stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output is posted back into the RichLog; user prompts in normal text, assistant replies in `dark_orange3`, errors prefixed with `[error: …]`.
+Submission flow: each submitted prompt is dispatched via `self.run_worker(..., exclusive=True)` to `_dispatch(prompt)`, which calls `core.chat.run_chat(opts, sink)` inside `asyncio.to_thread` so the Textual event loop stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output is posted back into the RichLog; user prompts prefixed with `>` in accent color, assistant final answer rendered as `Markdown(content)` (no tint), tool/iteration events in theme accent/foreground, errors/system messages rendered as `[…]` (e.g. `[error: {exc}]`) in theme warning.
 
 `cli/tui.py:tui_summary() -> dict` is a programmatic snapshot helper (currently unused by the runtime) that returns `{provider, model, style, session, styles_available}`.
 
@@ -110,14 +112,14 @@ Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.1.0"`) a
 File: `cli/__init__.py` (lines ~45–66).
 
 Reads:
-- `storage.settings.load()` → active `provider`, `model` (derived from provider's `default_model`), `style`, `session`
+- `storage.settings.load()` → active `provider`, `style`, `session`; `model` is derived from the active provider's `default_model` (or `'- (use chat --model)'` when empty)
 - `storage.paths.ROOT` → storage path
 - `storage.providers.load_all()` → all configured provider names
 - `storage.styles.list_styles()` → installed style names
-- `storage.skills.list_skills()` → all skill names
+- `storage.skills.list_skills()` → all visible skill names (hidden skills excluded)
 - `storage.sessions.list_sessions()` → session filenames
 
-Prints as rich-formatted key/value lines. Always exits 0 (no error states).
+Prints 9 rich-formatted key/value lines: `Default provider`, `Default model`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, `Sessions`. Always exits 0 (no error states).
 
 ---
 
@@ -128,7 +130,7 @@ File: `cli/chat.py`. Signature:
 ```
 chat_cmd(
     prompt: str,                       # required positional
-    --name        TEXT,                # session name (persists to settings.toml)
+    --name        TEXT,                # session name. Without --name and --continue, a fresh session is generated each call.
     --provider    TEXT,                # override active provider
     --model       TEXT,                # override resolved model
     --style       TEXT,                # override active style
@@ -142,7 +144,7 @@ chat_cmd(
 
 | Flag | Effect |
 |---|---|
-| `--name` | Session name (persists to `~/.miniouto/settings.toml`) |
+| `--name` | Session name. Without `--name` and `--continue`, a fresh session is generated each call |
 | `--provider` | Override the active provider for this call |
 | `--model` | Override the resolved model for this call |
 | `--style` | Override the active style for this call |
@@ -152,61 +154,88 @@ chat_cmd(
 
 ### Behavior
 
-1. Resolves `session_name = name or settings.load().session or "default"`.
-2. If `--name` was given OR `--continue` was set, calls `settings.update(session=session_name)` to persist.
-3. Builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts)`.
-4. On exception: prints `[red]✗[/red] {exc}` and raises `typer.Exit(code=1) from exc`.
-5. On success: prints the reply in `dark_orange3` rich style.
+1. Resolves `session_name` via a 3-way branch:
+   - If `--continue`: `name or settings.session or "default"`.
+   - elif `--name` was supplied: use `name` verbatim.
+   - else: generate a fresh `chat-{YYYYMMDD-HHMMSS}-{6hex}` name.
+2. **Always** calls `settings.update(session=session_name)` to persist (unconditional — every chat call updates the active session).
+3. Writes a `------{session_name}------` marker to stdout, then builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts, sink=ConsoleEventSink())`.
+4. On exception: `chat_cmd` does **not** catch — `run_chat` itself calls `_dump_failure_diagnostics` (prints `✗ {ExceptionType}: {msg}` + the last ≤5 tool calls + a full traceback to **stderr**) and **re-raises**. Typer prints the traceback and exits 1.
+5. On success: `ConsoleEventSink` writes the reply as plain stdout followed by a `------finish------` marker. Loop events (tool calls, intermediate responses) above it are rendered in `orange3`.
 
 ### Model resolution
 
-The active model is chosen by the first match in:
+The active model is chosen by the first match in (matches the README's 4-step list):
 
 1. `miniouto chat --model <name>` (per-call override)
-2. `miniouto provider add --default-model <name>` (provider-level default)
-3. **error** — no model can be inferred
+2. `settings.model` (legacy per-session override; cleared whenever the TUI model picker saves)
+3. `provider.default_model` (set by `provider add --default-model`, `provider custom add --default-model`, or the TUI model chip)
+4. **error** — no model can be inferred
 
 ---
 
 ## `miniouto provider ...`
 
-File: `cli/provider.py`. Sub-app `app = typer.Typer(help="Manage LLM providers.")`.
+File: `cli/provider.py`. Sub-app `app = typer.Typer(help="Manage LLM providers (catalog browse + custom config).")`.
 
-### `provider add`
+The provider command has three groups: **catalog** browse/add (`providers`, `models`, `add`), **storage** ops on already-configured providers (`list`, `remove`, `default`), and **custom** manual config (`custom add`).
+
+### `provider providers`
+
+Calls `GET https://lma.blp.sh/provider`. Prints a rich `Table` titled `Catalog providers (N)` with columns `Name | SDK | API URL | miniouto format | Addable?`. The "Addable?" column is `✓` when `core.providers.sdk_to_format(sdk, api)` returns a non-`None` format. Empty result → yellow "No providers returned by the catalog." (exit 0). Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
+
+### `provider models <provider-name>`
+
+Positional argument; lma does case-/whitespace-insensitive fuzzy match. Calls `GET https://lma.blp.sh/model-list?provider-name=<name>`. Prints a `Table` titled `Catalog models for '<name>' (N)` with columns `ID | Name`. Empty result → yellow "No models returned for `<name>`." + exit 1. Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
+
+### `provider add <provider-name> --api-key <key> [--default-model <id>]`
+
+Catalog add. Positional `provider_name` (fuzzy-matched via `core.lma.find_provider`), required `--api-key`, optional `--default-model` (default `""`).
+
+- If `find_provider` returns `None`: red `✗ No catalog provider matched <name>. Run 'miniouto provider providers' to see the catalog.` + exit 1.
+- Calls `core.providers.add_provider_from_lma(...)` to build a `Provider` with `source="lma"`.
+- If `--default-model` is empty, re-fetches the provider's model list and uses the first model id (re-invokes `add_provider_from_lma` with that id).
+- If the provider already exists: yellow `! Provider <name> already exists; overwriting.`
+- On success: `✓ Added provider <name> (<api_format>, default-model=<model or ->).`
+
+If `sdk_to_format` cannot map the SDK (raises `ValueError`): red `✗ {exc}` + exit 1.
+
+### `provider custom add`
+
+Manual add via a nested sub-app (`custom_app`). Flags:
 
 ```
-add(
+add_custom(
     --name           TEXT  # required
     --format         TEXT  # default "openai"; one of SUPPORTED_FORMATS:
-                          #   openai, openai-response, anthropic, google
+                           #   openai, openai-response, anthropic, google
     --base-url       TEXT  # default ""
     --api-key        TEXT  # default "" (omit to read from env at call time)
     --default-model  TEXT  # default "" (used when chat --model is not given)
 )
 ```
 
-- Validates `--format` against `core.providers.SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")`. Unknown → red error + `typer.Exit(1)`.
-- Calls `storage.paths.ensure_dirs()`, builds a `storage.providers.Provider(...)`, calls `storage.providers.upsert(provider)`.
-- Prints `✓ Added provider "<name>".`
+- Validates `--format` against `core.providers.SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")`. Unknown → red `✗ Unknown format <fmt>. Supported: …` + exit 1.
+- Calls `storage.paths.ensure_dirs()`, builds a `storage.providers.Provider(...)` (with `source="custom"`), calls `storage.providers.upsert(provider)`.
+- Prints `✓ Saved custom provider <name> (<api_format>).`
 
 ### `provider list`
 
-Pretty-prints a `rich.table.Table` with columns:
+Pretty-prints a `rich.table.Table` titled `Providers` with columns:
 
-| Name | Format | Base URL | Default Model | Default |
+| Name | Type | Format | Base URL | Default Model | Default |
 
-The active provider (per `settings.toml`) is marked with a green ● in the Default column.
+The `Type` column renders `custom` or `catalog` based on `provider.source` (`SOURCE_CUSTOM` → "custom", `SOURCE_LMA` → "catalog"). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
 
-If no providers are configured, prints yellow "No providers configured. Run `miniouto provider add`."
+If no providers are configured, prints yellow "No providers configured. Run `miniouto provider add <name>` or `miniouto provider custom add`."
 
 ### `provider remove <name>`
 
-Calls `storage.providers.remove(name)`. Prints `✓ Removed provider "<name>".` on success; red ✗ + `typer.Exit(1) from exc` if the provider was not found.
+Calls `storage.providers.remove(name)`. Prints `✓ Removed provider <name>.` on success; red `✗ Provider <name> does not exist.` + exit 1 if not found.
 
 ### `provider default <name>`
 
-Validates via `storage.providers.get(name)`. If `None` → red ✗ + `typer.Exit(1)`.
-Otherwise calls `settings.update(provider=name)` and prints `✓ Default provider set to "<name>".`
+Validates via `storage.providers.get(name)`. If `None` → red `✗ Provider <name> is not configured.` + exit 1. Otherwise calls `settings.update(provider=name)` and prints `✓ Default provider is now <name>.`.
 
 ---
 
@@ -220,8 +249,7 @@ Iterates `storage.styles.list_styles()`. Active style (per `settings.toml`) is m
 
 ### `style set <name>`
 
-Calls `storage.styles.read(name)`. If `None` → red ✗ + `typer.Exit(1)`.
-Otherwise calls `settings.update(style=name)` and prints `✓ Active style set to "<name>".`
+Calls `storage.styles.read(name)`. If `None` → red `✗ ... is not installed.` + exit 1. Otherwise calls `settings.update(style=name)` and prints `✓ Active style is now <name>.`.
 
 ### `style add <repo_url> [--name NAME]`
 
@@ -230,13 +258,13 @@ Fetches `/style-md/` from a remote git repo and writes the `.md` files into `~/.
 - `repo_url`: any of GitHub (`https://github.com/owner/repo`), GitLab (`https://gitlab.com/owner/repo`), or raw HTML index URL.
 - `--name`: override each downloaded file's basename (rarely used).
 
-Internally calls `storage.styles.add_from_repo(repo_url, name_override=name)`. On exception: red ✗ + `typer.Exit(1) from exc`. On success: prints `Added/updated styles: <comma list>`.
+Internally calls `storage.styles.add_from_repo(repo_url, name_override=name)`. On exception: red `✗ Failed to fetch styles: {exc}` + exit 1. On success: prints `✓ Added/updated styles: <comma list>`.
 
-See `docs/storage.md` and `tools/registry.py`-style fetcher in `storage/styles.py` (`_fetch_dir`, `_fetch_github_tree`, `_fetch_gitlab_tree`, `_fetch_raw_index`) for the URL shapes accepted.
+See `docs/storage.md` and the fetchers in `storage/styles.py` (`_fetch_github_tree`, `_fetch_gitlab_tree`, `_fetch_raw_index`) for the URL shapes accepted.
 
 ### `style show <name>`
 
-Prints the file contents of `~/.miniouto/style/<name>.md` to stdout. If missing → red ✗ + `typer.Exit(1)`.
+Prints the file contents of `~/.miniouto/style/<name>.md` to stdout. If missing → red `✗ ... is not installed.` + exit 1.
 
 ---
 
@@ -248,12 +276,11 @@ File: `cli/skill.py`. Sub-app `app = typer.Typer(help="Manage agent skills.")`.
 
 ### `skill list`
 
-Iterates `storage.skills.list_skills()`. Empty → yellow "No skills found. Check `~/.agents/skills/`".
-Otherwise prints a rich `Table` with columns `Name | Description`, truncating descriptions to 80 chars + "...".
+Iterates `storage.skills.list_skills()` — **hidden skills are excluded** (the function filters `not skill.hidden`). Empty → yellow "No skills found." followed by "Check ~/.agents/skills/". Otherwise prints a rich `Table` titled `Available Skills` with columns `Name | Description`, truncating descriptions to 80 chars + "…".
 
 ### `skill show <name>`
 
-- `skill = storage.skills.get_skill(name)`. If `None` → red ✗ + `typer.Exit(1)`.
+- `skill = storage.skills.get_skill(name)` (this does **not** filter on `hidden`, so hidden skills can still be shown by explicit name). If `None` → red `✗ Skill <name> not found.` + exit 1.
 - Prints in order:
   - `Name: <name>`
   - `Description: <description>`
@@ -264,25 +291,9 @@ Otherwise prints a rich `Table` with columns `Name | Description`, truncating de
 
 ---
 
-## `miniouto lma ...`
+## Catalog (lma) endpoint caching
 
-File: `cli/lma.py`. Sub-app `app = typer.Typer(help="Browse the lma (llm-model-api) provider and model catalog.")`.
-
-Thin CLI over `core/lma.py`, which wraps `https://lma.blp.sh` (a re-shaped view of `models.dev/api.json` deployed on Cloudflare Workers). The same client is used by the TUI provider add flow and by `core/context.py` for per-model context / max-output-token lookups. See `docs/lma.md` for the full endpoint reference.
-
-### `lma providers`
-
-Calls `GET https://lma.blp.sh/provider`. Prints a rich table with columns `Name | SDK | API URL | miniouto format | Addable?`. The "Addable?" column is `✓` when `core.providers.sdk_to_format(sdk, api)` returns a non-`None` format (i.e. the entry can be added by the TUI wizard or `lma add`). Transport failure → red ✗ + `typer.Exit(1)`.
-
-### `lma models <provider-name>`
-
-Calls `GET https://lma.blp.sh/model-list?provider-name=<name>` (lma does case-/whitespace-insensitive fuzzy match). Prints a table `ID | Name`. Empty result → yellow "No models returned for `<name>`" + `typer.Exit(1)`. Transport failure → red ✗ + `typer.Exit(1)`.
-
-### `lma add <provider-name> --api-key <key> [--default-model <id>]`
-
-Resolves `<provider-name>` via `core.lma.find_provider`. If found, derives `name = core.lma.slugify(...)`, calls `core.providers.add_provider_from_lma(...)`, and stores the resulting `Provider` with `source="lma"`. If `--default-model` is empty, fetches the provider's model list from lma and uses the first entry as `default_model`. Existing providers are overwritten (yellow warning printed first).
-
-The endpoint data is cached for 10 minutes (matching lma's server TTL); the cache lives in `core.lma._CACHE` and can be cleared with `core.lma.clear_cache()` (used by tests).
+The catalog commands (`provider providers`, `provider models`, `provider add`) and the TUI catalog flows all hit `https://lma.blp.sh` via `core/lma.py`. Responses are cached for 10 minutes (matching lma's server TTL); the cache lives in `core.lma._CACHE` and can be cleared with `core.lma.clear_cache()` (used by tests). See `docs/lma.md` for the full endpoint reference and `sdk_to_format` mapping table.
 
 ---
 
@@ -291,40 +302,41 @@ The endpoint data is cached for 10 minutes (matching lma's server TTL); the cach
 | Scenario | Behavior | Exit code |
 |---|---|---|
 | Successful command | stdout output, no error | 0 |
-| Unhandled exception in `chat_cmd` | `[red]✗[/red] {exc}` to stderr + `typer.Exit(code=1) from exc` | 1 |
-| `provider add` with unknown `--format` | `[red]✗[/red] Unknown format ...` + `typer.Exit(1)` | 1 |
-| `provider remove` on missing name | `[red]✗[/red] ... does not exist.` + `typer.Exit(1)` | 1 |
-| `provider default` on unconfigured name | `[red]✗[/red] ... is not configured.` + `typer.Exit(1)` | 1 |
-| `style set` on missing style | `[red]✗[/red] ... is not installed.` + `typer.Exit(1)` | 1 |
-| `style add` fetch failure | `[red]✗[/red] Failed to fetch styles: {exc}` + `typer.Exit(1) from exc` | 1 |
-| `style show` on missing style | `[red]✗[/red] ... is not installed.` + `typer.Exit(1)` | 1 |
-| `skill show` on missing skill | `[red]✗[/red] ... not found.` + `typer.Exit(1)` | 1 |
-| `lma providers` / `lma models` network failure | `[red]✗[/red] Failed to reach lma: ...` + `typer.Exit(1)` | 1 |
-| `lma add` for an unknown provider name | `[red]✗[/red] No lma provider matched ...` + `typer.Exit(1)` | 1 |
-| `lma add` for an unmappable SDK | `[red]✗[/red] Cannot map lma provider ...` + `typer.Exit(1)` | 1 |
-| `lma add` overwriting an existing provider | `[yellow]![/yellow] ... already exists; overwriting.` | 0 |
+| Unhandled exception in `chat_cmd` / `run_chat` | `run_chat._dump_failure_diagnostics` prints `✗ {ExceptionType}: {msg}` + last ≤5 tool calls + traceback to stderr, then re-raises; Typer prints the traceback | 1 |
+| `provider custom add` with unknown `--format` | `✗ Unknown format <fmt>. Supported: …` + `typer.Exit(1)` | 1 |
+| `provider add` for an unknown catalog provider name | `✗ No catalog provider matched <name>. Run 'miniouto provider providers' to see the catalog.` + exit 1 | 1 |
+| `provider add` for an unmappable SDK | `✗ {exc}` (ValueError from `add_provider_from_lma`) + exit 1 | 1 |
+| `provider add` overwriting an existing provider | yellow `! Provider <name> already exists; overwriting.` | 0 |
+| `provider providers` / `provider models` network failure | `✗ Failed to reach catalog: {exc}` + exit 1 | 1 |
+| `provider models` empty result | yellow "No models returned for `<name>`." + exit 1 | 1 |
+| `provider providers` empty result | yellow "No providers returned by the catalog." (returns, exit 0) | 0 |
+| `provider remove` on missing name | `✗ Provider <name> does not exist.` + `typer.Exit(1)` | 1 |
+| `provider default` on unconfigured name | `✗ Provider <name> is not configured.` + `typer.Exit(1)` | 1 |
+| `style set` on missing style | `✗ ... is not installed.` + `typer.Exit(1)` | 1 |
+| `style add` fetch failure | `✗ Failed to fetch styles: {exc}` + `typer.Exit(1) from exc` | 1 |
+| `style show` on missing style | `✗ ... is not installed.` + `typer.Exit(1)` | 1 |
+| `skill show` on missing skill | `✗ Skill <name> not found.` + `typer.Exit(1)` | 1 |
 | `--version` | print version + `raise typer.Exit()` (no code → 0) | 0 |
 | Typer argument parsing errors | Typer default (red error to stderr) | 2 |
 
-**Pattern**: All CLI handlers catch exceptions explicitly and exit via `typer.Exit(code=1)`, preserving tracebacks via `from exc`/`from BaseException`. The TUI's `_dispatch` catches everything internally and writes `[error: {exc}]` into the log without crashing the app.
+**Pattern**: Storage / style / skill / catalog handlers catch exceptions explicitly and exit via `typer.Exit(code=1)`, preserving tracebacks via `from exc`. `chat_cmd` does **not** catch — `run_chat` does its own diagnostics and re-raises so the caller sees a real traceback. The TUI's `_dispatch` catches everything internally and writes `[error: {exc}]` into the log without crashing the app.
 
 ## Rich output conventions
 
 - `✓` (green) — success
 - `✗` (red) — failure
-- yellow — warnings
-- `dark_orange3` — assistant replies (in both `chat` command and TUI log)
-- rich `Table` — `provider list`, `skill list`
+- `!` (yellow) — warnings (e.g. provider overwrite)
+- `orange3` — loop events in `ConsoleEventSink` (tool calls, intermediate responses). The final answer is written as plain stdout with a `------finish------` marker (no rich color).
+- rich `Table` — `provider list`, `provider providers`, `provider models`, `skill list`
 
 ## Module dependency graph (CLI layer only)
 
 ```
-cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.providers
+cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.lma, core.providers
                   ├─→ cli/style.py    ─→ storage.paths, storage.settings, storage.styles
                   ├─→ cli/skill.py    ─→ storage.skills
-                  ├─→ cli/lma.py      ─→ core.lma, core.providers, storage.{paths,providers}
-                  ├─→ cli/tui.py      ─→ core.{chat,lma}, core.providers, storage.{paths,providers,settings,styles,sessions}
-                  └─→ cli/chat.py     ─→ core.chat, storage.settings
+                  ├─→ cli/tui.py      ─→ core.{chat,events,lma}, core.providers, storage.{paths,providers,settings,styles,sessions}
+                  └─→ cli/chat.py     ─→ core.chat, core.events, storage.settings
 ```
 
-External libs the CLI directly imports: `typer`, `rich.console`, `rich.table`, `textual.app`, `textual.containers`, `textual.binding`, `textual.reactive`, `textual.widgets`, `rich.text`, `asyncio`, `dataclasses.replace`.
+External libs the CLI directly imports: `typer`, `rich.console`, `rich.table`, `rich.markdown`, `textual.app`, `textual.containers`, `textual.binding`, `textual.reactive`, `textual.widgets` (`RichLog`, `Input`, `ListView`, `ListItem`, `Label`, `Static`, `TextArea`), `textual.message`, `textual.screen`, `textual.timer`, `rich.text`, `asyncio`, `dataclasses.replace`.

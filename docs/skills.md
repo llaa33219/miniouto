@@ -46,7 +46,7 @@ Multi-line values are not supported.
 | `description` | yes | str | Shown in `miniouto skill list` and `miniouto skill show`. |
 | `license` | no | str | SPDX identifier or similar. |
 | `allowed-tools` | no | str (comma-separated) | Hint to the orchestrator about which tools this skill needs. |
-| `hidden` | no | bool (`true`/`false`) | If `true`, the skill is **not** prepended to prompts. Listed in `skill list` only if requested explicitly. |
+| `hidden` | no | bool (`true`/`false`) | If `true`, the skill is **not** prepended to prompts and is **excluded from `skill list`**. (`skill show <name>` still works on a hidden skill by explicit name.) Only the literal string `"true"` sets the field — anything else (including `"True"`, `"1"`) is treated as `false`. |
 
 If `name` or `description` is missing, the skill is skipped (parsed as `None`).
 
@@ -64,24 +64,28 @@ In `core/runtime.py:_load_active_skills()`:
 
 ```python
 def _load_active_skills() -> str:
-    parts = []
-    for skill in skill_store.list_skills():
-        parts.append(f"# Skill: {skill.name}\n\n{skill.content}")
+    skills = skill_store.list_skills()        # already excludes hidden skills
+    if not skills:
+        return ""
+    parts: list[str] = []
+    for skill in skills:
+        if skill.content:                     # skip empty-content skills
+            parts.append(f"# Skill: {skill.name}\n\n{skill.content}")
     return "\n\n---\n\n".join(parts)
 ```
 
-Every non-hidden skill is concatenated as `# Skill: <name>\n\n<content>` blocks, joined by `\n\n---\n\n`. The result is prepended to **both** the outo and subagent prompts.
+Every non-hidden skill (with non-empty content) is concatenated as `# Skill: <name>\n\n<content>` blocks, joined by `\n\n---\n\n`. The result is prepended to **both** the outo and subagent prompts.
 
-If no skills are installed, `_load_active_skills` returns an empty string (no separator, no heading).
+If no skills are installed (or all are hidden / empty), `_load_active_skills` returns an empty string (no separator, no heading).
 
 ## CLI
 
 ```bash
-miniouto skill list                  # list all (incl. hidden)
+miniouto skill list                  # list visible skills (hidden skills are EXCLUDED)
 miniouto skill show my-skill         # print name/description/license/tools + body
 ```
 
-`miniouto skill list` shows a rich table with `Name | Description` (description truncated to 80 chars). `skill show` prints the full skill metadata and body.
+`miniouto skill list` shows a rich table titled `Available Skills` with `Name | Description` (description truncated to 80 chars + "…"). Hidden skills never appear in this list — to view one, call `skill show <name>` explicitly (which does not filter on `hidden`).
 
 ## Adding a skill
 
@@ -128,7 +132,7 @@ class Skill:
 
 | Function | Returns | Notes |
 |---|---|---|
-| `list_skills()` | `list[Skill]` | walks every subdir of `SKILLS_DIR`, parses `SKILL.md` |
+| `list_skills()` | `list[Skill]` | walks every subdir of `SKILLS_DIR`, parses `SKILL.md`, **filters out hidden skills** |
 | `get_skill(name)` | `Skill \| None` | |
 | `get_skill_content(name)` | `str \| None` | shorthand for `get_skill(name).content` |
 | `_parse_skill(path)` | `Skill \| None` | internal: regex frontmatter parser |

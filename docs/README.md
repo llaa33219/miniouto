@@ -15,7 +15,7 @@ This directory contains a complete reference for the project. Read [`architectur
 | [`tools.md`](./tools.md) | The Write / Edit / Delete / Bash tools — handlers, schemas, edit rules, fuzzy fallback. |
 | [`styles.md`](./styles.md) | Style document format, `<outo>` / `<subagent>` tags, the six bundled templates. |
 | [`skills.md`](./skills.md) | Skill discovery from `~/.agents/skills/`, frontmatter schema. |
-| [`lma.md`](./lma.md) | lma (llm-model-api) integration: provider/model discovery, context caps, the `lma` CLI subcommand, TUI add flows. |
+| [`lma.md`](./lma.md) | lma (llm-model-api) integration: provider/model discovery, context caps, the `provider providers/models/add` CLI commands, TUI add flows. |
 | [`development.md`](./development.md) | Install, build, lint, release, contributing notes, known issues. |
 
 ## Source map
@@ -29,27 +29,27 @@ src/miniouto/
 ├── cli/                     # Typer commands + Textual TUI  → see cli.md
 │   ├── __init__.py          # app, console, _root callback, status command
 │   ├── chat.py              # chat_cmd
-│   ├── provider.py          # provider add/list/remove/default
+│   ├── provider.py          # provider providers/models/add + custom add + list/remove/default
 │   ├── style.py             # style list/set/add/show
 │   ├── skill.py             # skill list/show
-│   ├── lma.py               # lma providers/models/add    → see lma.md
-│   └── tui.py               # ChatTUI, run_tui(), model/provider pickers
+│   └── tui.py               # ChatTUI, run_tui(), model/provider pickers, catalog/custom add wizards
 ├── core/                    # Chat loop + runtime assembly   → see core.md
-│   ├── __init__.py          # re-exports chat, lma, providers, runtime
-│   ├── chat.py              # ChatOptions, run_chat, ToolCallArgsError, diagnostics
+│   ├── __init__.py          # re-exports chat, events, lma, providers, runtime
+│   ├── chat.py              # ChatOptions, run_chat, ToolCallArgsError, diagnostics, sink dispatchers
 │   ├── context.py           # lma fetcher, make_summarize_hook   → see lma.md
+│   ├── events.py            # LoopEvent, EventSink protocol, NullSink, ConsoleEventSink
 │   ├── lma.py               # lma REST client + slugify          → see lma.md
 │   ├── providers.py         # SUPPORTED_FORMATS, sdk_to_format, build_coreouto_provider
-│   └── runtime.py           # RuntimeConfig, build_runtime, subagent tool
+│   └── runtime.py           # RuntimeConfig, build_runtime, subagent tool, hooks
 ├── storage/                 # Filesystem persistence         → see storage.md
 │   ├── __init__.py
 │   ├── paths.py             # ROOT, PROVIDERS_FILE, …, ensure_dirs()
-│   ├── providers.py         # Provider dataclass + TOML CRUD (now with `source` field)
+│   ├── providers.py         # Provider dataclass + TOML CRUD (with `source` field)
 │   ├── sessions.py          # MessageRecord + JSON CRUD
-│   ├── settings.py          # Settings dataclass + TOML CRUD
+│   ├── settings.py          # Settings dataclass (provider/model/style/session/theme) + TOML CRUD
 │   ├── skills.py            # Skill dataclass + ~/.agents/skills/ discovery
 │   ├── styles.py            # style CRUD + add_from_repo + split_style
-│   └── toml_io.py           # tiny tomllib + tomli_w wrapper
+│   └── toml_io.py           # tiny tomllib + tomliw wrapper
 ├── tools/                   # File/bash tools                 → see tools.md
 │   ├── __init__.py
 │   ├── _normalize.py        # smart-quote/dash/NBSP/zero-width normalization

@@ -8,8 +8,8 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 
 ```
 ~/.miniouto/                      (or $MINIOUTO_HOME)
-├── providers.toml                # provider configurations
-├── settings.toml                 # active provider / style / session
+├── providers.toml                # provider configurations (one top-level TOML table per provider)
+├── settings.toml                 # active provider / model / style / session / theme
 ├── style/
 │   ├── default.md                # seeded on first run from src/miniouto/default_style/default.md
 │   ├── claude.md                 # seeded
@@ -47,34 +47,45 @@ LOG_DIR        = ROOT / "logs"
 
 ```toml
 # Miniouto provider registry
-# One TOML table per provider. Created/updated via `miniouto provider add`.
+# One top-level TOML table per provider (keyed by the provider name).
+# Created/updated via `miniouto provider add` (catalog) or `miniouto provider custom add`.
 
-[providers.openai]
+[openai]
+name = "openai"
 api_format = "openai"          # one of: openai, openai-response, anthropic, google
-base_url = ""                  # default provider URL
-api_key = ""                   # may be empty (read from env at call time)
+source = "custom"              # "custom" (manual) or "lma" (added from the catalog)
+base_url = "https://api.openai.com/v1"   # empty values are omitted on write; defaulted on read
+api_key = "sk-..."
 default_model = "gpt-5.5"      # used when chat --model is not given
 
-[providers.anthropic]
+[anthropic]
+name = "anthropic"
 api_format = "anthropic"
-base_url = ""
-api_key = ""
+source = "lma"                 # added via `provider add Anthropic …`
 default_model = "claude-opus-4.5"
 ```
 
-The on-disk key is always `providers.<name>` (regardless of nested structure); the loader flattens this. The `Provider` dataclass in `storage/providers.py` has an `extra: dict` field for unknown keys — they're preserved through round-trips so future fields won't be lost.
+Each provider is a **top-level TOML table named after the provider** (e.g. `[openai]`, not `[providers.openai]`). The `Provider` dataclass in `storage/providers.py` has an `extra: dict` field for unknown keys — they're preserved through round-trips so future fields won't be lost.
+
+Notes on the on-disk format:
+- Empty-string fields (`base_url=""`, `api_key=""`) are **omitted on write** by `Provider.to_dict()` (which filters `None`/`{}`/`""`). `from_dict()` restores them to defaults on read, so round-trips cleanly.
+- `name` is redundantly stored inside the table body (it is also the table key); `from_dict(name, body)` ignores the body's `name` for the field but does not put it in `extra`.
+- `source` is always written (its default `"custom"` is non-empty so survives the filter).
+- `extra` (default `{}`) is omitted on write and reconstituted as unknown keys on read.
 
 ### `settings.toml`
 
 ```toml
-provider = "openai"     # default provider name (must match a key in providers.toml)
+provider = "openai"     # default provider name (must match a top-level table in providers.toml)
+model    = ""           # optional; legacy per-session model override (cleared by TUI model picker)
 style    = "default"    # default style (must exist in ~/.miniouto/style/)
-session  = "default"    # default session name (used when chat --name is not given)
+session  = "default"    # default session name (auto-set to the most recent chat session)
+theme    = ""           # optional; TUI theme name (persisted by the TUI theme picker)
 ```
 
-All three keys are optional. Missing keys fall back to: empty string for `provider`, `"default"` for `style`, `"default"` for `session`.
+All five keys are optional. Missing keys fall back to: empty string for `provider`/`model`/`theme`, `"default"` for `style`/`session`.
 
-The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> Settings` — non-empty/non-None override values win.
+The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> Settings` — non-empty/non-None override values win. `to_dict()` drops empty values (same rule as `Provider`).
 
 ### `sessions/<name>.json`
 
@@ -160,6 +171,14 @@ The `<outo>` tag is required (or the whole document is treated as the outo promp
 
 ### `storage.providers`
 
+Module-level constants:
+
+```python
+SOURCE_CUSTOM = "custom"                       # manual provider (provider custom add)
+SOURCE_LMA    = "lma"                          # catalog provider (provider add)
+VALID_SOURCES = (SOURCE_CUSTOM, SOURCE_LMA)
+```
+
 ```python
 @dataclass
 class Provider:
@@ -168,15 +187,20 @@ class Provider:
     base_url: str = ""
     api_key: str = ""
     default_model: str = ""
+    source: str = SOURCE_CUSTOM     # one of SOURCE_CUSTOM | SOURCE_LMA
     extra: dict[str, Any] = field(default_factory=dict)
 ```
 
+`source` selects which TUI model picker is used: `SOURCE_LMA` → catalog model list (`_catalog_model_picker_flow`); `SOURCE_CUSTOM` → free-text editor (`_open_custom_model_editor`). See `docs/lma.md`. Invalid `source` values on load are coerced back to `SOURCE_CUSTOM`.
+
 | Function | Returns | Notes |
 |---|---|---|
-| `load_all()` | `dict[str, Provider]` | keyed by name |
+| `load_all()` | `dict[str, Provider]` | keyed by name (top-level TOML tables) |
 | `get(name)` | `Provider \| None` | |
 | `upsert(provider)` | `None` | overwrites by name |
 | `remove(name)` | `bool` | True if a row was deleted |
+| `Provider.to_dict()` | `dict` | drops `None`/`{}`/`""` |
+| `Provider.from_dict(name, data)` | `Provider` | unknown keys → `extra`; invalid `source` → `SOURCE_CUSTOM` |
 
 ### `storage.settings`
 
@@ -184,15 +208,19 @@ class Provider:
 @dataclass
 class Settings:
     provider: str = ""
+    model: str = ""           # legacy per-session model override; cleared by TUI model picker
     style: str = "default"
     session: str = "default"
+    theme: str = ""           # TUI theme name
 ```
 
 | Function | Returns | Notes |
 |---|---|---|
 | `load()` | `Settings` | returns defaults if file is missing |
-| `save(settings)` | `None` | atomic via tomli_w |
+| `save(settings)` | `None` | atomic via `tomli_w` |
 | `update(**kwargs)` | `Settings` | load → merge → save → return merged |
+| `Settings.to_dict()` | `dict` | drops `None`/`""` |
+| `Settings.merge(overrides)` | `Settings` | non-empty/non-None override values win |
 
 ### `storage.sessions`
 
@@ -224,9 +252,9 @@ class MessageRecord:
 | `list_styles()` | `list[str]` | sorted filenames without `.md` |
 | `read(name)` | `str \| None` | |
 | `path_for(name)` | `Path` | |
-| `write(name, content, *, overwrite=False)` | `Path` | raises if exists and `overwrite=False` |
+| `write(name, content, *, overwrite=False)` | `Path` | no-op (returns existing path) if target exists and `overwrite=False` — does **not** raise. (This is the *style* `write`, distinct from the `tools/write.py` "refuses overwrite" tool.) |
 | `add_from_repo(repo_url, *, name_override=None)` | `list[str]` | names added/updated |
-| `builtin_default()` | `str` | path to seeded `default.md` (seeded if necessary) |
+| `builtin_default()` | `str` | seeds `~/.miniouto/style/default.md` from the bundled copy if absent, then returns its **text content** (or `""` if neither exists). Despite the legacy docstring, it returns content — not a path. |
 | `write_default_style(content)` | `None` | writes `default.md` only if absent |
 | `split_style(content)` | `tuple[str, str]` | `(outo, subagent)`; missing tag → whole/empty |
 
@@ -235,7 +263,7 @@ class MessageRecord:
 - `_fetch_gitlab_tree(parsed)` — GitLab Repository Tree API + raw file API.
 - `_fetch_raw_index(url)` — fallback HTML directory-listing parser.
 
-URLs ending in `/tree/main/style-md` or `/tree/master/style-md` are normalized to the parent repo URL before fetching.
+The fetcher tries three candidate URL suffixes (`/style-md/`, `/tree/main/style-md/`, `/tree/master/style-md/`) and uses the first that returns files; GitHub/GitLab path components beyond owner/repo/branch are ignored, so passing a full `https://github.com/owner/repo/tree/main/style-md` URL also works.
 
 ### `storage.skills`
 

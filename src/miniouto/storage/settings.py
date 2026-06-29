@@ -15,6 +15,7 @@ class Settings:
     model: str = ""
     style: str = "default"
     session: str = "default"
+    theme: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v not in (None, "")}

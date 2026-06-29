@@ -106,13 +106,9 @@ class ConsoleEventSink:
         self._console.print(line, highlight=False)
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
-        # Stdout (not stderr) so callers can pipe the answer. The marker
-        # format is fixed-width so downstream scripts can grep reliably
-        # even if the answer itself contains Markdown.
         with self._stdout_lock:
             sys.stdout.write("------finish------\n")
             sys.stdout.write(content if content else "")
             if not content or not content.endswith("\n"):
                 sys.stdout.write("\n")
-            sys.stdout.write(f"------{session_name}------\n")
             sys.stdout.flush()

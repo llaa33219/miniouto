@@ -53,7 +53,7 @@ Every style should include a **Tools available** section that lists the five too
 | `Write(file_path, content)` | Create a new file (refuses overwrite). |
 | `Edit(file_path, edits)` | Apply search/replace ops to an existing file. |
 | `Delete(file_path)` | Remove a file or empty directory. |
-| `Bash(command, *, timeout_seconds=60, cwd=None, env=None)` | Run a shell command. |
+| `Bash(command, *, timeout_seconds=60, cwd=None, env=None)` | Run a shell command. (`env` is accepted by the underlying `bash()` function but is **not** exposed through the model-facing schema — the registered `_bash_handler` does not accept it.) |
 | `call_subagent(task)` | Delegate a self-contained subtask to a fresh-context agent. |
 
 All bundled styles describe these with **identical behavior summaries** (so the model doesn't see inconsistent tool docs across styles). The summaries come from `tools/registry.py`'s `_<name>_description` strings.
@@ -77,11 +77,11 @@ All six bundled templates live in `src/miniouto/default_style/`. They are seeded
 | File | Size | Persona | Orchestrator? | Sub-roles |
 |---|---|---|---|---|
 | `default.md` | ~4 KB | "**outo**" — minimal, sparse | No (deliberately) | n/a |
-| `claude.md` | ~15 KB | Claude Code-style | Yes (mild) | Explore / Plan / General-purpose |
-| `codex.md` | ~17 KB | OpenAI Codex CLI-style | Yes | File picker / Code searcher / Researcher / Editor / Code reviewer / Basher |
-| `opencode.md` | ~10 KB | OpenCode-style | No | (delegates ad-hoc) |
-| `oh-my-opencode.md` | ~13 KB | "**Sisyphus**" | **Aggressive** | Explorer / Researcher / Planner / Advisor / Reviewer / Editor / Basher |
-| `codebuff.md` | ~11 KB | "**Buffy**" | Yes | File picker / Code searcher / Researcher / Editor / Code reviewer / Basher |
+| `claude.md` | ~14 KB | Claude Code-style | Yes (mild) | Explore / Plan / General-purpose |
+| `codex.md` | ~16 KB | OpenAI Codex CLI-style | Yes | File picker / Code searcher / Researcher / Editor / Code reviewer / Basher |
+| `opencode.md` | ~9 KB | OpenCode-style | No | (delegates ad-hoc) |
+| `oh-my-opencode.md` | ~11 KB | "**Sisyphus**" | **Aggressive** | Explorer / Researcher / Planner / Advisor / Reviewer / Editor / Basher |
+| `codebuff.md` | ~10 KB | "**Buffy**" | Yes | File picker / Code searcher / Researcher / Editor / Code reviewer / Basher |
 
 The orchestration styles (claude/codex/codebuff/oh-my-opencode) include explicit guidance on when and how to delegate via `call_subagent`. `default.md` and `opencode.md` are more minimal.
 

@@ -95,7 +95,10 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
     if api_format == "anthropic":
         from coreouto.providers.anthropic import AnthropicProvider
 
-        return AnthropicProvider(api_key=api_key, base_url=base_url or None)
+        url = base_url or None
+        if url and url.rstrip("/").endswith("/v1"):
+            url = url.rstrip("/")[:-3]
+        return AnthropicProvider(api_key=api_key, base_url=url)
 
     if api_format == "google":
         from coreouto.providers.google import GoogleProvider

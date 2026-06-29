@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import sys
 import uuid
 
 import typer
@@ -53,7 +54,8 @@ def chat_cmd(
     )
     # The sink handles all output: braille spinner + loop events share
     # stdout (Rich's Live display owns one channel and keeps them
-    # vertically separated). The final answer is wrapped between
-    # `------finish------` / `------<session>------` so callers can pipe
-    # it verbatim with grep-friendly markers.
+    # vertically separated). The session marker is printed up front so
+    # callers know which session the output belongs to.
+    sys.stdout.write(f"------{session_name}------\n")
+    sys.stdout.flush()
     run_chat(opts, sink=ConsoleEventSink())

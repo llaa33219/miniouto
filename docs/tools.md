@@ -51,12 +51,14 @@ Raised by `write` on any of the failure modes above.
 
 ### JSON schema (`_write_schema`)
 
+This dict is **computed but never actually passed to coreouto** — see "A note on schemas" under `tools/registry.py` below. The handler's Python type hints + the `_write_description` string are what reach the model. The dict is reproduced for reference:
+
 ```json
 {
   "type": "object",
   "properties": {
-    "file_path": {"type": "string", "description": "Absolute path to create."},
-    "content":   {"type": "string", "description": "UTF-8 file contents. Max 50,000 chars."}
+    "file_path": {"type": "string", "description": "Absolute path of the file to create."},
+    "content":   {"type": "string", "description": "Full file content to write."}
   },
   "required": ["file_path", "content"]
 }
@@ -77,8 +79,8 @@ Behavior:
 2. Reads file content.
 3. For each edit, locates `oldText` (exact first, fuzzy fallback).
 4. Checks for overlaps between spans (`_check_no_overlaps`).
-5. Applies all replacements in a single pass (sorted by start position).
-6. Writes atomically via `Path.write_text`.
+5. Applies all replacements in a single pass against the original offsets (insertion order, not sorted — `_check_no_overlaps` sorts internally for its check, but the apply loop iterates `spans` in edit order; order is irrelevant for correctness because spans are non-overlapping and use original offsets).
+6. Writes via `Path.write_text` (not atomic — in contrast to `write.py`'s `_atomic_write_text`).
 7. Returns a human-readable summary via `_summary`.
 
 ### Six enforced rules
@@ -98,31 +100,36 @@ Behavior:
 - **`_check_no_overlaps(spans, file_path)`** — sorts spans by start, raises on any overlap.
 - **`_lines_for_indices(content, indices, length) -> list[int]`** — converts byte offsets to 1-based line numbers.
 - **`_no_match_message(content, old_text, edit_index, file_path, fuzzy=False)`** — composes the "not found" error with a short snippet of the first line of `oldText`.
-- **`_summary(spans, file_path, new_content) -> str`** — `"Applied N edit(s) to <path>."` followed by one line per edit with the new line number and a 80-char preview of `newText`.
+- **`_summary(spans, file_path, new_content) -> str`** — `"Applied N edit(s) to <path>."` (`edit`/`edits` pluralized correctly) followed by one line per edit with the new line number and an 80-char preview of the **first line** of `newText`.
 
 ### `class EditError(Exception)`
 
 ```python
 class EditError(Exception):
-    file_path: str | None = None
+    def __init__(self, message: str, *, file_path: str | None = None) -> None:
+        super().__init__(message)
+        self.file_path = file_path
 ```
 
-The `file_path` attribute is set when the error is per-file (e.g. during location) — otherwise it may be `None`.
+The `file_path` keyword argument is only set by the early path-validation failures (file-not-found, is-a-directory). Location / overlap / no-match errors embed the path in the message string but do **not** set the `file_path` attribute — by default it is `None`.
 
 ### JSON schema (`_edit_schema`)
+
+Computed but **not passed to coreouto** at registration time (see "A note on schemas" below). Reproduced for reference — the actual schema **does** include `description` fields on every property:
 
 ```json
 {
   "type": "object",
   "properties": {
-    "file_path": {"type": "string"},
+    "file_path": {"type": "string", "description": "Absolute path of the file to edit."},
     "edits": {
       "type": "array",
+      "description": "List of {oldText, newText} pairs to apply in one batch.",
       "items": {
         "type": "object",
         "properties": {
-          "oldText": {"type": "string"},
-          "newText": {"type": "string"}
+          "oldText": {"type": "string", "description": "Exact text to replace."},
+          "newText": {"type": "string", "description": "Replacement text."}
         },
         "required": ["oldText", "newText"]
       }
@@ -153,11 +160,13 @@ Raised by `delete` on any failure mode.
 
 ### JSON schema (`_delete_schema`)
 
+Computed but **not passed to coreouto** (see "A note on schemas" below). Reproduced for reference:
+
 ```json
 {
   "type": "object",
   "properties": {
-    "file_path": {"type": "string"}
+    "file_path": {"type": "string", "description": "Absolute path to delete."}
   },
   "required": ["file_path"]
 }
@@ -184,18 +193,22 @@ Behavior:
 - Spawns `asyncio.create_subprocess_shell` with `stdout=PIPE, stderr=PIPE`.
 - Captures stdout + stderr.
 - On timeout: kills the process and raises `BashError`.
-- Formats output as:
+- Formats output (via `_format_output`) as:
 
   ```
   <stdout>
+
   [stderr]
   <stderr>
-  [exit RC in T.TTs, cwd=<cwd>]
+
+  [exit RC in T.TTs, cwd=<INVOCATION_CWD>]
   ```
+
+  Note: the exit line **always** reports `INVOCATION_CWD`, **not** the actual `cwd`/`workdir` argument — `_format_output` hardcodes it. (This is arguably a small code bug; the model sees the invocation directory regardless of any `--cwd` override.)
 
 - Truncates the formatted output to `MAX_OUTPUT_BYTES` (30 KB) using UTF-8-safe byte truncation with a `<NOTE>` suffix.
 - `cwd` defaults to `INVOCATION_CWD` (the user's cwd at miniouto invocation).
-- `env` is **merged on top of** `os.environ` — existing env vars are preserved unless explicitly overridden.
+- `env` is **merged on top of** `os.environ` — existing env vars are preserved unless explicitly overridden. Note: the underlying `bash()` accepts `env`, but the model-facing handler `_bash_handler` does **not** expose it (see schemas below), so the LLM cannot set custom env vars.
 
 Raises `BashError` on empty command, spawn failure, or timeout.
 
@@ -205,18 +218,22 @@ Raised by `bash` on any failure mode.
 
 ### JSON schema (`_bash_schema`)
 
+Computed but **not passed to coreouto** (see "A note on schemas" below). Reproduced for reference. Note: there is **no** `env` property and **no** `"default": 60` key in the actual schema — the default is mentioned only inside the description text:
+
 ```json
 {
   "type": "object",
   "properties": {
-    "command":         {"type": "string"},
-    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 60},
-    "cwd":             {"type": "string"},
-    "env":             {"type": "object", "additionalProperties": {"type": "string"}}
+    "command":         {"type": "string", "description": "Shell command to execute."},
+    "timeout_seconds": {"type": "integer", "description": "Max seconds to wait (default 60, max 600).",
+                        "minimum": 1, "maximum": 600},
+    "cwd":             {"type": "string", "description": "Override working directory (default: process cwd)."}
   },
   "required": ["command"]
 }
 ```
+
+The handler `_bash_handler(command, timeout_seconds=60, cwd=None)` likewise has no `env` parameter, so even if a model sent `env` it would not be forwarded.
 
 ### Why `bash` is the only async tool
 
@@ -232,28 +249,28 @@ Fuzzy-matching helpers for the Edit tool's fallback path.
 
 ```python
 SMART_QUOTE_MAP  = str.maketrans(...)  # ' ' ' " " → ' " etc.
-DASH_MAP         = str.maketrans(...)  # – — ― ~ → -
+DASH_MAP         = str.maketrans(...)  # various dashes (– — ― ‐ ‑ ‒ − etc.) → -
 NBSP             = "\u00a0"
 ZERO_WIDTH       = ("\u200b", "\u200c", "\u200d", "\ufeff")
-BOM              = "\ufeff"
+BOM              = "\ufeff"            # also a member of ZERO_WIDTH
 ```
 
 ### `normalize_for_matching(s) -> str`
 
 Applies, in order:
-1. CRLF → LF
-2. Smart-quote translate (`SMART_QUOTE_MAP`)
-3. Dash translate (`DASH_MAP`)
-4. NBSP → space
-5. Strip zero-width characters
-6. NFKC normalization (handles composition, compatibility decomposition)
-7. Right-strip every line
+1. CRLF → LF (and lone `\r` → `\n`).
+2. Smart-quote translate (`SMART_QUOTE_MAP`).
+3. Dash translate (`DASH_MAP`).
+4. NBSP → space.
+5. Strip zero-width characters (also strips BOM, which is in the `ZERO_WIDTH` tuple).
+6. NFKC normalization (handles composition, compatibility decomposition).
+7. Right-strip every line.
 
 Used by `_locate_unique_fuzzy` to compare two strings after both have been normalized.
 
 ### `first_diff_index(a, b) -> int`
 
-Returns the index of the first differing character, or `len(a)` if `a` is a prefix of `b`.
+Returns the index of the first differing character, or `min(len(a), len(b))` if no difference is found in the common prefix. (So if `a` is a prefix of `b`, this equals `len(a)`; if `b` is a prefix of `a`, it equals `len(b)`.)
 
 ### `find_occurrences(haystack, needle) -> list[int]`
 
@@ -271,7 +288,11 @@ Idempotent: calls `_register_if_missing(name, handler, schema, description)` for
 
 ### `_register_if_missing(name, handler, schema, description)`
 
-Skips if `co.get_tool(name)` is already set; otherwise calls `co.register_tool(name, description=description)(handler)`. This is what makes repeated `build_runtime` calls safe in TUI mode.
+Skips if `co.get_tool(name)` is already set; otherwise calls `co.register_tool(name, description=description)(handler)` — **the `schema` parameter is accepted but silently discarded**. This is what makes repeated `build_runtime` calls safe in TUI mode.
+
+#### A note on schemas (dead code)
+
+The `_xxx_schema()` functions are invoked at registration time (`_register_if_missing("Write", _write_handler, _write_schema(), _write_description())`), but their return values are never forwarded to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts in this file are effectively documentation-only. Do not rely on them affecting model behavior; if you need the model to see a parameter restriction, encode it in the description text.
 
 ### Handlers (private)
 
@@ -280,18 +301,18 @@ Skips if `co.get_tool(name)` is already set; otherwise calls `co.register_tool(n
 | `Write` | `_write_handler(file_path, content) -> str` | sync |
 | `Edit` | `_edit_handler(file_path, edits) -> str` | sync |
 | `Delete` | `_delete_handler(file_path) -> str` | sync |
-| `Bash` | `async _bash_handler(command, timeout_seconds=60, cwd=None) -> str` | async |
+| `Bash` | `async _bash_handler(command, timeout_seconds=60, cwd=None) -> str` | async (no `env` — the handler signature does not expose it even though `bash()` does) |
 
-### Schemas + descriptions
+### Descriptions (what the LLM actually sees)
 
-For each tool, a `_<name>_schema` (dict passed to `register_tool`) and `_<name>_description` (str) are defined. Each description includes the tool's restrictions inline so the LLM sees them in its system prompt:
+Each description includes the tool's restrictions inline. Verbatim from `registry.py`:
 
-| Tool | Description includes |
+| Tool | Description (verbatim) |
 |---|---|
-| `Write` | "Creates a new file. Refuses to overwrite existing files. Max 50,000 chars inline." |
-| `Edit` | "Applies one or more search/replace operations to an existing file. Each oldText must match exactly once (or after normalization if needed). All edits are applied in a single pass." |
-| `Delete` | "Removes a file or empty directory. Refuses non-empty directories." |
-| `Bash` | "Runs a shell command asynchronously. Captures stdout and stderr. Default timeout 60s, max 600s. Output truncated to 30 KB." |
+| `Write` | "Create a new file with the given content. Refuses to overwrite an existing file — use the Edit tool for changes to existing files. Parent directories are created automatically. Pass an absolute path, or a path relative to the directory miniouto was invoked from. Content is capped at 50,000 characters: large inline content is likely to be silently truncated at the model layer, producing a partial file. For large or generated content, compose it with Bash (heredoc, printf, seq loop, or a short Python one-liner) and have Bash write the file directly." |
+| `Edit` | "Apply one or more search/replace edits to a file. Each edit has oldText (the exact string to find) and newText (its replacement). Multiple edits in one call all match against the original file; they cannot overlap. oldText must be unique within the file unless more context is provided. Pass an absolute path, or a path relative to the directory miniouto was invoked from." |
+| `Delete` | "Delete a file or an empty directory. Refuses to delete a non-empty directory — use Bash with `rm -rf` if you really mean it. Pass an absolute path, or a path relative to the directory miniouto was invoked from." |
+| `Bash` | "Run a shell command. Captures stdout and stderr; exits with the command's exit code. Default timeout 60s, max 600s. Output >30KB is truncated with a note. Default cwd is the directory miniouto was invoked from. Use this for `git`, `grep`, `find`, `ls`, `cat`, `pytest`, package managers, etc." |
 
 ---
 
@@ -306,9 +327,8 @@ If you need the agent to operate relative to a different directory, pass an abso
 ## Adding a new tool
 
 1. Create `src/miniouto/tools/<name>.py` with a single function `<name>(**kwargs) -> str` (or `async def`).
-2. Add the function's description, schema, and handler to `tools/registry.py`.
-3. Add `_<name>_handler`, `_<name>_schema`, `_<name>_description` to `registry.py`.
-4. Add the name to `core/runtime.ALL_TOOLS` (this controls which tools are visible to both outo and subagent presets).
-5. If the tool should only be visible to outo (not subagent), add it to a new list and adjust `_resolve_both_styles` in `core/runtime.py` accordingly.
-6. Update `default_style/*.md` if the tool's name or behavior should be documented to the model.
-7. Add a `Write`/`Edit`/`Delete`-style test for the new tool's edge cases (none exist yet, so this is a chance to start the test suite).
+2. Add the function's description, schema, and handler to `tools/registry.py`. Add `_<name>_handler`, `_<name>_schema`, `_<name>_description` and wire them via `_register_if_missing` inside `register_all`. (Note: per "A note on schemas" above, the schema dict is currently discarded at registration — the description string is what reaches the model.)
+3. Add the name to `core/runtime.ALL_TOOLS` (this controls which tools are visible to both outo and subagent presets — both `register_agent_preset("outo", tools=ALL_TOOLS, …)` and `register_agent_preset("subagent", tools=ALL_TOOLS, …)` reference it).
+4. If the tool should only be visible to outo (not subagent), create separate tool lists and edit the `tools=` argument in each `register_agent_preset` call. **Do not confuse this with `_resolve_both_styles`** — that function only resolves the style *prompts*, not the tool lists.
+5. Update `default_style/*.md` if the tool's name or behavior should be documented to the model.
+6. Add a `Write`/`Edit`/`Delete`-style test for the new tool's edge cases (none exist yet, so this is a chance to start the test suite).

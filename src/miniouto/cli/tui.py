@@ -9,28 +9,42 @@ Layout:
   ├─────────────────────────────────────────────┤
   │ Input                                       │
   ├─────────────────────────────────────────────┤
-  │ [provider] [model] [style] [session]   <- clickable chips
-  │ Tab/click to switch · Enter to open · Esc   │   <- help hint
+  │ Working spinner (1 row)                     │
+  │ model  provider             style           │   <- clickable chips
+  │ session                                      │   <- muted, left-aligned
+  │ Tab/click chips · Enter open · Esc cancel   │   <- help hint
   └─────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.markdown import Markdown
 from rich.text import Text
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, RichLog, Static
+from textual.widgets import (
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+    TextArea,
+)
 
-from ..core import lma as lma_api
+from ..core import lma as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import LoopEvent
 from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
@@ -42,7 +56,7 @@ from ..storage import styles as style_store
 from ..storage.providers import SOURCE_CUSTOM, SOURCE_LMA
 from ..storage.sessions import MessageRecord
 
-SENTINEL_LMA_ADD = "__lma_add__"
+SENTINEL_CATALOG_ADD = "__catalog_add__"
 SENTINEL_CUSTOM_ADD = "__custom_add__"
 
 # Braille spinner frames. The status line reads e.g. "⠧ Write…" and the
@@ -51,6 +65,114 @@ SENTINEL_CUSTOM_ADD = "__custom_add__"
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SPINNER_INTERVAL = 0.08
 _SPINNER_DEFAULT_TEXT = "Working…"
+
+# Logo: 180x36 packed bitmap from logo.png. _render_logo() scales to fit.
+_LOGO_PIX_W = 180
+_LOGO_PIX_H = 36
+_LOGO_BITS = bytes.fromhex(
+    "0000000000000000000000c00000000000000000000000"
+    "000000000000000000001ffe0000000000000003ff0000"
+    "000000000000000000007fff800000000000000fffe000"
+    "000000000f0000007800ffffe00000000000003ffff000"
+    "000000000f0000007803fffff0000000000000fffffc00"
+    "000000000f0000007807f803f8000000000001ff01fe00"
+    "000000000f000000780fe000fc000000000003f8007f00"
+    "0000000000000000001f80007e000000000003f0001f80"
+    "0000000000000000001f00e03f000000000007c0780fc0"
+    "0000000000000000003e01e01f00000000000f80f807c0"
+    "0000000000000000007c03f00f80000000000f80fc03e0"
+    "000000000f000000787c07f80780000001e01f01fe03e0"
+    "000000000f00000078787fff87c0000001e01e07ff81f0"
+    "000000000f00000078f8ffffc3c0000001e03e3ffff1f0"
+    "000000000f00000078f8ffffc3c0000001e03e7ffff0f0"
+    "fffffff80f1ffff878f07fffc3c3800e1ffc3c7ffff8f0"
+    "fffffff80f1ffff878f07fff83c3800e1ffc3c7ffff0f0"
+    "fffffff80f1ffff878f03fff83e3800e1ffc3c3ffff0f0"
+    "f001c0070f1e007878f07fff83e3800e01e03c1fffe0f0"
+    "f001c0070f1e007878f07fff83c3800e01e03c1fffc0f0"
+    "f001c0070f1e007878f07fffc3c3800e01e03c0fffc0f0"
+    "f001c0070f1e007878f8ffffc3c3800e01e03c0fffc0f0"
+    "f001c0070f1e007878787fffc7c3800e01e03e0fffc0f0"
+    "f001c0070f1e007878787fff87c3800e01e01e0fffc1f0"
+    "f001c0070f1e0078787c07f80f83800e01e01f0fffc1e0"
+    "f001c0070f1e0078783e03f00f83800e01e01f0fcf83e0"
+    "f001c0070f1e0078783e01e01f03800e01e00f820107c0"
+    "f001c0070f1e0078781f00c03f03800e01e007c0000fc0"
+    "f001c0070f1e0078780fc0007e03800e01e007e0001f80"
+    "f001c0070f1e0078780fe001fc03800e01e003f8003f00"
+    "f001c0070f1e00787807fc07f803800e01e001fe00fe00"
+    "f001c0070f1e00787801fffff003fffe01fc00fffffc00"
+    "f001c0070f1e00787800ffffc003fffe01fc003ffff800"
+    "f001c0070f1e007878003fff8003fffe01fc001fffe000"
+    "f001c0070f1e007878000ffc0003fffe01fc0007ff8000"
+    "0000000000000000000000000000000000000000000000"
+)
+
+
+def _unpack_logo_pixels() -> list[list[int]]:
+    row_bytes = (_LOGO_PIX_W + 7) // 8
+    return [
+        [
+            (_LOGO_BITS[y * row_bytes + x // 8] >> (7 - x % 8)) & 1
+            for x in range(_LOGO_PIX_W)
+        ]
+        for y in range(_LOGO_PIX_H)
+    ]
+
+
+def _pixels_to_braille(grid: list[list[int]], w: int, h: int) -> str:
+    rows = []
+    for gy in range(0, h, 4):
+        line = []
+        for gx in range(0, w, 2):
+            v = 0
+            if grid[gy][gx]:
+                v |= 0x01
+            if gy + 1 < h and grid[gy + 1][gx]:
+                v |= 0x02
+            if gy + 2 < h and grid[gy + 2][gx]:
+                v |= 0x04
+            if grid[gy][gx + 1]:
+                v |= 0x08
+            if gy + 1 < h and grid[gy + 1][gx + 1]:
+                v |= 0x10
+            if gy + 2 < h and grid[gy + 2][gx + 1]:
+                v |= 0x20
+            if gy + 3 < h and grid[gy + 3][gx]:
+                v |= 0x40
+            if gy + 3 < h and grid[gy + 3][gx + 1]:
+                v |= 0x80
+            line.append(chr(0x2800 + v))
+        rows.append("".join(line).rstrip("⠀"))
+    while rows and not rows[0]:
+        rows.pop(0)
+    while rows and not rows[-1]:
+        rows.pop()
+    return "\n".join(rows)
+
+
+def _render_logo(max_chars: int) -> str:
+    if max_chars < 10:
+        return "miniouto"
+    src = _unpack_logo_pixels()
+    target_w = min(max_chars * 2, _LOGO_PIX_W)
+    target_w -= target_w % 2
+    if target_w >= _LOGO_PIX_W:
+        return _pixels_to_braille(src, _LOGO_PIX_W, _LOGO_PIX_H)
+    scale = target_w / _LOGO_PIX_W
+    target_h = int(_LOGO_PIX_H * scale)
+    target_h -= target_h % 4
+    if target_h < 4:
+        target_h = 4
+    scaled = [
+        [
+            src[min(int(py / scale), _LOGO_PIX_H - 1)]
+            [min(int(px / scale), _LOGO_PIX_W - 1)]
+            for px in range(target_w)
+        ]
+        for py in range(target_h)
+    ]
+    return _pixels_to_braille(scaled, target_w, target_h)
 
 # ─── Clickable chip ──────────────────────────────────────────────────────────
 
@@ -70,13 +192,20 @@ class StatusChip(Static):
     DEFAULT_CSS = """
     StatusChip {
         height: 1;
-        width: 1fr;
+        width: auto;
         padding: 0 1;
         margin: 0 1 0 0;
         background: $boost;
         color: $text;
         text-style: bold;
+        text-wrap: nowrap;
         text-overflow: ellipsis;
+    }
+    StatusChip.-muted {
+        color: $text-muted;
+    }
+    StatusChip.-accent {
+        color: $accent;
     }
     StatusChip:hover {
         background: $primary 30%;
@@ -95,8 +224,11 @@ class StatusChip(Static):
         value: str,
         *,
         id: str | None = None,
+        variant: str = "default",
     ) -> None:
         super().__init__(id=id)
+        if variant != "default":
+            self.add_class(f"-{variant}")
         self._label = label
         self._value = value
 
@@ -110,12 +242,12 @@ class StatusChip(Static):
 
     def set_value(self, value: str) -> None:
         self._value = value
-        self.refresh()
+        self.refresh(layout=True)
 
     def render(self) -> Text:
         text = self._value or "-"
-        display = f"{self._label}: {text}"
-        return Text(display, style="bold")
+        display = f"{self._label}: {text}" if self._label else text
+        return Text(display)
 
     def on_click(self) -> None:
         self.post_message(self.ChipClicked(self))
@@ -227,6 +359,7 @@ class SelectionModal(ModalScreen[str | None]):
         if value is None and event.item not in self._row_values:
             return
         self.dismiss(value)
+        event.stop()
 
     def action_dismiss_cancel(self) -> None:
         self.dismiss(None)
@@ -294,6 +427,11 @@ class TextInputModal(ModalScreen[str | None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
+        # Input.Submitted bubbles by default; the parent ChatTUI has its own
+        # on_input_submitted that would otherwise dispatch the entered value
+        # (e.g. an API key) as a chat prompt. Stop propagation here so modal
+        # submits stay scoped to the modal.
+        event.stop()
 
     def action_dismiss_cancel(self) -> None:
         self.dismiss(None)
@@ -312,12 +450,12 @@ HELP_TEXT = (
 
 
 class BottomPanel(Static):
-    """The 3-row panel under the input: spinner on top, chips, help hint."""
+    """The 4-row panel under the input: spinner, chips, session, help hint."""
 
     DEFAULT_CSS = """
     BottomPanel {
-        height: 3;
-        background: $boost;
+        height: 4;
+        background: $background;
     }
     #spinner-row {
         height: 1;
@@ -325,6 +463,15 @@ class BottomPanel(Static):
     }
     #chip-row {
         height: 1;
+    }
+    #chip-spacer {
+        width: 1fr;
+    }
+    #session-row {
+        height: 1;
+        width: 100%;
+        padding: 0 1;
+        color: $text-muted;
     }
     #help-row {
         height: 1;
@@ -336,19 +483,30 @@ class BottomPanel(Static):
     def __init__(self) -> None:
         super().__init__()
         self._chips: dict[str, StatusChip] = {}
+        self._session_label: Static | None = None
         self._spinner_row: Static | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("", id="spinner-row")
         with Horizontal(id="chip-row"):
-            self._chips["provider"] = StatusChip("provider", "-", id="chip-provider")
-            self._chips["model"] = StatusChip("model", "-", id="chip-model")
-            self._chips["style"] = StatusChip("style", "-", id="chip-style")
-            self._chips["session"] = StatusChip("session", "-", id="chip-session")
-            yield from self._chips.values()
+            self._chips["model"] = StatusChip("", "-", id="chip-model", variant="accent")
+            self._chips["provider"] = StatusChip(
+                "", "-", id="chip-provider", variant="muted"
+            )
+            self._chips["style"] = StatusChip("", "-", id="chip-style")
+            yield self._chips["model"]
+            yield self._chips["provider"]
+            yield Static("", id="chip-spacer")
+            yield self._chips["style"]
+        self._session_label = Static("-", id="session-row")
+        yield self._session_label
         yield Static(HELP_TEXT, id="help-row", markup=True)
 
     def set_value(self, kind: str, value: str) -> None:
+        if kind == "session":
+            if self._session_label is not None:
+                self._session_label.update(value or "-")
+            return
         chip = self._chips.get(kind)
         if chip is not None:
             chip.set_value(value)
@@ -366,7 +524,10 @@ class BottomPanel(Static):
             self._spinner_row.update("")
             return
         self._spinner_row.update(
-            Text.assemble((frame, "bold cyan"), (f" {text}", "white"))
+            Text.assemble(
+                (frame, f"bold {self.app.current_theme.accent}"),
+                (f" {text}", self.app.current_theme.foreground),
+            )
         )
 
 
@@ -419,9 +580,11 @@ class TUIEventSink:
         log = self._app._log
         if log is None:
             return
+        accent = self._app.current_theme.accent
+        fg = self._app.current_theme.foreground
         line = Text.assemble(
-            (f"{event.actor}:", "orange3"),
-            (f" {event.text}", "white"),
+            (f"{event.actor}:", accent),
+            (f" {event.text}", fg),
         )
         log.write(line)
 
@@ -439,14 +602,80 @@ class TUIEventSink:
         log.write(Text(""))
 
 
+# ─── Chat input ──────────────────────────────────────────────────────────────
+
+
+class ChatInput(TextArea):
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("enter", "submit", "Send", show=False, priority=True),
+    ]
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(text="", soft_wrap=True, id=id)
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.show_line_numbers = False
+
+    async def _on_key(self, event) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.action_submit()
+            return
+        await super()._on_key(event)
+
+    def watch_virtual_size(self, virtual_size) -> None:
+        content_lines = virtual_size.height
+        target = max(5, min(content_lines + 2, 12))
+        self.styles.height = target
+
+    def action_submit(self) -> None:
+        if self.text.strip():
+            self.post_message(self.Submitted(self.text))
+
+
 # ─── Main app ────────────────────────────────────────────────────────────────
 
 
 class ChatTUI(App):
     CSS = """
     Screen { layout: vertical; }
-    #chat { height: 1fr; border: solid $primary; }
-    #input { height: 3; border: solid $secondary; }
+    #main-area {
+        width: 1fr;
+        height: 1fr;
+        background: $background;
+    }
+    #chat {
+        height: 1fr;
+        width: 1fr;
+        background: $background;
+        overflow-y: auto;
+        scrollbar-size: 0 0;
+    }
+    #chat:focus {
+        background: $background;
+        background-tint: transparent;
+    }
+    #input {
+        height: 5;
+        width: 1fr;
+        padding: 1 1;
+        margin: 0 2;
+        background: $surface;
+        border: none;
+        border-left: thick $primary;
+        scrollbar-size: 1 1;
+    }
+    #input:focus {
+        border: none;
+        border-left: thick $primary;
+    }
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -460,24 +689,100 @@ class ChatTUI(App):
         self._input: Input | None = None
         self._panel: BottomPanel | None = None
         self._busy = False
+        self._logo_shown = False
+        self._chat_started = False
+        self._session_assigned = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        with Vertical():
+        with Vertical(id="main-area"):
             self._log = RichLog(highlight=False, id="chat", wrap=True, markup=False)
             yield self._log
-            self._input = Input(placeholder="Type a message and press Enter…", id="input")
+            self._input = ChatInput(id="input")
             yield self._input
         self._panel = BottomPanel()
         yield self._panel
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = "miniouto"
-        self.sub_title = "outo x subagent"
+        cwd = Path.cwd()
+        home = Path.home()
+        try:
+            cwd_display = "~/" + str(cwd.relative_to(home))
+        except ValueError:
+            cwd_display = str(cwd)
+        self.title = cwd_display
         self._refresh_chips()
         self._log = self.query_one("#chat", RichLog)
-        self._log.write(Text("miniouto TUI ready. Click a chip below to switch settings.", style="dim"))
+        saved = settings_store.load()
+        if saved.theme:
+            self.theme = saved.theme
+        self._show_logo()
+        if self._input is not None:
+            self._input.focus()
+
+    def _show_logo(self) -> None:
+        if self._log is None:
+            return
+        self._log.clear()
+        width = self.size.width if self.size.width > 0 else 80
+        self._log.write(Text(_render_logo(width - 2), style=self.current_theme.accent))
+        self._log.write(Text(""))
+        self._log.write(Text("Ready. Press Ctrl+P for commands.", style="dim"))
+        self._logo_shown = True
+
+    def watch_theme(self) -> None:
+        settings_store.update(theme=self.theme)
+        if self._logo_shown:
+            self._show_logo()
+
+    def get_system_commands(self, screen) -> Iterable[SystemCommand]:
+        yield SystemCommand(
+            "00 New session",
+            "Create a new session",
+            self._new_session,
+        )
+        yield SystemCommand(
+            "01 Pick session",
+            "Switch the active session",
+            self._open_session_picker,
+        )
+        yield SystemCommand(
+            "02 Pick model",
+            "Set the active provider's default model",
+            self._open_model_editor,
+        )
+        yield SystemCommand(
+            "03 Pick provider",
+            "Switch the active provider (or add from catalog / custom)",
+            self._open_provider_picker,
+        )
+        yield SystemCommand(
+            "04 Pick style",
+            "Switch the active style document",
+            self._open_style_picker,
+        )
+        yield SystemCommand(
+            "05 Theme",
+            "Change the current theme",
+            self.action_change_theme,
+        )
+        yield SystemCommand(
+            "06 Clear log",
+            "Clear the chat log (also bound to Ctrl+L)",
+            self.action_clear_log,
+        )
+        remaining = [
+            cmd for cmd in super().get_system_commands(screen)
+            if cmd.title != "Theme"
+        ]
+        for i, cmd in enumerate(remaining):
+            yield SystemCommand(
+                f"{i + 7:02d} {cmd.title}",
+                cmd.help,
+                cmd.callback,
+                cmd.discover,
+            )
 
     # ── chip click routing ──────────────────────────────────────────────────
 
@@ -501,8 +806,8 @@ class ChatTUI(App):
         def _on_close(result: str | None) -> None:
             if not result:
                 return
-            if result == SENTINEL_LMA_ADD:
-                self.run_worker(self._lma_add_flow(), exclusive=False)
+            if result == SENTINEL_CATALOG_ADD:
+                self.run_worker(self._catalog_add_flow(), exclusive=False)
                 return
             if result == SENTINEL_CUSTOM_ADD:
                 self._open_custom_add_wizard()
@@ -516,7 +821,7 @@ class ChatTUI(App):
                 current=s.provider,
                 allow_none=False,
                 extra_options=[
-                    (SENTINEL_LMA_ADD, "+ add from lma…"),
+                    (SENTINEL_CATALOG_ADD, "+ add from catalog…"),
                     (SENTINEL_CUSTOM_ADD, "+ add custom…"),
                 ],
             ),
@@ -528,12 +833,12 @@ class ChatTUI(App):
         self._refresh_chips()
         self._post_system(f"provider → {name}")
 
-    async def _lma_add_flow(self) -> None:
-        self._post_system("fetching lma provider list…")
+    async def _catalog_add_flow(self) -> None:
+        self._post_system("fetching catalog…")
         try:
-            all_providers = await asyncio.to_thread(lma_api.list_providers)
+            all_providers = await asyncio.to_thread(catalog_api.list_providers)
         except Exception as exc:
-            self._post_system(f"lma error: {exc}")
+            self._post_system(f"catalog error: {exc}")
             return
 
         name_to_provider: dict[str, dict[str, Any]] = {}
@@ -542,12 +847,12 @@ class ChatTUI(App):
             if fmt:
                 name_to_provider[p["name"]] = p
         if not name_to_provider:
-            self._post_system("No lma providers have a supported api_format.")
+            self._post_system("No catalog providers have a supported api_format.")
             return
 
         picked_name = await self.push_screen_wait(
             SelectionModal(
-                f"Add from lma ({len(name_to_provider)} addable)",
+                f"Add from catalog ({len(name_to_provider)} addable)",
                 sorted(name_to_provider.keys()),
                 allow_none=False,
             )
@@ -555,8 +860,8 @@ class ChatTUI(App):
         if not picked_name:
             return
 
-        lma_p = name_to_provider[picked_name]
-        our_name = lma_api.slugify(picked_name)
+        catalog_p = name_to_provider[picked_name]
+        our_name = catalog_api.slugify(picked_name)
         if provider_store.get(our_name) is not None:
             choice = await self.push_screen_wait(
                 SelectionModal(
@@ -578,21 +883,21 @@ class ChatTUI(App):
         if api_key is None:
             return
 
-        self._post_system("fetching lma model list…")
+        self._post_system("fetching model list…")
         default_model = ""
         try:
-            models = await asyncio.to_thread(lma_api.list_models, picked_name)
+            models = await asyncio.to_thread(catalog_api.list_models, picked_name)
             if models:
                 default_model = models[0].get("id", "")
         except Exception as exc:
-            self._post_system(f"lma models error: {exc}")
+            self._post_system(f"catalog models error: {exc}")
 
         try:
             provider = add_provider_from_lma(
                 name=our_name,
                 api_key=api_key.strip(),
-                sdk=lma_p.get("sdk"),
-                api=lma_p.get("api"),
+                sdk=catalog_p.get("sdk"),
+                api=catalog_p.get("api"),
                 default_model=default_model,
             )
         except ValueError as exc:
@@ -604,7 +909,7 @@ class ChatTUI(App):
         settings_store.update(provider=our_name)
         self._refresh_chips()
         self._post_system(
-            f"provider → {our_name} (added from lma, "
+            f"provider → {our_name} (added from catalog, "
             f"default-model={default_model or '-'})"
         )
 
@@ -615,7 +920,7 @@ class ChatTUI(App):
             def on_close(result: str | None) -> None:
                 if result is None:
                     return
-                name = lma_api.slugify(result)
+                name = catalog_api.slugify(result)
                 if not name:
                     self._post_system("name required; wizard cancelled.")
                     return
@@ -721,7 +1026,7 @@ class ChatTUI(App):
             self._post_system("No active provider. Pick a provider first.")
             return
         if provider.source == SOURCE_LMA:
-            self.run_worker(self._lma_model_picker_flow(provider), exclusive=False)
+            self.run_worker(self._catalog_model_picker_flow(provider), exclusive=False)
         else:
             self._open_custom_model_editor(provider)
 
@@ -746,16 +1051,16 @@ class ChatTUI(App):
             _on_close,
         )
 
-    async def _lma_model_picker_flow(self, provider) -> None:
-        self._post_system("fetching lma model list…")
+    async def _catalog_model_picker_flow(self, provider) -> None:
+        self._post_system("fetching model list…")
         try:
-            models = await asyncio.to_thread(lma_api.list_models, provider.name)
+            models = await asyncio.to_thread(catalog_api.list_models, provider.name)
         except Exception as exc:
-            self._post_system(f"lma error: {exc}; falling back to text input")
+            self._post_system(f"catalog error: {exc}; falling back to text input")
             self._open_custom_model_editor(provider)
             return
         if not models:
-            self._post_system(f"No lma models for {provider.name!r}.")
+            self._post_system(f"No models found for {provider.name!r} in catalog.")
             return
 
         options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in models]
@@ -812,51 +1117,43 @@ class ChatTUI(App):
     def _open_session_picker(self) -> None:
         sessions = session_store.list_sessions()
         s = settings_store.load()
+        current = s.session if self._chat_started else ""
 
         def _on_close(result: str | None) -> None:
             if result is None:
-                # None means "cancel" — don't touch the allow_none option.
                 return
-            # Special sentinel for "new session" handled below.
             if result == "__new__":
-                self._open_new_session_dialog()
+                self._new_session()
                 return
             settings_store.update(session=result)
+            self._session_assigned = True
             self._refresh_chips()
-            self._post_system(f"session → {result}")
+            self._show_logo()
 
         options = [*sessions, "__new__"]
         self.push_screen(
             SelectionModal(
                 "Select session",
                 options,
-                current=s.session,
+                current=current,
                 allow_none=False,
                 extra_options=[("__new__", "+ new session…")],
             ),
             _on_close,
         )
 
-    def _open_new_session_dialog(self) -> None:
-        def _on_close(result: str | None) -> None:
-            if not result or not result.strip():
-                return
-            name = result.strip()
-            settings_store.update(session=name)
-            # Touch the session file so it shows up in `list_sessions()`.
-            session_store.append(name, MessageRecord(role="system", content="(session created)"))
-            self._refresh_chips()
-            self._post_system(f"session → {name} (new)")
+    def _new_session(self) -> None:
+        import datetime
+        import uuid
 
-        self.push_screen(
-            TextInputModal(
-                "New session name",
-                initial="",
-                placeholder="e.g. my-project",
-                hint="Enter to create · Esc to cancel",
-            ),
-            _on_close,
-        )
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        suffix = uuid.uuid4().hex[:6]
+        name = f"tui-{ts}-{suffix}"
+        settings_store.update(session=name)
+        session_store.append(name, MessageRecord(role="system", content="(session created)"))
+        self._session_assigned = True
+        self._refresh_chips()
+        self._show_logo()
 
     # ── status / refresh ────────────────────────────────────────────────────
 
@@ -869,17 +1166,23 @@ class ChatTUI(App):
         self._panel.set_value("provider", s.provider or "-")
         self._panel.set_value("model", active_model or "-")
         self._panel.set_value("style", s.style or "-")
-        self._panel.set_value("session", s.session or "-")
+        if self._chat_started:
+            self._panel.set_value("session", s.session or "-")
+        else:
+            self._panel.set_value("session", "-")
 
     # ── chat flow ───────────────────────────────────────────────────────────
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         if self._busy:
             return
         text = event.value.strip()
         if not text:
             return
-        self._input.value = ""
+        self._input.text = ""
+        if self._logo_shown and self._log is not None:
+            self._log.clear()
+            self._logo_shown = False
         self._post_user(text)
         self.run_worker(self._dispatch(text), exclusive=True)
 
@@ -890,17 +1193,17 @@ class ChatTUI(App):
     def _post_user(self, text: str) -> None:
         if self._log is None:
             return
-        self._log.write(Text("> ", style="bold cyan") + Text(text))
+        self._log.write(Text("> ", style=f"bold {self.current_theme.accent}") + Text(text))
 
     def _post_assistant(self, text: str) -> None:
         if self._log is None:
             return
-        self._log.write(Text(text, style="dark_orange3"))
+        self._log.write(Text(text, style=self.current_theme.foreground))
 
     def _post_system(self, text: str) -> None:
         if self._log is None:
             return
-        self._log.write(Text(f"[{text}]", style="yellow"))
+        self._log.write(Text(f"[{text}]", style=self.current_theme.warning))
 
     def _render_spinner(self, frame: str, text: str) -> None:
         if self._panel is not None:
@@ -908,14 +1211,26 @@ class ChatTUI(App):
 
     async def _dispatch(self, prompt: str) -> None:
         assert self._log is not None
-        s = settings_store.load()
+        first_message = not self._chat_started
+        self._chat_started = True
         self._busy = True
+        if first_message and not self._session_assigned:
+            import datetime
+            import uuid
+
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            suffix = uuid.uuid4().hex[:6]
+            settings_store.update(session=f"tui-{ts}-{suffix}")
+            self._session_assigned = True
+            self._refresh_chips()
+        s = settings_store.load()
         sink = TUIEventSink(self)
         try:
             opts = ChatOptions(
                 prompt=prompt,
                 session=s.session or "default",
                 model=s.model or None,
+                continue_session=True,
             )
             await asyncio.to_thread(run_chat, opts, sink)
         except Exception as exc:

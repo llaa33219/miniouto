@@ -25,16 +25,16 @@ uv tool install --editable . --force   # or `uv tool install .` for a pinned bui
 ## Quick start
 
 ```bash
-# Either add a provider by hand:
-miniouto provider add \
+# Either add a custom provider by hand:
+miniouto provider custom add \
   --name openai \
   --api-key sk-... \
   --base-url https://api.openai.com/v1 \
   --default-model gpt-5.5            # optional; used when chat --model is not given
 
 # Or browse the lma (llm-model-api) catalog and add from there:
-miniouto lma providers               # see all 144 providers
-miniouto lma add Anthropic --api-key sk-ant-...   # adds it with the first lma model
+miniouto provider providers          # see all 144 catalog providers
+miniouto provider add Anthropic --api-key sk-ant-...   # adds it with the first catalog model
 
 miniouto provider default openai
 miniouto style set default
@@ -48,7 +48,7 @@ The active model is chosen by the first match in:
 
 1. `miniouto chat --model <name>` (per-call override)
 2. `settings.model` (legacy per-session override; cleared whenever the TUI model picker saves)
-3. `miniouto provider add --default-model <name>` (provider-level default)
+3. `provider.default_model` (set by `provider add --default-model`, `provider custom add --default-model`, or the TUI model chip)
 4. error — no model can be inferred
 
 ## Commands
@@ -58,9 +58,11 @@ The active model is chosen by the first match in:
 | `miniouto chat "prompt"` | One-shot chat turn |
 | `miniouto` | TUI mode |
 | `miniouto status` | Show current configuration |
-| `miniouto provider add/list/remove/default` | Manage providers |
+| `miniouto provider providers/models/add` | Browse the lma catalog and add providers from it |
+| `miniouto provider custom add` | Add a custom provider by hand (api_format, base_url, api_key, default_model) |
+| `miniouto provider list/remove/default` | Manage saved providers |
 | `miniouto style list/set/add/show` | Manage style documents |
-| `miniouto lma providers/models/add` | Browse the lma (llm-model-api) catalog and add providers from it |
+| `miniouto skill list/show` | List/show skills from `~/.agents/skills/` |
 
 ### `chat` flags
 
@@ -77,9 +79,12 @@ The active model is chosen by the first match in:
 ## Storage
 
 Everything lives under `~/.miniouto/`:
-- `providers.toml` — provider configs (api_format, base_url, api_key, default_model)
-- `settings.toml` — active provider, style, session
+- `providers.toml` — provider configs (one top-level TOML table per provider: `api_format`, `base_url`, `api_key`, `default_model`, `source`)
+- `settings.toml` — active `provider`, `model` (legacy), `style`, `session`, `theme`
 - `style/<name>.md` — style documents
 - `sessions/<name>.json` — conversation history
+- `logs/` — reserved (currently unused)
+
+Skills live outside this tree, at `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention).
 
 Override the root with the `MINIOUTO_HOME` environment variable.
