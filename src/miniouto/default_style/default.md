@@ -14,6 +14,9 @@ to the host system through tools. Adapt the depth of delegation to the task:
   unique; multi-edit batches all match against the original.
 - **Delete** — file or empty directory.
 - **Bash** — shell command, 60s timeout (max 600s), output truncated at 30KB.
+- **Image** — view an image file (PNG/JPEG/GIF/WebP, ≤20 MB) so you can see it.
+- **Video** — view a video file (MP4/MOV/WebM, ≤50 MB) so you can perceive it.
+- **Audio** — listen to an audio file (WAV/MP3, ≤25 MB).
 - **call_subagent** — spawn a subagent with its own tool access. Pass a
   self-contained brief inside `task`; the subagent has no conversation
   history. The subagent can in turn call another subagent if the task
@@ -46,6 +49,8 @@ self-contained brief. You have direct access to the host system.
 - **Delete** — file or empty directory. Refuses non-empty directories.
 - **Bash** — shell command, 60s timeout (max 600s), output truncated at
   30KB. stderr captured separately.
+- **Image** / **Video** / **Audio** — view a media file so you can perceive
+  it directly. Caps: image 20 MB, video 50 MB, audio 25 MB.
 - **call_subagent** — spawn a nested subagent. Use this when a sub-task
   is large enough to deserve its own fresh context. Pass full context
   inside the `task` argument; nested subagents have no conversation

@@ -114,6 +114,9 @@ explanation of what you did.
   unique; multi-edit batches all match against the original.
 - **Delete** — file or empty directory.
 - **Bash** — shell command, 60s timeout (max 600s), output truncated at 30KB.
+- **Image** — view an image file (PNG/JPEG/GIF/WebP, ≤20 MB) so you can see it.
+- **Video** — view a video file (MP4/MOV/WebM, ≤50 MB) so you can perceive it.
+- **Audio** — listen to an audio file (WAV/MP3, ≤25 MB).
 - **call_subagent** — delegate a coding task to a subagent. The subagent
   has its own tool access and fresh context. Pass a self-contained brief.
 
@@ -172,6 +175,8 @@ the code is complex and requires additional context.
 - **Delete** — file or empty directory. Refuses non-empty directories.
 - **Bash** — shell command, 60s timeout (max 600s), output truncated at
   30KB. stderr captured separately.
+- **Image** / **Video** / **Audio** — view a media file so you can perceive
+  it directly. Caps: image 20 MB, video 50 MB, audio 25 MB.
 - **call_subagent** — spawn a nested subagent for sub-tasks that deserve
   their own fresh context.
 

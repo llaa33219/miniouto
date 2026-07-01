@@ -64,6 +64,9 @@ suggest adding them to `oh-my-opencode.md` for future reference.
 - **Edit** — one or more search/replace edits to a file.
 - **Delete** — file or empty directory.
 - **Bash** — shell command, 60s timeout (max 600s), output truncated at 30KB.
+- **Image** — view an image file (PNG/JPEG/GIF/WebP, ≤20 MB) so you can see it.
+- **Video** — view a video file (MP4/MOV/WebM, ≤50 MB) so you can perceive it.
+- **Audio** — listen to an audio file (WAV/MP3, ≤25 MB).
 - **call_subagent** — delegate a task to a sub-agent. Specify the role
   explicitly in the message (see Sub-Agent Roles below).
 
@@ -229,6 +232,8 @@ the code is complex and requires additional context.
 - **Delete** — file or empty directory. Refuses non-empty directories.
 - **Bash** — shell command, 60s timeout (max 600s), output truncated at
   30KB. stderr captured separately.
+- **Image** / **Video** / **Audio** — view a media file so you can perceive
+  it directly. Caps: image 20 MB, video 50 MB, audio 25 MB.
 - **call_subagent** — spawn a nested sub-agent for sub-tasks that deserve
   their own fresh context.
 

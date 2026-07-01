@@ -144,7 +144,7 @@ def _make_tool_call_dispatcher(sink: EventSink):
                 )
             )
             sink.update_activity("subagent")
-        elif name in ("Bash", "Write", "Edit", "Delete"):
+        elif name in ("Bash", "Write", "Edit", "Delete", "Image", "Video", "Audio"):
             preview = _short_arg_summary(name, arguments)
             sink.emit_loop_event(
                 LoopEvent(
@@ -262,7 +262,9 @@ def _to_coreouto_history(messages: list[MessageRecord]) -> list[co.Message]:
     return out
 
 
-_LOGGABLE_TOOL_NAMES = ("Bash", "Write", "Edit", "Delete", "call_subagent")
+_LOGGABLE_TOOL_NAMES = (
+    "Bash", "Write", "Edit", "Delete", "Image", "Video", "Audio", "call_subagent"
+)
 
 
 def _validate_tool_call_args(name: str, arguments: Any) -> None:
@@ -315,5 +317,7 @@ def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
         edits = args.get("edits") or []
         return f"{path} ({len(edits)} edit{'s' if len(edits) != 1 else ''})"
     if name == "Delete":
+        return args.get("file_path", "?")
+    if name in ("Image", "Video", "Audio"):
         return args.get("file_path", "?")
     return str(args)[:120]

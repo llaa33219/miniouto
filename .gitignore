@@ -46,3 +46,6 @@ htmlcov/
 
 # Local config
 miniouto.toml
+
+# Agent
+.omo/

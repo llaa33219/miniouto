@@ -17,7 +17,7 @@ from ..storage import styles as style_store
 from ..tools import registry as tool_registry
 from .providers import build_coreouto_provider, clear_coreouto_state
 
-ALL_TOOLS = ["Write", "Edit", "Delete", "Bash", "call_subagent"]
+ALL_TOOLS = ["Write", "Edit", "Delete", "Bash", "Image", "Video", "Audio", "call_subagent"]
 
 # Tracks how deep we are inside a `call_subagent` invocation. 0 = outo (or
 # after `build_runtime` has just been called), >=1 = inside a subagent.
@@ -270,10 +270,11 @@ def _make_response_logger(
 def _subagent_description() -> str:
     return (
         "Delegate a self-contained task to the subagent. The subagent "
-        "has its own tool access (Write/Edit/Delete/Bash) and a fresh "
-        "context. Pass the full brief in the `task` argument. The tool "
-        "blocks until the subagent terminates the loop (a turn with no "
-        "tool calls) and returns the subagent's final text as the result."
+        "has its own tool access (Write/Edit/Delete/Bash/Image/Video/Audio) "
+        "and a fresh context. Pass the full brief in the `task` argument. "
+        "The tool blocks until the subagent terminates the loop (a turn "
+        "with no tool calls) and returns the subagent's final text as the "
+        "result."
     )
 
 

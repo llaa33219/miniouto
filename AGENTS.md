@@ -52,7 +52,7 @@ CLI flag bag → ChatOptions (core/chat.py)
                     (BEFORE_TOOL_CALL, ON_ITERATION×2, AFTER_LLM_CALL)
                 → co.Agent(outo_config)
             → run_chat(opts, sink) → agent.call_sync(prompt, history=...)
-                → Write/Edit/Delete/Bash (via tools/registry.py)
+                → Write/Edit/Delete/Bash/Image/Video/Audio (via tools/registry.py)
                 → call_subagent (delegates to subagent preset)
             → persist user + assistant MessageRecord
 ```
@@ -200,8 +200,9 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `tools/bash.py` | `async bash(command, *, timeout_seconds, cwd, env)` |
 | `tools/delete.py` | `delete(file_path)` |
 | `tools/edit.py` | `edit(file_path, edits)` — batch search/replace |
+| `tools/media.py` | `load_image/load_video/load_audio(file_path)` → `LoadedMedia` (pure stdlib; `registry.py` wraps results into `co.ImageBlock`/`VideoBlock`/`AudioBlock`) |
 | `tools/write.py` | `write(file_path, content)` — refuses overwrite |
-| `tools/registry.py` | `register_all()` — wires tools into coreouto |
+| `tools/registry.py` | `register_all()` — wires Write/Edit/Delete/Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |
 | `default_style/claude.md` | Claude Code-style (~14 KB) |
 | `default_style/codex.md` | OpenAI Codex CLI-style (~16 KB) |
@@ -237,10 +238,12 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 ### "Add a new tool"
 See `docs/tools.md` § "Adding a new tool". TL;DR:
-1. `src/miniouto/tools/<name>.py` with the function.
-2. `tools/registry.py`: schema, description, handler, `_register_if_missing` call.
+1. `src/miniouto/tools/<name>.py` with the function (pure stdlib — no coreouto import; return a plain data structure if multimodal, like `media.py`'s `LoadedMedia`).
+2. `tools/registry.py`: schema, description, handler, `_register_if_missing` call. For multimodal tools the handler returns `list[co.ContentBlock]` — see the `Image`/`Video`/`Audio` handlers.
 3. `core/runtime.py`: add name to `ALL_TOOLS` (visible to both presets) or a new list.
-4. Update `default_style/*.md` if the tool's name or behavior should be documented to the model.
+4. `core/chat.py`: add the name to `_LOGGABLE_TOOL_NAMES`, the tool-name set in `_make_tool_call_dispatcher`, and a branch in `_short_arg_summary` so loop events + failure diagnostics render the tool.
+5. Update `default_style/*.md` if the tool's name or behavior should be documented to the model.
+6. If the tool returns multimodal content, note that provider support varies (OpenAI Chat Completions rejects all multimodal blocks; OpenAI Responses API rejects video/audio). **Do not** put provider names in the description or style prompts — the agent cannot introspect its provider, so such hints are unactionable. Let provider rejections surface as `ValueError` at call time. Document the matrix in `docs/tools.md` for human operators.
 
 ### "Add a new bundled style"
 1. Create `src/miniouto/default_style/<name>.md` (use the `<outo>` / `<subagent>` structure).
