@@ -61,7 +61,7 @@ The active model is chosen by the first match in:
 | `miniouto provider providers/models/add` | Browse the lma catalog and add providers from it |
 | `miniouto provider custom add` | Add a custom provider by hand (api_format, base_url, api_key, default_model) |
 | `miniouto provider list/remove/default` | Manage saved providers |
-| `miniouto style list/set/add/show` | Manage style documents |
+| `miniouto style list/set/add/update/show` | Manage style documents (`update` re-seeds bundled + re-fetches all repo styles) |
 | `miniouto skill list/show` | List/show skills from `~/.agents/skills/` |
 
 ### `chat` flags

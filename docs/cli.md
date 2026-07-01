@@ -28,6 +28,7 @@ miniouto [--version]
    │    ├─ list
    │    ├─ set <name>
    │    ├─ add <repo_url> [--name NAME]
+   │    ├─ update
    │    └─ show <name>
    └─ skill
         ├─ list
@@ -40,7 +41,7 @@ miniouto [--version]
 
 `@app.callback()` in `cli/__init__.py` runs before any subcommand. It:
 
-1. Calls `storage.paths.ensure_dirs()` to guarantee `~/.miniouto/` and its `style/`, `sessions/`, `logs/` subdirs exist (also seeds bundled styles on first run).
+1. Calls `storage.paths.ensure_dirs()` to guarantee `~/.miniouto/` and its `style/`, `sessions/`, `logs/` subdirs exist (also force-refreshes bundled styles — see `storage/paths.py`).
 2. If `--version` was passed: prints `miniouto {__version__}` and exits 0.
 3. If no subcommand was invoked (`ctx.invoked_subcommand is None`): calls `tui.run_tui()` which launches the Textual TUI.
 
@@ -258,9 +259,21 @@ Fetches `/style-md/` from a remote git repo and writes the `.md` files into `~/.
 - `repo_url`: any of GitHub (`https://github.com/owner/repo`), GitLab (`https://gitlab.com/owner/repo`), or raw HTML index URL.
 - `--name`: override each downloaded file's basename (rarely used).
 
-Internally calls `storage.styles.add_from_repo(repo_url, name_override=name)`. On exception: red `✗ Failed to fetch styles: {exc}` + exit 1. On success: prints `✓ Added/updated styles: <comma list>`.
+Internally calls `storage.styles.add_from_repo(repo_url, name_override=name)`. On success the repo URL is appended to `~/.miniouto/style_repos.toml` (deduped) so `style update` can re-fetch it later. On exception: red `✗ Failed to fetch styles: {exc}` + exit 1. On success: prints `✓ Added/updated styles: <comma list>`.
 
 See `docs/storage.md` and the fetchers in `storage/styles.py` (`_fetch_github_tree`, `_fetch_gitlab_tree`, `_fetch_raw_index`) for the URL shapes accepted.
+
+### `style update`
+
+Refreshes every style to its latest source. No arguments.
+
+1. Calls `storage.paths.ensure_dirs()` to force-refresh all bundled styles (any installed file whose name matches a bundled template is overwritten with the current bundled content).
+2. Reads every repo URL from `~/.miniouto/style_repos.toml` (recorded by prior `style add` calls) and re-fetches each via `storage.styles.add_from_repo(url)`.
+3. Prints `✓ Refreshed bundled styles: <names>` and `✓ Re-fetched N repo(s): <names>`.
+4. If there are no recorded repos, prints a dim hint: "No repo styles to update. Use `style add <repo-url>` to track a repo."
+5. Per-repo fetch failures are printed as `✗ Failed to update <url>: <err>` but do not abort the remaining repos.
+
+Styles you created by hand (no matching bundled template and no recorded repo) are left untouched.
 
 ### `style show <name>`
 
@@ -314,6 +327,7 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 | `provider default` on unconfigured name | `✗ Provider <name> is not configured.` + `typer.Exit(1)` | 1 |
 | `style set` on missing style | `✗ ... is not installed.` + `typer.Exit(1)` | 1 |
 | `style add` fetch failure | `✗ Failed to fetch styles: {exc}` + `typer.Exit(1) from exc` | 1 |
+| `style update` per-repo fetch failure | `✗ Failed to update <url>: <err>` (printed, remaining repos still attempted; command exits 0) | 0 |
 | `style show` on missing style | `✗ ... is not installed.` + `typer.Exit(1)` | 1 |
 | `skill show` on missing skill | `✗ Skill <name> not found.` + `typer.Exit(1)` | 1 |
 | `--version` | print version + `raise typer.Exit()` (no code → 0) | 0 |

@@ -72,7 +72,7 @@ The `continue_loop` tool is referenced in styles but not actually wired into the
 
 ## Bundled templates
 
-All six bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` on first run by `storage/paths.ensure_dirs` — only if a file of the same name doesn't already exist (your edits survive reinstalls).
+All six bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
 
 | File | Size | Persona | Orchestrator? | Sub-roles |
 |---|---|---|---|---|
@@ -158,7 +158,7 @@ miniouto style set mystyle
 miniouto style add https://github.com/owner/repo
 ```
 
-Fetches `https://api.github.com/repos/owner/repo/contents/style-md` (or GitLab equivalent) and copies every `*.md` into `~/.miniouto/style/`. Existing files with the same name are overwritten.
+Fetches `https://api.github.com/repos/owner/repo/contents/style-md` (or GitLab equivalent) and copies every `*.md` into `~/.miniouto/style/`. Existing files with the same name are overwritten. The repo URL is recorded in `~/.miniouto/style_repos.toml` so it can be re-fetched later.
 
 URL shapes accepted:
 - `https://github.com/owner/repo` (auto-resolves to `/style-md/`)
@@ -166,6 +166,18 @@ URL shapes accepted:
 - `https://gitlab.com/owner/repo` (auto-resolves to `/style-md/`)
 - `https://gitlab.com/owner/repo/tree/main/style-md`
 - Any URL whose directory listing exposes `<a href="*.md">` links (raw HTML fallback)
+
+### Refresh all styles
+
+```bash
+miniouto style update
+```
+
+Re-seeds all bundled styles from the miniouto package (same force-refresh that `ensure_dirs()` does), then re-fetches every repo previously added via `style add` from `~/.miniouto/style_repos.toml`. Same-name files are overwritten in place. Styles you created by hand (no matching bundled template and no recorded repo) are left untouched. Per-repo failures are reported individually but do not abort the rest.
+
+### Web access guidance in bundled styles
+
+Every bundled template includes a **Web access (search & fetch)** section in both its `<outo>` and `<subagent>` halves. It instructs the agent to use `curl` via Bash for all web access, and to search the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from any bundled template.
 
 ### Export / share a style
 

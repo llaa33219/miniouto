@@ -58,6 +58,49 @@ def add(
     console.print(f"[green]✓[/green] Added/updated styles: {', '.join(added)}")
 
 
+@app.command("update")
+def update_cmd() -> None:
+    """Refresh every style to its latest source.
+
+    Re-seeds all bundled styles from the miniouto package, then re-fetches
+    every repo previously added via ``style add``. Same-name files are
+    overwritten in place. Styles you created by hand (no matching bundled
+    template and no recorded repo) are left untouched.
+    """
+
+    paths.ensure_dirs()
+    refreshed_bundled = style_store.bundled_style_names()
+
+    repos = style_store.list_repos()
+    failed: list[tuple[str, str]] = []
+    refreshed_repos: list[str] = []
+    for url in repos:
+        try:
+            added = style_store.add_from_repo(url)
+        except Exception as exc:
+            failed.append((url, str(exc)))
+            continue
+        refreshed_repos.extend(added)
+
+    console.print(
+        f"[green]✓[/green] Refreshed bundled styles: "
+        f"{', '.join(refreshed_bundled) or '-'}"
+    )
+    if repos:
+        ok = sorted(set(refreshed_repos))
+        console.print(
+            f"[green]✓[/green] Re-fetched {len(repos)} repo(s): "
+            f"{', '.join(ok) or 'no .md files'}"
+        )
+        for url, err in failed:
+            console.print(f"[red]✗[/red] Failed to update {url}: {err}")
+    elif not repos:
+        console.print(
+            "[dim]No repo styles to update. Use `style add <repo-url>` "
+            "to track a repo.[/dim]"
+        )
+
+
 @app.command("show")
 def show(name: str) -> None:
     """Print the contents of a style document."""

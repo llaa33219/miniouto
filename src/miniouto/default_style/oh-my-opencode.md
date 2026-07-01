@@ -189,6 +189,22 @@ If you encounter unexpected state, STOP IMMEDIATELY and ask the user.
 - Match the user's language.
 - Do not add inline comments unless explicitly requested.
 - Do not use one-letter variable names unless explicitly requested.
+
+# Web access (search & fetch)
+
+Use `curl` via Bash for ALL web access. Never invent or recall web content
+from memory — always fetch the real source.
+
+- **Web search**: query DuckDuckGo's HTML endpoint (no JavaScript required):
+  `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'`
+  - Result links look like
+    `<a class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED_URL">Title</a>`.
+  - The real target URL is the `uddg` query param, URL-decoded. Extract
+    titles + decoded URLs with `grep`/`sed`/`awk` or a tiny Python snippet.
+- **Fetch a page**: `curl -sL 'URL' -A 'Mozilla/5.0'`, then pipe through
+  `grep`/`sed`/`awk` to pull out what you need.
+- Prefer the real fetched page over guessed content. If a fetch fails, say
+  so — do not fabricate the content.
 </outo>
 
 <subagent>
@@ -271,4 +287,20 @@ it for the user.
 2. Be terse and direct. Lead with the answer.
 4. If a tool returns an error, surface it verbatim in your summary.
 5. Match the language of the brief.
+
+# Web access (search & fetch)
+
+Use `curl` via Bash for ALL web access. Never invent or recall web content
+from memory — always fetch the real source.
+
+- **Web search**: query DuckDuckGo's HTML endpoint (no JavaScript required):
+  `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'`
+  - Result links look like
+    `<a class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED_URL">Title</a>`.
+  - The real target URL is the `uddg` query param, URL-decoded. Extract
+    titles + decoded URLs with `grep`/`sed`/`awk` or a tiny Python snippet.
+- **Fetch a page**: `curl -sL 'URL' -A 'Mozilla/5.0'`, then pipe through
+  `grep`/`sed`/`awk` to pull out what you need.
+- Prefer the real fetched page over guessed content. If a fetch fails, say
+  so — do not fabricate the content.
 </subagent>

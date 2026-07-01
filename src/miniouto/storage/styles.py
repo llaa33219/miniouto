@@ -9,12 +9,21 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .paths import STYLE_DIR, ensure_dirs
+from . import toml_io
+from .paths import BUNDLED_STYLE_DIR, STYLE_DIR, STYLE_REPOS_FILE, ensure_dirs
 
 
 def list_styles() -> list[str]:
     ensure_dirs()
     return sorted(p.stem for p in STYLE_DIR.glob("*.md"))
+
+
+def bundled_style_names() -> list[str]:
+    """Return the stems of the bundled templates shipped with the package."""
+
+    if not BUNDLED_STYLE_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in BUNDLED_STYLE_DIR.glob("*.md"))
 
 
 def read(name: str) -> str | None:
@@ -40,6 +49,7 @@ def add_from_repo(repo_url: str, *, name_override: str | None = None) -> list[st
 
     Files with matching basenames are treated as the same document
     (overwritten in place). Returns the list of style names added/updated.
+    The repo URL is recorded so ``style update`` can re-fetch it later.
     """
 
     ensure_dirs()
@@ -74,7 +84,31 @@ def add_from_repo(repo_url: str, *, name_override: str | None = None) -> list[st
         style_name = name_override or fname[: -len(".md")]
         target = write(style_name, content.decode("utf-8", errors="replace"), overwrite=True)
         written.append(target.stem)
+    record_repo(repo_url)
     return written
+
+
+def record_repo(repo_url: str) -> None:
+    """Append a repo URL to the tracked style-repo list (deduped, ordered)."""
+
+    ensure_dirs()
+    repos = list_repos()
+    if repo_url in repos:
+        return
+    repos.append(repo_url)
+    toml_io.save(STYLE_REPOS_FILE, {"repos": repos})
+
+
+def list_repos() -> list[str]:
+    """Return the list of repo URLs previously added via ``style add``."""
+
+    if not STYLE_REPOS_FILE.exists():
+        return []
+    data = toml_io.load(STYLE_REPOS_FILE)
+    repos = data.get("repos", [])
+    if not isinstance(repos, list):
+        return []
+    return [str(r) for r in repos if isinstance(r, str)]
 
 
 def _fetch_dir(url: str) -> dict[str, bytes]:

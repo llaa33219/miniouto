@@ -30,7 +30,7 @@ src/miniouto/
 │   ├── __init__.py          # app, console, _root callback, status command
 │   ├── chat.py              # chat_cmd
 │   ├── provider.py          # provider providers/models/add + custom add + list/remove/default
-│   ├── style.py             # style list/set/add/show
+│   ├── style.py             # style list/set/add/update/show
 │   ├── skill.py             # skill list/show
 │   └── tui.py               # ChatTUI, run_tui(), model/provider pickers, catalog/custom add wizards
 ├── core/                    # Chat loop + runtime assembly   → see core.md
@@ -48,7 +48,7 @@ src/miniouto/
 │   ├── sessions.py          # MessageRecord + JSON CRUD
 │   ├── settings.py          # Settings dataclass (provider/model/style/session/theme) + TOML CRUD
 │   ├── skills.py            # Skill dataclass + ~/.agents/skills/ discovery
-│   ├── styles.py            # style CRUD + add_from_repo + split_style
+│   ├── styles.py            # style CRUD + add_from_repo + record_repo/list_repos + split_style
 │   └── toml_io.py           # tiny tomllib + tomliw wrapper
 ├── tools/                   # File/bash tools                 → see tools.md
 │   ├── __init__.py

@@ -37,7 +37,7 @@ src/miniouto/
 ├── core/     ← chat loop, runtime assembly, subagent dispatch, event sinks
 ├── storage/  ← the only layer that touches disk (apart from tools/)
 ├── tools/    ← Write / Edit / Delete / Bash (only bash is async)
-├── default_style/  ← 6 bundled .md templates, seeded on first run
+├── default_style/  ← 6 bundled .md templates, force-refreshed on every run
 └── __init__.py, paths_runtime.py
 ```
 
@@ -177,7 +177,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
 | `cli/chat.py` | `chat_cmd` — one-shot chat command |
 | `cli/provider.py` | `provider providers/models/add` (catalog browse + add) + `provider custom add` + `provider list/remove/default` |
-| `cli/style.py` | `style list/set/add/show` |
+| `cli/style.py` | `style list/set/add/update/show` |
 | `cli/skill.py` | `skill list/show` (read-only) |
 | `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; provider catalog/custom add wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
@@ -188,12 +188,12 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
 | `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, subagent tool, hooks |
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
-| `storage/paths.py` | Path constants + `ensure_dirs()` (also seeds bundled styles) |
+| `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
 | `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
 | `storage/sessions.py` | `MessageRecord` + JSON CRUD |
 | `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`) + TOML CRUD |
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
-| `storage/styles.py` | Style CRUD + `add_from_repo` + `split_style` + `builtin_default` |
+| `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
 | `storage/toml_io.py` | `tomllib` + `tomli_w` wrapper |
 | `tools/__init__.py` | Re-exports + `normalize_for_matching` |
 | `tools/_normalize.py` | smart-quote/dash/NBSP/zero-width normalization |
@@ -247,7 +247,7 @@ See `docs/tools.md` § "Adding a new tool". TL;DR:
 
 ### "Add a new bundled style"
 1. Create `src/miniouto/default_style/<name>.md` (use the `<outo>` / `<subagent>` structure).
-2. It auto-seeds into `~/.miniouto/style/` on first run.
+2. It auto-seeds into `~/.miniouto/style/` and is force-refreshed on every `ensure_dirs()` call (overwrites any same-name installed file when content differs). To let users customize it, copy to a new name rather than editing the bundled one.
 3. Document in `docs/styles.md`.
 
 ### "Add a new provider format"

@@ -10,13 +10,14 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 ~/.miniouto/                      (or $MINIOUTO_HOME)
 ├── providers.toml                # provider configurations (one top-level TOML table per provider)
 ├── settings.toml                 # active provider / model / style / session / theme
+├── style_repos.toml              # recorded repo URLs added via `style add` (re-fetched by `style update`)
 ├── style/
-│   ├── default.md                # seeded on first run from src/miniouto/default_style/default.md
-│   ├── claude.md                 # seeded
-│   ├── codex.md                  # seeded
-│   ├── opencode.md               # seeded
-│   ├── oh-my-opencode.md         # seeded
-│   └── codebuff.md               # seeded
+│   ├── default.md                # seeded + force-refreshed from src/miniouto/default_style/default.md
+│   ├── claude.md                 # force-refreshed
+│   ├── codex.md                  # force-refreshed
+│   ├── opencode.md               # force-refreshed
+│   ├── oh-my-opencode.md         # force-refreshed
+│   └── codebuff.md               # force-refreshed
 ├── sessions/
 │   └── <name>.json               # conversation history per session
 └── logs/                         # reserved (currently unused by code)
@@ -29,17 +30,18 @@ Skills live **outside** `~/.miniouto/` at `~/.agents/skills/<name>/SKILL.md` (th
 Defined in `src/miniouto/storage/paths.py`:
 
 ```python
-ROOT           = Path(os.environ.get("MINIOUTO_HOME") or Path.home() / ".miniouto").expanduser()
-PROVIDERS_FILE = ROOT / "providers.toml"
-SETTINGS_FILE  = ROOT / "settings.toml"
-STYLE_DIR      = ROOT / "style"
-SESSION_DIR    = ROOT / "sessions"
-LOG_DIR        = ROOT / "logs"
+ROOT               = Path(os.environ.get("MINIOUTO_HOME") or Path.home() / ".miniouto").expanduser()
+PROVIDERS_FILE     = ROOT / "providers.toml"
+SETTINGS_FILE      = ROOT / "settings.toml"
+STYLE_DIR          = ROOT / "style"
+STYLE_REPOS_FILE   = ROOT / "style_repos.toml"
+SESSION_DIR        = ROOT / "sessions"
+LOG_DIR            = ROOT / "logs"
 ```
 
 `ensure_dirs()` (called by the CLI root callback before every command):
 1. Creates `ROOT`, `STYLE_DIR`, `SESSION_DIR`, `LOG_DIR` if missing.
-2. For every `*.md` in the bundled `src/miniouto/default_style/` package data, copies it into `STYLE_DIR/` **only if** the target file is absent (won't clobber user edits).
+2. For every `*.md` in the bundled `src/miniouto/default_style/` package data, overwrites the matching `STYLE_DIR/<name>.md` with the current bundled content **whenever the content differs** — bundled templates are force-refreshed, so editing a bundled style in place does not survive a reinstall/relaunch. To customize a bundled style, copy it to a new name. Files whose names do not match a bundled template are left untouched.
 
 ## File format schemas
 
@@ -165,9 +167,10 @@ The `<outo>` tag is required (or the whole document is treated as the outo promp
 | `PROVIDERS_FILE` | `Path` | `ROOT/providers.toml` |
 | `SETTINGS_FILE` | `Path` | `ROOT/settings.toml` |
 | `STYLE_DIR` | `Path` | `ROOT/style` |
+| `STYLE_REPOS_FILE` | `Path` | `ROOT/style_repos.toml` (repo URLs recorded by `style add`) |
 | `SESSION_DIR` | `Path` | `ROOT/sessions` |
 | `LOG_DIR` | `Path` | `ROOT/logs` |
-| `ensure_dirs() -> None` | function | Create dirs + seed bundled styles |
+| `ensure_dirs() -> None` | function | Create dirs + force-refresh bundled styles |
 
 ### `storage.providers`
 
@@ -253,7 +256,9 @@ class MessageRecord:
 | `read(name)` | `str \| None` | |
 | `path_for(name)` | `Path` | |
 | `write(name, content, *, overwrite=False)` | `Path` | no-op (returns existing path) if target exists and `overwrite=False` — does **not** raise. (This is the *style* `write`, distinct from the `tools/write.py` "refuses overwrite" tool.) |
-| `add_from_repo(repo_url, *, name_override=None)` | `list[str]` | names added/updated |
+| `add_from_repo(repo_url, *, name_override=None)` | `list[str]` | names added/updated; also records the repo URL via `record_repo` so `style update` can re-fetch it |
+| `record_repo(repo_url)` | `None` | append URL to `style_repos.toml` (deduped, ordered) |
+| `list_repos()` | `list[str]` | recorded repo URLs from `style_repos.toml` (`[]` if absent/malformed) |
 | `builtin_default()` | `str` | seeds `~/.miniouto/style/default.md` from the bundled copy if absent, then returns its **text content** (or `""` if neither exists). Despite the legacy docstring, it returns content — not a path. |
 | `write_default_style(content)` | `None` | writes `default.md` only if absent |
 | `split_style(content)` | `tuple[str, str]` | `(outo, subagent)`; missing tag → whole/empty |
