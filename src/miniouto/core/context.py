@@ -16,14 +16,6 @@ SUMMARIZE_THRESHOLD = 0.8
 # least this many tokens unless the API tells us the real cap is lower.
 DEFAULT_MAX_OUTPUT_TOKENS = 16384
 
-# Hard ceiling. lma sometimes reports `maxOutputTokens` values far above
-# what the upstream API will actually accept in a single request —
-# Anthropic's Messages API rejects very large `max_tokens` with
-# "Streaming is required for operations that may take longer than 10
-# minutes." We cap at 16K, which is plenty for the Write tool (≈64KB
-# of code) and stays within every provider's per-request limit.
-MAX_OUTPUT_TOKENS_CEILING = 16384
-
 # Cache: (model, provider) → {contextWindow, maxOutputTokens}. A cached
 # `{}` is meaningful — it means "lma had no info for this key" and we
 # should not re-hit it every turn.
@@ -51,29 +43,53 @@ def _fetch_model_caps(model: str, provider_name: str | None = None) -> dict[str,
     return result
 
 
+def _provider_caps_override(provider_name: str | None) -> dict[str, int]:
+    # Read fresh on every call — the TUI is long-lived and edits these
+    # mid-session, so caching here would freeze stale overrides.
+    if not provider_name:
+        return {}
+    try:
+        from ..storage import providers as provider_store
+
+        p = provider_store.get(provider_name)
+    except Exception:
+        return {}
+    if p is None:
+        return {}
+    out: dict[str, int] = {}
+    if isinstance(p.max_context_window, int) and p.max_context_window > 0:
+        out["contextWindow"] = p.max_context_window
+    if isinstance(p.max_output_tokens, int) and p.max_output_tokens > 0:
+        out["maxOutputTokens"] = p.max_output_tokens
+    return out
+
+
 def get_context_window(model: str, provider_name: str | None = None) -> int | None:
+    override = _provider_caps_override(provider_name).get("contextWindow")
+    if override:
+        return override
     return _fetch_model_caps(model, provider_name).get("contextWindow")
 
 
 def get_max_output_tokens(model: str, provider_name: str | None = None) -> int:
-    """Returns the model's max output token cap, bounded for safety.
+    """Returns the model's max output token cap.
 
     Order of preference:
-    1. lma's `max_output_tokens` for the (model, provider) pair.
-    2. lma's `context_window` (most APIs cap output at the context
+    1. The per-provider `max_output_tokens` override set in the TUI
+       custom-model editor.
+    2. lma's `max_output_tokens` for the (model, provider) pair.
+    3. lma's `context_window` (most APIs cap output at the context
        window; if a separate cap isn't published, this is a proxy).
-    3. `DEFAULT_MAX_OUTPUT_TOKENS` (16K) — a hard floor because some
+    4. `DEFAULT_MAX_OUTPUT_TOKENS` (16K) — a hard floor because some
        providers (Anthropic) default to 1024 otherwise, which silently
        truncates Write tool calls and corrupts files.
-
-    The result is also clamped to `MAX_OUTPUT_TOKENS_CEILING` because
-    lma's `max_output_tokens` can be the *theoretical* streaming cap
-    (e.g. 512K), not the per-request non-streaming cap that we send.
     """
 
+    override = _provider_caps_override(provider_name).get("maxOutputTokens")
+    if override:
+        return override
     caps = _fetch_model_caps(model, provider_name)
-    raw = caps.get("maxOutputTokens") or caps.get("contextWindow") or DEFAULT_MAX_OUTPUT_TOKENS
-    return min(raw, MAX_OUTPUT_TOKENS_CEILING)
+    return caps.get("maxOutputTokens") or caps.get("contextWindow") or DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def make_summarize_hook(model: str, session_name: str, provider_name: str | None = None) -> Any:

@@ -108,7 +108,7 @@ Suggested test priorities (in order):
 ## Build
 
 ```bash
-uv build          # produces dist/miniouto-0.1.0-py3-none-any.whl
+uv build          # produces dist/miniouto-0.1.1-py3-none-any.whl
 ```
 
 Build backend: `hatchling`. Wheel packages: `["src/miniouto"]`.

@@ -65,6 +65,13 @@ name = "anthropic"
 api_format = "anthropic"
 source = "lma"                 # added via `provider add Anthropic …`
 default_model = "claude-opus-4.5"
+
+# Optional per-provider model-cap overrides (set via the TUI custom-model
+# editor). When present they win over anything lma reports for the
+# default_model — useful for custom providers lma has never heard of.
+# Both are omitted on write when unset.
+max_context_window = 128000
+max_output_tokens = 8000
 ```
 
 Each provider is a **top-level TOML table named after the provider** (e.g. `[openai]`, not `[providers.openai]`). The `Provider` dataclass in `storage/providers.py` has an `extra: dict` field for unknown keys — they're preserved through round-trips so future fields won't be lost.
@@ -191,10 +198,14 @@ class Provider:
     api_key: str = ""
     default_model: str = ""
     source: str = SOURCE_CUSTOM     # one of SOURCE_CUSTOM | SOURCE_LMA
+    max_context_window: int | None = None   # TUI-only override of default_model's context window
+    max_output_tokens: int | None = None    # TUI-only override of default_model's max output tokens
     extra: dict[str, Any] = field(default_factory=dict)
 ```
 
 `source` selects which TUI model picker is used: `SOURCE_LMA` → catalog model list (`_catalog_model_picker_flow`); `SOURCE_CUSTOM` → free-text editor (`_open_custom_model_editor`). See `docs/lma.md`. Invalid `source` values on load are coerced back to `SOURCE_CUSTOM`.
+
+`max_context_window` / `max_output_tokens` are written only by the TUI custom-model editor and read only by `core/context.py`. When set, they win over anything lma reports for the model. Both default to `None` (omitted on write). Non-positive or garbage values loaded from disk are coerced back to `None` by `_coerce_positive_int`. See `docs/lma.md` for the full precedence ladder.
 
 | Function | Returns | Notes |
 |---|---|---|

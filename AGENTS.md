@@ -15,7 +15,7 @@
 
 Three principles from `README.md`: **Minimalism** (no bloat — extend with styles), **Automation-friendly** (full CLI, TUI optional), **Fluidity** (adapts to any environment).
 
-**Version**: `0.1.0` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
+**Version**: `0.1.1` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
 
 ---
 
@@ -99,12 +99,14 @@ The final prompt the outo model sees, top to bottom:
 Subagent mirrors this with `<subagent>` content and a different cwd preamble. The cwd preamble is regenerated on every call (not persisted).
 
 ### 4. Context-window safety
-`core/context.py` enforces a **16K-token output cap** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`) and clamping the result:
+`core/context.py` enforces a **16K-token output floor** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`):
 
 - **Floor**: `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates Write tool calls.
-- **Ceiling**: `MAX_OUTPUT_TOKENS_CEILING = 16384`. Some lma entries report theoretical streaming caps (e.g. 512K) that the non-streaming API rejects.
+- There is **no ceiling**. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
-If you touch `get_max_output_tokens`, you must preserve both bounds. Always thread the `provider_name` argument through so the lma lookup is scoped to the active provider (otherwise lma returns matches across every provider and we only see the first hit).
+If you touch `get_max_output_tokens`, you must preserve the floor. Always thread the `provider_name` argument through so the lma lookup is scoped to the active provider (otherwise lma returns matches across every provider and we only see the first hit).
+
+There is **one** deliberate precedence tier above lma: a per-provider `max_output_tokens` override (field on the `Provider` dataclass, set via the TUI custom-model editor). `_provider_caps_override` consults `provider_store` on every call (no caching — the TUI is long-lived and edits these mid-session). The override wins over lma. The CLI `chat --max-tokens` flag still wins over the override. Precedence: `--max-tokens` > provider override > lma `max_output_tokens` > lma `context_window` > `DEFAULT_MAX_OUTPUT_TOKENS`. The same override path exists for `max_context_window` via `get_context_window`.
 
 ### 5. Subagent is a re-implemented `agent_as_tool`
 `core/runtime.py:_build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()` — that means subagent `Write` calls inherit the provider's low hard cap (1024 for Anthropic → silent truncation). This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
@@ -172,7 +174,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | `__version__ = "0.1.0"` |
+| `__init__.py` | `__version__ = "0.1.1"` |
 | `paths_runtime.py` | `INVOCATION_CWD: Path` (captured cwd at import, used by every tool to absolutize relative paths) |
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
 | `cli/chat.py` | `chat_cmd` — one-shot chat command |

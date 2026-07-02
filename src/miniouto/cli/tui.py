@@ -59,6 +59,25 @@ from ..storage.sessions import MessageRecord
 SENTINEL_CATALOG_ADD = "__catalog_add__"
 SENTINEL_CUSTOM_ADD = "__custom_add__"
 
+
+def _parse_optional_int(result: str | None) -> int | None:
+    """Parse a TextInputModal int result.
+
+    Returns int for valid positive input, None for empty/cancelled (the
+    caller treats None as "clear the override"). Raises ValueError for
+    non-numeric, zero, or negative input so the caller can keep the
+    existing value and post a system message.
+    """
+    if result is None:
+        return None
+    stripped = result.strip()
+    if not stripped:
+        return None
+    v = int(stripped)
+    if v <= 0:
+        raise ValueError("must be > 0")
+    return v
+
 # Braille spinner frames. The status line reads e.g. "⠧ Write…" and the
 # glyph rotates through this set at ~12.5fps so the bottom of the screen
 # shows the agent is alive even between tool calls.
@@ -992,7 +1011,46 @@ class ChatTUI(App):
             def on_close(result: str | None) -> None:
                 if result is None:
                     return
-                model = result.strip()
+                ask_max_context(result.strip())
+
+            self.push_screen(
+                TextInputModal(
+                    "Custom provider: default model (optional)",
+                    placeholder="model-id",
+                    hint="Empty to set later · Enter to continue · Esc to cancel",
+                ),
+                on_close,
+            )
+
+        def ask_max_context(model: str) -> None:
+            def on_close(result: str | None) -> None:
+                if result is None:
+                    return
+                try:
+                    parsed = _parse_optional_int(result)
+                except ValueError:
+                    self._post_system("invalid max context window; skipping")
+                    parsed = None
+                ask_max_tokens(model, parsed)
+
+            self.push_screen(
+                TextInputModal(
+                    "Custom provider: max context window (optional)",
+                    placeholder="e.g. 128000 · empty to skip",
+                    hint="Enter to continue · Esc to cancel",
+                ),
+                on_close,
+            )
+
+        def ask_max_tokens(model: str, ctx: int | None) -> None:
+            def on_close(result: str | None) -> None:
+                if result is None:
+                    return
+                try:
+                    parsed = _parse_optional_int(result)
+                except ValueError:
+                    self._post_system("invalid max output tokens; skipping")
+                    parsed = None
                 paths.ensure_dirs()
                 provider_store.upsert(
                     provider_store.Provider(
@@ -1002,6 +1060,8 @@ class ChatTUI(App):
                         api_key=state["api_key"],
                         default_model=model,
                         source=SOURCE_CUSTOM,
+                        max_context_window=ctx,
+                        max_output_tokens=parsed,
                     )
                 )
                 settings_store.update(provider=state["name"])
@@ -1010,9 +1070,9 @@ class ChatTUI(App):
 
             self.push_screen(
                 TextInputModal(
-                    "Custom provider: default model (optional)",
-                    placeholder="model-id",
-                    hint="Empty to set later · Enter to save · Esc to cancel",
+                    "Custom provider: max output tokens (optional)",
+                    placeholder="e.g. 16384 · empty to skip",
+                    hint="Enter to save · Esc to cancel",
                 ),
                 on_close,
             )
@@ -1031,25 +1091,79 @@ class ChatTUI(App):
             self._open_custom_model_editor(provider)
 
     def _open_custom_model_editor(self, provider) -> None:
-        current = provider.default_model
-        placeholder = (
-            f"current default: {current}" if current else "model id"
-        )
+        current_model = provider.default_model
 
-        def _on_close(result: str | None) -> None:
-            if result is None:
-                return  # cancelled
-            self._save_model_change(provider.name, result.strip())
+        def ask_model_id() -> None:
+            def _on_close(result: str | None) -> None:
+                if result is None:
+                    return
+                ask_max_context(result.strip())
 
-        self.push_screen(
-            TextInputModal(
-                f"Edit model (custom provider: {provider.name})",
-                initial=current,
-                placeholder=placeholder,
-                hint="Empty to clear · Enter to confirm · Esc to cancel",
-            ),
-            _on_close,
-        )
+            self.push_screen(
+                TextInputModal(
+                    f"Edit model (custom provider: {provider.name})",
+                    initial=current_model,
+                    placeholder=(
+                        f"current default: {current_model}" if current_model else "model id"
+                    ),
+                    hint="Empty to clear · Enter to continue · Esc to cancel",
+                ),
+                _on_close,
+            )
+
+        def ask_max_context(new_model: str) -> None:
+            cur = provider.max_context_window
+
+            def _on_close(result: str | None) -> None:
+                if result is None:
+                    return
+                try:
+                    parsed = _parse_optional_int(result)
+                except ValueError:
+                    self._post_system(
+                        f"invalid max context window; keeping existing "
+                        f"({cur if cur else '-'})"
+                    )
+                    parsed = cur
+                ask_max_tokens(new_model, parsed)
+
+            self.push_screen(
+                TextInputModal(
+                    f"Max context window (tokens) — {provider.name}",
+                    initial=str(cur) if cur else "",
+                    placeholder="optional · e.g. 128000 · empty to clear",
+                    hint="Enter to continue · Esc to cancel",
+                ),
+                _on_close,
+            )
+
+        def ask_max_tokens(new_model: str, new_ctx: int | None) -> None:
+            cur = provider.max_output_tokens
+
+            def _on_close(result: str | None) -> None:
+                if result is None:
+                    return
+                try:
+                    parsed = _parse_optional_int(result)
+                except ValueError:
+                    self._post_system(
+                        f"invalid max output tokens; keeping existing "
+                        f"({cur if cur else '-'})"
+                    )
+                    parsed = cur
+                self._save_custom_model(provider.name, new_model, new_ctx, parsed)
+
+            self.push_screen(
+                TextInputModal(
+                    f"Max output tokens — {provider.name}",
+                    initial=str(cur) if cur else "",
+                    placeholder="optional · default 16384 · empty to clear",
+                    hint="Enter to save · Esc to cancel",
+                ),
+                _on_close,
+            )
+
+        ask_model_id()
 
     async def _catalog_model_picker_flow(self, provider) -> None:
         self._post_system("fetching model list…")
@@ -1094,6 +1208,35 @@ class ChatTUI(App):
             self._post_system(f"model → {new_model} (provider default)")
         else:
             self._post_system("model → cleared (provider default empty)")
+
+    def _save_custom_model(
+        self,
+        provider_name: str,
+        new_model: str,
+        max_context_window: int | None,
+        max_output_tokens: int | None,
+    ) -> None:
+        p = provider_store.get(provider_name)
+        if p is None:
+            return
+        provider_store.upsert(
+            replace(
+                p,
+                default_model=new_model,
+                max_context_window=max_context_window,
+                max_output_tokens=max_output_tokens,
+            )
+        )
+        settings_store.update(model="")
+        self._refresh_chips()
+        parts: list[str] = [
+            f"model → {new_model}" if new_model else "model → cleared"
+        ]
+        if max_context_window is not None:
+            parts.append(f"ctx={max_context_window}")
+        if max_output_tokens is not None:
+            parts.append(f"max-tokens={max_output_tokens}")
+        self._post_system(" · ".join(parts) + " (provider default)")
 
     def _open_style_picker(self) -> None:
         styles = style_store.list_styles()

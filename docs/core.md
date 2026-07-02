@@ -165,7 +165,7 @@ Per-tool one-liner:
 
 - `SUMMARIZE_THRESHOLD = 0.8` — summarization fires at 80% of context window.
 - `DEFAULT_MAX_OUTPUT_TOKENS = 16384` — hard floor. Rationale: Anthropic defaults to 1024 if you don't set it explicitly, silently truncating Write outputs.
-- `MAX_OUTPUT_TOKENS_CEILING = 16384` — hard ceiling. Some lma entries report theoretical streaming caps (e.g. 512K) that the non-streaming API rejects.
+- There is no ceiling. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
 ### `_fetch_model_caps(model, provider_name=None) -> dict[str, int]`
 
@@ -177,12 +177,13 @@ Returns the model's context window in tokens, or `None` if unknown. Passing `pro
 
 ### `get_max_output_tokens(model, provider_name=None) -> int`
 
-Resolution order:
-1. `caps["maxOutputTokens"]`
-2. `caps["contextWindow"]` (fallback proxy)
-3. `DEFAULT_MAX_OUTPUT_TOKENS` (16K hard floor)
+Resolution order (highest wins):
+1. Per-provider `max_output_tokens` override (set via the TUI custom-model editor; read fresh each call by `_provider_caps_override`).
+2. `caps["maxOutputTokens"]` (from lma).
+3. `caps["contextWindow"]` (fallback proxy).
+4. `DEFAULT_MAX_OUTPUT_TOKENS` (16K hard floor).
 
-Then clamps to `MAX_OUTPUT_TOKENS_CEILING` (16K).
+No ceiling clamp. See `docs/lma.md` for rationale.
 
 ### `make_summarize_hook(model, session_name, provider_name=None) -> Callable`
 

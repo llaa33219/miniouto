@@ -8,6 +8,23 @@ miniouto uses lma for three things:
 2. **Model discovery** — `miniouto provider models <provider>` lists every model lma knows for a provider; the TUI provider-add and model-edit flows fetch the same data.
 3. **Per-model context / max-output caps** — `core/context.py` calls lma's `/model` endpoint to look up `context_window` and `max_output_tokens` instead of the older `lcw-api.blp.sh/context-window` endpoint.
 
+### Per-provider overrides (custom providers)
+
+For providers that lma has never heard of (anything added via `miniouto provider custom add` or the TUI `+ add custom…` wizard), the `/model` lookup misses and `core/context.py` falls back to the 16K floor. To let these providers declare their real caps, the TUI custom-model editor (`_open_custom_model_editor`) and the custom-add wizard (`_open_custom_add_wizard`) collect two extra fields after the model id:
+
+- `max_context_window` — written to `providers.toml`, read by `get_context_window`.
+- `max_output_tokens` — written to `providers.toml`, read by `get_max_output_tokens`.
+
+Precedence for `max_output_tokens` (highest wins):
+
+1. `chat --max-tokens <n>` (per-call CLI flag)
+2. Provider's `max_output_tokens` override (set via the TUI)
+3. lma's `max_output_tokens` for the (model, provider) pair
+4. lma's `context_window` (most APIs cap output at the context window)
+5. `DEFAULT_MAX_OUTPUT_TOKENS = 16384` (the floor — defends against Anthropic's silent 1024 default that truncates Write tool calls)
+
+There is no upper ceiling. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed. A wrong value surfaces as a clear provider error at chat time, which is preferable to silent truncation.
+
 ## Endpoints used
 
 miniouto only ever issues **read-only GETs** against the four endpoints below. All responses are JSON; all calls are wrapped in `core.lma` with a 10-minute in-process cache mirroring lma's server TTL.

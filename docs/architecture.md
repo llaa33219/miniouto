@@ -25,7 +25,7 @@ From `README.md`:
 
 ```
 src/miniouto/
-├── __init__.py              # __version__ = "0.1.0"
+├── __init__.py              # __version__ = "0.1.1"
 ├── paths_runtime.py         # INVOCATION_CWD: Path  (captured cwd at import)
 ├── cli/                     # Typer commands + Textual TUI
 ├── core/                    # Chat loop + runtime assembly + event sinks
@@ -165,10 +165,10 @@ The final prompt the outo model sees, top to bottom:
 The subagent prompt mirrors this with `<subagent>` content and a different cwd preamble.
 
 ### 4. Context-window safety
-`core/context.py` enforces a **16K-token output cap** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`) and clamping the result:
+`core/context.py` enforces a **16K-token output floor** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`):
 
 - **Floor:** `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates Write tool calls.
-- **Ceiling:** `MAX_OUTPUT_TOKENS_CEILING = 16384`. Some lma entries report theoretical streaming caps (e.g. 512K) that the non-streaming API rejects.
+- **No ceiling.** The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
 ### 5. Subagent is a re-implemented `agent_as_tool`
 `core.runtime._build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()`, which means subagent `Write` calls inherit the provider's low hard cap. This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
