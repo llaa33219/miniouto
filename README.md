@@ -11,16 +11,23 @@ Three principles:
 2. **Automation-friendly** — Full CLI; TUI is optional.
 3. **Fluidity** — Adapts to any environment.
 
-## License
+## Preview
 
-[Apache License 2.0](./LICENSE)
+<p align="center">
+  <img src="preview.gif" alt="miniouto preview" width="800">
+</p>
 
 ## Install
 
 ```bash
-uv sync
-uv tool install --editable . --force   # or `uv tool install .` for a pinned build
+uv tool install miniouto
+# or
+pip install miniouto
 ```
+
+## License
+
+[Apache License 2.0](./LICENSE)
 
 ## Quick start
 

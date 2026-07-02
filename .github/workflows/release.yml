@@ -1,0 +1,68 @@
+name: release
+
+# Builds and publishes to PyPI automatically when a `vX.Y.Z` tag is pushed.
+#
+# Setup (one-time, on PyPI):
+#   https://docs.pypi.org/trusted-publishers/adding-a-publisher/
+#   Owner: <github-org-or-user>, Repo: miniouto,
+#   Workflow filename: release.yml, Environment name: pypi
+#
+# To cut a release:
+#   1. Bump `version` in pyproject.toml (and src/miniouto/__init__.py if it diverges).
+#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+#
+# This uses OIDC trusted publishing (no API token to manage or rotate).
+# If you prefer an API token instead, replace the publish step with:
+#   - uses: pypa/gh-action-pypi-publish@release/v1
+#     with:
+#       password: ${{ secrets.PYPI_API_TOKEN }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for trusted publishing (OIDC)
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

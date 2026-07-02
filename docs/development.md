@@ -115,18 +115,43 @@ Build backend: `hatchling`. Wheel packages: `["src/miniouto"]`.
 
 ## Release
 
+Releases are published automatically by `.github/workflows/release.yml`. Push a tag and CI handles the rest:
+
 ```bash
-# Bump version in pyproject.toml and src/miniouto/__init__.py
-$EDITOR pyproject.toml src/miniouto/__init__.py
+# 1. Bump version in pyproject.toml (keep src/miniouto/__init__.py in sync if it ever diverges)
+$EDITOR pyproject.toml
 
-# Build
-uv build
-
-# Publish (one-time uv auth required)
-uv publish
+# 2. Commit and tag
+git commit -am "v0.1.1"
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
-Tagging follows `vX.Y.Z` semver. There's no CI configured yet.
+The workflow triggers on any `v*` tag. It builds the wheel + sdist with `uv build`, then publishes to PyPI using OIDC trusted publishing (no API token in the repo).
+
+### One-time PyPI setup (trusted publisher)
+
+If this is the first release, register the trusted publisher once on PyPI:
+<https://docs.pypi.org/trusted-publishers/adding-a-publisher/>
+
+- PyPI Project Name: `miniouto`
+- Owner: the GitHub user/org that owns this repo
+- Repository name: `miniouto`
+- Workflow filename: `release.yml`
+- Environment name: `pypi`
+
+The workflow file already declares `environment: pypi` and `permissions: id-token: write`, so once the publisher is registered the first `git push origin vX.Y.Z` will publish.
+
+### Manual publish (fallback)
+
+If you ever need to publish by hand (e.g. CI is broken):
+
+```bash
+uv build
+uv publish   # one-time `uv publish` auth via browser
+```
+
+(Local-only builds without publishing are covered in [Build](#build) above.)
 
 ## Entry point
 
