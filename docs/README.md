@@ -10,6 +10,8 @@ This directory contains a complete reference for the project. Read [`architectur
 |---|---|
 | [`architecture.md`](./architecture.md) | High-level design: package layout, dependency graph, runtime data flow, key invariants. **Read this first.** |
 | [`cli.md`](./cli.md) | Every CLI command, flag, exit code, and configuration path. The user-facing surface. |
+| [`usage.md`](./usage.md) | **Cookbook of CLI command examples.** chat output modes, provider/style/skill usage patterns, TUI controls, pipeline recipes. |
+| [`automation.md`](./automation.md) | **Non-interactive automation reference.** Post-install auto-setup, `MINIOUTO_HOME`, chat output parsing, auto-registering providers/styles/skills, CI/Docker/cron patterns. |
 | [`storage.md`](./storage.md) | `~/.miniouto/` filesystem layout, TOML/JSON schemas, style/skills storage. The persistence layer. |
 | [`core.md`](./core.md) | Chat loop, `RuntimeConfig` resolution, provider construction, context-window management, subagent dispatch. |
 | [`tools.md`](./tools.md) | The Write / Edit / Delete / Bash tools — handlers, schemas, edit rules, fuzzy fallback. |
