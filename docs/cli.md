@@ -138,6 +138,8 @@ chat_cmd(
     --max-tokens  INT,                 # cap output tokens
     --temperature FLOAT,               # sampling temperature
     --continue, -c                     # prepend previous session history
+    --answer-only, -a                  # print only the final answer (suppresses session marker, loop events, finish marker)
+    --with-session                     # print only session marker + final answer (suppresses loop events + finish marker)
 )
 ```
 
@@ -152,6 +154,10 @@ chat_cmd(
 | `--max-tokens` | Cap output tokens |
 | `--temperature` | Sampling temperature |
 | `--continue` / `-c` | Prepend the session's previous history |
+| `--answer-only` / `-a` | Print only the final answer. Suppresses the `------{session}------` marker, loop events, and `------finish------` marker |
+| `--with-session` | Print only the `------{session}------` marker + final answer. Suppresses loop events and `------finish------` marker |
+
+`--answer-only` and `--with-session` are **mutually exclusive** (exit 1 with `✗ --answer-only and --with-session are mutually exclusive.`). Both suppress the spinner, loop events, and finish marker by putting the `ConsoleEventSink` into `quiet` mode; they differ only in whether the session marker line is emitted up front. The default (neither flag) keeps the full verbose output: session marker + spinner + loop events + finish marker + answer.
 
 ### Behavior
 
@@ -160,9 +166,9 @@ chat_cmd(
    - elif `--name` was supplied: use `name` verbatim.
    - else: generate a fresh `chat-{YYYYMMDD-HHMMSS}-{6hex}` name.
 2. **Always** calls `settings.update(session=session_name)` to persist (unconditional — every chat call updates the active session).
-3. Writes a `------{session_name}------` marker to stdout, then builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts, sink=ConsoleEventSink())`.
+3. Emits the `------{session_name}------` marker to stdout unless `--answer-only` was passed, then builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts, sink=ConsoleEventSink(quiet=answer_only or with_session))`.
 4. On exception: `chat_cmd` does **not** catch — `run_chat` itself calls `_dump_failure_diagnostics` (prints `✗ {ExceptionType}: {msg}` + the last ≤5 tool calls + a full traceback to **stderr**) and **re-raises**. Typer prints the traceback and exits 1.
-5. On success: `ConsoleEventSink` writes the reply as plain stdout followed by a `------finish------` marker. Loop events (tool calls, intermediate responses) above it are rendered in `orange3`.
+5. On success: `ConsoleEventSink` writes the reply as plain stdout; in verbose mode it is preceded by a `------finish------` marker and loop events (tool calls, intermediate responses) rendered in `orange3`. In quiet mode only the raw answer (and the session marker, for `--with-session`) reaches stdout.
 
 ### Model resolution
 

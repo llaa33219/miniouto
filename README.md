@@ -75,6 +75,8 @@ The active model is chosen by the first match in:
 | `--max-tokens` | Cap output tokens |
 | `--temperature` | Sampling temperature |
 | `--continue` / `-c` | Prepend the session's previous history |
+| `--answer-only` / `-a` | Print only the final answer (no session marker, no loop events, no finish marker) |
+| `--with-session` | Print only the session marker + final answer (no loop events, no finish marker) |
 
 ## Storage
 

@@ -64,18 +64,23 @@ class NullSink:
 class ConsoleEventSink:
     SPINNER_TEXT_DEFAULT = "Working…"
 
-    def __init__(self) -> None:
+    def __init__(self, *, quiet: bool = False) -> None:
         # Spinner and loop events share stdout so Rich's `Live` keeps them
         # vertically separated. Earlier stderr/stdout splits interleaved
         # on a shared tty, putting the spinner glyph on the same row as
         # the next `outo:` line.
+        #
+        # The session marker stays the CLI's job (see `cli/chat.py`), not
+        # the sink's — `quiet` only governs progress noise + the finish
+        # marker, never the session marker.
         self._console = Console(soft_wrap=False, highlight=False)
         self._activity: str = self.SPINNER_TEXT_DEFAULT
         self._status: Status | None = None
         self._stdout_lock = Lock()
+        self._quiet = quiet
 
     def begin_working(self) -> None:
-        if self._status is not None:
+        if self._quiet or self._status is not None:
             return
         self._status = self._console.status(
             f" {self._activity}",
@@ -85,17 +90,21 @@ class ConsoleEventSink:
         self._status.__enter__()
 
     def update_activity(self, text: str) -> None:
+        if self._quiet:
+            return
         self._activity = text or self.SPINNER_TEXT_DEFAULT
         if self._status is not None:
             self._status.update(f" {self._activity}")
 
     def end_working(self) -> None:
-        if self._status is None:
+        if self._quiet or self._status is None:
             return
         self._status.__exit__(None, None, None)
         self._status = None
 
     def emit_loop_event(self, event: LoopEvent) -> None:
+        if self._quiet:
+            return
         # Text.assemble avoids markup parsing entirely — the model/tool
         # text is stored as raw characters and styled by span, so stray
         # `[brackets]` in the payload can't crash Rich.
@@ -107,7 +116,8 @@ class ConsoleEventSink:
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
         with self._stdout_lock:
-            sys.stdout.write("------finish------\n")
+            if not self._quiet:
+                sys.stdout.write("------finish------\n")
             sys.stdout.write(content if content else "")
             if not content or not content.endswith("\n"):
                 sys.stdout.write("\n")
