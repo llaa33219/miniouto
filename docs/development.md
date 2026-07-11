@@ -49,7 +49,7 @@ miniouto/
 
 | Package | Min version | Role |
 |---|---|---|
-| `coreouto[all]` | 0.4.2 | Agent loop, providers, tools, hooks |
+| `coreouto[all]` | 0.9.0 | Agent loop, providers, tools, hooks |
 | `typer` | 0.12.0 | CLI framework |
 | `rich` | 13.7.0 | Terminal output, tables, markdown |
 | `textual` | 0.80.0 | TUI framework |
