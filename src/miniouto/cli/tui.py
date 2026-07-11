@@ -25,12 +25,16 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.markdown import Markdown
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.selection import Selection
+from textual.strip import Strip
 from textual.timer import Timer
 from textual.widgets import (
     Footer,
@@ -550,6 +554,62 @@ class BottomPanel(Static):
         )
 
 
+class SelectableRichLog(RichLog):
+    """RichLog subclass that supports text selection via mouse drag.
+
+    The stock ``RichLog`` overrides ``render_line`` and bypasses the
+    ``Visual.to_strips`` path where Textual applies the selection
+    highlight.  It also inherits ``Widget.get_selection`` which calls
+    ``self._render()`` — for ``RichLog`` that returns a ``Panel``
+    (from ``ScrollView.render``), so text extraction always fails.
+
+    This subclass:
+    * Calls ``Strip.apply_offsets`` so the compositor can map mouse
+      positions to content offsets (without this the entire widget is
+      selected as ``SELECT_ALL``).
+    * Applies ``Style(reverse=True)`` to the selected span to invert
+      foreground/background colors.
+    * Extracts selected text from ``self.lines`` (the list of ``Strip``
+      objects accumulated by ``RichLog.write``).
+    """
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        scroll_x, scroll_y = self.scroll_offset
+        content_y = scroll_y + y
+
+        selection = self.text_selection
+        if selection is not None:
+            span = selection.get_span(content_y)
+            if span is not None:
+                start_x, end_x = span
+                start_x = max(0, start_x - scroll_x)
+                if end_x == -1:
+                    end_x = strip.cell_length
+                else:
+                    end_x = min(end_x - scroll_x, strip.cell_length)
+
+                if start_x < end_x and start_x < strip.cell_length:
+                    before = strip.crop(0, start_x)
+                    selected_crop = strip.crop(start_x, end_x)
+                    styled_segments = list(
+                        Segment.apply_style(
+                            selected_crop._segments, post_style=Style(reverse=True)
+                        )
+                    )
+                    selected = Strip(styled_segments, selected_crop.cell_length)
+                    after = strip.crop(end_x)
+                    strip = Strip.join([before, selected, after])
+
+        return strip.apply_offsets(scroll_x, content_y)
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        if not self.lines:
+            return None
+        text = "\n".join(strip.text for strip in self.lines)
+        return selection.extract(text), "\n"
+
+
 class TUIEventSink:
     """Sink that posts chat events to a running `ChatTUI` app.
 
@@ -699,12 +759,13 @@ class ChatTUI(App):
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+shift+c", "copy_text", "Copy"),
         Binding("ctrl+l", "clear_log", "Clear"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
-        self._log: RichLog | None = None
+        self._log: SelectableRichLog | None = None
         self._input: Input | None = None
         self._panel: BottomPanel | None = None
         self._busy = False
@@ -715,7 +776,7 @@ class ChatTUI(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Vertical(id="main-area"):
-            self._log = RichLog(highlight=False, id="chat", wrap=True, markup=False)
+            self._log = SelectableRichLog(highlight=False, id="chat", wrap=True, markup=False)
             yield self._log
             self._input = ChatInput(id="input")
             yield self._input
@@ -732,7 +793,7 @@ class ChatTUI(App):
             cwd_display = str(cwd)
         self.title = cwd_display
         self._refresh_chips()
-        self._log = self.query_one("#chat", RichLog)
+        self._log = self.query_one("#chat", SelectableRichLog)
         saved = settings_store.load()
         if saved.theme:
             self.theme = saved.theme
@@ -850,15 +911,16 @@ class ChatTUI(App):
     def _switch_provider(self, name: str) -> None:
         settings_store.update(provider=name)
         self._refresh_chips()
-        self._post_system(f"provider → {name}")
+        self._spinner_status(f"provider → {name}")
 
     async def _catalog_add_flow(self) -> None:
-        self._post_system("fetching catalog…")
+        self._spinner_status("fetching catalog…")
         try:
             all_providers = await asyncio.to_thread(catalog_api.list_providers)
         except Exception as exc:
-            self._post_system(f"catalog error: {exc}")
+            self._spinner_status(f"catalog error: {exc}")
             return
+        self._clear_spinner_status()
 
         name_to_provider: dict[str, dict[str, Any]] = {}
         for p in all_providers:
@@ -866,7 +928,7 @@ class ChatTUI(App):
             if fmt:
                 name_to_provider[p["name"]] = p
         if not name_to_provider:
-            self._post_system("No catalog providers have a supported api_format.")
+            self._spinner_status("No catalog providers have a supported api_format.")
             return
 
         picked_name = await self.push_screen_wait(
@@ -902,14 +964,14 @@ class ChatTUI(App):
         if api_key is None:
             return
 
-        self._post_system("fetching model list…")
+        self._spinner_status("fetching model list…")
         default_model = ""
         try:
             models = await asyncio.to_thread(catalog_api.list_models, picked_name)
             if models:
                 default_model = models[0].get("id", "")
         except Exception as exc:
-            self._post_system(f"catalog models error: {exc}")
+            self._spinner_status(f"catalog models error: {exc}")
 
         try:
             provider = add_provider_from_lma(
@@ -920,14 +982,14 @@ class ChatTUI(App):
                 default_model=default_model,
             )
         except ValueError as exc:
-            self._post_system(f"add failed: {exc}")
+            self._spinner_status(f"add failed: {exc}")
             return
 
         paths.ensure_dirs()
         provider_store.upsert(provider)
         settings_store.update(provider=our_name)
         self._refresh_chips()
-        self._post_system(
+        self._spinner_status(
             f"provider → {our_name} (added from catalog, "
             f"default-model={default_model or '-'})"
         )
@@ -941,10 +1003,10 @@ class ChatTUI(App):
                     return
                 name = catalog_api.slugify(result)
                 if not name:
-                    self._post_system("name required; wizard cancelled.")
+                    self._spinner_status("name required; wizard cancelled.")
                     return
                 if provider_store.get(name) is not None:
-                    self._post_system(f"Provider {name!r} already exists.")
+                    self._spinner_status(f"Provider {name!r} already exists.")
                     return
                 state["name"] = name
                 ask_format()
@@ -1029,7 +1091,7 @@ class ChatTUI(App):
                 try:
                     parsed = _parse_optional_int(result)
                 except ValueError:
-                    self._post_system("invalid max context window; skipping")
+                    self._spinner_status("invalid max context window; skipping")
                     parsed = None
                 ask_max_tokens(model, parsed)
 
@@ -1049,7 +1111,7 @@ class ChatTUI(App):
                 try:
                     parsed = _parse_optional_int(result)
                 except ValueError:
-                    self._post_system("invalid max output tokens; skipping")
+                    self._spinner_status("invalid max output tokens; skipping")
                     parsed = None
                 paths.ensure_dirs()
                 provider_store.upsert(
@@ -1066,7 +1128,7 @@ class ChatTUI(App):
                 )
                 settings_store.update(provider=state["name"])
                 self._refresh_chips()
-                self._post_system(f"provider → {state['name']} (custom)")
+                self._spinner_status(f"provider → {state['name']} (custom)")
 
             self.push_screen(
                 TextInputModal(
@@ -1083,7 +1145,7 @@ class ChatTUI(App):
         s = settings_store.load()
         provider = provider_store.get(s.provider) if s.provider else None
         if not provider:
-            self._post_system("No active provider. Pick a provider first.")
+            self._spinner_status("No active provider. Pick a provider first.")
             return
         if provider.source == SOURCE_LMA:
             self.run_worker(self._catalog_model_picker_flow(provider), exclusive=False)
@@ -1120,7 +1182,7 @@ class ChatTUI(App):
                 try:
                     parsed = _parse_optional_int(result)
                 except ValueError:
-                    self._post_system(
+                    self._spinner_status(
                         f"invalid max context window; keeping existing "
                         f"({cur if cur else '-'})"
                     )
@@ -1146,7 +1208,7 @@ class ChatTUI(App):
                 try:
                     parsed = _parse_optional_int(result)
                 except ValueError:
-                    self._post_system(
+                    self._spinner_status(
                         f"invalid max output tokens; keeping existing "
                         f"({cur if cur else '-'})"
                     )
@@ -1166,15 +1228,16 @@ class ChatTUI(App):
         ask_model_id()
 
     async def _catalog_model_picker_flow(self, provider) -> None:
-        self._post_system("fetching model list…")
+        self._spinner_status("fetching model list…")
         try:
             models = await asyncio.to_thread(catalog_api.list_models, provider.name)
         except Exception as exc:
-            self._post_system(f"catalog error: {exc}; falling back to text input")
+            self._spinner_status(f"catalog error: {exc}; falling back to text input")
             self._open_custom_model_editor(provider)
             return
+        self._clear_spinner_status()
         if not models:
-            self._post_system(f"No models found for {provider.name!r} in catalog.")
+            self._spinner_status(f"No models found for {provider.name!r} in catalog.")
             return
 
         options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in models]
@@ -1205,9 +1268,9 @@ class ChatTUI(App):
         settings_store.update(model="")
         self._refresh_chips()
         if new_model:
-            self._post_system(f"model → {new_model} (provider default)")
+            self._spinner_status(f"model → {new_model} (provider default)")
         else:
-            self._post_system("model → cleared (provider default empty)")
+            self._spinner_status("model → cleared (provider default empty)")
 
     def _save_custom_model(
         self,
@@ -1236,12 +1299,12 @@ class ChatTUI(App):
             parts.append(f"ctx={max_context_window}")
         if max_output_tokens is not None:
             parts.append(f"max-tokens={max_output_tokens}")
-        self._post_system(" · ".join(parts) + " (provider default)")
+        self._spinner_status(" · ".join(parts) + " (provider default)")
 
     def _open_style_picker(self) -> None:
         styles = style_store.list_styles()
         if not styles:
-            self._post_system("No styles installed. Run `miniouto style add <repo>`.")
+            self._spinner_status("No styles installed. Run `miniouto style add <repo>`.")
             return
         s = settings_store.load()
 
@@ -1250,7 +1313,7 @@ class ChatTUI(App):
                 return
             settings_store.update(style=result)
             self._refresh_chips()
-            self._post_system(f"style → {result}")
+            self._spinner_status(f"style → {result}")
 
         self.push_screen(
             SelectionModal("Select style", styles, current=s.style, allow_none=False),
@@ -1270,8 +1333,9 @@ class ChatTUI(App):
                 return
             settings_store.update(session=result)
             self._session_assigned = True
+            self._chat_started = True
+            self._load_session_history(result)
             self._refresh_chips()
-            self._show_logo()
 
         options = [*sessions, "__new__"]
         self.push_screen(
@@ -1295,8 +1359,46 @@ class ChatTUI(App):
         settings_store.update(session=name)
         session_store.append(name, MessageRecord(role="system", content="(session created)"))
         self._session_assigned = True
+        self._chat_started = True
         self._refresh_chips()
         self._show_logo()
+
+    def _load_session_history(self, session_name: str) -> None:
+        if self._log is None:
+            return
+        self._log.clear()
+        self._logo_shown = False
+        messages = session_store.load(session_name)
+        if not messages:
+            self._log.write(Text("(empty session)", style="dim"))
+            return
+        accent = self.current_theme.accent
+        fg = self.current_theme.foreground
+        for m in messages:
+            if m.role == "user" and m.content:
+                self._log.write(
+                    Text("> ", style=f"bold {accent}") + Text(m.content)
+                )
+            elif m.role == "assistant":
+                if m.content:
+                    self._log.write(Markdown(m.content))
+                if m.tool_calls:
+                    for tc in m.tool_calls:
+                        fn = tc.get("function", {}).get("name", "?")
+                        self._log.write(
+                            Text.assemble(("tool:", accent), (f" {fn}", fg))
+                        )
+            elif m.role == "tool" and m.content:
+                name = m.name or "tool"
+                snippet = m.content[:200] + ("…" if len(m.content) > 200 else "")
+                self._log.write(
+                    Text.assemble((f"{name}:", accent), (f" {snippet}", fg))
+                )
+            elif m.role == "system" and m.content:
+                self._log.write(
+                    Text(f"[{m.content}]", style=self.current_theme.warning)
+                )
+        self._log.write(Text(""))
 
     # ── status / refresh ────────────────────────────────────────────────────
 
@@ -1333,6 +1435,12 @@ class ChatTUI(App):
         if self._log is not None:
             self._log.clear()
 
+    def action_copy_text(self) -> None:
+        text = self.screen.get_selected_text()
+        if text:
+            self.copy_to_clipboard(text)
+            self.screen.clear_selection()
+
     def _post_user(self, text: str) -> None:
         if self._log is None:
             return
@@ -1351,6 +1459,14 @@ class ChatTUI(App):
     def _render_spinner(self, frame: str, text: str) -> None:
         if self._panel is not None:
             self._panel.render_spinner(frame, text)
+
+    def _spinner_status(self, text: str) -> None:
+        if self._panel is not None:
+            self._panel.render_spinner("⠋", text)
+
+    def _clear_spinner_status(self) -> None:
+        if self._panel is not None:
+            self._panel.render_spinner("", "")
 
     async def _dispatch(self, prompt: str) -> None:
         assert self._log is not None
