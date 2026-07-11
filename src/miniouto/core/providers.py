@@ -82,15 +82,20 @@ def build_coreouto_provider(provider: Provider) -> None:
 
 
 def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
+    # `stream=True` is transport-only: coreouto reassembles the SSE
+    # fragments into the same `LLMResponse`, so no caller changes. It is
+    # required for Anthropic (SDK rejects non-streaming requests whose
+    # max_tokens estimate exceeds ~10 minutes, which our 16K output floor
+    # would trip) and harmless for OpenAI/Google.
     if api_format == "openai":
         from coreouto.providers.openai import OpenAIProvider
 
-        return OpenAIProvider(api_key=api_key, base_url=base_url or None)
+        return OpenAIProvider(api_key=api_key, base_url=base_url or None, stream=True)
 
     if api_format == "openai-response":
         from coreouto.providers.openai_response import OpenAIResponseProvider
 
-        return OpenAIResponseProvider(api_key=api_key, base_url=base_url or None)
+        return OpenAIResponseProvider(api_key=api_key, base_url=base_url or None, stream=True)
 
     if api_format == "anthropic":
         from coreouto.providers.anthropic import AnthropicProvider
@@ -98,7 +103,7 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
         url = base_url or None
         if url and url.rstrip("/").endswith("/v1"):
             url = url.rstrip("/")[:-3]
-        return AnthropicProvider(api_key=api_key, base_url=url)
+        return AnthropicProvider(api_key=api_key, base_url=url, stream=True)
 
     if api_format == "google":
         from coreouto.providers.google import GoogleProvider
@@ -106,7 +111,7 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
         http_options: dict[str, Any] | None = None
         if base_url:
             http_options = {"base_url": base_url}
-        return GoogleProvider(api_key=api_key, http_options=http_options)
+        return GoogleProvider(api_key=api_key, http_options=http_options, stream=True)
 
     raise ValueError(f"Unhandled api_format: {api_format!r}")
 
