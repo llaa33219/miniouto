@@ -36,7 +36,7 @@ src/miniouto/
 ├── cli/      ← Typer commands + Textual TUI
 ├── core/     ← chat loop, runtime assembly, subagent dispatch, event sinks
 ├── storage/  ← the only layer that touches disk (apart from tools/)
-├── tools/    ← Write / Edit / Delete / Bash (only bash is async)
+├── tools/    ← Bash + media loaders (only bash is async)
 ├── default_style/  ← 6 bundled .md templates, force-refreshed on every run
 └── __init__.py, paths_runtime.py
 ```
@@ -48,11 +48,12 @@ CLI flag bag → ChatOptions (core/chat.py)
             → resolve_runtime_from_settings (core/runtime.py)
             → RuntimeConfig
             → build_runtime (core/runtime.py)
-                → coreouto provider registry + tool registry + up to 4 hooks
-                    (BEFORE_TOOL_CALL, ON_ITERATION×2, AFTER_LLM_CALL)
+                → coreouto provider registry + tool registry + up to 5 hooks
+                    (BEFORE_TOOL_CALL, ON_ITERATION×2, AFTER_LLM_CALL,
+                    ON_PROVIDER_ERROR)
                 → co.Agent(outo_config)
             → run_chat(opts, sink) → agent.call_sync(prompt, history=...)
-                → Write/Edit/Delete/Bash/Image/Video/Audio (via tools/registry.py)
+                → Bash/Image/Video/Audio (via tools/registry.py)
                 → call_subagent (delegates to subagent preset)
             → persist user + assistant MessageRecord
 ```
@@ -75,7 +76,7 @@ CLI flag bag → ChatOptions (core/chat.py)
 
 ---
 
-## The 13 invariants (do NOT break these)
+## The 12 invariants (do NOT break these)
 
 These rules hold throughout the codebase. Breaking any of them silently degrades or breaks the system. **If your change seems to require breaking one, stop and ask.**
 
@@ -101,7 +102,7 @@ Subagent mirrors this with `<subagent>` content and a different cwd preamble. Th
 ### 4. Context-window safety
 `core/context.py` enforces a **16K-token output floor** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`):
 
-- **Floor**: `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates Write tool calls.
+- **Floor**: `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates long tool calls (e.g. heredoc file writes).
 - There is **no ceiling**. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
 If you touch `get_max_output_tokens`, you must preserve the floor. Always thread the `provider_name` argument through so the lma lookup is scoped to the active provider (otherwise lma returns matches across every provider and we only see the first hit).
@@ -109,7 +110,7 @@ If you touch `get_max_output_tokens`, you must preserve the floor. Always thread
 There is **one** deliberate precedence tier above lma: a per-provider `max_output_tokens` override (field on the `Provider` dataclass, set via the TUI custom-model editor). `_provider_caps_override` consults `provider_store` on every call (no caching — the TUI is long-lived and edits these mid-session). The override wins over lma. The CLI `chat --max-tokens` flag still wins over the override. Precedence: `--max-tokens` > provider override > lma `max_output_tokens` > lma `context_window` > `DEFAULT_MAX_OUTPUT_TOKENS`. The same override path exists for `max_context_window` via `get_context_window`.
 
 ### 5. Subagent is a re-implemented `agent_as_tool`
-`core/runtime.py:_build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()` — that means subagent `Write` calls inherit the provider's low hard cap (1024 for Anthropic → silent truncation). This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
+`core/runtime.py:_build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()` — that means subagent file-writing calls inherit the provider's low hard cap (1024 for Anthropic → silent truncation). This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
 
 **Do not "simplify" this back to `coreouto.contrib.agent_as_tool`.**
 
@@ -118,30 +119,19 @@ coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context. `core/runtime.py:_S
 
 If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth tracking will be wrong.
 
-### 7. Edit tool: 6 enforced rules
-`tools/edit.py` enforces six rules:
-1. **Exact match** priority (then fuzzy fallback).
-2. **Uniqueness** — multiple matches raise `EditError` with all line numbers.
-3. **All edits located against the original content** (no chaining).
-4. **No overlaps** — sorted-span check.
-5. **Reject empty / no-op edits** (empty `oldText`, identical `oldText`/`newText`).
-6. **Errors carry line numbers + how-to-fix** hints.
+### 7. File manipulation is Bash-only
+There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (error-prone; the agent reached for Bash anyway). **Do not reintroduce them without explicit discussion.** To add any other tool, follow the "Add a new tool" recipe below.
 
-The fuzzy fallback normalizes smart quotes, dashes, NBSP, BOM, CRLF, zero-width chars, and trailing whitespace. These rules are testable — write tests before refactoring.
+### 8. Async only where needed
+`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop. **Don't make the media loaders async** — they don't need to be, and it complicates the TUI dispatch.
 
-### 8. `Write` refuses overwrite
-`tools/write.py` raises `WriteError` if the target file exists. The intended workflow is `Write` to create, `Edit` to modify. **Do not add an `--overwrite` flag without explicit discussion** — accidental clobbering is the whole point of the refusal.
-
-### 9. Async only where needed
-`tools/bash.py` is async (it spawns a subprocess). The other three tools are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop. **Don't make the other tools async** — they don't need to be, and it complicates the TUI dispatch.
-
-### 10. Skill discovery lives outside `~/.miniouto/`
+### 9. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention), NOT from `~/.miniouto/`. Skills are portable content, not per-installation config. **Do not move them into `~/.miniouto/`.**
 
-### 11. TUI model editor manages `Provider.default_model`, not `Settings.model`
+### 10. TUI model editor manages `Provider.default_model`, not `Settings.model`
 In the TUI, picking or typing a model always writes to `provider.default_model` (via `dataclasses.replace(p, default_model=...)` + `provider_store.upsert`) and clears any prior `settings.model`. The model chip displays `provider.default_model` only — `settings.model` is reserved for the `chat --model` CLI flag. Legacy `settings.model` values from older sessions keep working at the runtime layer (`resolve_runtime_from_settings` still treats them as priority 2) but are invisible in the TUI. **Do not reintroduce a `settings.model`-as-TUI-override path.**
 
-### 12. lma-backed vs custom providers
+### 11. lma-backed vs custom providers
 `storage/providers.py:Provider` carries a `source: str` field, one of `SOURCE_CUSTOM` (default) or `SOURCE_LMA`. lma-backed (catalog) providers are added via `miniouto provider add …` or the TUI `+ add from catalog…` wizard; custom providers come from `provider custom add` or the TUI `+ add custom…` wizard. The TUI model picker dispatches on `source`:
 
 - `source == "lma"` → `cli/tui.py:_catalog_model_picker_flow` (fetches `/model-list` and shows a `SelectionModal`).
@@ -151,7 +141,7 @@ The CLI command `miniouto provider providers` filters its "Addable?" column thro
 
 Note: the source string remains the literal `"lma"` (it predates the "catalog" UI rename) — `SOURCE_LMA = "lma"`. The TUI and CLI surface call these "catalog" providers, but the underlying field value is still `"lma"`.
 
-### 13. lma cache lives in `core.lma._CACHE`
+### 12. lma cache lives in `core.lma._CACHE`
 `core/lma.py` mirrors lma's 10-minute server-side TTL with a module-level dict. Cache keys are explicit (`"providers"`, `f"models:{provider.lower()}"`, `f"model:{provider.lower()}:{model.lower()}"` — both segments are lowercased); a cached `None` payload is meaningful (means "lma returned 404"). `core.lma.clear_cache()` exists for tests / manual refresh. **Do not cache anything other than `None` and successful payloads** — a transient transport error must not pollute the cache for 10 minutes.
 
 ---
@@ -186,6 +176,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `core/chat.py` | `ChatOptions`, `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
 | `core/events.py` | `LoopEvent`, `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering) |
+| `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) + `default_error_handling(api_format)` |
 | `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
 | `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, subagent tool, hooks |
@@ -197,14 +188,10 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
 | `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
 | `storage/toml_io.py` | `tomllib` + `tomli_w` wrapper |
-| `tools/__init__.py` | Re-exports + `normalize_for_matching` |
-| `tools/_normalize.py` | smart-quote/dash/NBSP/zero-width normalization |
+| `tools/__init__.py` | Re-exports |
 | `tools/bash.py` | `async bash(command, *, timeout_seconds, cwd, env)` |
-| `tools/delete.py` | `delete(file_path)` |
-| `tools/edit.py` | `edit(file_path, edits)` — batch search/replace |
 | `tools/media.py` | `load_image/load_video/load_audio(file_path)` → `LoadedMedia` (pure stdlib; `registry.py` wraps results into `co.ImageBlock`/`VideoBlock`/`AudioBlock`) |
-| `tools/write.py` | `write(file_path, content)` — refuses overwrite |
-| `tools/registry.py` | `register_all()` — wires Write/Edit/Delete/Bash/Image/Video/Audio into coreouto |
+| `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |
 | `default_style/claude.md` | Claude Code-style (~14 KB) |
 | `default_style/codex.md` | OpenAI Codex CLI-style (~16 KB) |
@@ -276,12 +263,11 @@ The test directory doesn't exist yet. Suggested setup in `docs/development.md`. 
 - **`tui/` and `utils/` are empty** — placeholder directories from an older layout. The TUI code is in `cli/tui.py`. Don't add code to those empty dirs without first deciding the right home for it.
 - **`core/context.py` is not in `core/__init__.py`'s `__all__`** — it's an implementation detail of `runtime.build_runtime`.
 - **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly as `skill_store`.
-- **`Write` refuses to overwrite** — by design. The agent should use `Edit` for modifications.
 - **`continue_loop` is referenced in every bundled style** but **not registered** in `tools/registry.py`. Models improvise. If you want this to actually work, register a no-op tool and add it to `ALL_TOOLS`.
 
 ### Bugs / cleanup opportunities
 
-1. **No tests directory exists.** The codebase has zero automated test coverage. `tools/edit.py` and `core/context.py:make_summarize_hook` are the highest-value test targets.
+1. **No tests directory exists.** The codebase has zero automated test coverage. `tools/bash.py` and `core/context.py:make_summarize_hook` are the highest-value test targets.
 2. **Four of the six bundled styles** (`claude.md`, `codex.md`, `opencode.md`, `oh-my-opencode.md`) describe a `claude.md` / `codex.md` / `oh-my-opencode.md` / `opencode.md` CWD memory file. **No such loader exists in miniouto.** Either implement it (in `core/runtime.py:_load_active_skills` or a sibling) or edit the styles to remove the misleading references.
 3. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code.
 
@@ -291,7 +277,7 @@ The test directory doesn't exist yet. Suggested setup in `docs/development.md`. 
 
 | Package | Min version | Role |
 |---|---|---|
-| `coreouto[all]` | 0.9.0 | Agent loop, providers, tool registry, hooks (the runtime). 0.9.0+ required for provider-level `stream=True` (see `core/providers.py:_instantiate`). |
+| `coreouto[all]` | 0.10.0 | Agent loop, providers, tool registry, hooks (the runtime). 0.10.0+ required for provider-level `error_handling` (see `core/error_rules.py`); 0.10.0 removed `retry_intervals`/`ON_RETRY` (never used here). Provider-level `stream=True` (see `core/providers.py:_instantiate`) requires 0.9.0+. |
 | `typer` | 0.12.0 | CLI framework |
 | `rich` | 13.7.0 | Terminal output, tables, markdown |
 | `textual` | 0.80.0 | TUI framework |

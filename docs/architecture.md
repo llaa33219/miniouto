@@ -7,7 +7,7 @@
 1. A CLI (`miniouto`) and an optional Textual TUI for interactive use.
 2. File-driven configuration (TOML for providers/settings, Markdown for styles, JSON for sessions).
 3. Bundled agent "style" templates (six personas, including orchestrators).
-4. A minimal tool surface (Write, Edit, Delete, Bash, `call_subagent`).
+4. A minimal tool surface (Bash + Image/Video/Audio media viewers, `call_subagent`).
 5. Persistence of session history.
 6. Per-turn diagnostic output to stderr.
 
@@ -37,7 +37,7 @@ src/miniouto/
 │   ├── providers.py
 │   └── runtime.py
 ├── storage/                 # Filesystem persistence (the only layer that touches disk, besides tools/)
-├── tools/                   # Write/Edit/Delete/Bash (pure stdlib + async)
+├── tools/                   # Bash + media loaders (pure stdlib + async)
 ├── default_style/           # Bundled .md prompts (seeded into ~/.miniouto/style/ on first run)
 ├── tui/                     # EMPTY placeholder — TUI code lives in cli/tui.py
 └── utils/                   # EMPTY placeholder
@@ -66,15 +66,12 @@ src/miniouto/
                              └────┬─────┘           │ toml_io      │
                                   │                 └──────┬───────┘
                                   ▼                        │
-                            ┌──────────┐                  │
-                            │ tools/   │                  │
-                            │ write,   │                  │
-                            │ edit,    │                  │
-                            │ delete,  │                  │
-                            │ bash,    │                  │
-                            │ registry │                  │
-                            │ _normalize                  │
-                            └────┬─────┘                  │
+                             ┌──────────┐                  │
+                             │ tools/   │                  │
+                             │ bash,    │                  │
+                             │ media,   │                  │
+                             │ registry │                  │
+                             └────┬─────┘                  │
                                  │                        │
                                  ▼                        ▼
                          ┌──────────────────────────────────────┐
@@ -97,7 +94,7 @@ src/miniouto/
 | `tools/` | Yes (each tool mutates files) | No (only `tools/registry.py` does) | No |
 | `default_style/` | No (read-only packaged assets) | No | No |
 
-`tools/` is the only layer that touches both the filesystem and coreouto (via `registry.py`). Keep `bash.py`, `write.py`, `edit.py`, `delete.py` coreouto-free so they stay portable and testable.
+`tools/` is the only layer that touches both the filesystem and coreouto (via `registry.py`). Keep `bash.py` and `media.py` coreouto-free so they stay portable and testable.
 
 ## Runtime data flow
 
@@ -128,7 +125,7 @@ cli/__init__.py:app (Typer)
   │                     │     └─► coreouto.register_hook(AFTER_LLM_CALL, _make_response_logger)
   │                     ├─► storage.sessions.load (if --continue)
   │                     ├─► co.Agent.call_sync(prompt, history)
-  │                     │     ├─► tools.bash / .write / .edit / .delete (via registry)
+  │                     │     ├─► tools.bash / .media (via registry)
   │                     │     └─► on_tool_call closure (from _make_tool_call_dispatcher,
   │                     │          bridged by _make_tool_call_logger BEFORE_TOOL_CALL hook)
   │                     └─► storage.sessions.append(...)
@@ -167,33 +164,22 @@ The subagent prompt mirrors this with `<subagent>` content and a different cwd p
 ### 4. Context-window safety
 `core/context.py` enforces a **16K-token output floor** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`):
 
-- **Floor:** `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates Write tool calls.
+- **Floor:** `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates long tool calls (e.g. heredoc file writes).
 - **No ceiling.** The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
 ### 5. Subagent is a re-implemented `agent_as_tool`
-`core.runtime._build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()`, which means subagent `Write` calls inherit the provider's low hard cap. This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
+`core.runtime._build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()`, which means subagent file-writing calls inherit the provider's low hard cap. This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
 
 ### 6. `BEFORE_TOOL_CALL` is global — depth tracked via ContextVar
 coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context, so `core.runtime._SUBAGENT_DEPTH: ContextVar[int]` is the only signal of "are we currently inside a subagent?" The `on_tool_call` closure built by `core.chat._make_tool_call_dispatcher` reads it (via `current_subagent_depth()`) to label each tool trace with actor `outo` vs `subagent`. The bridge from coreouto's hook to that closure is `core.runtime._make_tool_call_logger`. The var is bumped only inside `_wrap_subagent_handler`.
 
-### 7. Edit tool: 6 rules
-`tools/edit.py` enforces six rules:
-1. **Exact match** priority (then fuzzy fallback).
-2. **Uniqueness** — multiple matches raise `EditError` with all line numbers.
-3. **All edits located against the original content** (no chaining).
-4. **No overlaps** — sorted-span check.
-5. **Reject empty / no-op edits** (empty `oldText`, identical `oldText`/`newText`).
-6. **Errors carry line numbers + how-to-fix** hints.
+### 7. File manipulation is Bash-only
+There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (they were error-prone and the agent reached for Bash anyway). Do not reintroduce them without explicit discussion; to add any other tool, follow `docs/tools.md` § "Adding a new tool".
 
-The fuzzy fallback normalizes smart quotes, dashes, NBSP, BOM, CRLF, zero-width chars, and trailing whitespace before comparing.
+### 8. Async only where needed
+`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop.
 
-### 8. `Write` refuses overwrite
-`tools/write.py` is **non-idempotent** by design: it raises `WriteError` if the target file exists. The intended workflow is `Write` to create, `Edit` to modify. This prevents accidental clobbering.
-
-### 9. Async only where needed
-`tools/bash.py` is async (it spawns a subprocess). The other three tools are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop.
-
-### 10. Skill discovery lives outside `~/.miniouto/`
+### 9. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from `~/.agents/skills/<name>/SKILL.md` (the Anthropic-style convention), NOT from `~/.miniouto/`. This is intentional: skills are a portable, project-shared concept, not a per-installation setting.
 
 ## Domain entities
@@ -225,7 +211,7 @@ ChatOptions (CLI flags)
                     ├─ _resolve_both_styles + _load_active_skills
                     ├─ registers "outo" + "subagent" presets
                     ├─ builds call_subagent tool (preserves max_tokens)
-                    └─ installs up to 4 hooks (BEFORE_TOOL_CALL, ON_ITERATION ×2, AFTER_LLM_CALL)
+                    └─ installs up to 5 hooks (BEFORE_TOOL_CALL, ON_ITERATION ×2, AFTER_LLM_CALL, ON_PROVIDER_ERROR)
                     └─ returns co.Agent(outo_config)
         └─> run_chat (chat.py)
               ├─ loads history (if --continue)
@@ -239,7 +225,7 @@ ChatOptions (CLI flags)
 
 | Package | Version | Role |
 |---|---|---|
-| `coreouto[all]` | `>=0.9.0` | Agent loop, providers, tool registry, hooks |
+| `coreouto[all]` | `>=0.10.0` | Agent loop, providers, tool registry, hooks |
 | `typer` | `>=0.12.0` | CLI framework |
 | `rich` | `>=13.7.0` | Terminal output, tables, markdown |
 | `textual` | `>=0.80.0` | TUI framework |

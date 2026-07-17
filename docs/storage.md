@@ -139,7 +139,7 @@ Schema (from `storage/sessions.py:MessageRecord`):
 | `content` | `str \| None` | text content (may be empty string for tool calls) |
 | `tool_calls` | `list[dict]` | assistant-only: list of `{id, type, function: {name, arguments}}` |
 | `tool_call_id` | `str \| None` | tool-only: matches an assistant's `tool_calls[].id` |
-| `name` | `str \| None` | tool-only: tool name (e.g. `Bash`, `Write`) |
+| `name` | `str \| None` | tool-only: tool name (e.g. `Bash`, `Image`) |
 | `ts` | `str` | UTC ISO-8601 timestamp, `Z`-suffixed |
 
 `to_dict()` drops fields with `None` / `[]` / `""` to keep the JSON compact. `ts` is auto-set on construction.

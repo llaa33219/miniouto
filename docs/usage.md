@@ -119,9 +119,9 @@ Default (no flags) output is the most verbose form:
 ```
 ------chat-20260702-103045-a1b2c3------       ← session marker
 ⠋ Working…                                     ← spinner (in flight)
-outo: Write quicksort.py (412 bytes)           ← loop events (orange3)
+outo: Bash cat > quicksort.py <<'EOF' ...        ← loop events (orange3)
 outo: iter 1 · 1280 tokens
-outo: Edit quicksort.py (2 edits)
+outo: Bash sed -i 's/pivot = xs\[0\]/pivot = xs[len(xs)\/\/2]/' quicksort.py
 outo: let me run the tests now...
 outo: Bash python -c "from quicksort import qsort; ..."
 outo: tests pass. Here is the final code.
@@ -222,7 +222,7 @@ miniouto chat "strict facts only" --temperature 0.0
 miniouto chat "summarize" --max-tokens 512 --temperature 0.3
 ```
 
-> When `--max-tokens` is omitted, `core/context.py:get_max_output_tokens` queries the lma `/model` endpoint for the model's real cap and uses it, with a 16384-token floor (prevents Anthropic's 1024 default from silently truncating Write tool calls mid-stream). A per-provider override can be set in the TUI custom-model editor for providers lma has no data on.
+> When `--max-tokens` is omitted, `core/context.py:get_max_output_tokens` queries the lma `/model` endpoint for the model's real cap and uses it, with a 16384-token floor (prevents Anthropic's 1024 default from silently truncating long tool calls, e.g. heredoc file writes, mid-stream). A per-provider override can be set in the TUI custom-model editor for providers lma has no data on.
 
 ---
 

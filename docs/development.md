@@ -33,7 +33,7 @@ miniouto/
     ├── cli/                # Typer commands + Textual TUI
     ├── core/               # chat loop + runtime
     ├── storage/            # filesystem persistence
-    ├── tools/              # Write/Edit/Delete/Bash
+    ├── tools/              # Bash + media loaders
     ├── default_style/      # bundled .md prompt templates
     ├── __init__.py         # __version__ only
     ├── paths_runtime.py    # INVOCATION_CWD

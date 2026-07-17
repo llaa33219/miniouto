@@ -14,7 +14,7 @@ This directory contains a complete reference for the project. Read [`architectur
 | [`automation.md`](./automation.md) | **Non-interactive automation reference.** Post-install auto-setup, `MINIOUTO_HOME`, chat output parsing, auto-registering providers/styles/skills, CI/Docker/cron patterns. |
 | [`storage.md`](./storage.md) | `~/.miniouto/` filesystem layout, TOML/JSON schemas, style/skills storage. The persistence layer. |
 | [`core.md`](./core.md) | Chat loop, `RuntimeConfig` resolution, provider construction, context-window management, subagent dispatch. |
-| [`tools.md`](./tools.md) | The Write / Edit / Delete / Bash tools — handlers, schemas, edit rules, fuzzy fallback. |
+| [`tools.md`](./tools.md) | The Bash + media tools — handlers, schemas, multimodal blocks. |
 | [`styles.md`](./styles.md) | Style document format, `<outo>` / `<subagent>` tags, the six bundled templates. |
 | [`skills.md`](./skills.md) | Skill discovery from `~/.agents/skills/`, frontmatter schema. |
 | [`lma.md`](./lma.md) | lma (llm-model-api) integration: provider/model discovery, context caps, the `provider providers/models/add` CLI commands, TUI add flows. |
@@ -40,6 +40,7 @@ src/miniouto/
 │   ├── chat.py              # ChatOptions, run_chat, ToolCallArgsError, diagnostics, sink dispatchers
 │   ├── context.py           # lma fetcher, make_summarize_hook   → see lma.md
 │   ├── events.py            # LoopEvent, EventSink protocol, NullSink, ConsoleEventSink
+│   ├── error_rules.py       # per-format ErrorRule lists for provider error_handling (coreouto >= 0.10)
 │   ├── lma.py               # lma REST client + slugify          → see lma.md
 │   ├── providers.py         # SUPPORTED_FORMATS, sdk_to_format, build_coreouto_provider
 │   └── runtime.py           # RuntimeConfig, build_runtime, subagent tool, hooks

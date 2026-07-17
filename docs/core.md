@@ -10,6 +10,7 @@ The `core/` subpackage is where the agent loop is wired together. It is a thin o
 |---|---|---|
 | `chat.py` | ~320 | Per-turn chat runner, history persistence, failure diagnostics, sink dispatchers |
 | `context.py` | ~185 | Context-window monitoring (lma `/model`), auto-summarization hook |
+| `error_rules.py` | ~190 | Per-format `ErrorRule` lists for coreouto >= 0.10 provider-level `error_handling` |
 | `events.py` | ~115 | `LoopEvent`, `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI rendering) |
 | `lma.py` | ~140 | `lma.blp.sh` REST client: list_providers, list_models, get_model, find_provider, slugify |
 | `providers.py` | ~135 | Maps `Provider` records → coreouto provider classes; clears global state; maps lma SDKs to coreouto formats |
@@ -25,28 +26,31 @@ resolve_runtime_from_settings(overrides) → RuntimeConfig
    │
    ▼
 build_runtime(runtime, *, style_overrides, provider_config,
-              on_tool_call, on_response, on_iteration) → co.Agent
+              on_tool_call, on_response, on_iteration,
+              on_provider_error) → co.Agent
    │
    │  ┌─ clear_coreouto_state()
    │  ├─ build_coreouto_provider(runtime.provider)      → co.register_provider
    │  ├─ build_coreouto_provider(subagent_provider)
-   │  ├─ tools.registry.register_all()                   → Write/Edit/Delete/Bash
+   │  ├─ tools.registry.register_all()                   → Bash/Image/Video/Audio
    │  ├─ _resolve_both_styles(style_name)                → split_style + skills
    │  ├─ co.register_agent_preset("outo", …)
    │  ├─ co.register_agent_preset("subagent", …)
    │  ├─ _build_subagent_tool("subagent", …)             → co.register_tool
    │  ├─ co.register_hook(BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
    │  ├─ co.register_hook(ON_ITERATION, make_summarize_hook(model, session, provider))
-   │  ├─ co.register_hook(ON_ITERATION, _make_iteration_logger(on_iteration))
-   │  └─ co.register_hook(AFTER_LLM_CALL, _make_response_logger(on_response))
+    │  ├─ co.register_hook(ON_ITERATION, _make_iteration_logger(on_iteration))
+    │  ├─ co.register_hook(AFTER_LLM_CALL, _make_response_logger(on_response))
+    │  └─ co.register_hook(ON_PROVIDER_ERROR, _make_provider_error_logger(on_provider_error))
    │
    ▼
 run_chat(ChatOptions, sink=None) → str
    ├─ load history (if continue_session)
    ├─ persist user MessageRecord
-   ├─ build sink dispatchers: _make_tool_call_dispatcher(sink),
-   │                          _make_response_dispatcher(sink),
-   │                          _make_iteration_dispatcher(sink)
+    ├─ build sink dispatchers: _make_tool_call_dispatcher(sink),
+    │                          _make_response_dispatcher(sink),
+    │                          _make_iteration_dispatcher(sink),
+    │                          _make_provider_error_dispatcher(sink)
    ├─ agent.call_sync(prompt, history=core_msgs)
    │     ├─ ON_ITERATION hooks → summarize at 80%; emit progress LoopEvent
    │     ├─ LLM call → provider → response
@@ -76,7 +80,7 @@ The sink layer — a tiny abstraction so the chat loop can emit progress/trace e
 ### Module-level state
 
 - `_tool_trace: list[dict]` + `_tool_trace_lock: threading.Lock` — last 5 tool calls observed this turn, used by failure diagnostics. Locked because subagent handlers may run concurrently.
-- `_LOGGABLE_TOOL_NAMES = ("Bash", "Write", "Edit", "Delete", "call_subagent")` — tools whose arguments get summarized in failure output.
+- `_LOGGABLE_TOOL_NAMES = ("Bash", "Image", "Video", "Audio", "call_subagent")` — tools whose arguments get summarized in failure output.
 - `_fail_console = rich.Console(stderr=True, soft_wrap=False, highlight=False)` — for diagnostic output (failure trace + traceback to stderr).
 - Imports `EventSink, LoopEvent, NullSink` from `.events`.
 
@@ -106,8 +110,8 @@ Raised when an LLM tool call arrives with non-dict or `None` arguments. This pre
 The main entry point. `sink=None` defaults to `NullSink()`. Steps:
 
 1. Resolves a `RuntimeConfig` from settings + overrides.
-2. Computes `provider_config` — `max_tokens` defaults to `get_max_output_tokens(runtime.model, runtime.provider_name)` so providers with low hard caps (Anthropic's 1024) don't truncate Write calls. The `provider_name` argument scopes the lma lookup so we don't accept the first cross-provider match.
-3. Builds three sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_iteration_dispatcher`) and calls `build_runtime(runtime, provider_config=provider_config, on_tool_call=on_tool_call, on_response=_make_response_dispatcher(sink), on_iteration=_make_iteration_dispatcher(sink))` to get a `co.Agent`.
+2. Computes `provider_config` — `max_tokens` defaults to `get_max_output_tokens(runtime.model, runtime.provider_name)` so providers with low hard caps (Anthropic's 1024) don't truncate long tool calls (e.g. heredoc file writes). The `provider_name` argument scopes the lma lookup so we don't accept the first cross-provider match.
+3. Builds four sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`) and calls `build_runtime(runtime, provider_config=provider_config, on_tool_call=on_tool_call, on_response=_make_response_dispatcher(sink), on_iteration=_make_iteration_dispatcher(sink), on_provider_error=_make_provider_error_dispatcher(sink))` to get a `co.Agent`.
 4. Loads prior history if `continue_session=True`; converts `MessageRecord` → `co.Message`.
 5. **Persists the user prompt** to the session before running (`session_store.append`).
 6. Clears `_tool_trace`, calls `agent.call_sync(prompt, history=core_msgs)` inside try/except.
@@ -123,7 +127,7 @@ Builds the `on_tool_call(name, arguments)` closure passed to `build_runtime`. Fo
 2. Computes `actor = "subagent" if current_subagent_depth() > 0 else "outo"`.
 3. Appends to `_tool_trace` for any tool in `_LOGGABLE_TOOL_NAMES`.
 4. For `call_subagent`, emits a `LoopEvent(kind="tool_call", text=<message-or-task>)` via the sink (no truncation).
-5. For `Bash/Write/Edit/Delete`, emits a `LoopEvent(kind="tool_call", text=_short_arg_summary(name, args))` and calls `sink.update_activity(name)`.
+5. For `Bash/Image/Video/Audio`, emits a `LoopEvent(kind="tool_call", text=_short_arg_summary(name, args))` and calls `sink.update_activity(name)`.
 
 This closure does **not** print directly — rendering is the sink's job (`ConsoleEventSink` for the CLI, the TUI widgets for TUI mode).
 
@@ -134,6 +138,10 @@ Builds the `on_response(content, has_tool_calls)` closure. When `has_tool_calls`
 ### `_make_iteration_dispatcher(sink: EventSink)`
 
 Builds the `on_iteration(*, iteration, messages, response, **kwargs)` closure that emits a `LoopEvent(kind="context", text=...)` for progress reporting. (Summarization logic lives separately in `make_summarize_hook`, registered as a second `ON_ITERATION` hook.)
+
+### `_make_provider_error_dispatcher(sink: EventSink)`
+
+Builds the `on_provider_error(*, status_code, error_message, reaction, reaction_message, **kwargs)` closure wired into coreouto's `ON_PROVIDER_ERROR` hook. Emits a `LoopEvent(actor="provider", kind="error", text="HTTP {code} → {reaction}: {message}")` for every rule-matched provider error, and switches the spinner activity to `"provider retry"` for retry reactions. This is the only surface for rule-matched errors — they no longer raise out of `call_sync` (see `core/error_rules.py` below), so without this hook a retry storm or a 401 would be invisible.
 
 ### `_dump_failure_diagnostics(exc, session_name)`
 
@@ -152,9 +160,7 @@ Per-tool one-liner:
 | Tool | Format |
 |---|---|
 | `Bash` | joined command, no length cap (literal `\n` → space) |
-| `Write` | `"{path} ({size} bytes)"` |
-| `Edit` | `"{path} ({n} edits)"` |
-| `Delete` | just the path |
+| `Image` / `Video` / `Audio` | just the path |
 | (other) | `str(args)[:120]` |
 
 ---
@@ -164,7 +170,7 @@ Per-tool one-liner:
 ### Constants
 
 - `SUMMARIZE_THRESHOLD = 0.8` — summarization fires at 80% of context window.
-- `DEFAULT_MAX_OUTPUT_TOKENS = 16384` — hard floor. Rationale: Anthropic defaults to 1024 if you don't set it explicitly, silently truncating Write outputs.
+- `DEFAULT_MAX_OUTPUT_TOKENS = 16384` — hard floor. Rationale: Anthropic defaults to 1024 if you don't set it explicitly, silently truncating long tool-call outputs (e.g. file writes).
 - There is no ceiling. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
 ### `_fetch_model_caps(model, provider_name=None) -> dict[str, int]`
@@ -204,6 +210,27 @@ Returns the `ON_ITERATION` hook (registered alongside `_make_iteration_logger`, 
 
 ---
 
+## `core/error_rules.py`
+
+Single source of truth for the provider-level `error_handling` lists (coreouto >= 0.10). coreouto 0.10 replaced agent-level `retry_intervals` (removed, along with the `ON_RETRY` hook) with per-provider `list[ErrorRule]` matching: each rule matches a provider exception by `status_code` (or google-genai's `.code`) plus an optional `content_contains` substring of the rendered error (first match wins) and reacts with one of:
+
+| Reaction | Loop behavior |
+|---|---|
+| `retry` | Sleeps `retry_after * retry_backoff^attempt`, up to `retry_max` attempts, then re-raises |
+| `terminate` | Ends the loop with `Response(stop_reason="failed", content=rule.message)` |
+| `tool_result` | Appends an `is_error=True` tool result to the last assistant tool call so the model self-corrects |
+| `user_message` | Injects `rule.message` as a user message and continues |
+
+`default_error_handling(api_format)` returns the per-format list; the lists mirror coreouto's own recipes (examples 18-20 in the coreouto repo), tuned to each SDK's exception hierarchy:
+
+- **openai / openai-response** — shared list built on `contrib.error_presets.COMMON_HTTP_ERRORS` (429/500/503 retry, 401/403 terminate) plus 400 splits (`context_length_exceeded` → terminate; `invalid_schema`/`tool` → tool_result), 404+model → terminate, 422 → tool_result.
+- **anthropic** — adds the Anthropic-specific 529 overload retry and 413 terminate; 400+context → terminate; 400+tool → tool_result; 422 → tool_result.
+- **google** — google-genai collapses all 4xx into `ClientError`, so the 400 rules split by `.status`-enum substrings (`tool`/`safety`/`precondition`) ahead of a generic 400 → tool_result fallback, plus 404 → terminate. Ordering matters — the specific matchers precede the fallback.
+
+Rule-matched errors **do not raise** — they surface via the `ON_PROVIDER_ERROR` hook (forwarded to the sink as `provider:` loop events by `_make_provider_error_dispatcher`). Unmatched errors (e.g. network failures with no `status_code`) propagate to `_dump_failure_diagnostics` as before.
+
+---
+
 ## `core/providers.py`
 
 ### `SUPPORTED_FORMATS`
@@ -228,7 +255,7 @@ Validates `api_format`, instantiates the right coreouto class via `_instantiate`
 
 ### `_instantiate(api_format, api_key, base_url)`
 
-Lazy `import` of each provider module (avoids loading all four SDKs at startup). Raises `ValueError("Unsupported api_format: …")` for anything not in `SUPPORTED_FORMATS`.
+Lazy `import` of each provider module (avoids loading all four SDKs at startup). Raises `ValueError("Unsupported api_format: …")` for anything not in `SUPPORTED_FORMATS`. Every instance is constructed with `error_handling=default_error_handling(api_format)` (see `core/error_rules.py`), so outo and subagent providers share the same retry/terminate/tool-result behavior.
 
 ### `clear_coreouto_state()`
 
@@ -248,7 +275,7 @@ Helper that bundles the two dicts under the keys coreouto's `AgentConfig` expect
 
 ### Module-level constants / state
 
-- `ALL_TOOLS = ["Write", "Edit", "Delete", "Bash", "call_subagent"]` — the fixed tool set used for both presets.
+- `ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]` — the fixed tool set used for both presets.
 - `_SUBAGENT_DEPTH: ContextVar[int]` — defaults to 0. Read by `chat._make_tool_call_dispatcher`'s closure (via `current_subagent_depth()`) to label each tool trace with actor `outo` vs `subagent`. Mutated only by `_wrap_subagent_handler`.
 
 ### `current_subagent_depth() -> int`
@@ -296,23 +323,24 @@ class ChatOverrides:
 
 Per-call overrides from CLI flags. All optional.
 
-### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_response=None, on_iteration=None) -> co.Agent`
+### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_response=None, on_iteration=None, on_provider_error=None) -> co.Agent`
 
 The heart of miniouto. Steps:
 
 1. **`clear_coreouto_state()`** — Reset all four coreouto registries.
 2. **Provider registration** — Look up `runtime.provider_name` in the provider store; raise `RuntimeError` if missing. Call `build_coreouto_provider` for it. Repeat for the subagent provider (which may differ).
-3. **`tools.registry.register_all()`** — Registers `Write/Edit/Delete/Bash` tools in coreouto.
+3. **`tools.registry.register_all()`** — Registers `Bash/Image/Video/Audio` tools in coreouto.
 4. **`_resolve_both_styles`** — Loads the named style document (or `builtin_default` for `"default"`), splits at `<subagent>…</subagent>` tags, and prepends active skill content to both halves. Returns `(outo_part, subagent_part)`.
 5. **`_with_cwd(role, body)`** — Prepends an absolute-cwd preamble (using `INVOCATION_CWD` from `paths_runtime.py`) so the model knows where the user invoked miniouto from.
 6. **Register two presets** — `"subagent"` (uses sub-provider + sub-model) and `"outo"` (uses runtime provider + model). Both get `tools=ALL_TOOLS` and `max_iterations=None`.
-7. **Subagent `provider_config`** — Pulls `max_tokens` from `get_max_output_tokens(subagent_model, sub_provider_name)` via lma, so subagent Write calls don't hit Anthropic's 1024 default.
+7. **Subagent `provider_config`** — Pulls `max_tokens` from `get_max_output_tokens(subagent_model, sub_provider_name)` via lma, so subagent file-writing calls don't hit Anthropic's 1024 default.
 8. **Build `call_subagent` tool** — Via `_build_subagent_tool("subagent", description=_subagent_description(), provider_config=subagent_provider_config)`. The handler is pre-wrapped with `_wrap_subagent_handler` to track depth. Registered via `co.register_tool(name, description=description)(wrapped_handler)` (function-call form, not decorator).
-9. **Register hooks (up to 4):**
+9. **Register hooks (up to 5):**
    - `BEFORE_TOOL_CALL` → `_make_tool_call_logger(on_tool_call)` (only if `on_tool_call` is not None).
    - `ON_ITERATION` → `make_summarize_hook(runtime.model, runtime.session or "default", runtime.provider_name)` — always registered.
    - `ON_ITERATION` → `_make_iteration_logger(on_iteration)` (only if `on_iteration` is not None — `chat.run_chat` always supplies one).
    - `AFTER_LLM_CALL` → `_make_response_logger(on_response)` (only if `on_response` is not None).
+   - `ON_PROVIDER_ERROR` → `_make_provider_error_logger(on_provider_error)` (only if `on_provider_error` is not None — `chat.run_chat` always supplies one).
 10. **Finalize the outo config** — `co.get_agent_preset("outo").to_config()`, merge in caller's `provider_config`, instantiate `co.Agent(outo_config)`. Returns the agent.
 
 ### Hook helpers
@@ -320,7 +348,8 @@ The heart of miniouto. Steps:
 - **`_make_tool_call_logger(callback)`** — Bridges coreouto's `BEFORE_TOOL_CALL` hook signature to the simpler `on_tool_call(name, args)` contract used by `chat.py`. Forwards `(name, arguments)` to `callback`.
 - **`_make_response_logger(callback)`** — Returns an `AFTER_LLM_CALL` hook that invokes `callback(response.content, bool(tool_calls))` for non-empty responses. No printing — rendering is the sink's job.
 - **`_make_iteration_logger(callback)`** — Returns an `ON_ITERATION` hook that forwards to `callback` so the sink can render progress.
-- **`_subagent_description()`** — Hardcoded prompt fragment explaining that the subagent has its own Write/Edit/Delete/Bash and a fresh context, blocks until the subagent finishes, returns the final text.
+- **`_make_provider_error_logger(callback)`** — Returns an `ON_PROVIDER_ERROR` hook that forwards `status_code`, `error_message`, `reaction`, `reaction_message` (dropping the raw exception and the message list, which a sink can't render).
+- **`_subagent_description()`** — Hardcoded prompt fragment explaining that the subagent has its own Bash/Image/Video/Audio and a fresh context, blocks until the subagent finishes, returns the final text.
 - **`_resolve_both_styles(style_name, overrides)`** — Splits the style at `<subagent>…</subagent>`. If no subagent section exists, uses `_fallback_style("subagent")`. Prepends active skills to both halves.
 - **`_read_raw_style(name, overrides)`** — Checks in-memory `overrides` first, then `style_store.read(name)`, then the builtin default, then `_fallback_style`.
 - **`_load_active_skills()`** — Lists skills, formats each as `"# Skill: {name}\n\n{content}"` (skipping skills with empty content), joins with `\n\n---\n\n`. Returns empty string if no skills.
@@ -365,10 +394,11 @@ No file I/O directly inside `core/` — all disk access is delegated to `storage
 | `httpx.HTTPError` / `JSONDecodeError` | `core/context.py` | Caught silently inside `_fetch_model_caps` |
 | `Exception` in summarizer | `core/context.py` | Caught, returns static fallback message (never corrupts messages) |
 | `Exception` from `agent.call_sync` | `core/chat.py` | Caught to dump tool trace + traceback, then re-raised |
+| Provider exceptions matching an `ErrorRule` | `core/error_rules.py` + coreouto loop | Absorbed per rule reaction (retry / terminate / tool_result / user_message); surfaced via `ON_PROVIDER_ERROR` → `provider:` loop event, never raised |
 
 ## Defensive patterns worth highlighting
 
 1. **`context.py` summarizer** — refuses to `messages.clear(); messages.extend(summarized)` unless `summarized` is a `list`, preventing the bug in upstream `coreouto.contrib.hooks.auto_summarize_hook`.
 2. **`chat.py` ToolCallArgsError** — fires *before* coreouto's handler so the LLM sees a precise, single message about which argument is missing, and the user sees the tool name in the failure trace.
-3. **`runtime.py` subagent `max_tokens`** — re-implements `coreouto.agent_as_tool` because the stock helper drops `provider_config` from the preset, causing Anthropic to silently truncate Write outputs at 1024 tokens.
+3. **`runtime.py` subagent `max_tokens`** — re-implements `coreouto.agent_as_tool` because the stock helper drops `provider_config` from the preset, causing Anthropic to silently truncate long tool-call outputs (e.g. file writes) at 1024 tokens.
 4. **`runtime.py` `_wrap_subagent_handler`** — uses a `ContextVar` because coreouto's `BEFORE_TOOL_CALL` hook is global and has no per-agent context.

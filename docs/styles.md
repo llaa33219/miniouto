@@ -44,19 +44,17 @@ From `storage/styles.py`. Parses a style document:
 
 The regex is non-greedy and case-sensitive. Tags may appear in either order, but the standard convention is `<outo>` first then `<subagent>`.
 
-## The five tools section (required)
+## The tools section (required)
 
-Every style should include a **Tools available** section that lists the five tools the agent can call:
+Every style should include a **Tools available** section that lists the tools the agent can call:
 
 | Tool | Purpose |
 |---|---|
-| `Write(file_path, content)` | Create a new file (refuses overwrite). |
-| `Edit(file_path, edits)` | Apply search/replace ops to an existing file. |
-| `Delete(file_path)` | Remove a file or empty directory. |
-| `Bash(command, *, timeout_seconds=60, cwd=None, env=None)` | Run a shell command. (`env` is accepted by the underlying `bash()` function but is **not** exposed through the model-facing schema — the registered `_bash_handler` does not accept it.) |
+| `Bash(command, *, timeout_seconds=60, cwd=None)` | Run a shell command — the ONLY file-manipulation tool (read via `cat`/`grep`, write via heredoc/`tee`, edit via `sed -i`/Python, delete via `rm`). (`env` is accepted by the underlying `bash()` function but is **not** exposed through the model-facing schema — the registered `_bash_handler` does not accept it.) |
+| `Image(file_path)` / `Video(file_path)` / `Audio(file_path)` | View/listen to a media file (multimodal blocks). |
 | `call_subagent(task)` | Delegate a self-contained subtask to a fresh-context agent. |
 
-All bundled styles describe these with **identical behavior summaries** (so the model doesn't see inconsistent tool docs across styles). The summaries come from `tools/registry.py`'s `_<name>_description` strings.
+There are deliberately **no** Write/Edit/Delete tools — file work goes through Bash (see `docs/tools.md` § "Why Bash is the only file tool"). All bundled styles describe the tools with **identical behavior summaries** (so the model doesn't see inconsistent tool docs across styles). The summaries come from `tools/registry.py`'s `_<name>_description` strings.
 
 ## The loop behavior section (required)
 
@@ -91,7 +89,7 @@ The original "outo" prompt. Short, opinionated, deliberately sparse. Used when n
 
 Key points:
 - 7 outo operating principles: be brief, lead with the answer, finish with text + no tool call (or use `continue_loop`), treat tool results as loop input, match delegation scope to task size, never invent outputs, match the user's language, pass paths correctly when delegating.
-- 10 subagent principles: treat the brief as the whole spec (no clarifying questions), be terse, prefer Edit over Write, read first, return useful extracted output (not full dumps), plan + execute + synthesize for multi-step work, use `call_subagent` only when the subtask deserves its own context, finish with text + no tool call, tool results are loop input, match brief language, surface errors verbatim.
+- 10 subagent principles: treat the brief as the whole spec (no clarifying questions), be terse, prefer targeted `sed`/Python edits over full-file rewrites, read first, return useful extracted output (not full dumps), plan + execute + synthesize for multi-step work, use `call_subagent` only when the subtask deserves its own context, finish with text + no tool call, tool results are loop input, match brief language, surface errors verbatim.
 
 ### `claude.md` — Claude Code-style
 
@@ -121,7 +119,7 @@ Seven sub-agent roles with explicit operating modes:
 - **Planner** (READ-ONLY) — 5–7 word step headings.
 - **Advisor** (READ-ONLY) — three-tier response (Essential / Expanded / Edge cases); confidence signal.
 - **Reviewer** (READ-ONLY) — blockers only (max 3), APPROVE-biased.
-- **Editor** — implementer; conventions, Edit-not-Write.
+- **Editor** — implementer; conventions, targeted Bash edits (`sed -i`, heredocs).
 - **Basher** — shell runner.
 
 Includes a Decision Framework (effort tag: Quick<1h / Short 1-4h / Medium 1-2d / Large 3d+) and AI-Slop Avoidance section.
@@ -175,9 +173,13 @@ miniouto style update
 
 Re-seeds all bundled styles from the miniouto package (same force-refresh that `ensure_dirs()` does), then re-fetches every repo previously added via `style add` from `~/.miniouto/style_repos.toml`. Same-name files are overwritten in place. Styles you created by hand (no matching bundled template and no recorded repo) are left untouched. Per-repo failures are reported individually but do not abort the rest.
 
+### Skills guidance in bundled styles
+
+Every bundled template includes a **Skills — MANDATORY first check** section in both its `<outo>` and `<subagent>` halves (immediately before the tools list). It instructs the agent to scan the skills injected into its context (each under a `# Skill: <name>` heading, sourced from `~/.agents/skills/`) before starting any task, and — when a skill matches the task's domain — to re-read that skill's body (or `cat` the SKILL.md and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in delegation briefs so the subagent follows it too. Keep this section when authoring a custom style; it is what makes installed skills actually get used.
+
 ### Web access guidance in bundled styles
 
-Every bundled template includes a **Web access (search & fetch)** section in both its `<outo>` and `<subagent>` halves. It instructs the agent to use `curl` via Bash for all web access, and to search the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from any bundled template.
+Every bundled template includes a **Web access (search & fetch)** section in both its `<outo>` and `<subagent>` halves. It is **skill-first**: the agent must check whether an available skill covers the web interaction (browser automation, scraping, search, platform-specific APIs) and follow that skill when one applies. Only when no skill applies does it fall back to `curl` via Bash — searching the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from any bundled template.
 
 ### Export / share a style
 

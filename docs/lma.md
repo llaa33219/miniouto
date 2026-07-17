@@ -21,7 +21,7 @@ Precedence for `max_output_tokens` (highest wins):
 2. Provider's `max_output_tokens` override (set via the TUI)
 3. lma's `max_output_tokens` for the (model, provider) pair
 4. lma's `context_window` (most APIs cap output at the context window)
-5. `DEFAULT_MAX_OUTPUT_TOKENS = 16384` (the floor — defends against Anthropic's silent 1024 default that truncates Write tool calls)
+5. `DEFAULT_MAX_OUTPUT_TOKENS = 16384` (the floor — defends against Anthropic's silent 1024 default that truncates long tool calls, e.g. file writes)
 
 There is no upper ceiling. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed. A wrong value surfaces as a clear provider error at chat time, which is preferable to silent truncation.
 
