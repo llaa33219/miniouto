@@ -12,6 +12,7 @@ from typing import Any
 import coreouto as co
 
 from ..storage.providers import SOURCE_LMA, Provider
+from .error_rules import default_error_handling
 
 SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")
 
@@ -87,15 +88,27 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
     # required for Anthropic (SDK rejects non-streaming requests whose
     # max_tokens estimate exceeds ~10 minutes, which our 16K output floor
     # would trip) and harmless for OpenAI/Google.
+    #
+    # `error_handling` (coreouto >= 0.10) attaches the per-format
+    # ErrorRule list so rate limits retry with backoff, auth failures
+    # terminate with a clear message, and provider-side tool-call
+    # rejections feed back as tool results instead of crashing the turn.
+    error_handling = default_error_handling(api_format)
     if api_format == "openai":
         from coreouto.providers.openai import OpenAIProvider
 
-        return OpenAIProvider(api_key=api_key, base_url=base_url or None, stream=True)
+        return OpenAIProvider(
+            api_key=api_key, base_url=base_url or None, stream=True,
+            error_handling=error_handling,
+        )
 
     if api_format == "openai-response":
         from coreouto.providers.openai_response import OpenAIResponseProvider
 
-        return OpenAIResponseProvider(api_key=api_key, base_url=base_url or None, stream=True)
+        return OpenAIResponseProvider(
+            api_key=api_key, base_url=base_url or None, stream=True,
+            error_handling=error_handling,
+        )
 
     if api_format == "anthropic":
         from coreouto.providers.anthropic import AnthropicProvider
@@ -103,7 +116,9 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
         url = base_url or None
         if url and url.rstrip("/").endswith("/v1"):
             url = url.rstrip("/")[:-3]
-        return AnthropicProvider(api_key=api_key, base_url=url, stream=True)
+        return AnthropicProvider(
+            api_key=api_key, base_url=url, stream=True, error_handling=error_handling
+        )
 
     if api_format == "google":
         from coreouto.providers.google import GoogleProvider
@@ -111,7 +126,10 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
         http_options: dict[str, Any] | None = None
         if base_url:
             http_options = {"base_url": base_url}
-        return GoogleProvider(api_key=api_key, http_options=http_options, stream=True)
+        return GoogleProvider(
+            api_key=api_key, http_options=http_options, stream=True,
+            error_handling=error_handling,
+        )
 
     raise ValueError(f"Unhandled api_format: {api_format!r}")
 
