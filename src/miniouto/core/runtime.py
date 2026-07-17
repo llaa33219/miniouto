@@ -17,7 +17,7 @@ from ..storage import styles as style_store
 from ..tools import registry as tool_registry
 from .providers import build_coreouto_provider, clear_coreouto_state
 
-ALL_TOOLS = ["Write", "Edit", "Delete", "Bash", "Image", "Video", "Audio", "call_subagent"]
+ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]
 
 # Tracks how deep we are inside a `call_subagent` invocation. 0 = outo (or
 # after `build_runtime` has just been called), >=1 = inside a subagent.
@@ -37,7 +37,7 @@ def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap `call_subagent`'s handler so the depth ContextVar tracks nesting.
 
     coreouto's `BEFORE_TOOL_CALL` hook is global and does not carry agent
-    context, so without this we cannot tell whether a Bash/Write/etc. call
+    context, so without this we cannot tell whether a Bash/Image/etc. call
     came from outo or from a subagent. Setting/resetting the ContextVar
     around the inner handler gives the hook the information it needs.
     """
@@ -63,7 +63,8 @@ def _build_subagent_tool(
     coreouto's `agent_as_tool` calls `preset.to_config()` and silently
     drops any provider_config we might want to inject — meaning the
     subagent runs with `max_tokens` unset, and Anthropic's 1024 hard
-    default silently truncates any Write call longer than ~4KB. We
+    default silently truncates any long tool call (e.g. a heredoc file
+    write). We
     rebuild the same `Tool` shape here, but with our own Agent instance
     built from a config whose `provider_config` carries the cap.
     """
@@ -122,6 +123,7 @@ def build_runtime(
     on_tool_call: Callable[[str, dict[str, Any]], None] | None = None,
     on_response: Callable[[str, bool], None] | None = None,
     on_iteration: Callable[..., None] | None = None,
+    on_provider_error: Callable[..., None] | None = None,
 ) -> co.Agent:
     """Construct the outo Agent with the active style and subagent wired in.
 
@@ -135,6 +137,11 @@ def build_runtime(
     `on_iteration` is called after each agent-loop iteration with the same
     kwargs coreouto passes to ON_ITERATION (iteration, messages, response),
     letting the caller stream loop-progress signals. Pass None to skip.
+    `on_provider_error` is called whenever an `error_handling` rule matches a
+    provider exception (coreouto >= 0.10), with `status_code`, `error_message`,
+    `reaction`, `reaction_message` kwargs. Rule-matched errors don't raise, so
+    without this hook a retry or termination is invisible to the user.
+    Pass None to skip.
     """
 
     clear_coreouto_state()
@@ -178,7 +185,8 @@ def build_runtime(
     )
 
     # Subagent runs the same model (or its override) and must share the
-    # output-token cap, otherwise Write calls it issues get truncated at
+    # output-token cap, otherwise long tool calls it issues (heredoc file
+    # writes) get truncated at
     # the provider's low default (1024 for Anthropic) and we end up with
     # a half-written file and an "I cut off mid-function" loop. We pull
     # the cap from the same lma endpoint as outo so it tracks the
@@ -215,6 +223,9 @@ def build_runtime(
     if on_iteration is not None:
         co.register_hook(co.ON_ITERATION, _make_iteration_logger(on_iteration))
 
+    if on_provider_error is not None:
+        co.register_hook(co.ON_PROVIDER_ERROR, _make_provider_error_logger(on_provider_error))
+
     outo_config = co.get_agent_preset("outo").to_config()
     if provider_config:
         outo_config.provider_config.update(provider_config)
@@ -228,6 +239,33 @@ def build_runtime(
 def _make_tool_call_logger(callback: Callable[[str, dict[str, Any]], None]):
     def hook(*, name: str, arguments: dict[str, Any], **kwargs: Any) -> None:
         callback(name, arguments)
+
+    return hook
+
+
+def _make_provider_error_logger(callback: Callable[..., None]):
+    """Build an ON_PROVIDER_ERROR hook that forwards the rule-match payload.
+
+    coreouto fires ON_PROVIDER_ERROR after an `error_handling` rule matches
+    a provider exception, before executing the reaction. Only the four
+    renderable fields are forwarded — the raw exception and the full
+    message list are also in the payload but are useless to a sink.
+    """
+
+    def hook(
+        *,
+        status_code: int | None,
+        error_message: str,
+        reaction: str,
+        reaction_message: str,
+        **kwargs: Any,
+    ) -> None:
+        callback(
+            status_code=status_code,
+            error_message=error_message,
+            reaction=reaction,
+            reaction_message=reaction_message,
+        )
 
     return hook
 
@@ -270,7 +308,7 @@ def _make_response_logger(
 def _subagent_description() -> str:
     return (
         "Delegate a self-contained task to the subagent. The subagent "
-        "has its own tool access (Write/Edit/Delete/Bash/Image/Video/Audio) "
+        "has its own tool access (Bash/Image/Video/Audio) "
         "and a fresh context. Pass the full brief in the `task` argument. "
         "The tool blocks until the subagent terminates the loop (a turn "
         "with no tool calls) and returns the subagent's final text as the "

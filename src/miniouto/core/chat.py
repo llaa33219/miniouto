@@ -66,7 +66,8 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         provider_config["max_tokens"] = opts.max_tokens
     else:
         # Default to the model's real cap so the LLM can emit multi-KB
-        # Write tool calls without hitting Anthropic's 1024 hard default
+        # tool calls (e.g. heredoc file writes) without hitting
+        # Anthropic's 1024 hard default
         # and silently truncating the file content mid-line.
         provider_config["max_tokens"] = get_max_output_tokens(
             runtime.model, runtime.provider_name
@@ -82,6 +83,7 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         on_tool_call=on_tool_call,
         on_response=_make_response_dispatcher(sink),
         on_iteration=_make_iteration_dispatcher(sink),
+        on_provider_error=_make_provider_error_dispatcher(sink),
     )
 
     session_name = opts.session or runtime.session
@@ -144,7 +146,7 @@ def _make_tool_call_dispatcher(sink: EventSink):
                 )
             )
             sink.update_activity("subagent")
-        elif name in ("Bash", "Write", "Edit", "Delete", "Image", "Video", "Audio"):
+        elif name in ("Bash", "Image", "Video", "Audio"):
             preview = _short_arg_summary(name, arguments)
             sink.emit_loop_event(
                 LoopEvent(
@@ -175,6 +177,40 @@ def _make_response_dispatcher(sink: EventSink):
         sink.emit_loop_event(LoopEvent(actor=actor, kind="response", text=content))
 
     return on_response
+
+
+def _make_provider_error_dispatcher(sink: EventSink):
+    """Build the per-provider-error callback wired into ON_PROVIDER_ERROR.
+
+    Rule-matched provider errors (coreouto >= 0.10 `error_handling`) no
+    longer raise out of `call_sync` — they retry, terminate with the
+    rule's message, or feed back as a tool result. Without this hook a
+    retry storm or a 401 would be invisible until the final answer.
+    Forward every match as a `provider:` loop event so the user sees the
+    status code and the reaction taken.
+    """
+
+    def on_provider_error(
+        *,
+        status_code: int | None,
+        error_message: str,
+        reaction: str,
+        reaction_message: str,
+        **_kwargs: Any,
+    ) -> None:
+        code = f"HTTP {status_code}" if status_code is not None else "error"
+        detail = reaction_message or error_message
+        sink.emit_loop_event(
+            LoopEvent(
+                actor="provider",
+                kind="error",
+                text=f"{code} → {reaction}: {detail}",
+            )
+        )
+        if reaction == "retry":
+            sink.update_activity("provider retry")
+
+    return on_provider_error
 
 
 def _make_iteration_dispatcher(sink: EventSink):
@@ -263,7 +299,7 @@ def _to_coreouto_history(messages: list[MessageRecord]) -> list[co.Message]:
 
 
 _LOGGABLE_TOOL_NAMES = (
-    "Bash", "Write", "Edit", "Delete", "Image", "Video", "Audio", "call_subagent"
+    "Bash", "Image", "Video", "Audio", "call_subagent"
 )
 
 
@@ -272,7 +308,7 @@ def _validate_tool_call_args(name: str, arguments: Any) -> None:
 
     coreouto 0.3.2's agent loop calls `tool.handler(**tool_call.arguments)`
     without first checking that `arguments` is a dict. When the LLM produces
-    `{"name": "Write", "arguments": null}` (or any non-dict) — for example
+    `{"name": "Bash", "arguments": null}` (or any non-dict) — for example
     because the JSON got truncated, the model lost track of which schema
     field it was filling, or the provider's tool_use parser saw a partial
     block — Python raises the cryptic `TypeError: 'NoneType' object is not
@@ -308,16 +344,6 @@ def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
     if name == "Bash":
         cmd = (args.get("command") or "").replace("\n", " ")
         return cmd
-    if name == "Write":
-        path = args.get("file_path", "?")
-        size = len(args.get("content") or "")
-        return f"{path} ({size} bytes)"
-    if name == "Edit":
-        path = args.get("file_path", "?")
-        edits = args.get("edits") or []
-        return f"{path} ({len(edits)} edit{'s' if len(edits) != 1 else ''})"
-    if name == "Delete":
-        return args.get("file_path", "?")
     if name in ("Image", "Video", "Audio"):
         return args.get("file_path", "?")
     return str(args)[:120]

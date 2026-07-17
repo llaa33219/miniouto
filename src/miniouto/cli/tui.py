@@ -82,7 +82,7 @@ def _parse_optional_int(result: str | None) -> int | None:
         raise ValueError("must be > 0")
     return v
 
-# Braille spinner frames. The status line reads e.g. "⠧ Write…" and the
+# Braille spinner frames. The status line reads e.g. "⠧ Bash…" and the
 # glyph rotates through this set at ~12.5fps so the bottom of the screen
 # shows the agent is alive even between tool calls.
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")

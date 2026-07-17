@@ -10,9 +10,9 @@ SUMMARIZE_THRESHOLD = 0.8
 
 # Hard floor for max_output_tokens. Some providers (Anthropic in particular)
 # default to 1024 if you don't set it explicitly, which is far too small
-# for our Write tool to handle anything larger than a tiny code snippet:
-# a 4KB JS file blows past 1024 output tokens and silently truncates
-# mid-line, leaving a half-written file on disk. We always inject at
+# for a file-writing tool call (a 4KB JS file blows past 1024 output
+# tokens and silently truncates mid-line, leaving a half-written file on
+# disk). We always inject at
 # least this many tokens unless the API tells us the real cap is lower.
 DEFAULT_MAX_OUTPUT_TOKENS = 16384
 
@@ -82,7 +82,7 @@ def get_max_output_tokens(model: str, provider_name: str | None = None) -> int:
        window; if a separate cap isn't published, this is a proxy).
     4. `DEFAULT_MAX_OUTPUT_TOKENS` (16K) — a hard floor because some
        providers (Anthropic) default to 1024 otherwise, which silently
-       truncates Write tool calls and corrupts files.
+       truncates long tool calls (e.g. file writes) and corrupts files.
     """
 
     override = _provider_caps_override(provider_name).get("maxOutputTokens")

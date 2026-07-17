@@ -4,7 +4,7 @@ The agent loop produces two distinct kinds of output that the user
 experiences very differently:
 
 1. **Internal loop events** — tool calls and intermediate model text
-   (e.g. `outo:Write …`, `subagent:Bash …`). The user wants these
+   (e.g. `outo:Bash …`, `subagent:Image …`). The user wants these
    streamed live so they know what the agent is doing.
 
 2. **The final answer** — the model's terminal response (no follow-up
