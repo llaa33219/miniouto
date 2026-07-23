@@ -55,13 +55,29 @@ Delegates to `cli/tui.py:run_tui()`, which constructs a `ChatTUI` (Textual `App`
 
 Layout (top to bottom):
 - `Header(show_clock=False)`
-- `Vertical(RichLog(id="chat", wrap=True), Input(placeholder="…", id="input"))`
+- `Vertical(VerticalScroll(id="chat"), ChatInput(id="input"))`
 - `BottomPanel` (height 4) with four rows:
-  1. spinner row (a `rich.status`-driven spinner shown while a chat turn is in flight)
+  1. spinner row (a Textual-`Timer`-driven braille spinner shown while a chat turn is in flight)
   2. chip row with **three** clickable `StatusChip`s — `model`, `provider`, `style`
   3. session row — a plain `Static` label showing the active session name (not clickable)
   4. help-hint row
 - `Footer`
+
+### Chat log rows
+
+The chat log is a `VerticalScroll` of row widgets (migrated from `RichLog` so rows can be clickable and live-updating). All row widgets derive from **`RowStatic`**, which gives every row identical drag selection: Textual's native path (theme `$screen-selection-*` colors — and nothing at all for Markdown, whose `RichVisual` ignores selection) is suppressed, and `render_line` paints the selected span itself with plain **reverse video (fg/bg inversion)**, character-accurate (CJK-safe) and clipped at the text end. `Ctrl+Shift+C` copies the extraction (`get_selection`, padding stripped).
+
+| Row widget | Shows |
+|---|---|
+| `Static` | user prompts (`> ` in accent), blank spacers, `[system]` lines in warning color |
+| `AnswerRow` | the final answer as `Markdown` — behavior inherited from `RowStatic`; exists as a distinct class because Markdown goes through `RichVisual` (no native selection painting) |
+| `ThinkingRow` | reasoning/thinking — **collapsed by default** (`▸ thinking`), click or `Enter` to expand the full text (`▾ thinking` + content), click again to re-collapse. Same translucent border + muted styling as `EventRow` |
+| `EventRow` | any other intermediate loop output — tool calls, iteration/token progress, provider errors — rendered with a **translucent left border (`$primary 40%`) and muted gray text** (provider errors use `$error`). No `actor:` prefixes |
+| `SubagentRow` | one clickable line per subagent invocation: a **live braille spinner** + `subagent-<6hex>` + task preview while running, flipping to `✓` (success) / `✗` (error) on completion |
+
+Clicking a `SubagentRow` (or focusing it and pressing `Enter`) pushes a **`SubagentDetailScreen`** — a modal rendering that invocation in the same notation as the main chat: the received task brief as a `> ` row, internal loop events as translucent-border muted rows, and the final result as a Markdown `AnswerRow` (live-refreshing while the subagent is still running). **`Esc` or `q` goes back.** Subagent-internal events never appear in the main chat log — only in the detail screen.
+
+Reloading a session (`Ctrl+P` → "Pick session") re-renders from the session's `turns` section: subagent rows come back finished but stay clickable, with their recorded internal events available in the detail screen.
 
 ### Clickable chips
 
@@ -96,7 +112,7 @@ Keybindings:
 - `Ctrl+P` — open the Textual system command palette (customized via `get_system_commands`) — new session, pick session, change model/provider/style/theme, clear log. The splash text on boot explicitly says "Press Ctrl+P for commands."
 - Widget-level (inside modals / chips): `Tab` / `Shift+Tab` — cycle focus; `Enter` — confirm; `Esc` — cancel.
 
-Submission flow: each submitted prompt is dispatched via `self.run_worker(..., exclusive=True)` to `_dispatch(prompt)`, which calls `core.chat.run_chat(opts, sink)` inside `asyncio.to_thread` so the Textual event loop stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output is posted back into the RichLog; user prompts prefixed with `>` in accent color, assistant final answer rendered as `Markdown(content)` (no tint), tool/iteration events in theme accent/foreground, errors/system messages rendered as `[…]` (e.g. `[error: {exc}]`) in theme warning.
+Submission flow: each submitted prompt is dispatched via `self.run_worker(..., exclusive=True)` to `_dispatch(prompt)`, which calls `core.chat.run_chat(opts, sink)` inside `asyncio.to_thread` so the Textual event loop stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output is mounted as row widgets (see "Chat log rows" above); errors/system messages render as `[…]` (e.g. `[error: {exc}]`) in theme warning.
 
 `cli/tui.py:tui_summary() -> dict` is a programmatic snapshot helper (currently unused by the runtime) that returns `{provider, model, style, session, styles_available}`.
 
@@ -104,7 +120,7 @@ Submission flow: each submitted prompt is dispatched via `self.run_worker(..., e
 
 ## `miniouto --version`
 
-Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.1.1"`) and raises `typer.Exit()` (exit code 0).
+Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.3.0"`) and raises `typer.Exit()` (exit code 0).
 
 ---
 
@@ -169,6 +185,20 @@ chat_cmd(
 3. Emits the `------{session_name}------` marker to stdout unless `--answer-only` was passed, then builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts, sink=ConsoleEventSink(quiet=answer_only or with_session))`.
 4. On exception: `chat_cmd` does **not** catch — `run_chat` itself calls `_dump_failure_diagnostics` (prints `✗ {ExceptionType}: {msg}` + the last ≤5 tool calls + a full traceback to **stderr**) and **re-raises**. Typer prints the traceback and exits 1.
 5. On success: `ConsoleEventSink` writes the reply as plain stdout; in verbose mode it is preceded by a `------finish------` marker and loop events (tool calls, intermediate responses) rendered in `orange3`. In quiet mode only the raw answer (and the session marker, for `--with-session`) reaches stdout.
+
+Loop-event notation in verbose CLI output keeps the `name:` prefix style:
+
+```
+outo: Bash ls -la                          # outo tool call
+outo:thinking: <full reasoning text>       # outo reasoning (dim, untruncated)
+subagent-a1b2c3: write the tests           # subagent invocation start (task preview)
+subagent-a1b2c3: Bash pytest -q            # a tool call inside that subagent
+subagent-a1b2c3:thinking: <full text>      # reasoning inside that subagent
+subagent-a1b2c3: done                      # subagent finished (dim; "error: …" on failure)
+provider: HTTP 429 → retry: …              # rule-matched provider error
+```
+
+Every subagent invocation gets a stable 6-hex id (`subagent-<6hex>`), so parallel `call_subagent` runs are distinguishable line-by-line. Reasoning/thinking is labeled `:thinking:` for both outo and subagents and printed **in full** in the CLI (the TUI shows a truncated gray row in the main chat and the full text in the subagent detail screen).
 
 ### Model resolution
 

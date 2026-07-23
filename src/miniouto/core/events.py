@@ -21,7 +21,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from threading import Lock
-from typing import Protocol
+from typing import Any, Protocol
 
 from rich.console import Console
 from rich.status import Status
@@ -34,6 +34,25 @@ class LoopEvent:
     kind: str
     text: str
     tool_name: str | None = None
+    subagent_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"actor": self.actor, "kind": self.kind, "text": self.text}
+        if self.tool_name:
+            d["tool_name"] = self.tool_name
+        if self.subagent_id:
+            d["subagent_id"] = self.subagent_id
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> LoopEvent:
+        return cls(
+            actor=str(d.get("actor") or "outo"),
+            kind=str(d.get("kind") or "tool"),
+            text=str(d.get("text") or ""),
+            tool_name=d.get("tool_name") or None,
+            subagent_id=d.get("subagent_id") or None,
+        )
 
 
 class EventSink(Protocol):
@@ -108,10 +127,27 @@ class ConsoleEventSink:
         # Text.assemble avoids markup parsing entirely — the model/tool
         # text is stored as raw characters and styled by span, so stray
         # `[brackets]` in the payload can't crash Rich.
-        line = Text.assemble(
-            (f"{event.actor}:", "orange3"),
-            (f" {event.text}", "white"),
-        )
+        if event.kind == "thinking":
+            line = Text.assemble(
+                (f"{event.actor}:thinking:", "orange3"),
+                (f" {event.text}", "dim white"),
+            )
+        elif event.kind in ("subagent_start", "subagent_end"):
+            # Start/end carry the full task/result for the session record
+            # and the TUI detail screen; the CLI shows a one-line preview.
+            preview = " ".join(event.text.split())
+            if len(preview) > 120:
+                preview = preview[:120] + "…"
+            style = "dim white" if event.kind == "subagent_end" else "white"
+            line = Text.assemble(
+                (f"{event.actor}:", "orange3"),
+                (f" {preview}", style),
+            )
+        else:
+            line = Text.assemble(
+                (f"{event.actor}:", "orange3"),
+                (f" {event.text}", "white"),
+            )
         self._console.print(line, highlight=False)
 
     def emit_final_answer(self, content: str, session_name: str) -> None:

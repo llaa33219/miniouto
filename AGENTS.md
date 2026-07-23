@@ -15,7 +15,7 @@
 
 Three principles from `README.md`: **Minimalism** (no bloat — extend with styles), **Automation-friendly** (full CLI, TUI optional), **Fluidity** (adapts to any environment).
 
-**Version**: `0.1.1` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
+**Version**: `0.3.0` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
 
 ---
 
@@ -26,7 +26,7 @@ Three principles from `README.md`: **Minimalism** (no bloat — extend with styl
 ├── providers.toml               ← LLM API connections (one top-level table per provider)
 ├── settings.toml                ← active provider / model / style / session / theme
 ├── style/*.md                   ← system prompts (outo + subagent halves)
-├── sessions/*.json              ← conversation history
+├── sessions/*.json              ← schema v2: restorable history + display turns
 └── logs/                        ← reserved (currently unused)
 
 ~/.agents/skills/                ← skills (NOT under ~/.miniouto/)
@@ -48,14 +48,16 @@ CLI flag bag → ChatOptions (core/chat.py)
             → resolve_runtime_from_settings (core/runtime.py)
             → RuntimeConfig
             → build_runtime (core/runtime.py)
-                → coreouto provider registry + tool registry + up to 5 hooks
+                → coreouto provider registry + tool registry + up to 6 hooks
                     (BEFORE_TOOL_CALL, ON_ITERATION×2, AFTER_LLM_CALL,
-                    ON_PROVIDER_ERROR)
+                    ON_THINKING, ON_PROVIDER_ERROR)
                 → co.Agent(outo_config)
             → run_chat(opts, sink) → agent.call_sync(prompt, history=...)
                 → Bash/Image/Video/Audio (via tools/registry.py)
-                → call_subagent (delegates to subagent preset)
-            → persist user + assistant MessageRecord
+                → call_subagent (delegates to subagent preset; each invocation
+                  mints a subagent-<6hex> id tracked via ContextVars)
+            → record_turn: rewrite session history from Response.messages
+              (minus system) + append TurnRecord(user, assistant, events)
 ```
 
 ---
@@ -76,7 +78,7 @@ CLI flag bag → ChatOptions (core/chat.py)
 
 ---
 
-## The 12 invariants (do NOT break these)
+## The 13 invariants (do NOT break these)
 
 These rules hold throughout the codebase. Breaking any of them silently degrades or breaks the system. **If your change seems to require breaking one, stop and ask.**
 
@@ -114,24 +116,37 @@ There is **one** deliberate precedence tier above lma: a per-provider `max_outpu
 
 **Do not "simplify" this back to `coreouto.contrib.agent_as_tool`.**
 
-### 6. `BEFORE_TOOL_CALL` is global — depth tracked via ContextVar
-coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context. `core/runtime.py:_SUBAGENT_DEPTH: ContextVar[int]` is the only signal of "are we currently inside a subagent?" The `on_tool_call` closure built by `core/chat.py:_make_tool_call_dispatcher` reads it (via `current_subagent_depth()`) to label each tool trace with actor `outo` vs `subagent`. The bridge from coreouto's hook to that closure is `core/runtime.py:_make_tool_call_logger`. The var is bumped only inside `_wrap_subagent_handler`.
+### 6. `BEFORE_TOOL_CALL` is global — depth + id tracked via ContextVars
+coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context. `core/runtime.py` keeps **two** ContextVars, both set only inside `_wrap_subagent_handler` (which runs exactly once per subagent invocation):
 
-If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth tracking will be wrong.
+- `_SUBAGENT_DEPTH: ContextVar[int]` — "are we inside a subagent?" (defensive fallback label)
+- `_SUBAGENT_ID: ContextVar[str | None]` — the invocation's 6-hex id (`secrets.token_hex(3)`)
 
-### 7. File manipulation is Bash-only
+`core/chat.py:_actor_label()` combines them into actor labels: `outo` vs `subagent-<6hex>`. Because ContextVars are copied per asyncio task, parallel `call_subagent` invocations each keep their own id — this is the mechanism that makes concurrent subagents distinguishable in output. Subagent start/end is reported through the module-level `_SUBAGENT_OBSERVER` slot (set per turn by `run_chat` via `set_subagent_observer`) — the `BEFORE_TOOL_CALL` hook for `call_subagent` itself still runs in the *parent* context and never sees the id, which is why `_make_tool_call_dispatcher` deliberately emits nothing for `call_subagent`.
+
+If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth/id tracking will be wrong.
+
+### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display)
+`storage/sessions.py` writes `{"version": 2, "history": [...], "turns": [...]}`:
+
+- `history` = raw coreouto `Message.model_dump` dicts **minus system messages** (coreouto prepends a fresh system prompt every `call()` — persisting it duplicates it per turn; see coreouto `examples/21_loop_history.py`). Rewritten in full every turn from `Response.messages`, so it stays consistent with in-loop summarize-hook compaction.
+- `turns` = display-only `TurnRecord`s (user, assistant, `LoopEvent` dicts). **Thinking lives only here** — coreouto providers never put thinking into history `Message` objects; it's captured via the `ON_THINKING` hook.
+
+`load()` migrates v1 files and never raises on corrupt content. If you change the schema again, bump `SCHEMA_VERSION` and extend the migration — do not break old files.
+
+### 8. File manipulation is Bash-only
 There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (error-prone; the agent reached for Bash anyway). **Do not reintroduce them without explicit discussion.** To add any other tool, follow the "Add a new tool" recipe below.
 
-### 8. Async only where needed
+### 9. Async only where needed
 `tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop. **Don't make the media loaders async** — they don't need to be, and it complicates the TUI dispatch.
 
-### 9. Skill discovery lives outside `~/.miniouto/`
+### 10. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention), NOT from `~/.miniouto/`. Skills are portable content, not per-installation config. **Do not move them into `~/.miniouto/`.**
 
-### 10. TUI model editor manages `Provider.default_model`, not `Settings.model`
+### 11. TUI model editor manages `Provider.default_model`, not `Settings.model`
 In the TUI, picking or typing a model always writes to `provider.default_model` (via `dataclasses.replace(p, default_model=...)` + `provider_store.upsert`) and clears any prior `settings.model`. The model chip displays `provider.default_model` only — `settings.model` is reserved for the `chat --model` CLI flag. Legacy `settings.model` values from older sessions keep working at the runtime layer (`resolve_runtime_from_settings` still treats them as priority 2) but are invisible in the TUI. **Do not reintroduce a `settings.model`-as-TUI-override path.**
 
-### 11. lma-backed vs custom providers
+### 12. lma-backed vs custom providers
 `storage/providers.py:Provider` carries a `source: str` field, one of `SOURCE_CUSTOM` (default) or `SOURCE_LMA`. lma-backed (catalog) providers are added via `miniouto provider add …` or the TUI `+ add from catalog…` wizard; custom providers come from `provider custom add` or the TUI `+ add custom…` wizard. The TUI model picker dispatches on `source`:
 
 - `source == "lma"` → `cli/tui.py:_catalog_model_picker_flow` (fetches `/model-list` and shows a `SelectionModal`).
@@ -141,7 +156,7 @@ The CLI command `miniouto provider providers` filters its "Addable?" column thro
 
 Note: the source string remains the literal `"lma"` (it predates the "catalog" UI rename) — `SOURCE_LMA = "lma"`. The TUI and CLI surface call these "catalog" providers, but the underlying field value is still `"lma"`.
 
-### 12. lma cache lives in `core.lma._CACHE`
+### 13. lma cache lives in `core.lma._CACHE`
 `core/lma.py` mirrors lma's 10-minute server-side TTL with a module-level dict. Cache keys are explicit (`"providers"`, `f"models:{provider.lower()}"`, `f"model:{provider.lower()}:{model.lower()}"` — both segments are lowercased); a cached `None` payload is meaningful (means "lma returned 404"). `core.lma.clear_cache()` exists for tests / manual refresh. **Do not cache anything other than `None` and successful payloads** — a transient transport error must not pollute the cache for 10 minutes.
 
 ---
@@ -164,26 +179,26 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | `__version__ = "0.1.1"` |
+| `__init__.py` | `__version__ = "0.3.0"` |
 | `paths_runtime.py` | `INVOCATION_CWD: Path` (captured cwd at import, used by every tool to absolutize relative paths) |
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
 | `cli/chat.py` | `chat_cmd` — one-shot chat command |
 | `cli/provider.py` | `provider providers/models/add` (catalog browse + add) + `provider custom add` + `provider list/remove/default` |
 | `cli/style.py` | `style list/set/add/update/show` |
 | `cli/skill.py` | `skill list/show` (read-only) |
-| `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; provider catalog/custom add wizards + model picker |
+| `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`SubagentRow`), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
-| `core/chat.py` | `ChatOptions`, `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_iteration_dispatcher`) |
+| `core/chat.py` | `ChatOptions`, `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
-| `core/events.py` | `LoopEvent`, `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering) |
+| `core/events.py` | `LoopEvent` (with `subagent_id`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering) |
 | `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) + `default_error_handling(api_format)` |
 | `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
-| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, subagent tool, hooks |
+| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, subagent tool (per-invocation 6-hex id + lifecycle observer), hooks |
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
 | `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
 | `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
-| `storage/sessions.py` | `MessageRecord` + JSON CRUD |
+| `storage/sessions.py` | `SessionData` + `TurnRecord` (schema v2: restorable `history` + display `turns`) + JSON CRUD with v1 migration |
 | `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`) + TOML CRUD |
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
 | `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |

@@ -1,6 +1,6 @@
 [project]
 name = "miniouto"
-version = "0.2.0"
+version = "0.3.0"
 description = "A minimal, file-driven CLI agent harness built on coreouto."
 readme = "README.md"
 requires-python = ">=3.10"

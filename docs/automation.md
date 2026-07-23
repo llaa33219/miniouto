@@ -500,22 +500,11 @@ miniouto skill show project-conventions
 
 ## 7. Session automation
 
-A session is a file at `~/.miniouto/sessions/<name>.json` — a JSON list of `MessageRecord` objects.
-
-### Schema (`storage/sessions.py:MessageRecord`)
-
-```json
-[
-  {"role": "user", "content": "gather the requirements", "tool_calls": null, "tool_call_id": null, "name": null},
-  {"role": "assistant", "content": "here they are: ...", "tool_calls": [...], "tool_call_id": null, "name": null}
-]
-```
-
-The `tool_calls` field is populated only when an assistant message emitted tool calls (`core/chat.py:run_chat` extracts them from the last assistant message and persists them).
+A session is a file at `~/.miniouto/sessions/<name>.json` — a schema-v2 envelope with two sections: `history` (restorable model context: raw coreouto `Message` dicts, system messages excluded, full loop transcript including tool calls/results) and `turns` (display log: user/assistant text + `LoopEvent` dicts including thinking). See `docs/storage.md` § `sessions/<name>.json` for the full schema.
 
 ### Continuing a session programmatically
 
-`--continue` (`-c`) prepends a session's existing history to the next prompt. This is the backbone of multi-step workflow automation:
+`--continue` (`-c`) prepends a session's existing `history` to the next prompt. This is the backbone of multi-step workflow automation:
 
 ```bash
 SESSION="refactor-$(date +%Y%m%d)"
@@ -532,25 +521,25 @@ miniouto chat "execute the plan" --name "$SESSION" -c
 
 ### Manipulating session files directly
 
-A session JSON is a plain list, so you can read and write it directly:
+The `history` section is a plain list of coreouto `Message` dicts, so you can read and write it directly:
 
 ```python
 import json
 from pathlib import Path
 
 session_path = Path.home() / ".miniouto/sessions/my-session.json"
-messages = json.loads(session_path.read_text())
+data = json.loads(session_path.read_text())
 
 # Extract all user messages
-user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+user_msgs = [m["content"] for m in data["history"] if m["role"] == "user"]
 
 # Inject pre-existing history (e.g. few-shot examples)
-messages.insert(0, {"role": "user", "content": "system context: ..."})
-messages.insert(1, {"role": "assistant", "content": "understood."})
-session_path.write_text(json.dumps(messages, ensure_ascii=False, indent=2))
+data["history"].insert(0, {"role": "user", "content": "system context: ..."})
+data["history"].insert(1, {"role": "assistant", "content": "understood."})
+session_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 ```
 
-> Note: when loading such a hand-written file via `--continue`, the message structure must follow the `MessageRecord` schema (`role`, `content`, `tool_calls`, `tool_call_id`, `name`) exactly for `core/chat.py:_to_coreouto_history` to convert it into `co.Message` objects.
+> Note: when loading such a hand-edited file via `--continue`, each `history` entry must be a valid coreouto `Message` dict (`role`, `content`, optional `tool_calls` / `tool_call_id` / `name`) — `core/chat.py:_load_coreouto_history` runs every entry through `co.Message.model_validate` (invalid entries degrade to plain text messages instead of failing). Do not add a `role: "system"` entry — coreouto prepends a fresh system prompt on every call. Editing `turns` is optional; it only affects what the TUI displays.
 
 ---
 

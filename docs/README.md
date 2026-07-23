@@ -48,7 +48,7 @@ src/miniouto/
 │   ├── __init__.py
 │   ├── paths.py             # ROOT, PROVIDERS_FILE, …, ensure_dirs()
 │   ├── providers.py         # Provider dataclass + TOML CRUD (with `source` field)
-│   ├── sessions.py          # MessageRecord + JSON CRUD
+│   ├── sessions.py          # SessionData/TurnRecord (schema v2) + JSON CRUD
 │   ├── settings.py          # Settings dataclass (provider/model/style/session/theme) + TOML CRUD
 │   ├── skills.py            # Skill dataclass + ~/.agents/skills/ discovery
 │   ├── styles.py            # style CRUD + add_from_repo + record_repo/list_repos + split_style

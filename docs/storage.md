@@ -98,51 +98,56 @@ The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> S
 
 ### `sessions/<name>.json`
 
+Schema v2 (`"version": 2`). Two sections with distinct jobs:
+
 ```json
 {
+  "version": 2,
   "session": "<name>",
-  "updated": "2026-06-20T10:34:12Z",
-  "messages": [
-    {
-      "role": "user",
-      "content": "hello",
-      "ts": "2026-06-20T10:34:00Z"
-    },
+  "updated": "2026-07-23T10:34:12Z",
+  "history": [
+    {"role": "user", "content": "hello"},
     {
       "role": "assistant",
-      "content": "Hi! How can I help?",
-      "tool_calls": [
-        {
-          "id": "call_abc",
-          "type": "function",
-          "function": {"name": "Bash", "arguments": "{\"command\":\"ls\"}"}
-        }
-      ],
-      "ts": "2026-06-20T10:34:11Z"
+      "content": "",
+      "tool_calls": [{"id": "call_abc", "name": "Bash", "arguments": {"command": "ls"}}]
     },
+    {"role": "tool", "content": "file1.py\n", "tool_call_id": "call_abc", "name": "Bash"},
+    {"role": "assistant", "content": "You have file1.py"}
+  ],
+  "turns": [
     {
-      "role": "tool",
-      "tool_call_id": "call_abc",
-      "name": "Bash",
-      "content": "file1.py\nfile2.py\n",
-      "ts": "2026-06-20T10:34:12Z"
+      "ts": "2026-07-23T10:34:12Z",
+      "user": "hello",
+      "assistant": "You have file1.py",
+      "events": [
+        {"actor": "outo", "kind": "thinking", "text": "the user wants a listing…"},
+        {"actor": "outo", "kind": "tool", "text": "Bash ls", "tool_name": "Bash"},
+        {"actor": "subagent-a1b2c3", "kind": "subagent_start", "text": "inspect the dir", "tool_name": "call_subagent", "subagent_id": "a1b2c3"},
+        {"actor": "subagent-a1b2c3", "kind": "subagent_end", "text": "done", "subagent_id": "a1b2c3"}
+      ]
     }
   ]
 }
 ```
 
-Schema (from `storage/sessions.py:MessageRecord`):
+- **`history`** — restorable model context: raw coreouto `Message.model_dump(mode="json")` dicts, **system messages excluded** (coreouto prepends a fresh system prompt on every `call()`, so persisting it would duplicate it — see coreouto `examples/21_loop_history.py`). Contains the *full* loop transcript: intermediate assistant messages, tool calls, and tool results. **Rewritten in full after every turn** from `Response.messages`, so it always matches what the model actually saw — including any in-loop compaction done by the summarize hook. Reloaded via `co.Message.model_validate`.
+- **`turns`** — display-only log, appended once per turn. `events` are `LoopEvent` dicts (`actor`, `kind`, `text`, optional `tool_name` / `subagent_id`). Thinking/reasoning lives **only here** as `kind="thinking"` events: coreouto's providers never put thinking into history `Message` objects, so it is captured from the `ON_THINKING` hook and cannot be part of the restorable history. The TUI renders past sessions from `turns`.
+
+Notes:
+- **v1 migration**: files without a `version` key (flat `messages` list) are migrated on load — records become `history` entries, and user/assistant pairs are synthesized into `turns`. The `(session created)` system marker is dropped.
+- **Tolerant loading**: corrupt JSON, non-dict envelopes, and unknown record fields never raise — they yield an empty `SessionData`.
+- **Media caveat**: a message whose content blocks carry raw bytes that fail JSON serialization degrades to `{"role", "content": <text>}` for that message only (see `core/chat.py:_dump_message`).
+
+Schema of one `history` entry (coreouto `Message`):
 
 | Field | Type | Notes |
 |---|---|---|
-| `role` | `str` | `system` / `user` / `assistant` / `tool` |
-| `content` | `str \| None` | text content (may be empty string for tool calls) |
-| `tool_calls` | `list[dict]` | assistant-only: list of `{id, type, function: {name, arguments}}` |
-| `tool_call_id` | `str \| None` | tool-only: matches an assistant's `tool_calls[].id` |
-| `name` | `str \| None` | tool-only: tool name (e.g. `Bash`, `Image`) |
-| `ts` | `str` | UTC ISO-8601 timestamp, `Z`-suffixed |
-
-`to_dict()` drops fields with `None` / `[]` / `""` to keep the JSON compact. `ts` is auto-set on construction.
+| `role` | `str` | `user` / `assistant` / `tool` (never `system`) |
+| `content` | `str \| list[dict]` | str, or provider-shaped blocks (Anthropic interleaves `TextBlock`/`ToolCall` dicts) |
+| `tool_calls` | `list[dict] \| null` | assistant-only: `{id, name, arguments}` (flat — coreouto `ToolCall`, **not** the OpenAI nested `function` shape) |
+| `tool_call_id` | `str \| null` | tool-only: matches an assistant's `tool_calls[].id` |
+| `name` | `str \| null` | tool-only: tool name (e.g. `Bash`) |
 
 ### `style/<name>.md`
 
@@ -239,25 +244,33 @@ class Settings:
 ### `storage.sessions`
 
 ```python
+SCHEMA_VERSION = 2
+
 @dataclass
-class MessageRecord:
-    role: str
-    content: str | None = None
-    tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    tool_call_id: str | None = None
-    name: str | None = None
-    ts: str = ""  # auto-filled with UTC ISO seconds + "Z"
+class TurnRecord:                # one user→assistant exchange + its loop events
+    user: str
+    assistant: str = ""
+    events: list[dict[str, Any]] = field(default_factory=list)   # LoopEvent dicts
+    ts: str = ""                 # auto-filled with UTC ISO seconds + "Z"
+
+@dataclass
+class SessionData:
+    name: str
+    history: list[dict[str, Any]] = field(default_factory=list)  # coreouto Message dumps
+    turns: list[TurnRecord] = field(default_factory=list)
 ```
 
 | Function | Returns | Notes |
 |---|---|---|
 | `path_for(name)` | `Path` | |
-| `load(name)` | `list[MessageRecord]` | `[]` if missing |
-| `save(name, messages)` | `None` | overwrites |
-| `append(name, message)` | `list[MessageRecord]` | load + append + save, returns full list |
+| `load(name)` | `SessionData` | empty on missing/corrupt; migrates v1 files on the fly |
+| `save(name, data)` | `None` | full envelope rewrite |
+| `record_turn(name, *, history, turn)` | `None` | load → replace `history` wholesale → append `turn` → save. The per-turn entry point used by `core/chat.py` |
+| `create(name)` | `None` | touch an empty session (no-op if the file exists) |
 | `clear(name)` | `None` | deletes the file |
 | `list_sessions()` | `list[str]` | sorted |
-| `to_coreouto_messages(messages)` | `list[dict]` | for external consumers (not the main chat path) |
+
+`TurnRecord.to_dict()` omits an empty `events` list; `from_dict` ignores unknown keys and coerces garbage to defaults.
 
 ### `storage.styles`
 

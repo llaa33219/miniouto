@@ -25,12 +25,11 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.markdown import Markdown
-from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult, SystemCommand
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.selection import Selection
@@ -43,7 +42,6 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
-    RichLog,
     Static,
     TextArea,
 )
@@ -58,7 +56,6 @@ from ..storage import sessions as session_store
 from ..storage import settings as settings_store
 from ..storage import styles as style_store
 from ..storage.providers import SOURCE_CUSTOM, SOURCE_LMA
-from ..storage.sessions import MessageRecord
 
 SENTINEL_CATALOG_ADD = "__catalog_add__"
 SENTINEL_CUSTOM_ADD = "__custom_add__"
@@ -554,60 +551,322 @@ class BottomPanel(Static):
         )
 
 
-class SelectableRichLog(RichLog):
-    """RichLog subclass that supports text selection via mouse drag.
+# ─── Chat log rows ───────────────────────────────────────────────────────────
 
-    The stock ``RichLog`` overrides ``render_line`` and bypasses the
-    ``Visual.to_strips`` path where Textual applies the selection
-    highlight.  It also inherits ``Widget.get_selection`` which calls
-    ``self._render()`` — for ``RichLog`` that returns a ``Panel``
-    (from ``ScrollView.render``), so text extraction always fails.
 
-    This subclass:
-    * Calls ``Strip.apply_offsets`` so the compositor can map mouse
-      positions to content offsets (without this the entire widget is
-      selected as ``SELECT_ALL``).
-    * Applies ``Style(reverse=True)`` to the selected span to invert
-      foreground/background colors.
-    * Extracts selected text from ``self.lines`` (the list of ``Strip``
-      objects accumulated by ``RichLog.write``).
+class RowStatic(Static):
+    """Chat-log row with uniform reverse-video drag selection.
+
+    Textual's native selection paints with the theme's
+    `$screen-selection-background` color — and Markdown rows (RichVisual)
+    get no native painting at all. This base class suppresses the native
+    path (`text_selection` → None, so `Visual.to_strips` skips its
+    painting) and paints the selected span itself with plain
+    `Style(reverse=True)` — a true fg/bg inversion that looks identical
+    on every row type (prompts, loop output, thinking, subagents, and
+    Markdown answers).
     """
+
+    @property
+    def text_selection(self) -> Selection | None:
+        return None  # selection is painted in render_line instead
 
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
-        scroll_x, scroll_y = self.scroll_offset
-        content_y = scroll_y + y
-
-        selection = self.text_selection
+        try:
+            selection = self.screen.selections.get(self)
+        except Exception:
+            selection = None
         if selection is not None:
-            span = selection.get_span(content_y)
+            span = selection.get_span(y)
             if span is not None:
+                # Rebuild as Rich Text and stylize the span in *characters*
+                # (Strip.crop is cell-based and misaligns on CJK glyphs);
+                # end == -1 stops at the text end, not the padded width.
+                text = Text.assemble(*((seg.text, seg.style) for seg in strip))
+                text_length = len(text.plain.rstrip())
                 start_x, end_x = span
-                start_x = max(0, start_x - scroll_x)
-                if end_x == -1:
-                    end_x = strip.cell_length
-                else:
-                    end_x = min(end_x - scroll_x, strip.cell_length)
-
-                if start_x < end_x and start_x < strip.cell_length:
-                    before = strip.crop(0, start_x)
-                    selected_crop = strip.crop(start_x, end_x)
-                    styled_segments = list(
-                        Segment.apply_style(
-                            selected_crop._segments, post_style=Style(reverse=True)
-                        )
+                start_x = max(0, start_x)
+                end_x = text_length if end_x == -1 else min(end_x, text_length)
+                if start_x < end_x:
+                    text.stylize(Style(reverse=True), start_x, end_x)
+                    strip = Strip(
+                        list(text.render(self.app.console)), strip.cell_length
                     )
-                    selected = Strip(styled_segments, selected_crop.cell_length)
-                    after = strip.crop(end_x)
-                    strip = Strip.join([before, selected, after])
-
-        return strip.apply_offsets(scroll_x, content_y)
+        return strip.apply_offsets(0, y)
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
-        if not self.lines:
+        strips = self._render_cache.lines
+        if not strips:
             return None
-        text = "\n".join(strip.text for strip in self.lines)
+        # rstrip: rendered lines can be padded to full width (e.g. Rich
+        # Markdown), and the padding must not leak into the clipboard.
+        text = "\n".join(strip.text.rstrip() for strip in strips)
         return selection.extract(text), "\n"
+
+
+class EventRow(RowStatic):
+    """One intermediate loop-output line (tool call, thinking, progress).
+
+    Rendered with a translucent left border and muted gray text instead of
+    the old `actor:` prefix — everything that is not the final answer is
+    visually grouped and subordinated. The `$primary 40%` tint follows the
+    active theme automatically.
+    """
+
+    DEFAULT_CSS = """
+    EventRow {
+        height: auto;
+        width: 1fr;
+        border-left: heavy $primary 40%;
+        padding-left: 1;
+        color: $text-muted;
+    }
+    EventRow.-error {
+        color: $error;
+        border-left: heavy $error 60%;
+    }
+    """
+
+
+class ThinkingRow(EventRow):
+    """Collapsible reasoning row: `▸ thinking` collapsed (default), click
+    or Enter to expand the full reasoning text, click again to re-collapse.
+
+    Inherits EventRow's translucent left border + muted styling.
+    """
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    ThinkingRow:hover {
+        background: $primary 30%;
+    }
+    ThinkingRow:focus {
+        background: $primary 50%;
+    }
+    """
+
+    def __init__(self, thinking: str) -> None:
+        super().__init__(Text("▸ thinking"))
+        self._thinking = thinking
+        self._expanded = False
+
+    def on_click(self) -> None:
+        self._toggle()
+
+    def key_enter(self) -> None:
+        self._toggle()
+
+    def _toggle(self) -> None:
+        self._expanded = not self._expanded
+        if self._expanded:
+            self.update(Text(f"▾ thinking\n{self._thinking}"))
+        else:
+            self.update(Text("▸ thinking"))
+
+
+class SubagentRow(RowStatic):
+    """Clickable subagent status line with a live braille spinner.
+
+    Shows `⠿ subagent-<6hex> <task>` while running (frame ticked by the
+    app spinner timer), then `✓`/`✗` on completion. Click or Enter opens
+    the subagent's internal-step detail screen.
+    """
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    SubagentRow {
+        height: 1;
+        width: 1fr;
+        padding-left: 1;
+        border-left: heavy $accent 60%;
+        color: $text;
+        text-overflow: ellipsis;
+        text-wrap: nowrap;
+    }
+    SubagentRow:hover {
+        background: $primary 30%;
+    }
+    SubagentRow:focus {
+        background: $primary 50%;
+    }
+    """
+
+    class Opened(Message):
+        def __init__(self, row: SubagentRow) -> None:
+            super().__init__()
+            self.row = row
+
+    def __init__(self, sid: str, task_preview: str, *, running: bool = True) -> None:
+        super().__init__()
+        self.sid = sid
+        # MessagePump owns `_task` (the pump's asyncio Task) and `_running`
+        # (flipped True on mount), so widget state must avoid both names.
+        self._task_preview = task_preview
+        self._active = running
+        self._failed = False
+        self._frame = _SPINNER_FRAMES[0]
+
+    @property
+    def running(self) -> bool:
+        return self._active
+
+    def on_mount(self) -> None:
+        self._refresh_text()
+
+    def set_frame(self, frame: str) -> None:
+        if self._active:
+            self._frame = frame
+            self._refresh_text()
+
+    def finish(self, *, ok: bool) -> None:
+        self._active = False
+        self._failed = not ok
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
+        theme = self.app.current_theme
+        if self._active:
+            glyph, glyph_style = self._frame, f"bold {theme.accent}"
+        elif self._failed:
+            glyph, glyph_style = "✗", f"bold {theme.error}"
+        else:
+            glyph, glyph_style = "✓", f"bold {theme.success}"
+        self.update(
+            Text.assemble(
+                (f"{glyph} ", glyph_style),
+                (f"subagent-{self.sid}", f"bold {theme.accent}"),
+                (f"  {' '.join(self._task_preview.split())}", theme.foreground),
+            )
+        )
+
+    def on_click(self) -> None:
+        self.post_message(self.Opened(self))
+
+    def key_enter(self) -> None:
+        self.post_message(self.Opened(self))
+
+
+class AnswerRow(RowStatic):
+    """Final-answer row (Markdown). Selection behavior comes from
+    RowStatic — needed because Markdown is wrapped in `RichVisual`, whose
+    `render_strips` ignores `RenderOptions.selection` entirely (Text-backed
+    widgets are promoted to `Content`, which honors it)."""
+
+    DEFAULT_CSS = """
+    AnswerRow {
+        height: auto;
+        width: 1fr;
+    }
+    """
+
+
+class SubagentDetailScreen(ModalScreen[None]):
+    """One subagent invocation, rendered like the main chat notation.
+
+    Layout: the received task brief as a `> ` row, internal loop events as
+    translucent-border muted rows (same as EventRow), and the final result
+    as a Markdown answer row. Reads from ChatTUI's per-subagent event
+    buffer; while the subagent is still running a timer appends new events
+    live. Esc/q goes back.
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "go_back", "Back"),
+        Binding("q", "go_back", "Back"),
+    ]
+
+    DEFAULT_CSS = """
+    SubagentDetailScreen {
+        align: center middle;
+    }
+    #subagent-dialog {
+        width: 90%;
+        height: 85%;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    #subagent-title {
+        width: 100%;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #subagent-log {
+        height: 1fr;
+        background: $surface;
+    }
+    #subagent-hint {
+        width: 100%;
+        content-align: center middle;
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, sid: str, events: list[LoopEvent], *, live: bool) -> None:
+        super().__init__()
+        self._sid = sid
+        self._events = events
+        self._live = live
+        self._timer: Timer | None = None
+        self._rendered = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="subagent-dialog"):
+            yield Label(f"subagent-{self._sid}", id="subagent-title")
+            yield VerticalScroll(id="subagent-log")
+            yield Label("Esc to go back", id="subagent-hint")
+
+    def on_mount(self) -> None:
+        self._refresh_log()
+        if self._live:
+            self._timer = self.set_interval(0.3, self._refresh_log)
+
+    def _refresh_log(self) -> None:
+        try:
+            log = self.query_one("#subagent-log", VerticalScroll)
+        except Exception:
+            return
+        new_events = self._events[self._rendered:]
+        for ev in new_events:
+            widget = self._event_widget(ev)
+            if widget is not None:
+                log.mount(widget)
+        if new_events:
+            self._rendered = len(self._events)
+            log.scroll_end(animate=False)
+
+    def _event_widget(self, ev: LoopEvent) -> Static | None:
+        theme = self.app.current_theme
+        if ev.kind == "subagent_start":
+            return RowStatic(Text("> ", style=f"bold {theme.accent}") + Text(ev.text))
+        if ev.kind == "subagent_end":
+            if ev.text.startswith("error:"):
+                row = EventRow(Text(ev.text))
+                row.add_class("-error")
+                return row
+            return AnswerRow(Markdown(ev.text))
+        if ev.kind == "thinking":
+            return EventRow(
+                Text.assemble(
+                    ("thinking: ", f"italic {theme.accent}"),
+                    (ev.text, ""),
+                )
+            )
+        if ev.kind == "error":
+            row = EventRow(Text(ev.text))
+            row.add_class("-error")
+            return row
+        return EventRow(Text(ev.text))
+
+    def action_go_back(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self.dismiss(None)
 
 
 class TUIEventSink:
@@ -639,6 +898,7 @@ class TUIEventSink:
         frame = _SPINNER_FRAMES[self._frame_idx % len(_SPINNER_FRAMES)]
         self._frame_idx += 1
         self._app._render_spinner(frame, self._activity)
+        self._app._tick_subagent_rows(frame)
 
     def update_activity(self, text: str) -> None:
         self._activity = text or _SPINNER_DEFAULT_TEXT
@@ -656,29 +916,27 @@ class TUIEventSink:
         self._app.call_from_thread(self._post_loop_event, event)
 
     def _post_loop_event(self, event: LoopEvent) -> None:
-        log = self._app._log
-        if log is None:
-            return
-        accent = self._app.current_theme.accent
-        fg = self._app.current_theme.foreground
-        line = Text.assemble(
-            (f"{event.actor}:", accent),
-            (f" {event.text}", fg),
-        )
-        log.write(line)
+        app = self._app
+        if event.subagent_id:
+            app._record_subagent_event(event)
+        if event.kind == "subagent_start":
+            app._add_subagent_row(event)
+        elif event.kind == "subagent_end":
+            app._finish_subagent_row(event)
+        elif event.subagent_id:
+            pass  # subagent internals live in the detail screen, not main chat
+        else:
+            app._add_event_row(event)
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
         self._app.call_from_thread(self._post_final_answer, content, session_name)
 
     def _post_final_answer(self, content: str, session_name: str) -> None:
-        log = self._app._log
-        if log is None:
-            return
         if content:
-            log.write(Markdown(content))
+            self._app._mount_row(AnswerRow(Markdown(content)))
         else:
-            log.write(Text("(empty response)", style="dim"))
-        log.write(Text(""))
+            self._app._mount_row(Static(Text("(empty response)", style="dim")))
+        self._app._mount_row(Static(""))
 
 
 # ─── Chat input ──────────────────────────────────────────────────────────────
@@ -765,18 +1023,20 @@ class ChatTUI(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self._log: SelectableRichLog | None = None
+        self._log: VerticalScroll | None = None
         self._input: Input | None = None
         self._panel: BottomPanel | None = None
         self._busy = False
         self._logo_shown = False
         self._chat_started = False
         self._session_assigned = False
+        self._subagent_events: dict[str, list[LoopEvent]] = {}
+        self._subagent_rows: dict[str, SubagentRow] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Vertical(id="main-area"):
-            self._log = SelectableRichLog(highlight=False, id="chat", wrap=True, markup=False)
+            self._log = VerticalScroll(id="chat")
             yield self._log
             self._input = ChatInput(id="input")
             yield self._input
@@ -793,7 +1053,7 @@ class ChatTUI(App):
             cwd_display = str(cwd)
         self.title = cwd_display
         self._refresh_chips()
-        self._log = self.query_one("#chat", SelectableRichLog)
+        self._log = self.query_one("#chat", VerticalScroll)
         saved = settings_store.load()
         if saved.theme:
             self.theme = saved.theme
@@ -804,11 +1064,11 @@ class ChatTUI(App):
     def _show_logo(self) -> None:
         if self._log is None:
             return
-        self._log.clear()
+        self._log.remove_children()
         width = self.size.width if self.size.width > 0 else 80
-        self._log.write(Text(_render_logo(width - 2), style=self.current_theme.accent))
-        self._log.write(Text(""))
-        self._log.write(Text("Ready. Press Ctrl+P for commands.", style="dim"))
+        self._log.mount(Static(Text(_render_logo(width - 2), style=self.current_theme.accent)))
+        self._log.mount(Static(""))
+        self._log.mount(Static(Text("Ready. Press Ctrl+P for commands.", style="dim")))
         self._logo_shown = True
 
     def watch_theme(self) -> None:
@@ -1357,7 +1617,7 @@ class ChatTUI(App):
         suffix = uuid.uuid4().hex[:6]
         name = f"tui-{ts}-{suffix}"
         settings_store.update(session=name)
-        session_store.append(name, MessageRecord(role="system", content="(session created)"))
+        session_store.create(name)
         self._session_assigned = True
         self._chat_started = True
         self._refresh_chips()
@@ -1366,39 +1626,43 @@ class ChatTUI(App):
     def _load_session_history(self, session_name: str) -> None:
         if self._log is None:
             return
-        self._log.clear()
+        self._log.remove_children()
         self._logo_shown = False
-        messages = session_store.load(session_name)
-        if not messages:
-            self._log.write(Text("(empty session)", style="dim"))
+        self._subagent_events.clear()
+        self._subagent_rows.clear()
+        data = session_store.load(session_name)
+        if not data.turns:
+            self._mount_row(Static(Text("(empty session)", style="dim")))
             return
-        accent = self.current_theme.accent
-        fg = self.current_theme.foreground
-        for m in messages:
-            if m.role == "user" and m.content:
-                self._log.write(
-                    Text("> ", style=f"bold {accent}") + Text(m.content)
-                )
-            elif m.role == "assistant":
-                if m.content:
-                    self._log.write(Markdown(m.content))
-                if m.tool_calls:
-                    for tc in m.tool_calls:
-                        fn = tc.get("function", {}).get("name", "?")
-                        self._log.write(
-                            Text.assemble(("tool:", accent), (f" {fn}", fg))
-                        )
-            elif m.role == "tool" and m.content:
-                name = m.name or "tool"
-                snippet = m.content[:200] + ("…" if len(m.content) > 200 else "")
-                self._log.write(
-                    Text.assemble((f"{name}:", accent), (f" {snippet}", fg))
-                )
-            elif m.role == "system" and m.content:
-                self._log.write(
-                    Text(f"[{m.content}]", style=self.current_theme.warning)
-                )
-        self._log.write(Text(""))
+        for turn in data.turns:
+            if turn.user:
+                self._post_user(turn.user)
+            for ev_dict in turn.events:
+                self._replay_event(LoopEvent.from_dict(ev_dict))
+            if turn.assistant:
+                self._mount_row(AnswerRow(Markdown(turn.assistant)))
+            self._mount_row(Static(""))
+
+    def _replay_event(self, event: LoopEvent) -> None:
+        """Re-render one recorded turn event (session reload path).
+
+        Subagent rows come back in their finished state but stay clickable
+        — the recorded internal events are re-buffered so the detail
+        screen works for historical turns too.
+        """
+
+        if event.subagent_id:
+            self._record_subagent_event(event)
+        if event.kind == "subagent_start":
+            row = SubagentRow(event.subagent_id or "??????", event.text, running=False)
+            self._subagent_rows[row.sid] = row
+            self._mount_row(row)
+        elif event.kind == "subagent_end":
+            self._finish_subagent_row(event)
+        elif event.subagent_id:
+            pass
+        else:
+            self._add_event_row(event)
 
     # ── status / refresh ────────────────────────────────────────────────────
 
@@ -1426,14 +1690,14 @@ class ChatTUI(App):
             return
         self._input.text = ""
         if self._logo_shown and self._log is not None:
-            self._log.clear()
+            self._log.remove_children()
             self._logo_shown = False
         self._post_user(text)
         self.run_worker(self._dispatch(text), exclusive=True)
 
     def action_clear_log(self) -> None:
         if self._log is not None:
-            self._log.clear()
+            self._log.remove_children()
 
     def action_copy_text(self) -> None:
         text = self.screen.get_selected_text()
@@ -1441,20 +1705,57 @@ class ChatTUI(App):
             self.copy_to_clipboard(text)
             self.screen.clear_selection()
 
-    def _post_user(self, text: str) -> None:
-        if self._log is None:
-            return
-        self._log.write(Text("> ", style=f"bold {self.current_theme.accent}") + Text(text))
+    # ── chat log rows ───────────────────────────────────────────────────────
 
-    def _post_assistant(self, text: str) -> None:
+    def _mount_row(self, widget: Static) -> None:
         if self._log is None:
             return
-        self._log.write(Text(text, style=self.current_theme.foreground))
+        self._log.mount(widget)
+        self._log.scroll_end(animate=False)
+
+    def _add_event_row(self, event: LoopEvent) -> None:
+        if event.kind == "thinking":
+            self._mount_row(ThinkingRow(event.text))
+            return
+        row = EventRow(Text(event.text))
+        if event.kind == "error":
+            row.add_class("-error")
+        self._mount_row(row)
+
+    def _record_subagent_event(self, event: LoopEvent) -> None:
+        if event.subagent_id:
+            self._subagent_events.setdefault(event.subagent_id, []).append(event)
+
+    def _add_subagent_row(self, event: LoopEvent) -> None:
+        if not event.subagent_id:
+            return
+        row = SubagentRow(event.subagent_id, event.text)
+        self._subagent_rows[event.subagent_id] = row
+        self._subagent_events.setdefault(event.subagent_id, [])
+        self._mount_row(row)
+
+    def _finish_subagent_row(self, event: LoopEvent) -> None:
+        row = self._subagent_rows.get(event.subagent_id or "")
+        if row is not None:
+            row.finish(ok=not event.text.startswith("error:"))
+
+    def _tick_subagent_rows(self, frame: str) -> None:
+        for row in self._subagent_rows.values():
+            row.set_frame(frame)
+
+    def on_subagent_row_opened(self, event: SubagentRow.Opened) -> None:
+        sid = event.row.sid
+        events = self._subagent_events.get(sid, [])
+        live = sid in self._subagent_rows and self._subagent_rows[sid].running
+        self.push_screen(SubagentDetailScreen(sid, events, live=live))
+
+    def _post_user(self, text: str) -> None:
+        self._mount_row(
+            RowStatic(Text("> ", style=f"bold {self.current_theme.accent}") + Text(text))
+        )
 
     def _post_system(self, text: str) -> None:
-        if self._log is None:
-            return
-        self._log.write(Text(f"[{text}]", style=self.current_theme.warning))
+        self._mount_row(RowStatic(Text(f"[{text}]", style=self.current_theme.warning)))
 
     def _render_spinner(self, frame: str, text: str) -> None:
         if self._panel is not None:

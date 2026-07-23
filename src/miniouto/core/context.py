@@ -196,5 +196,9 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
             return
         messages.clear()
         messages.extend(summarized)
+        # Reset after compaction (coreouto examples/23 pattern): without
+        # this, every later iteration that reports usage re-triggers the
+        # LLM summarizer, turning one compaction into a per-iteration tax.
+        total[0] = 0
 
     return hook

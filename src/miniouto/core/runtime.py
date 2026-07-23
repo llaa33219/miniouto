@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import secrets
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -21,10 +23,24 @@ ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]
 
 # Tracks how deep we are inside a `call_subagent` invocation. 0 = outo (or
 # after `build_runtime` has just been called), >=1 = inside a subagent.
-# Read by `core.chat._log_tool_call` to decide whether a tool call came
-# from outo (no prefix) or a nested subagent (indented `subagent:` prefix).
+# Read by `core.chat` dispatchers to decide whether a tool call came
+# from outo (no prefix) or a nested subagent (`subagent-<id>:` prefix).
 # Mutated only by the wrapper installed around `call_subagent`'s handler.
 _SUBAGENT_DEPTH: ContextVar[int] = ContextVar("miniouto_subagent_depth", default=0)
+
+# Stable per-invocation id (6 hex chars) of the innermost active subagent
+# call. Set alongside _SUBAGENT_DEPTH so every hook fired inside that
+# subagent's loop (tool calls, thinking, iterations) can be attributed to
+# one specific invocation — with parallel subagents this is the only way
+# to tell them apart. ContextVars are copied per asyncio task, so
+# concurrent `call_subagent` handlers each see their own id.
+_SUBAGENT_ID: ContextVar[str | None] = ContextVar("miniouto_subagent_id", default=None)
+
+# Lifecycle observer for subagent invocations: callable(phase, sid, text)
+# where phase is "start" or "end". Set per-turn by `core.chat.run_chat`
+# (the hooks are global, so this module-level slot is the bridge between
+# the wrapped handler and the active turn's sink). None outside a turn.
+_SUBAGENT_OBSERVER: Callable[[str, str, str], None] | None = None
 
 
 def current_subagent_depth() -> int:
@@ -33,21 +49,54 @@ def current_subagent_depth() -> int:
     return _SUBAGENT_DEPTH.get()
 
 
+def current_subagent_id() -> str | None:
+    """Return the innermost active subagent invocation id, or None for outo."""
+
+    return _SUBAGENT_ID.get()
+
+
+def set_subagent_observer(observer: Callable[[str, str, str], None] | None) -> None:
+    """Install (or clear, with None) the subagent lifecycle observer."""
+
+    global _SUBAGENT_OBSERVER
+    _SUBAGENT_OBSERVER = observer
+
+
+def _notify_subagent(phase: str, sid: str, text: str) -> None:
+    observer = _SUBAGENT_OBSERVER
+    if observer is not None:
+        # an observer must never break the subagent loop
+        with contextlib.suppress(Exception):
+            observer(phase, sid, text)
+
+
 def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap `call_subagent`'s handler so the depth ContextVar tracks nesting.
+    """Wrap `call_subagent`'s handler so depth + id ContextVars track it.
 
     coreouto's `BEFORE_TOOL_CALL` hook is global and does not carry agent
     context, so without this we cannot tell whether a Bash/Image/etc. call
-    came from outo or from a subagent. Setting/resetting the ContextVar
-    around the inner handler gives the hook the information it needs.
+    came from outo or from a subagent. Setting/resetting the ContextVars
+    around the inner handler gives the hooks the information they need,
+    and minting the id here (this wrapper runs exactly once per subagent
+    invocation) gives each invocation a stable `subagent-<6hex>` label.
     """
 
     async def wrapped(task: str) -> str:
-        token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
+        sid = secrets.token_hex(3)  # 6 hex chars
+        depth_token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
+        id_token = _SUBAGENT_ID.set(sid)
+        _notify_subagent("start", sid, task)
         try:
-            return await inner(task)
+            result = await inner(task)
+        except Exception as exc:
+            _notify_subagent("end", sid, f"error: {type(exc).__name__}: {exc}")
+            raise
+        else:
+            _notify_subagent("end", sid, result or "")
+            return result
         finally:
-            _SUBAGENT_DEPTH.reset(token)
+            _SUBAGENT_ID.reset(id_token)
+            _SUBAGENT_DEPTH.reset(depth_token)
 
     return wrapped
 
@@ -122,6 +171,7 @@ def build_runtime(
     provider_config: dict[str, Any] | None = None,
     on_tool_call: Callable[[str, dict[str, Any]], None] | None = None,
     on_response: Callable[[str, bool], None] | None = None,
+    on_thinking: Callable[[str], None] | None = None,
     on_iteration: Callable[..., None] | None = None,
     on_provider_error: Callable[..., None] | None = None,
 ) -> co.Agent:
@@ -134,6 +184,9 @@ def build_runtime(
     with `(tool_name, arguments)`. Pass None to skip.
     `on_response` is called after each LLM response with `(content, has_tool_calls)`
     so the caller can stream intermediate model text. Pass None to skip.
+    `on_thinking` is called after each LLM response that carries reasoning
+    text (coreouto's ON_THINKING; providers never put thinking into history
+    messages, so this hook is the only way to surface it). Pass None to skip.
     `on_iteration` is called after each agent-loop iteration with the same
     kwargs coreouto passes to ON_ITERATION (iteration, messages, response),
     letting the caller stream loop-progress signals. Pass None to skip.
@@ -220,6 +273,9 @@ def build_runtime(
     if on_response is not None:
         co.register_hook(co.AFTER_LLM_CALL, _make_response_logger(on_response))
 
+    if on_thinking is not None:
+        co.register_hook(co.ON_THINKING, _make_thinking_logger(on_thinking))
+
     if on_iteration is not None:
         co.register_hook(co.ON_ITERATION, _make_iteration_logger(on_iteration))
 
@@ -301,6 +357,21 @@ def _make_response_logger(
             return
         tool_calls = getattr(response, "tool_calls", None) or []
         callback(response.content, bool(tool_calls))
+
+    return hook
+
+
+def _make_thinking_logger(callback: Callable[[str], None]):
+    """Build the ON_THINKING hook that streams reasoning text.
+
+    coreouto fires ON_THINKING once per LLM response that carries thinking
+    (Anthropic extended thinking, OpenAI reasoning summaries). Fired inside
+    subagent loops too, so the ContextVars above attribute it correctly.
+    """
+
+    def hook(*, thinking: str, **kwargs: Any) -> None:
+        if thinking:
+            callback(thinking)
 
     return hook
 

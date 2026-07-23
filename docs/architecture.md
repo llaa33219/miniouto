@@ -170,16 +170,19 @@ The subagent prompt mirrors this with `<subagent>` content and a different cwd p
 ### 5. Subagent is a re-implemented `agent_as_tool`
 `core.runtime._build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()`, which means subagent file-writing calls inherit the provider's low hard cap. This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
 
-### 6. `BEFORE_TOOL_CALL` is global — depth tracked via ContextVar
-coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context, so `core.runtime._SUBAGENT_DEPTH: ContextVar[int]` is the only signal of "are we currently inside a subagent?" The `on_tool_call` closure built by `core.chat._make_tool_call_dispatcher` reads it (via `current_subagent_depth()`) to label each tool trace with actor `outo` vs `subagent`. The bridge from coreouto's hook to that closure is `core.runtime._make_tool_call_logger`. The var is bumped only inside `_wrap_subagent_handler`.
+### 6. `BEFORE_TOOL_CALL` is global — depth + id tracked via ContextVars
+coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context, so `core.runtime` keeps two ContextVars set only inside `_wrap_subagent_handler` (runs exactly once per subagent invocation): `_SUBAGENT_DEPTH` ("are we inside a subagent?") and `_SUBAGENT_ID` (the invocation's 6-hex id). `core.chat._actor_label()` combines them into `outo` vs `subagent-<6hex>` labels; ContextVars are copied per asyncio task, so parallel subagents each keep their own id. Start/end lifecycle is reported through the module-level `_SUBAGENT_OBSERVER` slot set per turn by `run_chat` — the `BEFORE_TOOL_CALL` hook for `call_subagent` itself runs in the parent context and never sees the id, which is why the tool-call dispatcher emits nothing for `call_subagent`.
 
-### 7. File manipulation is Bash-only
+### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display)
+`storage/sessions.py` writes `{"version": 2, "history": [...], "turns": [...]}`. `history` = raw coreouto `Message` dumps minus system messages, rewritten in full every turn from `Response.messages` (consistent with summarize-hook compaction). `turns` = display-only `TurnRecord`s including `LoopEvent` dicts — thinking lives only there (providers never put thinking into history messages). `load()` migrates v1 files and never raises on corrupt content.
+
+### 8. File manipulation is Bash-only
 There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (they were error-prone and the agent reached for Bash anyway). Do not reintroduce them without explicit discussion; to add any other tool, follow `docs/tools.md` § "Adding a new tool".
 
-### 8. Async only where needed
+### 9. Async only where needed
 `tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop.
 
-### 9. Skill discovery lives outside `~/.miniouto/`
+### 10. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from `~/.agents/skills/<name>/SKILL.md` (the Anthropic-style convention), NOT from `~/.miniouto/`. This is intentional: skills are a portable, project-shared concept, not a per-installation setting.
 
 ## Domain entities
@@ -190,11 +193,11 @@ There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all fi
 | **Settings** | `storage/settings.py` | Active `provider`, `model` (legacy), `style`, `session`, `theme` |
 | **Style** | `storage/styles.py` | Markdown system prompt, optionally split into outo + subagent sections via `<subagent>…</subagent>` tags |
 | **Skill** | `storage/skills.py` | YAML-frontmatter markdown, discovered from `~/.agents/skills/`, prepended to every style |
-| **Session** | `storage/sessions.py` | JSON conversation history keyed by name |
-| **MessageRecord** | `storage/sessions.py` | Single message: `role`, `content`, `tool_calls`, `tool_call_id`, `name`, `ts` |
+| **Session** | `storage/sessions.py` | Schema-v2 JSON: restorable `history` + display `turns`, keyed by name |
+| **SessionData / TurnRecord** | `storage/sessions.py` | `SessionData`: `name`, `history` (coreouto Message dicts), `turns`. `TurnRecord`: `user`, `assistant`, `events` (LoopEvent dicts), `ts` |
 | **RuntimeConfig** | `core/runtime.py` | Resolved per-call configuration (provider, model, style, session) |
 | **ChatOptions** | `core/chat.py` | Raw CLI flag bag for a single chat turn |
-| **LoopEvent** | `core/events.py` | Single trace event (actor=`outo`/`subagent`, kind, text) emitted via the `EventSink` |
+| **LoopEvent** | `core/events.py` | Single trace event (actor=`outo`/`subagent-<6hex>`/`provider`, kind, text, optional `subagent_id`) emitted via the `EventSink` |
 | **EventSink** | `core/events.py` | Protocol implemented by `NullSink` (no-op) and `ConsoleEventSink` (CLI rendering) |
 | **ToolCallArgsError** | `core/chat.py` | Local exception for malformed LLM tool arguments |
 
@@ -211,14 +214,16 @@ ChatOptions (CLI flags)
                     ├─ _resolve_both_styles + _load_active_skills
                     ├─ registers "outo" + "subagent" presets
                     ├─ builds call_subagent tool (preserves max_tokens)
-                    └─ installs up to 5 hooks (BEFORE_TOOL_CALL, ON_ITERATION ×2, AFTER_LLM_CALL, ON_PROVIDER_ERROR)
-                    └─ returns co.Agent(outo_config)
+                     └─ installs up to 6 hooks (BEFORE_TOOL_CALL, ON_ITERATION ×2, AFTER_LLM_CALL, ON_THINKING, ON_PROVIDER_ERROR)
+                     └─ returns co.Agent(outo_config)
         └─> run_chat (chat.py)
-              ├─ loads history (if --continue)
-              ├─ builds sink dispatchers from sink (tool/response/iteration)
-              ├─ calls agent.call_sync(prompt, history=core_msgs)
-              ├─ on exception: _dump_failure_diagnostics
-              └─ appends user + assistant MessageRecord to session
+               ├─ loads history (if --continue)
+               ├─ builds sink dispatchers (tool/response/thinking/iteration/provider-error)
+               │    + installs the subagent lifecycle observer
+               ├─ calls agent.call_sync(prompt, history=core_msgs)
+               ├─ on exception: _dump_failure_diagnostics
+               └─ record_turn: rewrite history from Response.messages (minus system)
+                  + append TurnRecord(user, assistant, events)
 ```
 
 ## External dependencies

@@ -26,7 +26,7 @@ resolve_runtime_from_settings(overrides) → RuntimeConfig
    │
    ▼
 build_runtime(runtime, *, style_overrides, provider_config,
-              on_tool_call, on_response, on_iteration,
+              on_tool_call, on_response, on_thinking, on_iteration,
               on_provider_error) → co.Agent
    │
    │  ┌─ clear_coreouto_state()
@@ -37,29 +37,31 @@ build_runtime(runtime, *, style_overrides, provider_config,
    │  ├─ co.register_agent_preset("outo", …)
    │  ├─ co.register_agent_preset("subagent", …)
    │  ├─ _build_subagent_tool("subagent", …)             → co.register_tool
+   │  │    └─ _wrap_subagent_handler: mints subagent-<6hex> id per invocation
    │  ├─ co.register_hook(BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
    │  ├─ co.register_hook(ON_ITERATION, make_summarize_hook(model, session, provider))
     │  ├─ co.register_hook(ON_ITERATION, _make_iteration_logger(on_iteration))
     │  ├─ co.register_hook(AFTER_LLM_CALL, _make_response_logger(on_response))
+    │  ├─ co.register_hook(ON_THINKING, _make_thinking_logger(on_thinking))
     │  └─ co.register_hook(ON_PROVIDER_ERROR, _make_provider_error_logger(on_provider_error))
    │
    ▼
 run_chat(ChatOptions, sink=None) → str
-   ├─ load history (if continue_session)
-   ├─ persist user MessageRecord
-    ├─ build sink dispatchers: _make_tool_call_dispatcher(sink),
-    │                          _make_response_dispatcher(sink),
-    │                          _make_iteration_dispatcher(sink),
-    │                          _make_provider_error_dispatcher(sink)
+   ├─ wrap sink in _RecordingSink (captures LoopEvents for the session turn)
+   ├─ load history (if continue_session): session history dicts → co.Message.model_validate
+   ├─ set_subagent_observer(_make_subagent_dispatcher(sink))
    ├─ agent.call_sync(prompt, history=core_msgs)
-   │     ├─ ON_ITERATION hooks → summarize at 80%; emit progress LoopEvent
+   │     ├─ ON_ITERATION hooks → summarize at 80% (counter resets); emit progress LoopEvent
    │     ├─ LLM call → provider → response
    │     ├─ AFTER_LLM_CALL hook → on_response(content, has_tool_calls) → LoopEvent
-   │     └─ tool call?
+   │     ├─ ON_THINKING hook → on_thinking(text) → LoopEvent(kind="thinking")
+   │     ├─ call_subagent start/end → observer → LoopEvent(subagent_start/end, subagent_id)
+   │     └─ other tool call?
    │          ├─ BEFORE_TOOL_CALL → _make_tool_call_logger bridges to on_tool_call closure
    │          └─ handler(**args)
-   ├─ on exception → _dump_failure_diagnostics (re-raise)
-   └─ persist assistant MessageRecord (with tool_calls)
+   ├─ on exception → record turn with empty assistant → _dump_failure_diagnostics (re-raise)
+   └─ _persist_turn: history = Response.messages minus system (full rewrite);
+      append TurnRecord(user, assistant, recorded events)
 ```
 
 ---
@@ -68,10 +70,10 @@ run_chat(ChatOptions, sink=None) → str
 
 The sink layer — a tiny abstraction so the chat loop can emit progress/trace events without coupling to either the CLI (`rich.Console`) or the TUI (Textual widgets). Introduced when the TUI was added so `run_chat` could drive both surfaces from the same code path.
 
-- **`LoopEvent`** — frozen dataclass with `actor: str` (`"outo"` / `"subagent"`), `kind: str` (`"tool_call"` / `"response"` / `"context"` / …), and `text: str` (rendered representation).
-- **`EventSink`** — `Protocol` with three methods: `emit_loop_event(event)`, `update_activity(name)`, and `emit_final_answer(text)`.
+- **`LoopEvent`** — dataclass with `actor: str` (`"outo"` / `"subagent-<6hex>"` / `"provider"`), `kind: str`, `text: str`, optional `tool_name`, optional `subagent_id` (the 6-hex invocation id, set on every event emitted inside a subagent). Kinds: `"tool"` / `"response"` / `"thinking"` / `"context"` / `"error"` / `"subagent_start"` / `"subagent_end"`. `to_dict()`/`from_dict()` provide the sparse JSON form stored in session turns.
+- **`EventSink`** — `Protocol`: `begin_working()`, `update_activity(text)`, `end_working()`, `emit_loop_event(event)`, `emit_final_answer(content, session_name)`.
 - **`NullSink`** — no-op implementation (used when `run_chat` is called without a sink).
-- **`ConsoleEventSink`** — CLI implementation. Renders loop events with `rich` in `orange3`; runs a `rich.status` spinner that is updated by `update_activity` and stopped by `emit_final_answer`; writes the final answer as plain stdout (no rich color) followed by a `------finish------` marker.
+- **`ConsoleEventSink`** — CLI implementation. Renders loop events as `{actor}: {text}` in `orange3`; `kind="thinking"` renders the **full** reasoning text as `{actor}:thinking: {text}` (dim); `subagent_start`/`subagent_end` render as a single-line preview (whitespace-flattened, 120 chars; `subagent_end` dim); runs a `rich.status` spinner updated by `update_activity`; writes the final answer as plain stdout followed by a `------finish------` marker.
 
 ---
 
@@ -107,29 +109,39 @@ Raised when an LLM tool call arrives with non-dict or `None` arguments. This pre
 
 ### `run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str`
 
-The main entry point. `sink=None` defaults to `NullSink()`. Steps:
+The main entry point. `sink=None` defaults to `NullSink()`; either way the sink is wrapped in a `_RecordingSink` that captures every `LoopEvent` (for the session's turn record) before delegating. Steps:
 
 1. Resolves a `RuntimeConfig` from settings + overrides.
 2. Computes `provider_config` — `max_tokens` defaults to `get_max_output_tokens(runtime.model, runtime.provider_name)` so providers with low hard caps (Anthropic's 1024) don't truncate long tool calls (e.g. heredoc file writes). The `provider_name` argument scopes the lma lookup so we don't accept the first cross-provider match.
-3. Builds four sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`) and calls `build_runtime(runtime, provider_config=provider_config, on_tool_call=on_tool_call, on_response=_make_response_dispatcher(sink), on_iteration=_make_iteration_dispatcher(sink), on_provider_error=_make_provider_error_dispatcher(sink))` to get a `co.Agent`.
-4. Loads prior history if `continue_session=True`; converts `MessageRecord` → `co.Message`.
-5. **Persists the user prompt** to the session before running (`session_store.append`).
+3. Builds the sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`) and calls `build_runtime(...)` to get a `co.Agent`.
+4. Loads prior history if `continue_session=True` via `_load_coreouto_history` — session `history` dicts are validated back into `co.Message` objects (invalid entries degrade to plain text messages rather than aborting the resume).
+5. Installs `_make_subagent_dispatcher(sink)` as the subagent observer (`set_subagent_observer`), cleared in a `finally` after the call.
 6. Clears `_tool_trace`, calls `agent.call_sync(prompt, history=core_msgs)` inside try/except.
-7. On exception, calls `_dump_failure_diagnostics` and re-raises.
-8. Extracts the final assistant message; serializes `tool_calls` via `model_dump()`.
-9. Persists the assistant reply + tool calls; calls `sink.emit_final_answer(response.content)`; returns `response.content`.
+7. On exception, records the turn with an empty assistant text (previous on-disk history kept), calls `_dump_failure_diagnostics`, re-raises.
+8. `_persist_turn`: rewrites the session `history` with `[m.model_dump(mode="json") for m in response.messages if m.role != "system"]` and appends a `TurnRecord(user, assistant, recorded_events)`. Persistence failures are swallowed — they must never mask the turn's outcome.
+9. Calls `sink.emit_final_answer(response.content)`; returns `response.content`.
+
+### `_actor_label() -> (str, str | None)`
+
+Shared by all dispatchers: returns `("subagent-<6hex>", sid)` inside a subagent invocation (the id ContextVar is always set there), `("subagent", None)` as a defensive depth-only fallback, `("outo", None)` otherwise.
 
 ### `_make_tool_call_dispatcher(sink: EventSink)`
 
 Builds the `on_tool_call(name, arguments)` closure passed to `build_runtime`. For each tool call:
 
 1. Validates `arguments` is a dict via `_validate_tool_call_args` (raises `ToolCallArgsError` otherwise).
-2. Computes `actor = "subagent" if current_subagent_depth() > 0 else "outo"`.
-3. Appends to `_tool_trace` for any tool in `_LOGGABLE_TOOL_NAMES`.
-4. For `call_subagent`, emits a `LoopEvent(kind="tool_call", text=<message-or-task>)` via the sink (no truncation).
-5. For `Bash/Image/Video/Audio`, emits a `LoopEvent(kind="tool_call", text=_short_arg_summary(name, args))` and calls `sink.update_activity(name)`.
+2. Computes actor + subagent id via `_actor_label()`.
+3. Appends to `_tool_trace`.
+4. For `call_subagent`, **emits nothing** — the subagent observer emits the `subagent_start` event with the minted id immediately after (the `BEFORE_TOOL_CALL` hook for `call_subagent` still runs in the *parent* context, so the id does not exist yet here).
+5. For `Bash/Image/Video/Audio`, emits a `LoopEvent(kind="tool", text=f"{name} {preview}", subagent_id=sid)` and updates the spinner activity (the subagent label when nested, else the tool name).
 
-This closure does **not** print directly — rendering is the sink's job (`ConsoleEventSink` for the CLI, the TUI widgets for TUI mode).
+### `_make_subagent_dispatcher(sink: EventSink)`
+
+Builds the `(phase, sid, text)` lifecycle callback installed via `set_subagent_observer`. `"start"` (text = task brief) emits `LoopEvent(kind="subagent_start", actor=f"subagent-{sid}", subagent_id=sid)` and switches the spinner activity to the subagent label; `"end"` (text = final result or `error: …`) emits `kind="subagent_end"`. The **full** task/result text goes into the event (and thus the session turn and the TUI detail screen); each sink truncates for its own display (CLI: one line, 120 chars).
+
+### `_make_thinking_dispatcher(sink: EventSink)`
+
+Builds the `on_thinking(thinking)` closure wired into coreouto's `ON_THINKING` hook. Emits `LoopEvent(kind="thinking", text=thinking)` with the current actor/subagent id — reasoning fires inside subagent loops too and is labeled `subagent-<6hex>` automatically. The full text is preserved in the event (and thus in the session turn); sinks decide how much to display.
 
 ### `_make_response_dispatcher(sink: EventSink)`
 
@@ -206,7 +218,7 @@ Returns the `ON_ITERATION` hook (registered alongside `_make_iteration_logger`, 
   5. On any failure, returns a static `"[Summary] Unable to generate LLM summary…"` message.
   6. **Always** returns `[*system_msgs, summary_msg]` — never overwrites with garbage.
 
-  **`hook(*, iteration, messages, response, **_kwargs)`** — Accumulates `response.usage.total_tokens`. When total ≥ 80% of window, runs `summarizer(messages)`. **Critical guard:** if the summarizer returns a non-list, prints a yellow warning to stderr and keeps the original messages (this is the divergence from `coreouto.contrib.hooks.auto_summarize_hook`, which would `clear()` and `extend()` with the non-iterable and both corrupt the turn *and* raise `TypeError`).
+  **`hook(*, iteration, messages, response, **_kwargs)`** — Accumulates `response.usage.total_tokens`. When total ≥ 80% of window, runs `summarizer(messages)`. **Critical guard:** if the summarizer returns a non-list, prints a yellow warning to stderr and keeps the original messages (this is the divergence from `coreouto.contrib.hooks.auto_summarize_hook`, which would `clear()` and `extend()` with the non-iterable and both corrupt the turn *and* raise `TypeError`). **The counter resets to 0 after each compaction** (coreouto `examples/23` pattern) — without the reset, every later iteration that reports usage re-triggers the LLM summarizer.
 
 ---
 
@@ -276,15 +288,21 @@ Helper that bundles the two dicts under the keys coreouto's `AgentConfig` expect
 ### Module-level constants / state
 
 - `ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]` — the fixed tool set used for both presets.
-- `_SUBAGENT_DEPTH: ContextVar[int]` — defaults to 0. Read by `chat._make_tool_call_dispatcher`'s closure (via `current_subagent_depth()`) to label each tool trace with actor `outo` vs `subagent`. Mutated only by `_wrap_subagent_handler`.
+- `_SUBAGENT_DEPTH: ContextVar[int]` — defaults to 0. Read by `chat.py` dispatchers (via `current_subagent_depth()`) as a defensive fallback label. Mutated only by `_wrap_subagent_handler`.
+- `_SUBAGENT_ID: ContextVar[str | None]` — defaults to None. The 6-hex id of the innermost active subagent invocation; read by `chat._actor_label()` to build `subagent-<6hex>` labels. ContextVars are copied per asyncio task, so parallel `call_subagent` invocations each see their own id — this is what makes concurrent subagents distinguishable.
+- `_SUBAGENT_OBSERVER` — module-level `(phase, sid, text) -> None` slot set per turn by `chat.run_chat` via `set_subagent_observer()`. Because coreouto's hooks are global, this slot is the bridge between the wrapped `call_subagent` handler and the active turn's sink. Observer exceptions are suppressed (`contextlib.suppress`) so a sink can never break the subagent loop.
 
-### `current_subagent_depth() -> int`
+### `current_subagent_depth() -> int` / `current_subagent_id() -> str | None`
 
-Returns `_SUBAGENT_DEPTH.get()`. Read by `chat.py`.
+ContextVar getters read by `chat.py`.
+
+### `set_subagent_observer(observer | None)`
+
+Installs/clears the lifecycle observer.
 
 ### `_wrap_subagent_handler(inner)`
 
-Returns an async wrapper that does `_SUBAGENT_DEPTH.set(get() + 1)` / `reset(token)` around `await inner(task)`. Necessary because `co.BEFORE_TOOL_CALL` is a global hook with no per-agent context — the depth ContextVar is the only signal of "are we currently inside a subagent?".
+Returns an async wrapper that, per invocation: mints `secrets.token_hex(3)` (6 hex chars), sets `_SUBAGENT_DEPTH` + `_SUBAGENT_ID`, notifies the observer `"start"` (task brief) and `"end"` (final result, or `error: {type}: {msg}` on exception), and resets both ContextVars in `finally`. Necessary because `co.BEFORE_TOOL_CALL` is a global hook with no per-agent context — and the wrapper runs exactly once per subagent invocation, which is what makes it the correct mint point for the id.
 
 ### `_build_subagent_tool(preset_name, *, description, provider_config)`
 
@@ -323,7 +341,7 @@ class ChatOverrides:
 
 Per-call overrides from CLI flags. All optional.
 
-### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_response=None, on_iteration=None, on_provider_error=None) -> co.Agent`
+### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_response=None, on_thinking=None, on_iteration=None, on_provider_error=None) -> co.Agent`
 
 The heart of miniouto. Steps:
 
@@ -335,11 +353,12 @@ The heart of miniouto. Steps:
 6. **Register two presets** — `"subagent"` (uses sub-provider + sub-model) and `"outo"` (uses runtime provider + model). Both get `tools=ALL_TOOLS` and `max_iterations=None`.
 7. **Subagent `provider_config`** — Pulls `max_tokens` from `get_max_output_tokens(subagent_model, sub_provider_name)` via lma, so subagent file-writing calls don't hit Anthropic's 1024 default.
 8. **Build `call_subagent` tool** — Via `_build_subagent_tool("subagent", description=_subagent_description(), provider_config=subagent_provider_config)`. The handler is pre-wrapped with `_wrap_subagent_handler` to track depth. Registered via `co.register_tool(name, description=description)(wrapped_handler)` (function-call form, not decorator).
-9. **Register hooks (up to 5):**
+9. **Register hooks (up to 6):**
    - `BEFORE_TOOL_CALL` → `_make_tool_call_logger(on_tool_call)` (only if `on_tool_call` is not None).
    - `ON_ITERATION` → `make_summarize_hook(runtime.model, runtime.session or "default", runtime.provider_name)` — always registered.
    - `ON_ITERATION` → `_make_iteration_logger(on_iteration)` (only if `on_iteration` is not None — `chat.run_chat` always supplies one).
    - `AFTER_LLM_CALL` → `_make_response_logger(on_response)` (only if `on_response` is not None).
+   - `ON_THINKING` → `_make_thinking_logger(on_thinking)` (only if `on_thinking` is not None — `chat.run_chat` always supplies one).
    - `ON_PROVIDER_ERROR` → `_make_provider_error_logger(on_provider_error)` (only if `on_provider_error` is not None — `chat.run_chat` always supplies one).
 10. **Finalize the outo config** — `co.get_agent_preset("outo").to_config()`, merge in caller's `provider_config`, instantiate `co.Agent(outo_config)`. Returns the agent.
 
@@ -348,6 +367,7 @@ The heart of miniouto. Steps:
 - **`_make_tool_call_logger(callback)`** — Bridges coreouto's `BEFORE_TOOL_CALL` hook signature to the simpler `on_tool_call(name, args)` contract used by `chat.py`. Forwards `(name, arguments)` to `callback`.
 - **`_make_response_logger(callback)`** — Returns an `AFTER_LLM_CALL` hook that invokes `callback(response.content, bool(tool_calls))` for non-empty responses. No printing — rendering is the sink's job.
 - **`_make_iteration_logger(callback)`** — Returns an `ON_ITERATION` hook that forwards to `callback` so the sink can render progress.
+- **`_make_thinking_logger(callback)`** — Returns an `ON_THINKING` hook that invokes `callback(thinking)` for each LLM response carrying reasoning text. Providers never put thinking into history messages (coreouto's `format_assistant_message` drops it), so this hook is the only surface for reasoning.
 - **`_make_provider_error_logger(callback)`** — Returns an `ON_PROVIDER_ERROR` hook that forwards `status_code`, `error_message`, `reaction`, `reaction_message` (dropping the raw exception and the message list, which a sink can't render).
 - **`_subagent_description()`** — Hardcoded prompt fragment explaining that the subagent has its own Bash/Image/Video/Audio and a fresh context, blocks until the subagent finishes, returns the final text.
 - **`_resolve_both_styles(style_name, overrides)`** — Splits the style at `<subagent>…</subagent>`. If no subagent section exists, uses `_fallback_style("subagent")`. Prepends active skills to both halves.
@@ -374,7 +394,7 @@ Returns a `RuntimeConfig`. Subagent-related fields (`subagent_model`, `subagent_
 | `core/context.py` | (via `core.lma.get_model`) | Fetch `context_window` + `max_output_tokens` for a model | Caught, caches `{}` in `_MODEL_CACHE` (no TTL — process lifetime), returns 16K default |
 | `core/providers.py` | `co.register_provider`, `co.clear_*` | coreouto global registry I/O | None caught |
 | `core/runtime.py` | `tool_registry.register_all`, `co.register_agent_preset`, `co.register_tool`, `co.register_hook` | coreouto global registry I/O | None caught |
-| `core/chat.py` | `session_store.append`, `session_store.load` | JSON session persistence | Propagated to caller |
+| `core/chat.py` | `session_store.record_turn`, `session_store.load` | JSON session persistence (schema v2) | Load is tolerant (never raises); record failures swallowed in `_persist_turn` |
 | `core/chat.py` | `agent.call_sync(prompt, history=core_msgs)` | LLM call (network to configured provider) | Caught locally for diagnostics, re-raised |
 | `core/chat.py` | `_fail_console.print(...)` | Human-readable diagnostic lines to stderr | None — best-effort |
 
@@ -401,4 +421,4 @@ No file I/O directly inside `core/` — all disk access is delegated to `storage
 1. **`context.py` summarizer** — refuses to `messages.clear(); messages.extend(summarized)` unless `summarized` is a `list`, preventing the bug in upstream `coreouto.contrib.hooks.auto_summarize_hook`.
 2. **`chat.py` ToolCallArgsError** — fires *before* coreouto's handler so the LLM sees a precise, single message about which argument is missing, and the user sees the tool name in the failure trace.
 3. **`runtime.py` subagent `max_tokens`** — re-implements `coreouto.agent_as_tool` because the stock helper drops `provider_config` from the preset, causing Anthropic to silently truncate long tool-call outputs (e.g. file writes) at 1024 tokens.
-4. **`runtime.py` `_wrap_subagent_handler`** — uses a `ContextVar` because coreouto's `BEFORE_TOOL_CALL` hook is global and has no per-agent context.
+4. **`runtime.py` `_wrap_subagent_handler`** — uses two `ContextVar`s (depth + per-invocation 6-hex id) because coreouto's `BEFORE_TOOL_CALL` hook is global and has no per-agent context; the id survives `asyncio.gather` (each task gets a context copy), so parallel subagents stay distinguishable.
