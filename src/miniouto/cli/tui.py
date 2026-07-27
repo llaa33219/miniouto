@@ -46,6 +46,7 @@ from textual.widgets import (
     TextArea,
 )
 
+from .. import __version__
 from ..core import lma as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import LoopEvent
@@ -59,6 +60,10 @@ from ..storage.providers import SOURCE_CUSTOM, SOURCE_LMA
 
 SENTINEL_CATALOG_ADD = "__catalog_add__"
 SENTINEL_CUSTOM_ADD = "__custom_add__"
+
+# Sentinel for `_save_model_change(reasoning_effort=...)`: don't touch the
+# provider's existing value (vs. None which would clear it).
+_SENTINEL_NO_REASONING = object()
 
 
 def _parse_optional_int(result: str | None) -> int | None:
@@ -78,6 +83,76 @@ def _parse_optional_int(result: str | None) -> int | None:
     if v <= 0:
         raise ValueError("must be > 0")
     return v
+
+
+def _get_reasoning_api():
+    """Lazy import of `miniouto.core.reasoning`; returns None if missing.
+
+    The parallel work that defines `reasoning_choices` /
+    `default_reasoning_choice` may not have landed yet, so we defer the
+    import to call time. Callers treat None as "no reasoning options
+    available" and skip the picker.
+    """
+    try:
+        from ..core import reasoning as reasoning_api
+    except ImportError:
+        return None
+    return reasoning_api
+
+
+def _reasoning_value(provider: provider_store.Provider) -> str | None:
+    """Defensive read of the (parallel-work) `reasoning_effort` field."""
+    return getattr(provider, "reasoning_effort", None)
+
+
+def _reasoning_chip_value(provider: provider_store.Provider | None) -> str:
+    """Render the reasoning chip's value: stored value, "off", or "auto"."""
+    if provider is None:
+        return "auto"
+    re_val = _reasoning_value(provider)
+    if re_val is None:
+        return "auto"
+    if re_val.lower() in ("off", "none"):
+        return "off"
+    return re_val
+
+
+def _with_reasoning_effort(
+    provider: provider_store.Provider,
+    value: str | None,
+) -> provider_store.Provider:
+    """Return a copy of `provider` with `reasoning_effort` set to `value`.
+
+    Falls back to stashing in `extra` if the field hasn't landed on
+    `Provider` yet (parallel work in flight). `None` clears the override.
+    """
+    try:
+        return replace(provider, reasoning_effort=value)
+    except TypeError:
+        extra = {k: v for k, v in provider.extra.items() if k != "reasoning_effort"}
+        if value is not None:
+            extra["reasoning_effort"] = value
+        return replace(provider, extra=extra)
+
+
+def _construct_provider_with_reasoning(**kwargs: Any) -> provider_store.Provider:
+    """Construct a `Provider`, surfacing `reasoning_effort` if supported.
+
+    If the field hasn't landed yet, the `reasoning_effort` kwarg is moved
+    into `extra` so the value survives a round-trip.
+    """
+    re_kw = kwargs.pop("reasoning_effort", _SENTINEL_NO_REASONING)
+    if re_kw is _SENTINEL_NO_REASONING:
+        return provider_store.Provider(**kwargs)
+    try:
+        return provider_store.Provider(**kwargs, reasoning_effort=re_kw)
+    except TypeError:
+        extra = {k: v for k, v in kwargs.get("extra", {}).items() if k != "reasoning_effort"}
+        if re_kw is not None:
+            extra["reasoning_effort"] = re_kw
+        kwargs["extra"] = extra
+        return provider_store.Provider(**kwargs)
+
 
 # Braille spinner frames. The status line reads e.g. "⠧ Bash…" and the
 # glyph rotates through this set at ~12.5fps so the bottom of the screen
@@ -513,9 +588,13 @@ class BottomPanel(Static):
             self._chips["provider"] = StatusChip(
                 "", "-", id="chip-provider", variant="muted"
             )
+            self._chips["reasoning"] = StatusChip(
+                "reasoning", "-", id="chip-reasoning", variant="muted"
+            )
             self._chips["style"] = StatusChip("", "-", id="chip-style")
             yield self._chips["model"]
             yield self._chips["provider"]
+            yield self._chips["reasoning"]
             yield Static("", id="chip-spacer")
             yield self._chips["style"]
         self._session_label = Static("-", id="session-row")
@@ -664,6 +743,115 @@ class ThinkingRow(EventRow):
             self.update(Text(f"▾ thinking\n{self._thinking}"))
         else:
             self.update(Text("▸ thinking"))
+
+
+class ToolRow(EventRow):
+    """Collapsible tool-call row: `▸ <header>` collapsed (default), click
+    or Enter to expand the full command + result. The result is attached
+    later via `set_result`; until then the box is purely the call preview.
+
+    Inherits EventRow's translucent left border + muted styling. When the
+    result is an error (prefixed `"error: "`), the row gains the `-error`
+    class (muted → `$error` text and `$error` border-left) and the header
+    shows a subtle `✗` marker.
+
+    Detail (multi-line command) and result are each capped at ~4000 chars
+    on display as a safety net even though the core layer already truncates.
+    """
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    ToolRow:hover {
+        background: $primary 30%;
+    }
+    ToolRow:focus {
+        background: $primary 50%;
+    }
+    """
+
+    # Display cap (chars). Core already truncates to ~4000; we re-cap here
+    # so old sessions that somehow escaped that pass still don't blow up the
+    # layout.
+    _MAX_DETAIL_CHARS = 4000
+    _MAX_RESULT_CHARS = 4000
+
+    def __init__(
+        self,
+        header: str,
+        *,
+        detail: str | None = None,
+        tool_name: str | None = None,
+    ) -> None:
+        super().__init__(Text(f"▸ {header}"))
+        self._header = header
+        self._detail = detail
+        self._result: str | None = None
+        self._is_error = False
+        self._expanded = False
+        self._tool_name = tool_name
+
+    @property
+    def tool_name(self) -> str | None:
+        return self._tool_name
+
+    @property
+    def has_result(self) -> bool:
+        return self._result is not None
+
+    def on_click(self) -> None:
+        self._toggle()
+
+    def key_enter(self) -> None:
+        self._toggle()
+
+    def set_result(self, text: str, *, is_error: bool = False) -> None:
+        """Attach a result to this row. Idempotent — second call is a no-op.
+
+        Used both for the live path (paired Bash/Image/... result) and for
+        the subagent result box (single result attached at mount time).
+        """
+        if self._result is not None:
+            return
+        self._result = text
+        self._is_error = is_error
+        if is_error:
+            self.add_class("-error")
+        self._refresh()
+
+    def _toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._refresh()
+
+    def _refresh(self) -> None:
+        theme = self.app.current_theme
+        if not self._expanded:
+            header = Text.assemble(
+                ("▸ ", f"bold {theme.accent}"),
+                (self._header, ""),
+                (" ✗", f"bold {theme.error}") if self._is_error else ("", ""),
+            )
+            self.update(header)
+            return
+        pieces: list[tuple[str, str]] = [
+            ("▾ ", f"bold {theme.accent}"),
+            (self._header, ""),
+        ]
+        if self._is_error:
+            pieces.append((" ✗", f"bold {theme.error}"))
+        if self._detail:
+            detail = self._detail
+            if len(detail) > self._MAX_DETAIL_CHARS:
+                detail = detail[: self._MAX_DETAIL_CHARS] + "\n…(truncated)"
+            pieces.append(("\n", ""))
+            pieces.append((detail, ""))
+        if self._result is not None:
+            pieces.append(("\n── output ──\n", "dim"))
+            result = self._result
+            if len(result) > self._MAX_RESULT_CHARS:
+                result = result[: self._MAX_RESULT_CHARS] + "\n…(truncated)"
+            pieces.append((result, ""))
+        self.update(Text.assemble(*pieces))
 
 
 class SubagentRow(RowStatic):
@@ -849,6 +1037,11 @@ class SubagentDetailScreen(ModalScreen[None]):
                 row.add_class("-error")
                 return row
             return AnswerRow(Markdown(ev.text))
+        if ev.kind == "tool_result":
+            row = EventRow(Text(ev.text))
+            if ev.text.startswith("error:"):
+                row.add_class("-error")
+            return row
         if ev.kind == "thinking":
             return EventRow(
                 Text.assemble(
@@ -1032,6 +1225,7 @@ class ChatTUI(App):
         self._session_assigned = False
         self._subagent_events: dict[str, list[LoopEvent]] = {}
         self._subagent_rows: dict[str, SubagentRow] = {}
+        self._pending_tool_rows: list[ToolRow] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -1052,6 +1246,7 @@ class ChatTUI(App):
         except ValueError:
             cwd_display = str(cwd)
         self.title = cwd_display
+        self.sub_title = f"miniouto v{__version__}"
         self._refresh_chips()
         self._log = self.query_one("#chat", VerticalScroll)
         saved = settings_store.load()
@@ -1068,7 +1263,7 @@ class ChatTUI(App):
         width = self.size.width if self.size.width > 0 else 80
         self._log.mount(Static(Text(_render_logo(width - 2), style=self.current_theme.accent)))
         self._log.mount(Static(""))
-        self._log.mount(Static(Text("Ready. Press Ctrl+P for commands.", style="dim")))
+        self._log.mount(Static(Text(f"miniouto v{__version__} — Ready. Press Ctrl+P for commands.", style="dim")))
         self._logo_shown = True
 
     def watch_theme(self) -> None:
@@ -1136,6 +1331,8 @@ class ChatTUI(App):
             self._open_style_picker()
         elif chip.id == "chip-session":
             self._open_session_picker()
+        elif chip.id == "chip-reasoning":
+            self._open_reasoning_picker()
 
     # ── modal actions ───────────────────────────────────────────────────────
 
@@ -1233,7 +1430,49 @@ class ChatTUI(App):
         except Exception as exc:
             self._spinner_status(f"catalog models error: {exc}")
 
+        reasoning_effort: str | None = None
+        reasoning_api = _get_reasoning_api()
+        if default_model and reasoning_api is not None:
+            choices: list[str] | None = None
+            try:
+                choices = await asyncio.to_thread(
+                    reasoning_api.reasoning_choices, default_model, our_name
+                )
+            except Exception:
+                choices = None
+            if choices:
+                default_choice: str | None = None
+                try:
+                    default_choice = await asyncio.to_thread(
+                        reasoning_api.default_reasoning_choice,
+                        default_model,
+                        our_name,
+                    )
+                except Exception:
+                    default_choice = None
+                picked = await self.push_screen_wait(
+                    SelectionModal(
+                        f"Reasoning ({default_model})",
+                        choices,
+                        current=default_choice or "off",
+                        allow_none=False,
+                    )
+                )
+                if picked:
+                    reasoning_effort = picked
+
         try:
+            provider = add_provider_from_lma(
+                name=our_name,
+                api_key=api_key.strip(),
+                sdk=catalog_p.get("sdk"),
+                api=catalog_p.get("api"),
+                default_model=default_model,
+                reasoning_effort=reasoning_effort,
+            )
+        except TypeError:
+            # Parallel `reasoning_effort` kwarg hasn't landed yet; build
+            # without it and persist the value via upsert afterward.
             provider = add_provider_from_lma(
                 name=our_name,
                 api_key=api_key.strip(),
@@ -1247,12 +1486,22 @@ class ChatTUI(App):
 
         paths.ensure_dirs()
         provider_store.upsert(provider)
+        if reasoning_effort is not None:
+            stored = provider_store.get(our_name)
+            if stored is not None:
+                try:
+                    provider_store.upsert(replace(stored, reasoning_effort=reasoning_effort))
+                except TypeError:
+                    provider_store.upsert(_with_reasoning_effort(stored, reasoning_effort))
         settings_store.update(provider=our_name)
         self._refresh_chips()
-        self._spinner_status(
-            f"provider → {our_name} (added from catalog, "
-            f"default-model={default_model or '-'})"
-        )
+        status_parts = [
+            f"provider → {our_name} (added from catalog, default-model={default_model or '-'}"
+        ]
+        if reasoning_effort:
+            status_parts.append(f"reasoning={reasoning_effort}")
+        status_parts.append(")")
+        self._spinner_status(" · ".join(status_parts))
 
     def _open_custom_add_wizard(self) -> None:
         state: dict[str, Any] = {}
@@ -1373,9 +1622,26 @@ class ChatTUI(App):
                 except ValueError:
                     self._spinner_status("invalid max output tokens; skipping")
                     parsed = None
+                ask_reasoning(model, ctx, parsed)
+
+            self.push_screen(
+                TextInputModal(
+                    "Custom provider: max output tokens (optional)",
+                    placeholder="e.g. 16384 · empty to skip",
+                    hint="Enter to save · Esc to cancel",
+                ),
+                on_close,
+            )
+
+        def ask_reasoning(model: str, ctx: int | None, tokens: int | None) -> None:
+            def on_close(result: str | None) -> None:
+                if result is None:
+                    return
+                stored = result.strip() or None
+                state["reasoning"] = stored
                 paths.ensure_dirs()
                 provider_store.upsert(
-                    provider_store.Provider(
+                    _construct_provider_with_reasoning(
                         name=state["name"],
                         api_format=state["api_format"],
                         base_url=state["base_url"],
@@ -1383,17 +1649,23 @@ class ChatTUI(App):
                         default_model=model,
                         source=SOURCE_CUSTOM,
                         max_context_window=ctx,
-                        max_output_tokens=parsed,
+                        max_output_tokens=tokens,
+                        reasoning_effort=stored,
                     )
                 )
                 settings_store.update(provider=state["name"])
                 self._refresh_chips()
-                self._spinner_status(f"provider → {state['name']} (custom)")
+                status = f"provider → {state['name']} (custom)"
+                if stored:
+                    status = f"{status} · reasoning={stored}"
+                self._spinner_status(status)
 
             self.push_screen(
                 TextInputModal(
-                    "Custom provider: max output tokens (optional)",
-                    placeholder="e.g. 16384 · empty to skip",
+                    "Custom provider: reasoning effort (optional)",
+                    placeholder=(
+                        "optional · e.g. medium / on · empty to skip"
+                    ),
                     hint="Enter to save · Esc to cancel",
                 ),
                 on_close,
@@ -1411,6 +1683,66 @@ class ChatTUI(App):
             self.run_worker(self._catalog_model_picker_flow(provider), exclusive=False)
         else:
             self._open_custom_model_editor(provider)
+
+    def _open_reasoning_picker(self) -> None:
+        provider = provider_store.get(settings_store.load().provider)
+        if not provider:
+            self._spinner_status("No active provider. Pick a provider first.")
+            return
+        self.run_worker(self._reasoning_picker_flow(provider), exclusive=False)
+
+    async def _reasoning_picker_flow(self, provider) -> None:
+        model = provider.default_model
+        stored = _reasoning_value(provider)
+        reasoning_api = _get_reasoning_api()
+        choices: list[str] | None = None
+        if reasoning_api is not None:
+            try:
+                choices = await asyncio.to_thread(
+                    reasoning_api.reasoning_choices, model, provider.name
+                )
+            except Exception:
+                choices = None
+        if choices:
+            if stored and stored in choices:
+                current = stored
+            else:
+                default_choice: str | None = None
+                if reasoning_api is not None:
+                    try:
+                        default_choice = await asyncio.to_thread(
+                            reasoning_api.default_reasoning_choice, model, provider.name
+                        )
+                    except Exception:
+                        default_choice = None
+                current = default_choice or "off"
+            picked = await self.push_screen_wait(
+                SelectionModal(
+                    f"Reasoning ({model or provider.name})",
+                    choices,
+                    current=current,
+                    allow_none=False,
+                )
+            )
+            if not picked:
+                return
+            new_value: str | None = picked
+        else:
+            picked_text = await self.push_screen_wait(
+                TextInputModal(
+                    f"Reasoning effort — {provider.name}",
+                    initial=stored or "",
+                    placeholder="optional · e.g. medium / on · empty for auto",
+                    hint="Enter to save · Esc to cancel",
+                )
+            )
+            if picked_text is None:
+                return
+            stripped = picked_text.strip()
+            new_value = stripped or None
+        provider_store.upsert(_with_reasoning_effort(provider, new_value))
+        self._refresh_chips()
+        self._spinner_status(f"reasoning → {new_value or 'auto'}")
 
     def _open_custom_model_editor(self, provider) -> None:
         current_model = provider.default_model
@@ -1473,13 +1805,37 @@ class ChatTUI(App):
                         f"({cur if cur else '-'})"
                     )
                     parsed = cur
-                self._save_custom_model(provider.name, new_model, new_ctx, parsed)
+                ask_reasoning(new_model, new_ctx, parsed)
 
             self.push_screen(
                 TextInputModal(
                     f"Max output tokens — {provider.name}",
                     initial=str(cur) if cur else "",
                     placeholder="optional · default 16384 · empty to clear",
+                    hint="Enter to save · Esc to cancel",
+                ),
+                _on_close,
+            )
+
+        def ask_reasoning(new_model: str, new_ctx: int | None, new_tokens: int | None) -> None:
+            cur = _reasoning_value(provider) or ""
+
+            def _on_close(result: str | None) -> None:
+                if result is None:
+                    return
+                # Empty string → clear (None); non-empty values are stored
+                # verbatim so the agent layer interprets them (e.g. "medium",
+                # "on", or a decimal token budget).
+                stored = result.strip() or None
+                self._save_custom_model(provider.name, new_model, new_ctx, new_tokens, stored)
+
+            self.push_screen(
+                TextInputModal(
+                    f"Reasoning effort — {provider.name}",
+                    initial=cur,
+                    placeholder=(
+                        "optional · e.g. medium / on · empty to clear"
+                    ),
                     hint="Enter to save · Esc to cancel",
                 ),
                 _on_close,
@@ -1518,19 +1874,70 @@ class ChatTUI(App):
         if not picked:
             return
         new_id = picked.split(" — ", 1)[0].strip()
-        self._save_model_change(provider.name, new_id)
 
-    def _save_model_change(self, provider_name: str, new_model: str) -> None:
+        reasoning_effort: Any = _SENTINEL_NO_REASONING
+        reasoning_api = _get_reasoning_api()
+        if reasoning_api is not None:
+            choices: list[str] | None = None
+            try:
+                choices = await asyncio.to_thread(
+                    reasoning_api.reasoning_choices, new_id, provider.name
+                )
+            except Exception:
+                choices = None
+            if choices:
+                existing = _reasoning_value(provider)
+                if existing and existing in choices:
+                    current = existing
+                else:
+                    default_choice: str | None = None
+                    try:
+                        default_choice = await asyncio.to_thread(
+                            reasoning_api.default_reasoning_choice,
+                            new_id,
+                            provider.name,
+                        )
+                    except Exception:
+                        default_choice = None
+                    current = default_choice or "off"
+                picked_reasoning = await self.push_screen_wait(
+                    SelectionModal(
+                        f"Reasoning ({new_id})",
+                        choices,
+                        current=current,
+                        allow_none=False,
+                    )
+                )
+                if picked_reasoning:
+                    reasoning_effort = picked_reasoning
+
+        self._save_model_change(provider.name, new_id, reasoning_effort=reasoning_effort)
+
+    def _save_model_change(
+        self,
+        provider_name: str,
+        new_model: str,
+        reasoning_effort: Any = _SENTINEL_NO_REASONING,
+    ) -> None:
         p = provider_store.get(provider_name)
         if p is None:
             return
-        provider_store.upsert(replace(p, default_model=new_model))
+        if reasoning_effort is _SENTINEL_NO_REASONING:
+            new_p = replace(p, default_model=new_model)
+        else:
+            try:
+                new_p = replace(p, default_model=new_model, reasoning_effort=reasoning_effort)
+            except TypeError:
+                new_p = _with_reasoning_effort(
+                    replace(p, default_model=new_model), reasoning_effort
+                )
+        provider_store.upsert(new_p)
         settings_store.update(model="")
         self._refresh_chips()
-        if new_model:
-            self._spinner_status(f"model → {new_model} (provider default)")
-        else:
-            self._spinner_status("model → cleared (provider default empty)")
+        parts: list[str] = [f"model → {new_model}" if new_model else "model → cleared"]
+        if reasoning_effort is not _SENTINEL_NO_REASONING and reasoning_effort:
+            parts.append(f"reasoning={reasoning_effort}")
+        self._spinner_status(" · ".join(parts) + " (provider default)")
 
     def _save_custom_model(
         self,
@@ -1538,27 +1945,40 @@ class ChatTUI(App):
         new_model: str,
         max_context_window: int | None,
         max_output_tokens: int | None,
+        reasoning_effort: str | None = None,
     ) -> None:
         p = provider_store.get(provider_name)
         if p is None:
             return
-        provider_store.upsert(
-            replace(
+        new_p: provider_store.Provider
+        try:
+            new_p = replace(
                 p,
                 default_model=new_model,
                 max_context_window=max_context_window,
                 max_output_tokens=max_output_tokens,
+                reasoning_effort=reasoning_effort,
             )
-        )
+        except TypeError:
+            new_p = _with_reasoning_effort(
+                replace(
+                    p,
+                    default_model=new_model,
+                    max_context_window=max_context_window,
+                    max_output_tokens=max_output_tokens,
+                ),
+                reasoning_effort,
+            )
+        provider_store.upsert(new_p)
         settings_store.update(model="")
         self._refresh_chips()
-        parts: list[str] = [
-            f"model → {new_model}" if new_model else "model → cleared"
-        ]
+        parts: list[str] = [f"model → {new_model}" if new_model else "model → cleared"]
         if max_context_window is not None:
             parts.append(f"ctx={max_context_window}")
         if max_output_tokens is not None:
             parts.append(f"max-tokens={max_output_tokens}")
+        if reasoning_effort:
+            parts.append(f"reasoning={reasoning_effort}")
         self._spinner_status(" · ".join(parts) + " (provider default)")
 
     def _open_style_picker(self) -> None:
@@ -1630,6 +2050,7 @@ class ChatTUI(App):
         self._logo_shown = False
         self._subagent_events.clear()
         self._subagent_rows.clear()
+        self._pending_tool_rows.clear()
         data = session_store.load(session_name)
         if not data.turns:
             self._mount_row(Static(Text("(empty session)", style="dim")))
@@ -1648,7 +2069,12 @@ class ChatTUI(App):
 
         Subagent rows come back in their finished state but stay clickable
         — the recorded internal events are re-buffered so the detail
-        screen works for historical turns too.
+        screen works for historical turns too. Tool/tool_result events
+        route through `_add_event_row` so historical turns re-render with
+        the same collapsible `ToolRow` + result pairing as the live path;
+        subagent_end replays through `_finish_subagent_row`, which both
+        flips the `SubagentRow` status *and* mounts the subagent result
+        box.
         """
 
         if event.subagent_id:
@@ -1659,6 +2085,8 @@ class ChatTUI(App):
             self._mount_row(row)
         elif event.kind == "subagent_end":
             self._finish_subagent_row(event)
+        elif event.kind in ("tool", "tool_result", "thinking", "error"):
+            self._add_event_row(event)
         elif event.subagent_id:
             pass
         else:
@@ -1675,6 +2103,7 @@ class ChatTUI(App):
         self._panel.set_value("provider", s.provider or "-")
         self._panel.set_value("model", active_model or "-")
         self._panel.set_value("style", s.style or "-")
+        self._panel.set_value("reasoning", _reasoning_chip_value(provider))
         if self._chat_started:
             self._panel.set_value("session", s.session or "-")
         else:
@@ -1717,6 +2146,38 @@ class ChatTUI(App):
         if event.kind == "thinking":
             self._mount_row(ThinkingRow(event.text))
             return
+        if event.kind == "tool":
+            row = ToolRow(
+                event.text,
+                detail=getattr(event, "detail", None),
+                tool_name=event.tool_name,
+            )
+            self._pending_tool_rows.append(row)
+            self._mount_row(row)
+            return
+        if event.kind == "tool_result":
+            text = event.text or ""
+            is_error = text.startswith("error: ")
+            pending: ToolRow | None = None
+            for candidate in self._pending_tool_rows:
+                if (
+                    candidate.tool_name == event.tool_name
+                    and not candidate.has_result
+                ):
+                    pending = candidate
+                    break
+            if pending is not None:
+                self._pending_tool_rows.remove(pending)
+                pending.set_result(text, is_error=is_error)
+            else:
+                # Defensive fallback: a tool_result with no matching tool
+                # event (replay oddity, out-of-order delivery, partial
+                # session). Mount a plain muted row so the result isn't lost.
+                row = EventRow(Text(text))
+                if is_error:
+                    row.add_class("-error")
+                self._mount_row(row)
+            return
         row = EventRow(Text(event.text))
         if event.kind == "error":
             row.add_class("-error")
@@ -1735,9 +2196,24 @@ class ChatTUI(App):
         self._mount_row(row)
 
     def _finish_subagent_row(self, event: LoopEvent) -> None:
-        row = self._subagent_rows.get(event.subagent_id or "")
+        sid = event.subagent_id or ""
+        row = self._subagent_rows.get(sid)
         if row is not None:
             row.finish(ok=not event.text.startswith("error:"))
+        # Mount a collapsible result box below the SubagentRow so users see
+        # the full returned text inline (the SubagentRow itself stays
+        # focused on the task summary and still opens the detail screen on
+        # click). Skip when the result is empty or a no-op sentinel like
+        # `"done"`.
+        if sid:
+            text = event.text or ""
+            stripped = text.strip()
+            if stripped and stripped.lower() != "done":
+                result_row = ToolRow(f"subagent-{sid} result")
+                result_row.set_result(
+                    text, is_error=text.startswith("error:")
+                )
+                self._mount_row(result_row)
 
     def _tick_subagent_rows(self, frame: str) -> None:
         for row in self._subagent_rows.values():
