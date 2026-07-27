@@ -48,9 +48,9 @@ CLI flag bag → ChatOptions (core/chat.py)
             → resolve_runtime_from_settings (core/runtime.py)
             → RuntimeConfig
             → build_runtime (core/runtime.py)
-                → coreouto provider registry + tool registry + up to 6 hooks
-                    (BEFORE_TOOL_CALL, ON_ITERATION×2, AFTER_LLM_CALL,
-                    ON_THINKING, ON_PROVIDER_ERROR)
+                → coreouto provider registry + tool registry + up to 7 hooks
+                    (BEFORE_TOOL_CALL, AFTER_TOOL_CALL, ON_ITERATION×2,
+                    AFTER_LLM_CALL, ON_THINKING, ON_PROVIDER_ERROR)
                 → co.Agent(outo_config)
             → run_chat(opts, sink) → agent.call_sync(prompt, history=...)
                 → Bash/Image/Video/Audio (via tools/registry.py)
@@ -186,18 +186,19 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `cli/provider.py` | `provider providers/models/add` (catalog browse + add) + `provider custom add` + `provider list/remove/default` |
 | `cli/style.py` | `style list/set/add/update/show` |
 | `cli/skill.py` | `skill list/show` (read-only) |
-| `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`SubagentRow`), `SubagentDetailScreen`, provider wizards + model picker |
+| `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
-| `core/chat.py` | `ChatOptions`, `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
+| `core/chat.py` | `ChatOptions`, `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
-| `core/events.py` | `LoopEvent` (with `subagent_id`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering) |
+| `core/events.py` | `LoopEvent` (with `subagent_id`, `detail`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events) |
 | `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) + `default_error_handling(api_format)` |
 | `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
+| `core/reasoning.py` | lma `reasoning_options` resolver → `provider_passthrough` kwargs (`resolve_reasoning_passthrough` + UI helpers `reasoning_choices`/`default_reasoning_choice`); google unsupported |
 | `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, subagent tool (per-invocation 6-hex id + lifecycle observer), hooks |
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
 | `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
-| `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
+| `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`, optional `max_context_window`/`max_output_tokens`/`reasoning_effort` overrides) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
 | `storage/sessions.py` | `SessionData` + `TurnRecord` (schema v2: restorable `history` + display `turns`) + JSON CRUD with v1 migration |
 | `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`) + TOML CRUD |
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
@@ -213,6 +214,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `default_style/opencode.md` | OpenCode-style (~9 KB) |
 | `default_style/oh-my-opencode.md` | "Sisyphus" orchestrator (~11 KB) |
 | `default_style/codebuff.md` | "Buffy" orchestrator (~10 KB) |
+| `default_style/coding.md` | Coding-expert orchestrator (~14 KB) — delegation-first, parallel `call_subagent`, `.miniouto/plans/` lifecycle |
 | `tui/` | **EMPTY placeholder** — TUI code lives in `cli/tui.py` |
 | `utils/` | **EMPTY placeholder** — no code anywhere |
 

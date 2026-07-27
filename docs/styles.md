@@ -70,7 +70,7 @@ The `continue_loop` tool is referenced in styles but not actually wired into the
 
 ## Bundled templates
 
-All six bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
+All seven bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
 
 | File | Size | Persona | Orchestrator? | Sub-roles |
 |---|---|---|---|---|
@@ -80,8 +80,9 @@ All six bundled templates live in `src/miniouto/default_style/`. They are seeded
 | `opencode.md` | ~9 KB | OpenCode-style | No | (delegates ad-hoc) |
 | `oh-my-opencode.md` | ~11 KB | "**Sisyphus**" | **Aggressive** | Explorer / Researcher / Planner / Advisor / Reviewer / Editor / Basher |
 | `codebuff.md` | ~10 KB | "**Buffy**" | Yes | File picker / Code searcher / Researcher / Editor / Code reviewer / Basher |
+| `coding.md` | ~14 KB | "**coding expert**" orchestrator | **Aggressive** | (delegates ad-hoc, parallel) |
 
-The orchestration styles (claude/codex/codebuff/oh-my-opencode) include explicit guidance on when and how to delegate via `call_subagent`. `default.md` and `opencode.md` are more minimal.
+The orchestration styles (claude/codex/codebuff/oh-my-opencode/coding) include explicit guidance on when and how to delegate via `call_subagent`. `default.md` and `opencode.md` are more minimal.
 
 ### `default.md` — minimal fallback
 
@@ -129,6 +130,28 @@ Includes a Decision Framework (effort tag: Quick<1h / Short 1-4h / Medium 1-2d /
 "Buffy, a strategic assistant that orchestrates complex coding tasks through specialized sub-agents."
 
 Same six sub-agent roles as codex (no Planner/Advisor). Stronger emphasis on quality-over-speed: "fewer, well-informed agents > many rushed ones."
+
+### `coding.md`: coding expert orchestrator
+
+A professional coding expert orchestrator focused on flawless, systematic,
+production-grade software work. It requires the following behaviors:
+
+- **Delegation-first**: delegate any task that is even slightly complex,
+  including multi-file, multi-step, non-obvious, investigative, planned, or
+  higher-risk work, through `call_subagent(task)`.
+- **Parallel calls**: issue independent `call_subagent` invocations in the
+  same turn, rather than handling independent subtasks sequentially.
+- **Project onboarding**: on first contact, survey the directory layout,
+  project state, build and test configuration, README, and any `AGENT.md`,
+  `AGENTS.md`, `CURSOR.md`, or `CLAUDE.md` files before doing the work.
+- **Plan-file lifecycle**: write planned work to exactly
+  `./.miniouto/plans/<name>.md`, keep it updated with progress and revisions,
+  and delete it only after the task is fully complete and verified.
+- **Ask the user**: stop and ask a plain-text final question when a required
+  design or intent decision cannot be resolved from evidence. Never guess.
+- **Quality and verification**: hold subagents to the same professional bar,
+  read before editing, follow project conventions, and report only results
+  confirmed by real build, lint, typecheck, test, or execution runs.
 
 ---
 

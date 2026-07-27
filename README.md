@@ -81,6 +81,7 @@ The active model is chosen by the first match in:
 | `--style` | Override the active style for this call |
 | `--max-tokens` | Cap output tokens |
 | `--temperature` | Sampling temperature |
+| `--reasoning` | Override reasoning for this call (effort level / `on` / `none`). Default: provider setting, else lma model default |
 | `--continue` / `-c` | Prepend the session's previous history |
 | `--answer-only` / `-a` | Print only the final answer (no session marker, no loop events, no finish marker) |
 | `--with-session` | Print only the session marker + final answer (no loop events, no finish marker) |
