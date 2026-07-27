@@ -106,6 +106,7 @@ def _build_subagent_tool(
     *,
     description: str,
     provider_config: dict[str, Any],
+    provider_passthrough: dict[str, Any] | None = None,
 ) -> Any:
     """Build the subagent tool with a non-empty provider_config.
 
@@ -122,6 +123,8 @@ def _build_subagent_tool(
     config = preset.to_config()
     if provider_config:
         config.provider_config.update(provider_config)
+    if provider_passthrough:
+        config.provider_passthrough.update(provider_passthrough)
     sub_agent = co.Agent(config)
 
     tool_name = f"call_{preset_name}"
@@ -170,10 +173,12 @@ def build_runtime(
     style_overrides: dict[str, str] | None = None,
     provider_config: dict[str, Any] | None = None,
     on_tool_call: Callable[[str, dict[str, Any]], None] | None = None,
+    on_tool_result: Callable[[str, Any], None] | None = None,
     on_response: Callable[[str, bool], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
     on_iteration: Callable[..., None] | None = None,
     on_provider_error: Callable[..., None] | None = None,
+    reasoning: str | None = None,
 ) -> co.Agent:
     """Construct the outo Agent with the active style and subagent wired in.
 
@@ -182,6 +187,11 @@ def build_runtime(
     normalizer without us having to mutate the config after construction.
     `on_tool_call` is called for every tool invocation (outo and subagent)
     with `(tool_name, arguments)`. Pass None to skip.
+    `on_tool_result` is called after every tool handler returns (coreouto's
+    AFTER_TOOL_CALL) with `(tool_name, result)` where result is coreouto's
+    ToolResult — this is the only way to surface tool return values to a
+    sink, since the BEFORE_TOOL_CALL hook fires before the handler runs.
+    Pass None to skip.
     `on_response` is called after each LLM response with `(content, has_tool_calls)`
     so the caller can stream intermediate model text. Pass None to skip.
     `on_thinking` is called after each LLM response that carries reasoning
@@ -195,6 +205,13 @@ def build_runtime(
     `reaction`, `reaction_message` kwargs. Rule-matched errors don't raise, so
     without this hook a retry or termination is invisible to the user.
     Pass None to skip.
+    `reasoning` overrides reasoning for this call (effort level / "on" /
+    token budget / "none"). None = auto: the provider's stored
+    `reasoning_effort` wins if set, otherwise lma's per-model default.
+    Resolved by `core.reasoning.resolve_reasoning_passthrough` into
+    provider-native kwargs merged into `provider_passthrough` for both
+    outo and subagent — this is what makes providers return thinking
+    blocks at all.
     """
 
     clear_coreouto_state()
@@ -245,17 +262,26 @@ def build_runtime(
     # the cap from the same lma endpoint as outo so it tracks the
     # subagent's model when one is configured.
     from .context import get_max_output_tokens
+    from .reasoning import resolve_reasoning_passthrough
 
     subagent_model = runtime.subagent_model or runtime.model
     subagent_provider_config = dict(provider_config or {})
     subagent_provider_config.setdefault(
         "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
     )
+    subagent_choice = reasoning if reasoning is not None else sub_provider.reasoning_effort
+    subagent_passthrough = resolve_reasoning_passthrough(
+        sub_provider.api_format,
+        subagent_model,
+        sub_provider_name,
+        subagent_choice,
+    )
 
     subagent_tool = _build_subagent_tool(
         "subagent",
         description=_subagent_description(),
         provider_config=subagent_provider_config,
+        provider_passthrough=subagent_passthrough,
     )
     co.register_tool(subagent_tool.name, description=subagent_tool.description)(
         _wrap_subagent_handler(subagent_tool.handler)
@@ -263,6 +289,9 @@ def build_runtime(
 
     if on_tool_call is not None:
         co.register_hook(co.BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
+
+    if on_tool_result is not None:
+        co.register_hook(co.AFTER_TOOL_CALL, _make_tool_result_logger(on_tool_result))
 
     from .context import make_summarize_hook
     summarize_hook = make_summarize_hook(
@@ -285,6 +314,19 @@ def build_runtime(
     outo_config = co.get_agent_preset("outo").to_config()
     if provider_config:
         outo_config.provider_config.update(provider_config)
+    # Thinking display (ON_THINKING → CLI/TUI) only works when the model is
+    # asked to reason — providers never emit thinking blocks unrequested.
+    # The resolver consults lma's per-model reasoning_options; an explicit
+    # `reasoning` choice wins over the provider's stored reasoning_effort.
+    outo_choice = reasoning if reasoning is not None else provider.reasoning_effort
+    outo_passthrough = resolve_reasoning_passthrough(
+        provider.api_format,
+        runtime.model,
+        runtime.provider_name,
+        outo_choice,
+    )
+    if outo_passthrough:
+        outo_config.provider_passthrough.update(outo_passthrough)
 
     subagent_config = co.get_agent_preset("subagent").to_config()
     subagent_config.provider_config.update(subagent_provider_config)
@@ -295,6 +337,22 @@ def build_runtime(
 def _make_tool_call_logger(callback: Callable[[str, dict[str, Any]], None]):
     def hook(*, name: str, arguments: dict[str, Any], **kwargs: Any) -> None:
         callback(name, arguments)
+
+    return hook
+
+
+def _make_tool_result_logger(callback: Callable[[str, Any], None]):
+    """Build an AFTER_TOOL_CALL hook that forwards the tool's return value.
+
+    coreouto fires AFTER_TOOL_CALL after each tool handler completes with
+    `(name, result)` where result is a ToolResult (`.content`, `.blocks`,
+    `.is_error`, `.flatten_text()`). Only the name and the result object
+    are forwarded — everything else in the payload is already available
+    from the BEFORE_TOOL_CALL hook.
+    """
+
+    def hook(*, name: str, result: Any, **kwargs: Any) -> None:
+        callback(name, result)
 
     return hook
 

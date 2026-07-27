@@ -47,6 +47,7 @@ class ChatOptions:
     style: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
+    reasoning: str | None = None
     continue_session: bool = False
 
 
@@ -128,6 +129,8 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         on_thinking=_make_thinking_dispatcher(sink),
         on_iteration=_make_iteration_dispatcher(sink),
         on_provider_error=_make_provider_error_dispatcher(sink),
+        on_tool_result=_make_tool_result_dispatcher(sink),
+        reasoning=opts.reasoning,
     )
 
     session_name = opts.session or runtime.session
@@ -217,6 +220,10 @@ def _make_tool_call_dispatcher(sink: EventSink):
             return
         if name in ("Bash", "Image", "Video", "Audio"):
             preview = _short_arg_summary(name, arguments)
+            # detail carries the FULL untruncated command for Bash (the
+            # preview flattens newlines; the TUI detail view wants the
+            # verbatim input). Media tools have no useful extra payload.
+            detail = arguments.get("command") if name == "Bash" else None
             sink.emit_loop_event(
                 LoopEvent(
                     actor=actor,
@@ -224,11 +231,54 @@ def _make_tool_call_dispatcher(sink: EventSink):
                     text=f"{name} {preview}",
                     tool_name=name,
                     subagent_id=sid,
+                    detail=detail,
                 )
             )
             sink.update_activity(actor if sid else name)
 
     return on_tool_call
+
+
+_TOOL_RESULT_NAMES = ("Bash", "Image", "Video", "Audio")
+_TOOL_RESULT_MAX = 4000
+
+
+def _make_tool_result_dispatcher(sink: EventSink):
+    """Build the per-tool-result callback wired into the AFTER_TOOL_CALL hook.
+
+    coreouto fires AFTER_TOOL_CALL with the handler's ToolResult, so this
+    is the only place a sink can see tool return values. Emits a
+    `LoopEvent(kind="tool_result")` whose text is the flattened result
+    (prefixed with "error: " on failure, mirroring the subagent_end
+    convention the TUI keys on), truncated to 4000 chars. `call_subagent`
+    is skipped — the subagent observer's `subagent_end` event already
+    carries that result. The dispatcher must never raise: a sink failure
+    here must not break the agent loop.
+    """
+
+    def on_tool_result(name: str, result: Any) -> None:
+        try:
+            if name == "call_subagent" or name not in _TOOL_RESULT_NAMES:
+                return
+            text = result.flatten_text()
+            if result.is_error:
+                text = f"error: {text}"
+            if len(text) > _TOOL_RESULT_MAX:
+                text = text[:_TOOL_RESULT_MAX] + "\n… [truncated]"
+            actor, sid = _actor_label()
+            sink.emit_loop_event(
+                LoopEvent(
+                    actor=actor,
+                    kind="tool_result",
+                    text=text,
+                    tool_name=name,
+                    subagent_id=sid,
+                )
+            )
+        except Exception:
+            pass  # a sink/hook failure must never break the agent loop
+
+    return on_tool_result
 
 
 def _make_subagent_dispatcher(sink: EventSink):
