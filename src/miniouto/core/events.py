@@ -35,6 +35,7 @@ class LoopEvent:
     text: str
     tool_name: str | None = None
     subagent_id: str | None = None
+    detail: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"actor": self.actor, "kind": self.kind, "text": self.text}
@@ -42,6 +43,8 @@ class LoopEvent:
             d["tool_name"] = self.tool_name
         if self.subagent_id:
             d["subagent_id"] = self.subagent_id
+        if self.detail:
+            d["detail"] = self.detail
         return d
 
     @classmethod
@@ -52,6 +55,7 @@ class LoopEvent:
             text=str(d.get("text") or ""),
             tool_name=d.get("tool_name") or None,
             subagent_id=d.get("subagent_id") or None,
+            detail=d.get("detail") or None,
         )
 
 
@@ -123,6 +127,11 @@ class ConsoleEventSink:
 
     def emit_loop_event(self, event: LoopEvent) -> None:
         if self._quiet:
+            return
+        # tool_result events exist so the TUI can show tool return values;
+        # the CLI deliberately ignores them to keep output byte-identical
+        # to the pre-tool_result behavior.
+        if event.kind == "tool_result":
             return
         # Text.assemble avoids markup parsing entirely — the model/tool
         # text is stored as raw characters and styled by span, so stray
