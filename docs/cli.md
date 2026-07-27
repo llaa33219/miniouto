@@ -153,6 +153,8 @@ chat_cmd(
     --style       TEXT,                # override active style
     --max-tokens  INT,                 # cap output tokens
     --temperature FLOAT,               # sampling temperature
+    --reasoning   TEXT,                # override reasoning for this call (effort level / on / none).
+                                       # Default: provider setting, else lma model default
     --continue, -c                     # prepend previous session history
     --answer-only, -a                  # print only the final answer (suppresses session marker, loop events, finish marker)
     --with-session                     # print only session marker + final answer (suppresses loop events + finish marker)
@@ -169,6 +171,7 @@ chat_cmd(
 | `--style` | Override the active style for this call |
 | `--max-tokens` | Cap output tokens |
 | `--temperature` | Sampling temperature |
+| `--reasoning` | Override reasoning for this call: an effort level (`low`/`medium`/`high`/…), `on` (toggle models), or `none`/`off` to disable. Default: the provider's stored `reasoning_effort`, else the lma model default. Resolved per-model via lma `reasoning_options` (see `docs/core.md` step 11); thinking only appears when the provider is asked to reason |
 | `--continue` / `-c` | Prepend the session's previous history |
 | `--answer-only` / `-a` | Print only the final answer. Suppresses the `------{session}------` marker, loop events, and `------finish------` marker |
 | `--with-session` | Print only the `------{session}------` marker + final answer. Suppresses loop events and `------finish------` marker |
@@ -225,15 +228,16 @@ Calls `GET https://lma.blp.sh/provider`. Prints a rich `Table` titled `Catalog p
 
 Positional argument; lma does case-/whitespace-insensitive fuzzy match. Calls `GET https://lma.blp.sh/model-list?provider-name=<name>`. Prints a `Table` titled `Catalog models for '<name>' (N)` with columns `ID | Name`. Empty result → yellow "No models returned for `<name>`." + exit 1. Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
 
-### `provider add <provider-name> --api-key <key> [--default-model <id>]`
+### `provider add <provider-name> --api-key <key> [--default-model <id>] [--reasoning <v>]`
 
-Catalog add. Positional `provider_name` (fuzzy-matched via `core.lma.find_provider`), required `--api-key`, optional `--default-model` (default `""`).
+Catalog add. Positional `provider_name` (fuzzy-matched via `core.lma.find_provider`), required `--api-key`, optional `--default-model` (default `""`), optional `--reasoning` (default `None`).
 
 - If `find_provider` returns `None`: red `✗ No catalog provider matched <name>. Run 'miniouto provider providers' to see the catalog.` + exit 1.
 - Calls `core.providers.add_provider_from_lma(...)` to build a `Provider` with `source="lma"`.
 - If `--default-model` is empty, re-fetches the provider's model list and uses the first model id (re-invokes `add_provider_from_lma` with that id).
+- `--reasoning` is stored verbatim as `Provider.reasoning_effort`; when omitted, it is auto-filled from `core.reasoning.default_reasoning_choice(default_model, provider_name)` (best-effort, silent when lma has no data).
 - If the provider already exists: yellow `! Provider <name> already exists; overwriting.`
-- On success: `✓ Added provider <name> (<api_format>, default-model=<model or ->).`
+- On success: `✓ Added provider <name> (<api_format>, default-model=<model or ->, reasoning=<value or ->).`
 
 If `sdk_to_format` cannot map the SDK (raises `ValueError`): red `✗ {exc}` + exit 1.
 
@@ -249,20 +253,21 @@ add_custom(
     --base-url       TEXT  # default ""
     --api-key        TEXT  # default "" (omit to read from env at call time)
     --default-model  TEXT  # default "" (used when chat --model is not given)
+    --reasoning      TEXT  # default None (stored verbatim as reasoning_effort)
 )
 ```
 
 - Validates `--format` against `core.providers.SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")`. Unknown → red `✗ Unknown format <fmt>. Supported: …` + exit 1.
 - Calls `storage.paths.ensure_dirs()`, builds a `storage.providers.Provider(...)` (with `source="custom"`), calls `storage.providers.upsert(provider)`.
-- Prints `✓ Saved custom provider <name> (<api_format>).`
+- Prints `✓ Saved custom provider <name> (<api_format>, reasoning=<value or ->).`
 
 ### `provider list`
 
 Pretty-prints a `rich.table.Table` titled `Providers` with columns:
 
-| Name | Type | Format | Base URL | Default Model | Default |
+| Name | Type | Format | Base URL | Default Model | Reasoning | Default |
 
-The `Type` column renders `custom` or `catalog` based on `provider.source` (`SOURCE_CUSTOM` → "custom", `SOURCE_LMA` → "catalog"). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
+The `Type` column renders `custom` or `catalog` based on `provider.source` (`SOURCE_CUSTOM` → "custom", `SOURCE_LMA` → "catalog"). The `Reasoning` column shows the provider's stored `reasoning_effort` (or `-`). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
 
 If no providers are configured, prints yellow "No providers configured. Run `miniouto provider add <name>` or `miniouto provider custom add`."
 

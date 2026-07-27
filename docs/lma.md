@@ -2,11 +2,12 @@
 
 `miniouto` integrates [lma](https://github.com/llaa33219/llm-model-api) — a re-shaped, fuzzy-search view of [`models.dev/api.json`](https://models.dev/api.json) deployed to [`https://lma.blp.sh`](https://lma.blp.sh) via Cloudflare Workers. lma covers **144 providers** and **5,000+ models** with a 10-minute server-side cache.
 
-miniouto uses lma for three things:
+miniouto uses lma for four things:
 
 1. **Provider discovery** — `miniouto provider providers` lists every known provider and whether miniouto can host it.
 2. **Model discovery** — `miniouto provider models <provider>` lists every model lma knows for a provider; the TUI provider-add and model-edit flows fetch the same data.
 3. **Per-model context / max-output caps** — `core/context.py` calls lma's `/model` endpoint to look up `context_window` and `max_output_tokens` instead of the older `lcw-api.blp.sh/context-window` endpoint.
+4. **Per-model reasoning metadata** — `core/reasoning.py` reads `reasoning_options` from the same `/model` endpoint to resolve reasoning request kwargs (see below).
 
 ### Per-provider overrides (custom providers)
 
@@ -33,7 +34,7 @@ miniouto only ever issues **read-only GETs** against the four endpoints below. A
 |---|---|---|
 | `GET https://lma.blp.sh/provider` | `lma.list_providers()` | `cli/provider.py:providers_cmd`, `cli/tui.py:_catalog_add_flow` |
 | `GET https://lma.blp.sh/model-list?provider-name=<name>` | `lma.list_models(name)` | `cli/provider.py:models_cmd`, `cli/tui.py:_catalog_add_flow`, `cli/tui.py:_catalog_model_picker_flow` |
-| `GET https://lma.blp.sh/model?model-name=<name>&provider-name=<name>` | `lma.get_model(name, provider_name)` | `core/context.py:get_context_window`, `core/context.py:get_max_output_tokens` |
+| `GET https://lma.blp.sh/model?model-name=<name>&provider-name=<name>` | `lma.get_model(name, provider_name)` | `core/context.py:get_context_window`, `core/context.py:get_max_output_tokens`, `core/reasoning.py` |
 | `GET https://lma.blp.sh/model?model-name=<name>` (no provider filter) | same, with `provider_name=None` | fallback in `core/context.py` when no provider context is available |
 
 Network failures (timeouts, 5xx, DNS) are caught and fail soft: `lma.list_providers` propagates the exception so callers can show an error, but `lma.find_provider` swallows the error and returns `None` (so the TUI can degrade gracefully to "custom provider" mode).
@@ -56,6 +57,26 @@ Cache keys:
 | `"providers"` | `/provider` |
 | `f"models:{provider.lower()}"` | `/model-list?provider-name=<provider>` |
 | `f"model:{provider.lower()}:{model.lower()}"` | `/model?model-name=…&provider-name=…` |
+
+## Per-model reasoning metadata (`reasoning_options`)
+
+The `/model` endpoint also reports per-model reasoning capabilities via a top-level `reasoning: bool` flag and a `reasoning_options` list (may be `[]` or absent). Three verified shapes of an entry:
+
+```json
+[{"type": "toggle"}]                                            // on/off only — MiniMax-M3, GLM-4.7, Kimi-K2.5
+[{"type": "effort", "values": ["none","low","medium","high","xhigh"]}]  // effort ladder — gpt-5.2 (gemini-3-pro: ["low","high"])
+[{"type": "budget_tokens", "min": 1024}]                        // token budget — claude-sonnet-4-5
+```
+
+The list can carry **multiple** descriptors for one model — e.g. kimi-k3 returns `[{"type": "toggle"}, {"type": "effort", "values": ["low","high","max"]}]`. miniouto picks the richest entry (**effort > budget_tokens > toggle**); reading only the first entry would hide the effort ladder behind the toggle.
+
+miniouto consumes this in three places:
+
+1. **`core/reasoning.py:resolve_reasoning_passthrough`** — maps the resolved reasoning choice (CLI `--reasoning` > `Provider.reasoning_effort` > lma default) into provider-native request kwargs merged into `provider_passthrough` by `build_runtime`. Only effort values and anthropic's `thinking: {"type": "adaptive"}` are emitted — `budget_tokens` models are driven as a plain toggle because many providers reject budget parameters. The mapping table and the google-format limitation are documented in `docs/core.md` (step 11).
+2. **`miniouto provider add`** — auto-fills the new provider's `reasoning_effort` field from `default_reasoning_choice(default_model, provider_name)` when `--reasoning` is not given (best-effort, silent on failure).
+3. **TUI pickers** — `reasoning_choices(model, provider_name)` supplies the picker list (`["off", ...]`); `default_reasoning_choice(...)` supplies the pre-selected default. Both return `None` when the model has no reasoning options or lma is unreachable.
+
+Always scope the lookup with `provider-name` (`lma.get_model(model, provider_name)`) — an unscoped lookup can return the same model id from a different provider with different reasoning options.
 
 ## Provider name → coreouto format mapping
 
