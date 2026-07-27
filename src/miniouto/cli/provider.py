@@ -17,6 +17,7 @@ from rich.table import Table
 
 from ..core import lma as catalog_api
 from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
+from ..core.reasoning import default_reasoning_choice
 from ..storage import paths
 from ..storage import providers as provider_store
 from ..storage import settings as settings_store
@@ -112,6 +113,12 @@ def add_cmd(
         "--default-model",
         help="Default model id. If empty, the first model the catalog lists for this provider is used.",
     ),
+    reasoning: str | None = typer.Option(
+        None,
+        "--reasoning",
+        help="Reasoning preference stored on the provider (effort level / on / none). "
+        "Default: auto-fill from the catalog's model metadata.",
+    ),
 ) -> None:
     """Add a provider from the catalog by name + API key.
 
@@ -138,6 +145,7 @@ def add_cmd(
             sdk=sdk,
             api=api,
             default_model=default_model,
+            reasoning_effort=reasoning,
         )
     except ValueError as exc:
         console.print(f"[red]✗[/red] {exc}")
@@ -153,9 +161,17 @@ def add_cmd(
                     sdk=sdk,
                     api=api,
                     default_model=models[0].get("id", ""),
+                    reasoning_effort=reasoning,
                 )
         except Exception:
             pass
+
+    if provider.reasoning_effort is None and provider.default_model:
+        # Best-effort auto-fill from lma's per-model reasoning metadata so
+        # thinking works out of the box; silent when lma has no data.
+        provider.reasoning_effort = default_reasoning_choice(
+            provider.default_model, name
+        )
 
     paths.ensure_dirs()
     if provider_store.get(name) is not None:
@@ -165,7 +181,8 @@ def add_cmd(
     provider_store.upsert(provider)
     console.print(
         f"[green]✓[/green] Added provider [bold]{name}[/bold] "
-        f"({provider.api_format}, default-model={provider.default_model or '-'})."
+        f"({provider.api_format}, default-model={provider.default_model or '-'}, "
+        f"reasoning={provider.reasoning_effort or '-'})."
     )
 
 
@@ -190,6 +207,7 @@ def list_cmd() -> None:
     table.add_column("Format")
     table.add_column("Base URL")
     table.add_column("Default Model")
+    table.add_column("Reasoning")
     table.add_column("Default", justify="center")
     for p in rows.values():
         marker = "[green]●[/green]" if p.name == current else ""
@@ -200,6 +218,7 @@ def list_cmd() -> None:
             p.api_format,
             p.base_url or "-",
             p.default_model or "-",
+            p.reasoning_effort or "-",
             marker,
         )
     console.print(table)
@@ -246,6 +265,11 @@ def add_custom(
     default_model: str = typer.Option(
         "", "--default-model", help="Default model used when chat --model is not given."
     ),
+    reasoning: str | None = typer.Option(
+        None,
+        "--reasoning",
+        help="Reasoning preference stored on the provider (effort level / on / none).",
+    ),
 ) -> None:
     """Manually add or update a custom provider.
 
@@ -267,6 +291,10 @@ def add_custom(
         base_url=base_url,
         api_key=api_key,
         default_model=default_model,
+        reasoning_effort=reasoning,
     )
     provider_store.upsert(provider)
-    console.print(f"[green]✓[/green] Saved custom provider [bold]{name}[/bold] ({api_format}).")
+    console.print(
+        f"[green]✓[/green] Saved custom provider [bold]{name}[/bold] "
+        f"({api_format}, reasoning={provider.reasoning_effort or '-'})."
+    )

@@ -23,6 +23,11 @@ def chat_cmd(
     style: str | None = typer.Option(None, "--style", help="Override the active style."),
     max_tokens: int | None = typer.Option(None, "--max-tokens", help="Cap output tokens."),
     temperature: float | None = typer.Option(None, "--temperature", help="Sampling temperature."),
+    reasoning: str | None = typer.Option(
+        None, "--reasoning",
+        help="Override reasoning for this call (effort level / on / none). "
+        "Default: provider setting, else lma model default.",
+    ),
     continue_session: bool = typer.Option(
         False, "--continue", "-c", help="Prepend the session's previous history."
     ),
@@ -64,6 +69,7 @@ def chat_cmd(
         style=style,
         max_tokens=max_tokens,
         temperature=temperature,
+        reasoning=reasoning,
         continue_session=continue_session,
     )
     # The sink handles all output: braille spinner + loop events share
