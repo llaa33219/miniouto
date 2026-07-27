@@ -30,6 +30,13 @@ def _coerce_positive_int(value: Any) -> int | None:
     return None
 
 
+def _coerce_optional_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        s = value.strip()
+        return s or None
+    return None
+
+
 @dataclass
 class Provider:
     name: str
@@ -43,6 +50,11 @@ class Provider:
     # editor, read only by core/context.py.
     max_context_window: int | None = None
     max_output_tokens: int | None = None
+    # Per-provider reasoning preference for default_model: "none"/"off" =
+    # disabled, "on" = toggle on, an effort level ("medium"), or a decimal
+    # string = token budget. None = auto (lma default). Read by
+    # core/reasoning.py via core/runtime.py.
+    reasoning_effort: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -54,6 +66,7 @@ class Provider:
         known = {
             "name", "api_format", "base_url", "api_key", "default_model",
             "source", "max_context_window", "max_output_tokens",
+            "reasoning_effort",
         }
         extra = {k: v for k, v in data.items() if k not in known}
         source = data.get("source") or SOURCE_CUSTOM
@@ -68,6 +81,7 @@ class Provider:
             source=source,
             max_context_window=_coerce_positive_int(data.get("max_context_window")),
             max_output_tokens=_coerce_positive_int(data.get("max_output_tokens")),
+            reasoning_effort=_coerce_optional_str(data.get("reasoning_effort")),
             extra=extra,
         )
 

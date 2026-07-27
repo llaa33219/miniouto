@@ -47,6 +47,7 @@ def add_provider_from_lma(
     sdk: str | None,
     api: str | None,
     default_model: str = "",
+    reasoning_effort: str | None = None,
 ) -> Provider:
     """Build a Provider from lma metadata. Raises ValueError on unsupported SDK."""
 
@@ -64,6 +65,7 @@ def add_provider_from_lma(
         api_key=api_key,
         default_model=default_model,
         source=SOURCE_LMA,
+        reasoning_effort=reasoning_effort,
     )
 
 
