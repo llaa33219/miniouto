@@ -67,16 +67,21 @@ def _load_active_skills() -> str:
     skills = skill_store.list_skills()        # already excludes hidden skills
     if not skills:
         return ""
-    parts: list[str] = []
+    lines = [
+        "# Available Skills",
+        "",
+        "The following skills are installed. Each lives in its own directory at "
+        f"{skill_store.SKILLS_DIR}/<name>/ containing a SKILL.md with ...",
+        "",
+    ]
     for skill in skills:
-        if skill.content:                     # skip empty-content skills
-            parts.append(f"# Skill: {skill.name}\n\n{skill.content}")
-    return "\n\n---\n\n".join(parts)
+        lines.append(f"- {skill.name}: {skill.description}")
+    return "\n".join(lines)
 ```
 
-Every non-hidden skill (with non-empty content) is concatenated as `# Skill: <name>\n\n<content>` blocks, joined by `\n\n---\n\n`. The result is prepended to **both** the outo and subagent prompts.
+Skills are **lazy-loaded**. Only a catalog — a `# Available Skills` heading, a short instruction telling the model where the skill directories live (`~/.agents/skills/<name>/`) and that it should read the SKILL.md via Bash when a task matches, plus one `- <name>: <description>` line per skill — is prepended to **both** the outo and subagent prompts. The full SKILL.md body is NOT injected; the agent reads it on demand.
 
-If no skills are installed (or all are hidden / empty), `_load_active_skills` returns an empty string (no separator, no heading).
+If no skills are installed (or all are hidden), `_load_active_skills` returns an empty string (no catalog block at all).
 
 ## CLI
 

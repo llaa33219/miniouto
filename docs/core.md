@@ -101,7 +101,9 @@ class ChatOptions:
     style: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
+    reasoning: str | None = None
     continue_session: bool = False
+    cancel_event: threading.Event | None = None
 ```
 
 Mirrors the CLI flags for `miniouto chat`. The CLI is responsible for translating `--name` → `session`, `--continue` → `continue_session`, etc.
@@ -117,11 +119,11 @@ The main entry point. `sink=None` defaults to `NullSink()`; either way the sink 
 1. Resolves a `RuntimeConfig` from settings + overrides.
 2. Computes `provider_config` — `max_tokens` defaults to `get_max_output_tokens(runtime.model, runtime.provider_name)` so providers with low hard caps (Anthropic's 1024) don't truncate long tool calls (e.g. heredoc file writes). The `provider_name` argument scopes the lma lookup so we don't accept the first cross-provider match.
 3. Builds the sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`) and calls `build_runtime(...)` to get a `co.Agent`.
-4. Loads prior history if `continue_session=True` via `_load_coreouto_history` — session `history` dicts are validated back into `co.Message` objects (invalid entries degrade to plain text messages rather than aborting the resume).
+4. Loads prior history if `continue_session=True` via `_load_coreouto_history` — session `history` dicts are validated back into `co.Message` objects; invalid entries degrade to plain text (media block lists are flattened via `_flatten_media_blocks`) but **keep `tool_call_id`/`name` for tool messages** so tool_use/tool_result pairing survives even unknown schema drift (without the id the provider 400s the whole request on resume).
 5. Installs `_make_subagent_dispatcher(sink)` as the subagent observer (`set_subagent_observer`), cleared in a `finally` after the call.
 6. Clears `_tool_trace`, calls `agent.call_sync(prompt, history=core_msgs)` inside try/except.
-7. On exception, records the turn with an empty assistant text (previous on-disk history kept), calls `_dump_failure_diagnostics`, re-raises.
-8. `_persist_turn`: rewrites the session `history` with `[m.model_dump(mode="json") for m in response.messages if m.role != "system"]` and appends a `TurnRecord(user, assistant, recorded_events)`. Persistence failures are swallowed — they must never mask the turn's outcome.
+7. On `LoopCancelledError` (the `cancel_event` was set), records the turn with an empty assistant text and re-raises WITHOUT `_dump_failure_diagnostics` — a user force-stop is a clean cancel, not a failure. On any other exception, records the turn the same way, calls `_dump_failure_diagnostics`, re-raises.
+8. `_persist_turn`: rewrites the session `history` with `[_dump_message(m) for m in response.messages if m.role != "system"]` (media blocks flattened to text placeholders, tool pairing fields always preserved) and appends a `TurnRecord(user, assistant, recorded_events)`. Persistence failures are swallowed — they must never mask the turn's outcome.
 9. Calls `sink.emit_final_answer(response.content)`; returns `response.content`.
 
 ### `_actor_label() -> (str, str | None)`
@@ -355,11 +357,12 @@ class ChatOverrides:
 
 Per-call overrides from CLI flags. All optional.
 
-### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_tool_result=None, on_response=None, on_thinking=None, on_iteration=None, on_provider_error=None, reasoning=None) -> co.Agent`
+### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_tool_result=None, on_response=None, on_thinking=None, on_iteration=None, on_provider_error=None, reasoning=None, cancel_event=None) -> co.Agent`
 
 The heart of miniouto. Steps:
 
 1. **`clear_coreouto_state()`** — Reset all four coreouto registries.
+   - **`cancel_event` guard** — If a `threading.Event` is passed, a `_make_cancel_guard` hook is registered FIRST on both `BEFORE_LLM_CALL` and `BEFORE_TOOL_CALL`: once the event is set the hook raises `LoopCancelledError`, which coreouto's `trigger` does not swallow, so it propagates out of `agent.call_sync`. This is cooperative cancellation — an in-flight LLM call or tool execution is not interrupted; the loop stops before the next step. Inside a `call_subagent` handler the raise is caught by coreouto's tool-call wrapper and surfaces as an error `ToolResult` (killing the subagent immediately); the outo loop then stops at its next `BEFORE_LLM_CALL`.
 2. **Provider registration** — Look up `runtime.provider_name` in the provider store; raise `RuntimeError` if missing. Call `build_coreouto_provider` for it. Repeat for the subagent provider (which may differ).
 3. **`tools.registry.register_all()`** — Registers `Bash/Image/Video/Audio` tools in coreouto.
 4. **`_resolve_both_styles`** — Loads the named style document (or `builtin_default` for `"default"`), splits at `<subagent>…</subagent>` tags, and prepends active skill content to both halves. Returns `(outo_part, subagent_part)`.
@@ -401,7 +404,7 @@ The heart of miniouto. Steps:
 - **`_subagent_description()`** — Hardcoded prompt fragment explaining that the subagent has its own Bash/Image/Video/Audio and a fresh context, blocks until the subagent finishes, returns the final text.
 - **`_resolve_both_styles(style_name, overrides)`** — Splits the style at `<subagent>…</subagent>`. If no subagent section exists, uses `_fallback_style("subagent")`. Prepends active skills to both halves.
 - **`_read_raw_style(name, overrides)`** — Checks in-memory `overrides` first, then `style_store.read(name)`, then the builtin default, then `_fallback_style`.
-- **`_load_active_skills()`** — Lists skills, formats each as `"# Skill: {name}\n\n{content}"` (skipping skills with empty content), joins with `\n\n---\n\n`. Returns empty string if no skills.
+- **`_load_active_skills()`** — Lists skills and builds a lazy-load catalog: a `# Available Skills` heading, a note that each skill lives at `~/.agents/skills/<name>/` and should be read via Bash when matched, then `- <name>: <description>` lines. Skill bodies are NOT injected. Returns empty string if no skills.
 - **`_with_cwd(role, body)`** — Prepends role-specific preamble. Subagent: *"You operate inside this working directory: {INVOCATION_CWD}…"*; outo: *"The user invoked miniouto from: {INVOCATION_CWD}…"*. Regenerated on every call.
 - **`_fallback_style(name)`** — Hardcoded prompts used when no style file exists. Subagent: *"You are subagent. Execute the brief directly…"*; otherwise: *"You are {name}. Use the call_subagent tool for non-trivial work…"*. Both mention the `continue_loop` tool for sending text while still planning more tool calls.
 

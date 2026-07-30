@@ -366,7 +366,7 @@ miniouto skill show git-master
 # [full SKILL.md body]
 ```
 
-Skills are automatically prepended to both the outo and subagent system prompts on every chat call (`core/runtime.py:_load_active_skills`).
+Skills are automatically listed (name + description, plus their on-disk location) in both the outo and subagent system prompts on every chat call (`core/runtime.py:_load_active_skills`); the agent reads the full SKILL.md via Bash when a task matches.
 
 ---
 

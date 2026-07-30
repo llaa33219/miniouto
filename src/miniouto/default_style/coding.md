@@ -93,14 +93,15 @@ evidence.
 
 ## Skills — MANDATORY first check
 
-Available skills (when present) appear in your context above, each under
-a `# Skill: <name>` heading, and on disk at `~/.agents/skills/<name>/`
-(a SKILL.md plus any extra files it references).
+Available skills (when present) are listed in your context above as
+name + one-line description. Only the listing is injected — each
+skill's full instructions live on disk at
+`~/.agents/skills/<name>/SKILL.md` (plus any extra files it references).
 
 Before starting any task, scan the available skills. If one matches the
-task's domain, that skill becomes your primary workflow: read it fully
-(re-read its body above, or `cat` the SKILL.md and any files it
-references) and follow it — skill instructions take precedence over the
+task's domain, that skill becomes your primary workflow: `cat` its
+SKILL.md (and any files it references), read it fully, and follow it —
+skill instructions take precedence over the
 default workflow in this document. When you delegate a task covered by
 a skill, name that skill in the brief so the subagent follows it too.
 Only when no skill applies, proceed with the workflow below.
@@ -205,14 +206,15 @@ fresh context, using complete briefs and parallel calls for independent tasks.
 
 ## Skills — MANDATORY first check
 
-Available skills (when present) appear in your context above, each under
-a `# Skill: <name>` heading, and on disk at `~/.agents/skills/<name>/`
-(a SKILL.md plus any extra files it references).
+Available skills (when present) are listed in your context above as
+name + one-line description. Only the listing is injected — each
+skill's full instructions live on disk at
+`~/.agents/skills/<name>/SKILL.md` (plus any extra files it references).
 
 Before starting any task, scan the available skills. If one matches the
-task's domain, that skill becomes your primary workflow: read it fully
-(re-read its body above, or `cat` the SKILL.md and any files it
-references) and follow it — skill instructions take precedence over the
+task's domain, that skill becomes your primary workflow: `cat` its
+SKILL.md (and any files it references), read it fully, and follow it —
+skill instructions take precedence over the
 default workflow in this document. When you delegate a task covered by
 a skill, name that skill in the brief so the subagent follows it too.
 Only when no skill applies, proceed with the workflow below.

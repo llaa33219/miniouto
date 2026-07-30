@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import secrets
+import threading
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -41,6 +42,25 @@ _SUBAGENT_ID: ContextVar[str | None] = ContextVar("miniouto_subagent_id", defaul
 # (the hooks are global, so this module-level slot is the bridge between
 # the wrapped handler and the active turn's sink). None outside a turn.
 _SUBAGENT_OBSERVER: Callable[[str, str, str], None] | None = None
+
+
+class LoopCancelledError(Exception):
+    """Raised from a hook when the caller's cancel event is set.
+
+    coreouto's hook `trigger` does not swallow exceptions, so raising here
+    propagates out of `agent.call_sync` and terminates the loop at the next
+    hook boundary (before the next LLM call or tool execution).
+    """
+
+
+def _make_cancel_guard(cancel_event: threading.Event) -> Callable[..., None]:
+    """Build a hook that raises LoopCancelledError once the event is set."""
+
+    def _guard(**kwargs: Any) -> None:
+        if cancel_event.is_set():
+            raise LoopCancelledError("stopped by user")
+
+    return _guard
 
 
 def current_subagent_depth() -> int:
@@ -179,6 +199,7 @@ def build_runtime(
     on_iteration: Callable[..., None] | None = None,
     on_provider_error: Callable[..., None] | None = None,
     reasoning: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> co.Agent:
     """Construct the outo Agent with the active style and subagent wired in.
 
@@ -212,9 +233,22 @@ def build_runtime(
     provider-native kwargs merged into `provider_passthrough` for both
     outo and subagent — this is what makes providers return thinking
     blocks at all.
+    `cancel_event` (optional) is a threading.Event polled at every
+    BEFORE_LLM_CALL / BEFORE_TOOL_CALL hook; once set, the hook raises
+    LoopCancelledError, terminating the loop at the next hook boundary.
+    An in-flight LLM call or tool execution is not interrupted — the loop
+    stops cooperatively before the next step.
     """
 
     clear_coreouto_state()
+
+    if cancel_event is not None:
+        # Register first so the guard runs before any logging hook on the
+        # same event — a cancelled tool call should never be logged as if
+        # it were about to run.
+        guard = _make_cancel_guard(cancel_event)
+        co.register_hook(co.BEFORE_LLM_CALL, guard)
+        co.register_hook(co.BEFORE_TOOL_CALL, guard)
 
     provider = provider_store.get(runtime.provider_name)
     if provider is None:
@@ -480,18 +514,31 @@ def _read_raw_style(name: str, overrides: dict[str, str] | None) -> str:
 
 
 def _load_active_skills() -> str:
-    """Load content from all available skills."""
+    """List installed skills (name + description + on-disk location) for lazy loading.
+
+    Only the catalog is injected into the prompt — the model reads the full
+    SKILL.md itself (via Bash) when a task matches a skill's description.
+    """
 
     skills = skill_store.list_skills()
     if not skills:
         return ""
 
-    parts: list[str] = []
+    lines = [
+        "# Available Skills",
+        "",
+        "The following skills are installed. Each lives in its own directory at "
+        f"{skill_store.SKILLS_DIR}/<name>/ containing a SKILL.md with "
+        "instructions plus any supporting files it references. When a task "
+        "matches a skill's description, read that skill's SKILL.md (and the "
+        "files it references) via Bash before proceeding — skill instructions "
+        "take precedence over the default workflow.",
+        "",
+    ]
     for skill in skills:
-        if skill.content:
-            parts.append(f"# Skill: {skill.name}\n\n{skill.content}")
+        lines.append(f"- {skill.name}: {skill.description}")
 
-    return "\n\n---\n\n".join(parts)
+    return "\n".join(lines)
 
 
 def _with_cwd(role: str, body: str) -> str:

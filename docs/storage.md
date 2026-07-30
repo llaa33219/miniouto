@@ -137,7 +137,7 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
 Notes:
 - **v1 migration**: files without a `version` key (flat `messages` list) are migrated on load — records become `history` entries, and user/assistant pairs are synthesized into `turns`. The `(session created)` system marker is dropped.
 - **Tolerant loading**: corrupt JSON, non-dict envelopes, and unknown record fields never raise — they yield an empty `SessionData`.
-- **Media caveat**: a message whose content blocks carry raw bytes that fail JSON serialization degrades to `{"role", "content": <text>}` for that message only (see `core/chat.py:_dump_message`).
+- **Media handling**: media tool results (Image/Video/Audio) are never persisted as media. coreouto's providers build them as raw API wire dicts via `Message.model_construct` (validation bypass), which fail `Message.model_validate` on reload — so `core/chat.py:_dump_message` flattens any content list containing media blocks to plain text (`[image omitted from restored history: image/png]` placeholder) at persist time. A message whose blocks still fail JSON serialization (raw bytes) degrades to a text placeholder too, but **keeps `tool_call_id`/`name`/`tool_calls`** — dropping them would break tool_use/tool_result pairing and make the provider reject the whole restored request with HTTP 400.
 
 Schema of one `history` entry (coreouto `Message`):
 

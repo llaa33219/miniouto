@@ -108,7 +108,7 @@ Modal results are persisted via `storage.settings.update(...)` (for provider/sty
 In the TUI, the model chip always shows `Provider.default_model` — the `Settings.model` field is reserved for the `chat --model` CLI override and is no longer surfaced through the UI.
 
 Keybindings:
-- App-level (registered on `ChatTUI`): `Ctrl+L` — clear log; `Ctrl+C` — quit.
+- App-level (registered on `ChatTUI`): `Ctrl+L` — clear log; `Ctrl+C` — quit; `Esc Esc` (two presses within 0.6 s while the agent is busy) — force-stop the running turn. The stop is cooperative: a `threading.Event` is passed via `ChatOptions.cancel_event`, and the loop's cancel-guard hook raises `LoopCancelledError` at the next hook boundary (before the next LLM call / tool execution) — an in-flight LLM call or tool is not interrupted. The TUI shows `[stopped by user (esc esc)]`; a single `Esc` while busy shows a "press esc again to stop" hint in the spinner line.
 - `Ctrl+P` — open the Textual system command palette (customized via `get_system_commands`) — new session, pick session, change model/provider/style/theme, clear log. The splash text on boot explicitly says "Press Ctrl+P for commands."
 - Widget-level (inside modals / chips): `Tab` / `Shift+Tab` — cycle focus; `Enter` — confirm; `Esc` — cancel.
 

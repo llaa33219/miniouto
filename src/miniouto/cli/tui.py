@@ -19,6 +19,8 @@ Layout:
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
@@ -51,6 +53,7 @@ from ..core import lma as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import LoopEvent
 from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
+from ..core.runtime import LoopCancelledError
 from ..storage import paths
 from ..storage import providers as provider_store
 from ..storage import sessions as session_store
@@ -64,6 +67,9 @@ SENTINEL_CUSTOM_ADD = "__custom_add__"
 # Sentinel for `_save_model_change(reasoning_effort=...)`: don't touch the
 # provider's existing value (vs. None which would clear it).
 _SENTINEL_NO_REASONING = object()
+
+# Two escape presses within this window (seconds) while busy force-stop the loop.
+_ESC_DOUBLE_PRESS_WINDOW = 0.6
 
 
 def _parse_optional_int(result: str | None) -> int | None:
@@ -1212,6 +1218,7 @@ class ChatTUI(App):
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+shift+c", "copy_text", "Copy"),
         Binding("ctrl+l", "clear_log", "Clear"),
+        Binding("escape", "escape_pressed", "Stop", show=False),
     ]
 
     def __init__(self) -> None:
@@ -1226,6 +1233,8 @@ class ChatTUI(App):
         self._subagent_events: dict[str, list[LoopEvent]] = {}
         self._subagent_rows: dict[str, SubagentRow] = {}
         self._pending_tool_rows: list[ToolRow] = []
+        self._cancel_event: threading.Event | None = None
+        self._last_escape = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -2134,6 +2143,19 @@ class ChatTUI(App):
             self.copy_to_clipboard(text)
             self.screen.clear_selection()
 
+    def action_escape_pressed(self) -> None:
+        if not self._busy or self._cancel_event is None:
+            self._last_escape = 0.0
+            return
+        now = time.monotonic()
+        if now - self._last_escape <= _ESC_DOUBLE_PRESS_WINDOW:
+            self._last_escape = 0.0
+            self._cancel_event.set()
+            self._spinner_status("stopping after the current step…")
+        else:
+            self._last_escape = now
+            self._spinner_status("press esc again to stop")
+
     # ── chat log rows ───────────────────────────────────────────────────────
 
     def _mount_row(self, widget: Static) -> None:
@@ -2261,18 +2283,22 @@ class ChatTUI(App):
             self._refresh_chips()
         s = settings_store.load()
         sink = TUIEventSink(self)
+        self._cancel_event = threading.Event()
+        self._last_escape = 0.0
         try:
             opts = ChatOptions(
                 prompt=prompt,
                 session=s.session or "default",
                 model=s.model or None,
                 continue_session=True,
+                cancel_event=self._cancel_event,
             )
             await asyncio.to_thread(run_chat, opts, sink)
+        except LoopCancelledError:
+            self._post_system("stopped by user (esc esc)")
         except Exception as exc:
             self._post_system(f"error: {exc}")
-            self._busy = False
-            return
+        self._cancel_event = None
         self._busy = False
         self._refresh_chips()
 

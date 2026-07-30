@@ -466,7 +466,7 @@ When the user says "format this" ...
 
 ### Auto-detection
 
-**Just create the directory and file — the next chat call picks it up automatically.** There is no registration command. `core/runtime.py:_load_active_skills` scans `~/.agents/skills/` on every `build_runtime()` call and joins the body of every visible skill with `---` separators, prepended to both the outo and subagent system prompts.
+**Just create the directory and file — the next chat call picks it up automatically.** There is no registration command. `core/runtime.py:_load_active_skills` scans `~/.agents/skills/` on every `build_runtime()` call and injects a catalog (name + description per skill, plus the on-disk location) into both the outo and subagent system prompts; the agent reads the full SKILL.md via Bash on demand.
 
 ### Auto-registration script example
 

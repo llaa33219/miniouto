@@ -30,7 +30,7 @@ Both blocks are concatenated with:
 So the final outo prompt the model sees, top to bottom, is:
 
 1. cwd preamble: *"The user invoked miniouto from: {INVOCATION_CWD}…"*
-2. All active skills from `~/.agents/skills/`, formatted as `# Skill: <name>\n\n<content>` joined by `\n\n---\n\n`.
+2. A skill catalog from `~/.agents/skills/`: a `# Available Skills` block listing each skill as `- <name>: <description>` plus a note that full instructions live at `~/.agents/skills/<name>/SKILL.md` (bodies are read on demand via Bash — see `docs/skills.md`).
 3. The `<outo>` section content (or the whole document if `<outo>` is missing).
 
 The subagent prompt mirrors this with the `<subagent>` section and a different preamble: *"You operate inside this working directory: {INVOCATION_CWD}…"*.
@@ -198,7 +198,7 @@ Re-seeds all bundled styles from the miniouto package (same force-refresh that `
 
 ### Skills guidance in bundled styles
 
-Every bundled template includes a **Skills — MANDATORY first check** section in both its `<outo>` and `<subagent>` halves (immediately before the tools list). It instructs the agent to scan the skills injected into its context (each under a `# Skill: <name>` heading, sourced from `~/.agents/skills/`) before starting any task, and — when a skill matches the task's domain — to re-read that skill's body (or `cat` the SKILL.md and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in delegation briefs so the subagent follows it too. Keep this section when authoring a custom style; it is what makes installed skills actually get used.
+Every bundled template includes a **Skills — MANDATORY first check** section in both its `<outo>` and `<subagent>` halves (immediately before the tools list). It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from `~/.agents/skills/`) before starting any task, and — when a skill matches the task's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in delegation briefs so the subagent follows it too. Keep this section when authoring a custom style; it is what makes installed skills actually get used.
 
 ### Web access guidance in bundled styles
 

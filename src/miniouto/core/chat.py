@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import traceback
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,7 @@ from .context import get_max_output_tokens
 from .events import EventSink, LoopEvent, NullSink
 from .runtime import (
     ChatOverrides,
+    LoopCancelledError,
     build_runtime,
     current_subagent_depth,
     current_subagent_id,
@@ -49,6 +51,9 @@ class ChatOptions:
     temperature: float | None = None
     reasoning: str | None = None
     continue_session: bool = False
+    # Cooperative cancellation: once set, the loop raises LoopCancelledError
+    # at the next hook boundary (before the next LLM call / tool execution).
+    cancel_event: threading.Event | None = None
 
 
 def _actor_label() -> tuple[str, str | None]:
@@ -131,6 +136,7 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         on_provider_error=_make_provider_error_dispatcher(sink),
         on_tool_result=_make_tool_result_dispatcher(sink),
         reasoning=opts.reasoning,
+        cancel_event=opts.cancel_event,
     )
 
     session_name = opts.session or runtime.session
@@ -144,6 +150,12 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
     try:
         try:
             response = agent.call_sync(opts.prompt, history=core_msgs)
+        except LoopCancelledError:
+            # User force-stopped the loop — a clean cancel, not a failure:
+            # persist the turn but skip the failure diagnostics dump.
+            sink.end_working()
+            _persist_turn(session_name, None, opts, sink, assistant="")
+            raise
         except Exception as exc:
             sink.end_working()
             _persist_turn(session_name, None, opts, sink, assistant="")
@@ -191,16 +203,65 @@ def _persist_turn(
         pass  # persistence must never mask the turn's real outcome
 
 
+_MEDIA_BLOCK_TYPES = ("image", "video", "audio", "document")
+
+
+def _flatten_media_blocks(blocks: list[Any]) -> str:
+    """Flatten content blocks to plain text, replacing media with placeholders.
+
+    Media tool results (Image/Video/Audio) reach the transcript as raw
+    provider wire dicts (coreouto's anthropic provider builds them via
+    `Message.model_construct`, bypassing validation), so they fail
+    `Message.model_validate` on reload — and even when they survive,
+    re-sending base64 media on every resumed turn wastes tokens. Text is
+    kept verbatim; each media block becomes a one-line placeholder.
+    """
+
+    parts: list[str] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text":
+            text = b.get("text")
+            if text:
+                parts.append(text)
+        elif t in _MEDIA_BLOCK_TYPES:
+            source = b.get("source") or {}
+            mime = b.get("mime_type") or source.get("media_type") or "unknown"
+            parts.append(f"[{t} omitted from restored history: {mime}]")
+    return "\n".join(parts)
+
+
 def _dump_message(m: Any) -> dict[str, Any]:
     try:
-        return m.model_dump(mode="json")
+        dumped = m.model_dump(mode="json")
     except Exception:
         # Media blocks with raw bytes may not survive JSON mode; degrade to
-        # the text content rather than losing the whole transcript.
-        return {
+        # a text placeholder but PRESERVE tool pairing fields — dropping
+        # tool_call_id makes the provider reject the whole restored
+        # request (HTTP 400) on the next turn.
+        d: dict[str, Any] = {
             "role": m.role,
-            "content": m.content if isinstance(m.content, str) else "",
+            "content": m.content
+            if isinstance(m.content, str)
+            else "[media omitted from restored history]",
         }
+        for attr in ("tool_call_id", "name"):
+            v = getattr(m, attr, None)
+            if v is not None:
+                d[attr] = v
+        tcs = getattr(m, "tool_calls", None)
+        if tcs:
+            with suppress(Exception):
+                d["tool_calls"] = [tc.model_dump(mode="json") for tc in tcs]
+        return d
+    content = dumped.get("content")
+    if isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") in _MEDIA_BLOCK_TYPES for b in content
+    ):
+        dumped["content"] = _flatten_media_blocks(content)
+    return dumped
 
 
 def _make_tool_call_dispatcher(sink: EventSink):
@@ -466,7 +527,17 @@ def _load_coreouto_history(session: str, continue_session: bool) -> list[co.Mess
         except Exception:
             role = d.get("role") if d.get("role") in ("user", "assistant", "tool") else "user"
             content = d.get("content")
-            out.append(co.Message(role=role, content=content if isinstance(content, str) else ""))
+            if isinstance(content, list):
+                content = _flatten_media_blocks(content)
+            elif not isinstance(content, str):
+                content = ""
+            kwargs: dict[str, Any] = {"role": role, "content": content}
+            # Preserve tool pairing: a tool message without tool_call_id
+            # makes the provider reject the whole request (HTTP 400).
+            if role == "tool":
+                kwargs["tool_call_id"] = d.get("tool_call_id")
+                kwargs["name"] = d.get("name")
+            out.append(co.Message(**kwargs))
     return out or None
 
 

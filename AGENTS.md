@@ -93,10 +93,10 @@ These rules hold throughout the codebase. Breaking any of them silently degrades
 
 If you change the tag format, update `split_style`, `default_style/*.md`, and `docs/styles.md`.
 
-### 3. Two-layer prompt assembly
+### 3. Two-layer prompt assembly (skills are lazy-loaded)
 The final prompt the outo model sees, top to bottom:
 1. **Per-call cwd preamble** (`_with_cwd("outo", …)`) — the user's working directory at miniouto invocation.
-2. **All active skills** from `~/.agents/skills/` joined by `\n\n---\n\n`.
+2. **A skill catalog** from `~/.agents/skills/` — a `# Available Skills` block listing each skill as `- <name>: <description>` plus a note that full instructions live at `~/.agents/skills/<name>/SKILL.md`. Bodies are **not** injected; the agent reads them on demand via Bash (lazy loading).
 3. **The `<outo>` section** of the active style (or whole-document fallback).
 
 Subagent mirrors this with `<subagent>` content and a different cwd preamble. The cwd preamble is regenerated on every call (not persisted).
@@ -129,7 +129,7 @@ If you add a new async tool that itself calls subagents, route it through `_wrap
 ### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display)
 `storage/sessions.py` writes `{"version": 2, "history": [...], "turns": [...]}`:
 
-- `history` = raw coreouto `Message.model_dump` dicts **minus system messages** (coreouto prepends a fresh system prompt every `call()` — persisting it duplicates it per turn; see coreouto `examples/21_loop_history.py`). Rewritten in full every turn from `Response.messages`, so it stays consistent with in-loop summarize-hook compaction.
+- `history` = coreouto `Message.model_dump` dicts **minus system messages** (coreouto prepends a fresh system prompt every `call()` — persisting it duplicates it per turn; see coreouto `examples/21_loop_history.py`), **with media blocks flattened to text placeholders** (`_dump_message` — coreouto persists media tool results as provider wire dicts that fail `Message` validation on reload; the flatten also keeps `tool_call_id`/`name` so tool pairing never breaks — dropping it makes the provider HTTP 400 the whole restored request). Rewritten in full every turn from `Response.messages`, so it stays consistent with in-loop summarize-hook compaction.
 - `turns` = display-only `TurnRecord`s (user, assistant, `LoopEvent` dicts). **Thinking lives only here** — coreouto providers never put thinking into history `Message` objects; it's captured via the `ON_THINKING` hook.
 
 `load()` migrates v1 files and never raises on corrupt content. If you change the schema again, bump `SCHEMA_VERSION` and extend the migration — do not break old files.
@@ -188,14 +188,14 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `cli/skill.py` | `skill list/show` (read-only) |
 | `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
-| `core/chat.py` | `ChatOptions`, `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
+| `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
 | `core/events.py` | `LoopEvent` (with `subagent_id`, `detail`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events) |
 | `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) + `default_error_handling(api_format)` |
 | `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
 | `core/reasoning.py` | lma `reasoning_options` resolver → `provider_passthrough` kwargs (`resolve_reasoning_passthrough` + UI helpers `reasoning_choices`/`default_reasoning_choice`); google unsupported |
-| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, subagent tool (per-invocation 6-hex id + lifecycle observer), hooks |
+| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, `LoopCancelledError` + cancel-guard hook (cooperative loop stop via `threading.Event`), subagent tool (per-invocation 6-hex id + lifecycle observer), hooks |
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
 | `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
 | `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`, optional `max_context_window`/`max_output_tokens`/`reasoning_effort` overrides) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
