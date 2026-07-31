@@ -26,8 +26,8 @@ def _register_if_missing(name: str, handler, schema: dict, description: str) -> 
     co.register_tool(name, description=description)(handler)
 
 
-async def _bash_handler(command: str, timeout_seconds: int = 60, cwd: str | None = None) -> str:
-    return await bash(command, timeout_seconds=timeout_seconds, cwd=cwd)
+async def _bash_handler(command: str, cwd: str | None = None) -> str:
+    return await bash(command, cwd=cwd)
 
 
 # The Image/Video/Audio handlers below return list[co.ContentBlock] (a TextBlock
@@ -79,9 +79,10 @@ def _audio_handler(file_path: str) -> list:
 def _bash_description() -> str:
     return (
         "Run a shell command. Captures stdout and stderr; exits with the "
-        "command's exit code. Default timeout 60s, max 600s. Output >30KB "
-        "is truncated with a note. Default cwd is the directory miniouto "
-        "was invoked from. This is the ONLY file-manipulation tool: read "
+        "command's exit code. No timeout — the command runs to completion. "
+        "Output >30KB is truncated with a note. Default cwd is the "
+        "directory miniouto was invoked from. This is the ONLY "
+        "file-manipulation tool: read "
         "with `cat`/`grep`/`find`, create with `cat > file <<'EOF'` or "
         "`tee`, edit with `sed -i` or a short Python snippet, delete with "
         "`rm`. Also use it for `git`, `pytest`, package managers, etc."
@@ -93,12 +94,6 @@ def _bash_schema() -> dict:
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "Shell command to execute."},
-            "timeout_seconds": {
-                "type": "integer",
-                "description": "Max seconds to wait (default 60, max 600).",
-                "minimum": 1,
-                "maximum": 600,
-            },
             "cwd": {
                 "type": "string",
                 "description": "Override working directory (default: process cwd).",

@@ -69,7 +69,7 @@ SENTINEL_CUSTOM_ADD = "__custom_add__"
 _SENTINEL_NO_REASONING = object()
 
 # Two escape presses within this window (seconds) while busy force-stop the loop.
-_ESC_DOUBLE_PRESS_WINDOW = 0.6
+_ESC_DOUBLE_PRESS_WINDOW = 2.0
 
 
 def _parse_optional_int(result: str | None) -> int | None:

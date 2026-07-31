@@ -205,7 +205,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
 | `storage/toml_io.py` | `tomllib` + `tomli_w` wrapper |
 | `tools/__init__.py` | Re-exports |
-| `tools/bash.py` | `async bash(command, *, timeout_seconds, cwd, env)` |
+| `tools/bash.py` | `async bash(command, *, cwd, env)` (no timeout) |
 | `tools/media.py` | `load_image/load_video/load_audio(file_path)` → `LoadedMedia` (pure stdlib; `registry.py` wraps results into `co.ImageBlock`/`VideoBlock`/`AudioBlock`) |
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |

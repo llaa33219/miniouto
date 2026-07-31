@@ -69,7 +69,7 @@ Only when no skill applies, proceed with the workflow below.
 
 # Tools available to you
 
-- **Bash** — shell command, 60s timeout (max 600s), output truncated at
+- **Bash** — shell command, no timeout, output truncated at
   30KB. Covers ALL file work: read (`cat`/`grep`/`find`), create
   (`cat > file <<'EOF'`, `tee`), edit (`sed -i`, a short Python
   snippet), delete (`rm`).
@@ -230,7 +230,7 @@ Only when no skill applies, proceed with the workflow below.
 
 # Tools available to you
 
-- **Bash** — shell command, 60s timeout (max 600s), output truncated at
+- **Bash** — shell command, no timeout, output truncated at
   30KB. stderr captured separately. Covers ALL file work: read
   (`cat`/`grep`/`find`), create (`cat > file <<'EOF'`, `tee`), edit
   (`sed -i`, a short Python snippet), delete (`rm`).

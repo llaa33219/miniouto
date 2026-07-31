@@ -5,7 +5,7 @@ The `tools/` subpackage implements the tools the agent can invoke: one shell too
 ```
 src/miniouto/tools/
 ├── __init__.py
-├── bash.py           # async bash(command, *, timeout_seconds, cwd, env)
+├── bash.py           # async bash(command, *, cwd, env)
 ├── media.py          # load_image/load_video/load_audio — read media bytes (pure stdlib)
 └── registry.py       # register_all() — wires tools into coreouto
 ```
@@ -28,17 +28,15 @@ Async shell tool.
 
 ```python
 MAX_OUTPUT_BYTES = 30_000
-DEFAULT_TIMEOUT_SECONDS = 60
-MAX_TIMEOUT_SECONDS = 600
 TRUNCATION_NOTE = "<NOTE>Output was truncated to {max} bytes. ...</NOTE>"
 ```
 
-### `async bash(command: str, *, timeout_seconds: int = 60, cwd: str | None = None, env: dict[str, str] | None = None) -> str`
+### `async bash(command: str, *, cwd: str | None = None, env: dict[str, str] | None = None) -> str`
 
 Behavior:
 - Spawns `asyncio.create_subprocess_shell` with `stdout=PIPE, stderr=PIPE`.
 - Captures stdout + stderr.
-- On timeout: kills the process and raises `BashError`.
+- **No timeout** — the command runs to completion (the user can force-stop the loop from the TUI with a double-ESC, which aborts the pending tool call).
 - Formats output (via `_format_output`) as:
 
   ```
@@ -56,7 +54,7 @@ Behavior:
 - `cwd` defaults to `INVOCATION_CWD` (the user's cwd at miniouto invocation).
 - `env` is **merged on top of** `os.environ` — existing env vars are preserved unless explicitly overridden. Note: the underlying `bash()` accepts `env`, but the model-facing handler `_bash_handler` does **not** expose it (see schemas below), so the LLM cannot set custom env vars.
 
-Raises `BashError` on empty command, spawn failure, or timeout.
+Raises `BashError` on empty command or spawn failure.
 
 ### `class BashError(Exception)`
 
@@ -71,15 +69,13 @@ Computed but **not passed to coreouto** (see "A note on schemas" below). Reprodu
   "type": "object",
   "properties": {
     "command":         {"type": "string", "description": "Shell command to execute."},
-    "timeout_seconds": {"type": "integer", "description": "Max seconds to wait (default 60, max 600).",
-                        "minimum": 1, "maximum": 600},
     "cwd":             {"type": "string", "description": "Override working directory (default: process cwd)."}
   },
   "required": ["command"]
 }
 ```
 
-The handler `_bash_handler(command, timeout_seconds=60, cwd=None)` likewise has no `env` parameter, so even if a model sent `env` it would not be forwarded.
+The handler `_bash_handler(command, cwd=None)` likewise has no `env` parameter, so even if a model sent `env` it would not be forwarded.
 
 ### Why `bash` is the only async tool
 
@@ -178,7 +174,7 @@ The `_xxx_schema()` functions are invoked at registration time (`_register_if_mi
 
 | Tool | Handler | Signature |
 |---|---|---|
-| `Bash` | `async _bash_handler(command, timeout_seconds=60, cwd=None) -> str` | async (no `env` — the handler signature does not expose it even though `bash()` does) |
+| `Bash` | `async _bash_handler(command, cwd=None) -> str` | async (no `env` — the handler signature does not expose it even though `bash()` does) |
 | `Image` | `_image_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, ImageBlock]` |
 | `Video` | `_video_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, VideoBlock]` |
 | `Audio` | `_audio_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, AudioBlock]` |
@@ -191,7 +187,7 @@ Each description includes the tool's restrictions inline. Verbatim from `registr
 
 | Tool | Description (verbatim) |
 |---|---|
-| `Bash` | "Run a shell command. Captures stdout and stderr; exits with the command's exit code. Default timeout 60s, max 600s. Output >30KB is truncated with a note. Default cwd is the directory miniouto was invoked from. This is the ONLY file-manipulation tool: read with `cat`/`grep`/`find`, create with `cat > file <<'EOF'` or `tee`, edit with `sed -i` or a short Python snippet, delete with `rm`. Also use it for `git`, `pytest`, package managers, etc." |
+| `Bash` | "Run a shell command. Captures stdout and stderr; exits with the command's exit code. No timeout — the command runs to completion. Output >30KB is truncated with a note. Default cwd is the directory miniouto was invoked from. This is the ONLY file-manipulation tool: read with `cat`/`grep`/`find`, create with `cat > file <<'EOF'` or `tee`, edit with `sed -i` or a short Python snippet, delete with `rm`. Also use it for `git`, `pytest`, package managers, etc." |
 | `Image` | "View an image file and return it to the model so it can actually be seen. Supports PNG, JPEG, GIF, WebP. Capped at 20 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an image content block — the model receives the pixels, not a text description. For unsupported formats or oversized files, convert first with Bash (e.g. ImageMagick `convert`, Pillow)." |
 | `Video` | "View a video file and return it to the model so it can actually be perceived. Supports MP4, MOV, WebM. Capped at 50 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as a video content block. For unsupported formats or oversized files, downsample first with Bash (e.g. ffmpeg)." |
 | `Audio` | "View an audio file and return it to the model so it can actually be heard. Supports WAV, MP3. Capped at 25 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an audio content block. For unsupported formats or oversized files, downsample first with Bash (e.g. sox, ffmpeg)." |
