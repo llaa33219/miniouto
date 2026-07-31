@@ -17,6 +17,7 @@ from ..storage import providers as provider_store
 from ..storage import settings as settings_store
 from ..storage import skills as skill_store
 from ..storage import styles as style_store
+from ..tools import bash as bash_tool
 from ..tools import registry as tool_registry
 from .providers import build_coreouto_provider, clear_coreouto_state
 
@@ -236,11 +237,14 @@ def build_runtime(
     `cancel_event` (optional) is a threading.Event polled at every
     BEFORE_LLM_CALL / BEFORE_TOOL_CALL hook; once set, the hook raises
     LoopCancelledError, terminating the loop at the next hook boundary.
-    An in-flight LLM call or tool execution is not interrupted — the loop
-    stops cooperatively before the next step.
+    An in-flight LLM call is not interrupted; an in-flight Bash call IS
+    killed (tools/bash.py polls the same event, since Bash has no timeout).
+    Other in-flight tools finish — the loop stops cooperatively before the
+    next step.
     """
 
     clear_coreouto_state()
+    bash_tool.set_cancel_event(cancel_event)
 
     if cancel_event is not None:
         # Register first so the guard runs before any logging hook on the

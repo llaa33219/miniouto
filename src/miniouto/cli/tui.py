@@ -1096,7 +1096,14 @@ class TUIEventSink:
     def _tick_spin(self) -> None:
         frame = _SPINNER_FRAMES[self._frame_idx % len(_SPINNER_FRAMES)]
         self._frame_idx += 1
-        self._app._render_spinner(frame, self._activity)
+        text = self._activity
+        hint = self._app._esc_hint
+        if hint is not None:
+            if time.monotonic() < self._app._esc_hint_until:
+                text = hint
+            else:
+                self._app._esc_hint = None
+        self._app._render_spinner(frame, text)
         self._app._tick_subagent_rows(frame)
 
     def update_activity(self, text: str) -> None:
@@ -1235,6 +1242,8 @@ class ChatTUI(App):
         self._pending_tool_rows: list[ToolRow] = []
         self._cancel_event: threading.Event | None = None
         self._last_escape = 0.0
+        self._esc_hint: str | None = None
+        self._esc_hint_until = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -2150,11 +2159,15 @@ class ChatTUI(App):
         now = time.monotonic()
         if now - self._last_escape <= _ESC_DOUBLE_PRESS_WINDOW:
             self._last_escape = 0.0
+            self._esc_hint = "stopping after the current step…"
+            self._esc_hint_until = float("inf")
             self._cancel_event.set()
-            self._spinner_status("stopping after the current step…")
+            self._spinner_status(self._esc_hint)
         else:
             self._last_escape = now
-            self._spinner_status("press esc again to stop")
+            self._esc_hint = "press esc again to stop"
+            self._esc_hint_until = now + _ESC_DOUBLE_PRESS_WINDOW
+            self._spinner_status(self._esc_hint)
 
     # ── chat log rows ───────────────────────────────────────────────────────
 
@@ -2300,6 +2313,7 @@ class ChatTUI(App):
             self._post_system(f"error: {exc}")
         self._cancel_event = None
         self._busy = False
+        self._esc_hint = None
         self._refresh_chips()
 
 

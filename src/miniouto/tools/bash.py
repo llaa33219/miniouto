@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 
 from ..paths_runtime import INVOCATION_CWD
@@ -13,6 +14,16 @@ TRUNCATION_NOTE = (
     "\n\n<NOTE>Output was truncated to {max} bytes. "
     "If you need more, narrow the command (e.g. pipe to `head`, `grep`, or write to a file).</NOTE>"
 )
+
+# Per-turn cancel slot, set by core.runtime.build_runtime. Unlike every other
+# tool, Bash has no timeout, so the TUI's ESC ESC cancel must be able to kill
+# an in-flight process — the loop-level cancel guard only fires between steps.
+_CANCEL_EVENT: threading.Event | None = None
+
+
+def set_cancel_event(event: threading.Event | None) -> None:
+    global _CANCEL_EVENT
+    _CANCEL_EVENT = event
 
 
 async def bash(
@@ -37,7 +48,15 @@ async def bash(
     except FileNotFoundError as exc:
         raise BashError(f"Failed to spawn shell: {exc}") from exc
 
-    stdout_b, stderr_b = await proc.communicate()
+    comm = asyncio.ensure_future(proc.communicate())
+    while not comm.done():
+        if _CANCEL_EVENT is not None and _CANCEL_EVENT.is_set():
+            proc.kill()
+            await comm
+            elapsed = time.monotonic() - start
+            raise BashError(f"Command cancelled by user (esc esc) after {elapsed:.1f}s.")
+        await asyncio.sleep(0.1)
+    stdout_b, stderr_b = comm.result()
 
     elapsed = time.monotonic() - start
     out = stdout_b.decode("utf-8", errors="replace")

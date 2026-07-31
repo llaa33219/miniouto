@@ -36,7 +36,7 @@ TRUNCATION_NOTE = "<NOTE>Output was truncated to {max} bytes. ...</NOTE>"
 Behavior:
 - Spawns `asyncio.create_subprocess_shell` with `stdout=PIPE, stderr=PIPE`.
 - Captures stdout + stderr.
-- **No timeout** — the command runs to completion (the user can force-stop the loop from the TUI with a double-ESC, which aborts the pending tool call).
+- **No timeout** — the command runs to completion (the user can force-stop the loop from the TUI with a double-ESC, which kills the in-flight process: `build_runtime` passes the turn's `cancel_event` into `set_cancel_event`, and `bash()` polls it every 0.1 s while waiting for the process).
 - Formats output (via `_format_output`) as:
 
   ```
