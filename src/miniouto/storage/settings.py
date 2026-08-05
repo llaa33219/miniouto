@@ -16,6 +16,15 @@ class Settings:
     style: str = "default"
     session: str = "default"
     theme: str = ""
+    # Subagent provider/model/reasoning overrides. Empty string = inherit
+    # outo's provider/model and fall back to the subagent provider's
+    # `reasoning_effort`. NOTE: `merge()` and `update()` skip empty-string
+    # values, so these cannot be cleared through `update()` — callers must
+    # clear them via `save(replace(load(), subagent_provider="", ...))`
+    # (see cli/subagent.py's `clear` command and `set --reasoning ""`).
+    subagent_provider: str = ""
+    subagent_model: str = ""
+    subagent_reasoning: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v not in (None, "")}

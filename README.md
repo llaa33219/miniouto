@@ -58,6 +58,23 @@ The active model is chosen by the first match in:
 3. `provider.default_model` (set by `provider add --default-model`, `provider custom add --default-model`, or the TUI model chip)
 4. error — no model can be inferred
 
+The **subagent** can run on a different provider/model. Its provider is chosen by:
+
+1. `miniouto chat --subagent-provider <name>` (per-call override)
+2. `settings.subagent_provider` (set via `miniouto subagent set --provider`)
+3. inherit outo's provider
+
+Its model is chosen by:
+
+1. `miniouto chat --subagent-model <name>` (per-call override)
+2. `settings.subagent_model` (set via `miniouto subagent set --model`)
+3. the subagent provider's `default_model`
+4. inherit outo's model (only when no subagent provider is set; otherwise error)
+
+A model-only override (no subagent provider) is also valid — the subagent then runs outo's provider with the overridden model.
+
+The subagent's reasoning effort resolves as: `--reasoning` flag (per-call, applies to both outo and subagent) > `settings.subagent_reasoning` (via `miniouto subagent set --reasoning`) > the subagent provider's `reasoning_effort`.
+
 ## Commands
 
 | Command | Purpose |
@@ -70,6 +87,7 @@ The active model is chosen by the first match in:
 | `miniouto provider list/remove/default` | Manage saved providers |
 | `miniouto style list/set/add/update/show` | Manage style documents (`update` re-seeds bundled + re-fetches all repo styles) |
 | `miniouto skill list/show` | List/show skills from `~/.agents/skills/` |
+| `miniouto subagent show/set/clear` | Manage the subagent's provider/model override (empty = inherit outo's) |
 
 ### `chat` flags
 
@@ -79,6 +97,8 @@ The active model is chosen by the first match in:
 | `--provider` | Override the active provider for this call |
 | `--model` | Override the resolved model for this call |
 | `--style` | Override the active style for this call |
+| `--subagent-provider` | Override the subagent's provider for this call |
+| `--subagent-model` | Override the subagent's model for this call |
 | `--max-tokens` | Cap output tokens |
 | `--temperature` | Sampling temperature |
 | `--reasoning` | Override reasoning for this call (effort level / `on` / `none`). Default: provider setting, else lma model default |
@@ -90,7 +110,7 @@ The active model is chosen by the first match in:
 
 Everything lives under `~/.miniouto/`:
 - `providers.toml` — provider configs (one top-level TOML table per provider: `api_format`, `base_url`, `api_key`, `default_model`, `source`)
-- `settings.toml` — active `provider`, `model` (legacy), `style`, `session`, `theme`
+- `settings.toml` — active `provider`, `model` (legacy), `style`, `session`, `theme`, `subagent_provider`, `subagent_model`, `subagent_reasoning`
 - `style/<name>.md` — style documents
 - `sessions/<name>.json` — conversation history
 - `logs/` — reserved (currently unused)

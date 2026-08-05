@@ -21,6 +21,12 @@ def chat_cmd(
     provider: str | None = typer.Option(None, "--provider", help="Override the active provider."),
     model: str | None = typer.Option(None, "--model", help="Override the default model."),
     style: str | None = typer.Option(None, "--style", help="Override the active style."),
+    subagent_provider: str | None = typer.Option(
+        None, "--subagent-provider", help="Override the subagent's provider for this call."
+    ),
+    subagent_model: str | None = typer.Option(
+        None, "--subagent-model", help="Override the subagent's model for this call."
+    ),
     max_tokens: int | None = typer.Option(None, "--max-tokens", help="Cap output tokens."),
     temperature: float | None = typer.Option(None, "--temperature", help="Sampling temperature."),
     reasoning: str | None = typer.Option(
@@ -67,6 +73,8 @@ def chat_cmd(
         provider=provider,
         model=model,
         style=style,
+        subagent_provider=subagent_provider,
+        subagent_model=subagent_model,
         max_tokens=max_tokens,
         temperature=temperature,
         reasoning=reasoning,

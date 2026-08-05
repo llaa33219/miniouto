@@ -90,11 +90,14 @@ model    = ""           # optional; legacy per-session model override (cleared b
 style    = "default"    # default style (must exist in ~/.miniouto/style/)
 session  = "default"    # default session name (auto-set to the most recent chat session)
 theme    = ""           # optional; TUI theme name (persisted by the TUI theme picker)
+subagent_provider = ""  # optional; subagent provider override (empty = inherit outo's provider)
+subagent_model    = ""  # optional; subagent model override (empty = subagent provider's default_model, else inherit outo's model)
+subagent_reasoning = "" # optional; subagent reasoning-effort override (empty = subagent provider's reasoning_effort, else auto)
 ```
 
-All five keys are optional. Missing keys fall back to: empty string for `provider`/`model`/`theme`, `"default"` for `style`/`session`.
+All eight keys are optional. Missing keys fall back to: empty string for `provider`/`model`/`theme`/`subagent_provider`/`subagent_model`/`subagent_reasoning`, `"default"` for `style`/`session`.
 
-The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> Settings` — non-empty/non-None override values win. `to_dict()` drops empty values (same rule as `Provider`).
+The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> Settings` — non-empty/non-None override values win. `to_dict()` drops empty values (same rule as `Provider`). Because `merge()`/`update()` skip empty strings, the subagent keys cannot be *cleared* through `update()` — `cli/subagent.py`'s `clear` command uses `save(replace(load(), subagent_provider="", subagent_model="", subagent_reasoning=""))` instead (and `set --reasoning ""` does the same for the reasoning key alone).
 
 ### `sessions/<name>.json`
 

@@ -178,6 +178,7 @@ class RuntimeConfig:
     style_name: str
     subagent_model: str | None = None
     subagent_provider: str | None = None
+    subagent_reasoning: str | None = None
     session: str | None = None
 
 
@@ -186,6 +187,8 @@ class ChatOverrides:
     provider: str | None = None
     model: str | None = None
     style: str | None = None
+    subagent_provider: str | None = None
+    subagent_model: str | None = None
 
 
 def build_runtime(
@@ -307,7 +310,11 @@ def build_runtime(
     subagent_provider_config.setdefault(
         "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
     )
-    subagent_choice = reasoning if reasoning is not None else sub_provider.reasoning_effort
+    subagent_choice = (
+        reasoning
+        if reasoning is not None
+        else (runtime.subagent_reasoning or sub_provider.reasoning_effort)
+    )
     subagent_passthrough = resolve_reasoning_passthrough(
         sub_provider.api_format,
         subagent_model,
@@ -608,9 +615,53 @@ def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> Run
             "`miniouto provider add --default-model <name>`."
         )
 
+    subagent_provider, subagent_model = _resolve_subagent(overrides, s)
+
     return RuntimeConfig(
         provider_name=provider_name,
         model=model,
         style_name=overrides.style or s.style or "default",
         session=s.session or "default",
+        subagent_provider=subagent_provider,
+        subagent_model=subagent_model,
+        subagent_reasoning=s.subagent_reasoning or None,
     )
+
+
+def _resolve_subagent(
+    overrides: ChatOverrides, s: settings_store.Settings
+) -> tuple[str | None, str | None]:
+    """Resolve the subagent's provider/model for build_runtime.
+
+    Provider precedence: CLI override > settings > None (None = inherit
+    outo's provider — build_runtime's `runtime.subagent_provider or
+    runtime.provider_name` fallback handles it).
+    Model precedence: CLI override > settings > subagent provider's
+    default_model > None (None = inherit outo's model via the same
+    `or`-fallback in build_runtime). A model-only override (no subagent
+    provider) is valid: the subagent then runs outo's provider with a
+    different model.
+    """
+
+    subagent_provider = overrides.subagent_provider or s.subagent_provider or None
+    subagent_model = overrides.subagent_model or s.subagent_model or None
+    if subagent_provider is None:
+        return None, subagent_model
+
+    sub_provider = provider_store.get(subagent_provider)
+    if sub_provider is None:
+        raise RuntimeError(
+            f"Subagent provider {subagent_provider!r} is not configured. "
+            "Run `miniouto provider add`/`miniouto provider custom add` first, "
+            "or pick a different one via `miniouto subagent set --provider`."
+        )
+
+    if subagent_model is None and sub_provider.default_model:
+        subagent_model = sub_provider.default_model
+    if subagent_model is None:
+        raise RuntimeError(
+            f"No model specified for subagent provider {subagent_provider!r}. "
+            "Set one via `chat --subagent-model <name>` or "
+            "`miniouto subagent set --model <name>`."
+        )
+    return subagent_provider, subagent_model

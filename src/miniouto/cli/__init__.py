@@ -9,6 +9,7 @@ from ..storage import paths
 from . import provider as provider_module
 from . import skill as skill_module
 from . import style as style_module
+from . import subagent as subagent_module
 from . import tui as tui_module
 from .chat import chat_cmd
 
@@ -22,6 +23,7 @@ app = typer.Typer(
 app.add_typer(provider_module.app, name="provider")
 app.add_typer(style_module.app, name="style")
 app.add_typer(skill_module.app, name="skill")
+app.add_typer(subagent_module.app, name="subagent")
 app.command("chat", help="Run a single chat turn.")(chat_cmd)
 
 console = Console()
@@ -57,6 +59,13 @@ def status() -> None:
     default_model = active_provider.default_model if active_provider else ""
     console.print(f"[bold]Default provider:[/bold] {s.provider or '-'}")
     console.print(f"[bold]Default model:[/bold]    {default_model or '- (use chat --model)'}")
+    if s.subagent_provider or s.subagent_model:
+        sub_name = s.subagent_provider or s.provider
+        sub = provider_store.get(sub_name) if sub_name else None
+        sub_model = s.subagent_model or (sub.default_model if sub else "") or "-"
+        console.print(f"[bold]Subagent:[/bold]        {sub_name or '-'}/{sub_model}")
+    else:
+        console.print(f"[bold]Subagent:[/bold]        same as outo ({s.provider or '-'}/{default_model or '-'})")
     console.print(f"[bold]Active style:[/bold]    {s.style or '-'}")
     console.print(f"[bold]Session:[/bold]         {s.session or '-'}")
     console.print(f"[bold]Storage:[/bold]         {paths.ROOT}")

@@ -9,11 +9,11 @@ Layout:
   ├─────────────────────────────────────────────┤
   │ Input                                       │
   ├─────────────────────────────────────────────┤
-  │ Working spinner (1 row)                     │
-  │ model  provider             style           │   <- clickable chips
-  │ session                                      │   <- muted, left-aligned
-  │ Tab/click chips · Enter open · Esc cancel   │   <- help hint
-  └─────────────────────────────────────────────┘
+   │ Working spinner (1 row)                     │
+   │ outo:model reasoning:v  subagent:… … style   │   <- clickable chips
+   │ session                                      │   <- muted, left-aligned
+   │ Tab/click chips · Enter open · Esc cancel   │   <- help hint
+   └─────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ from ..storage.providers import SOURCE_CUSTOM, SOURCE_LMA
 
 SENTINEL_CATALOG_ADD = "__catalog_add__"
 SENTINEL_CUSTOM_ADD = "__custom_add__"
+SENTINEL_SAME_AS_OUTO = "__same_as_outo__"
 
 # Sentinel for `_save_model_change(reasoning_effort=...)`: don't touch the
 # provider's existing value (vs. None which would clear it).
@@ -590,17 +591,13 @@ class BottomPanel(Static):
     def compose(self) -> ComposeResult:
         yield Static("", id="spinner-row")
         with Horizontal(id="chip-row"):
-            self._chips["model"] = StatusChip("", "-", id="chip-model", variant="accent")
-            self._chips["provider"] = StatusChip(
-                "", "-", id="chip-provider", variant="muted"
-            )
-            self._chips["reasoning"] = StatusChip(
-                "reasoning", "-", id="chip-reasoning", variant="muted"
+            self._chips["outo"] = StatusChip("outo", "-", id="chip-outo", variant="accent")
+            self._chips["subagent"] = StatusChip(
+                "subagent", "-", id="chip-subagent", variant="muted"
             )
             self._chips["style"] = StatusChip("", "-", id="chip-style")
-            yield self._chips["model"]
-            yield self._chips["provider"]
-            yield self._chips["reasoning"]
+            yield self._chips["outo"]
+            yield self._chips["subagent"]
             yield Static("", id="chip-spacer")
             yield self._chips["style"]
         self._session_label = Static("-", id="session-row")
@@ -1301,14 +1298,14 @@ class ChatTUI(App):
             self._open_session_picker,
         )
         yield SystemCommand(
-            "02 Pick model",
-            "Set the active provider's default model",
-            self._open_model_editor,
+            "02 Configure outo",
+            "Provider → model → reasoning for the main agent",
+            self._configure_outo,
         )
         yield SystemCommand(
-            "03 Pick provider",
-            "Switch the active provider (or add from catalog / custom)",
-            self._open_provider_picker,
+            "03 Configure subagent",
+            "Provider → model → reasoning for the subagent",
+            self._open_subagent_editor,
         )
         yield SystemCommand(
             "04 Pick style",
@@ -1341,18 +1338,19 @@ class ChatTUI(App):
 
     def on_status_chip_chip_clicked(self, event: StatusChip.ChipClicked) -> None:
         chip = event.chip
-        if chip.id == "chip-provider":
-            self._open_provider_picker()
-        elif chip.id == "chip-model":
-            self._open_model_editor()
+        if chip.id == "chip-outo":
+            self._configure_outo()
+        elif chip.id == "chip-subagent":
+            self._open_subagent_editor()
         elif chip.id == "chip-style":
             self._open_style_picker()
         elif chip.id == "chip-session":
             self._open_session_picker()
-        elif chip.id == "chip-reasoning":
-            self._open_reasoning_picker()
 
     # ── modal actions ───────────────────────────────────────────────────────
+
+    def _configure_outo(self) -> None:
+        self._open_provider_picker()
 
     def _open_provider_picker(self) -> None:
         providers = sorted(provider_store.load_all().keys())
@@ -1368,6 +1366,7 @@ class ChatTUI(App):
                 self._open_custom_add_wizard()
                 return
             self._switch_provider(result)
+            self._open_model_editor()
 
         self.push_screen(
             SelectionModal(
@@ -1702,66 +1701,6 @@ class ChatTUI(App):
         else:
             self._open_custom_model_editor(provider)
 
-    def _open_reasoning_picker(self) -> None:
-        provider = provider_store.get(settings_store.load().provider)
-        if not provider:
-            self._spinner_status("No active provider. Pick a provider first.")
-            return
-        self.run_worker(self._reasoning_picker_flow(provider), exclusive=False)
-
-    async def _reasoning_picker_flow(self, provider) -> None:
-        model = provider.default_model
-        stored = _reasoning_value(provider)
-        reasoning_api = _get_reasoning_api()
-        choices: list[str] | None = None
-        if reasoning_api is not None:
-            try:
-                choices = await asyncio.to_thread(
-                    reasoning_api.reasoning_choices, model, provider.name
-                )
-            except Exception:
-                choices = None
-        if choices:
-            if stored and stored in choices:
-                current = stored
-            else:
-                default_choice: str | None = None
-                if reasoning_api is not None:
-                    try:
-                        default_choice = await asyncio.to_thread(
-                            reasoning_api.default_reasoning_choice, model, provider.name
-                        )
-                    except Exception:
-                        default_choice = None
-                current = default_choice or "off"
-            picked = await self.push_screen_wait(
-                SelectionModal(
-                    f"Reasoning ({model or provider.name})",
-                    choices,
-                    current=current,
-                    allow_none=False,
-                )
-            )
-            if not picked:
-                return
-            new_value: str | None = picked
-        else:
-            picked_text = await self.push_screen_wait(
-                TextInputModal(
-                    f"Reasoning effort — {provider.name}",
-                    initial=stored or "",
-                    placeholder="optional · e.g. medium / on · empty for auto",
-                    hint="Enter to save · Esc to cancel",
-                )
-            )
-            if picked_text is None:
-                return
-            stripped = picked_text.strip()
-            new_value = stripped or None
-        provider_store.upsert(_with_reasoning_effort(provider, new_value))
-        self._refresh_chips()
-        self._spinner_status(f"reasoning → {new_value or 'auto'}")
-
     def _open_custom_model_editor(self, provider) -> None:
         current_model = provider.default_model
 
@@ -1999,6 +1938,196 @@ class ChatTUI(App):
             parts.append(f"reasoning={reasoning_effort}")
         self._spinner_status(" · ".join(parts) + " (provider default)")
 
+    def _open_subagent_editor(self) -> None:
+        s = settings_store.load()
+        options = sorted(provider_store.load_all().keys())
+        if not options:
+            self._spinner_status("No providers configured. Add one first.")
+            return
+
+        def _on_close(result: str | None) -> None:
+            if result is None:
+                return
+            if result == SENTINEL_SAME_AS_OUTO:
+                current = settings_store.load()
+                settings_store.save(
+                    replace(
+                        current,
+                        subagent_provider="",
+                        subagent_model="",
+                        subagent_reasoning="",
+                    )
+                )
+                self._refresh_chips()
+                self._spinner_status("subagent → same as outo")
+                return
+            provider = provider_store.get(result)
+            if provider is None:
+                self._spinner_status(f"provider {result!r} no longer exists")
+                return
+            if provider.source == SOURCE_LMA:
+                self.run_worker(self._subagent_catalog_flow(provider), exclusive=False)
+            else:
+                self._open_subagent_custom_editor(provider)
+
+        self.push_screen(
+            SelectionModal(
+                "Subagent provider",
+                options,
+                current=s.subagent_provider or SENTINEL_SAME_AS_OUTO,
+                allow_none=False,
+                extra_options=[(SENTINEL_SAME_AS_OUTO, "same as outo")],
+            ),
+            _on_close,
+        )
+
+    async def _subagent_catalog_flow(self, provider) -> None:
+        self._spinner_status("fetching model list…")
+        try:
+            models = await asyncio.to_thread(catalog_api.list_models, provider.name)
+        except Exception as exc:
+            self._spinner_status(f"catalog error: {exc}; falling back to text input")
+            self._open_subagent_custom_editor(provider)
+            return
+        self._clear_spinner_status()
+        if not models:
+            self._spinner_status(f"No models found for {provider.name!r} in catalog.")
+            return
+
+        options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in models]
+        s = settings_store.load()
+        current = s.subagent_model if s.subagent_provider == provider.name else ""
+        current_disp = next(
+            (opt for opt in options if opt.split(" — ", 1)[0] == current),
+            "",
+        )
+
+        picked = await self.push_screen_wait(
+            SelectionModal(
+                f"Subagent model ({provider.name}, {len(options)})",
+                options,
+                current=current_disp,
+                allow_none=False,
+            )
+        )
+        if not picked:
+            return
+        new_id = picked.split(" — ", 1)[0].strip()
+
+        picked_reasoning: str | None = None
+        reasoning_api = _get_reasoning_api()
+        if reasoning_api is not None:
+            choices: list[str] | None = None
+            try:
+                choices = await asyncio.to_thread(
+                    reasoning_api.reasoning_choices, new_id, provider.name
+                )
+            except Exception:
+                choices = None
+            if choices:
+                s = settings_store.load()
+                existing = s.subagent_reasoning
+                if existing and existing in choices:
+                    current_choice: str = existing
+                else:
+                    default_choice: str | None = None
+                    try:
+                        default_choice = await asyncio.to_thread(
+                            reasoning_api.default_reasoning_choice,
+                            new_id,
+                            provider.name,
+                        )
+                    except Exception:
+                        default_choice = None
+                    current_choice = default_choice or "off"
+                picked_reasoning = await self.push_screen_wait(
+                    SelectionModal(
+                        f"Subagent reasoning ({new_id})",
+                        choices,
+                        current=current_choice,
+                        allow_none=False,
+                    )
+                )
+
+        if picked_reasoning:
+            settings_store.update(
+                subagent_provider=provider.name,
+                subagent_model=new_id,
+                subagent_reasoning=picked_reasoning,
+            )
+        else:
+            settings_store.update(
+                subagent_provider=provider.name, subagent_model=new_id
+            )
+        self._refresh_chips()
+        status_parts = [f"subagent → {provider.name}/{new_id}"]
+        if picked_reasoning:
+            status_parts.append(f"reasoning={picked_reasoning}")
+        self._spinner_status(" · ".join(status_parts))
+
+    def _open_subagent_custom_editor(self, provider) -> None:
+        s = settings_store.load()
+        initial_model = s.subagent_model if s.subagent_provider == provider.name else ""
+        initial_reasoning = s.subagent_reasoning if s.subagent_provider == provider.name else ""
+
+        def ask_reasoning(model: str) -> None:
+            def _on_reasoning_close(result: str | None) -> None:
+                if result is None:
+                    return
+                reasoning = result.strip()
+                if model and reasoning:
+                    settings_store.update(
+                        subagent_provider=provider.name,
+                        subagent_model=model,
+                        subagent_reasoning=reasoning,
+                    )
+                else:
+                    current = settings_store.load()
+                    settings_store.save(
+                        replace(
+                            current,
+                            subagent_provider=provider.name,
+                            subagent_model=model,
+                            subagent_reasoning=reasoning,
+                        )
+                    )
+                self._refresh_chips()
+                parts: list[str] = []
+                if model:
+                    parts.append(f"subagent → {provider.name}/{model}")
+                else:
+                    parts.append(f"subagent → {provider.name}/(provider default)")
+                parts.append(f"reasoning={reasoning or 'auto'}")
+                self._spinner_status(" · ".join(parts))
+
+            self.push_screen(
+                TextInputModal(
+                    f"Subagent reasoning — {provider.name}",
+                    initial=initial_reasoning,
+                    placeholder="optional · e.g. medium / on · empty to clear",
+                    hint="Enter to save · Esc to cancel",
+                ),
+                _on_reasoning_close,
+            )
+
+        def _on_close(result: str | None) -> None:
+            if result is None:
+                return
+            model = result.strip()
+            ask_reasoning(model)
+
+        self.push_screen(
+            TextInputModal(
+                f"Subagent model (custom provider: {provider.name})",
+                initial=initial_model,
+                placeholder=(
+                    f"current: {initial_model}" if initial_model else "model id · empty = use provider default"
+                ),
+                hint="Empty = use provider default · Enter to continue · Esc to cancel",
+            ),
+            _on_close,
+        )
+
     def _open_style_picker(self) -> None:
         styles = style_store.list_styles()
         if not styles:
@@ -2117,11 +2246,32 @@ class ChatTUI(App):
             return
         s = settings_store.load()
         provider = provider_store.get(s.provider) if s.provider else None
-        active_model = provider.default_model if provider else ""
-        self._panel.set_value("provider", s.provider or "-")
-        self._panel.set_value("model", active_model or "-")
+        outo_model = provider.default_model if provider else "-"
+        outo_value = f"{outo_model or '-'} reasoning:{_reasoning_chip_value(provider)}"
+        self._panel.set_value("outo", outo_value)
+
+        if s.subagent_provider or s.subagent_model or s.subagent_reasoning:
+            sub_provider = (
+                provider_store.get(s.subagent_provider) if s.subagent_provider else None
+            )
+            if s.subagent_model:
+                model_part = s.subagent_model
+            elif sub_provider is not None and sub_provider.default_model:
+                model_part = sub_provider.default_model
+            elif not s.subagent_provider:
+                model_part = "same"
+            else:
+                model_part = "?"
+            if s.subagent_reasoning:
+                reasoning_part = s.subagent_reasoning
+            else:
+                reasoning_part = _reasoning_chip_value(sub_provider) if sub_provider else "auto"
+            sub_value = f"{model_part} reasoning:{reasoning_part}"
+        else:
+            sub_value = "same as outo"
+        self._panel.set_value("subagent", sub_value)
+
         self._panel.set_value("style", s.style or "-")
-        self._panel.set_value("reasoning", _reasoning_chip_value(provider))
         if self._chat_started:
             self._panel.set_value("session", s.session or "-")
         else:

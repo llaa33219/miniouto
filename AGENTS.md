@@ -15,7 +15,7 @@
 
 Three principles from `README.md`: **Minimalism** (no bloat — extend with styles), **Automation-friendly** (full CLI, TUI optional), **Fluidity** (adapts to any environment).
 
-**Version**: `0.3.0` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
+**Version**: `0.6.0` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
 
 ---
 
@@ -179,13 +179,14 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | `__version__ = "0.3.0"` |
+| `__init__.py` | `__version__ = "0.6.0"` |
 | `paths_runtime.py` | `INVOCATION_CWD: Path` (captured cwd at import, used by every tool to absolutize relative paths) |
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
 | `cli/chat.py` | `chat_cmd` — one-shot chat command |
 | `cli/provider.py` | `provider providers/models/add` (catalog browse + add) + `provider custom add` + `provider list/remove/default` |
 | `cli/style.py` | `style list/set/add/update/show` |
 | `cli/skill.py` | `skill list/show` (read-only) |
+| `cli/subagent.py` | `subagent show/set/clear` — manage the subagent provider/model override persisted in settings |
 | `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
 | `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
@@ -200,7 +201,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
 | `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`, optional `max_context_window`/`max_output_tokens`/`reasoning_effort` overrides) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
 | `storage/sessions.py` | `SessionData` + `TurnRecord` (schema v2: restorable `history` + display `turns`) + JSON CRUD with v1 migration |
-| `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`) + TOML CRUD |
+| `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`, `subagent_provider`, `subagent_model`) + TOML CRUD |
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
 | `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
 | `storage/toml_io.py` | `tomllib` + `tomli_w` wrapper |

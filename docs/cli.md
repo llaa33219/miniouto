@@ -31,8 +31,12 @@ miniouto [--version]
    │    ├─ update
    │    └─ show <name>
    └─ skill
-        ├─ list
-        └─ show <name>
+   │    ├─ list
+   │    └─ show <name>
+   └─ subagent
+        ├─ show
+        ├─ set [--provider NAME] [--model NAME]
+        └─ clear
 ```
 
 > **Naming note:** the catalog commands (`providers`, `models`, `add`) source their data from `https://lma.blp.sh` (the "lma" service). The codebase and UI call these **"catalog"** providers (see `cli/provider.py` importing `core.lma as catalog_api` and the `+ add from catalog…` TUI sentinel), but the underlying `Provider.source` field value remains the literal string `"lma"` (`SOURCE_LMA = "lma"`).
@@ -120,7 +124,7 @@ Submission flow: each submitted prompt is dispatched via `self.run_worker(..., e
 
 ## `miniouto --version`
 
-Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.3.0"`) and raises `typer.Exit()` (exit code 0).
+Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.6.0"`) and raises `typer.Exit()` (exit code 0).
 
 ---
 
@@ -136,7 +140,7 @@ Reads:
 - `storage.skills.list_skills()` → all visible skill names (hidden skills excluded)
 - `storage.sessions.list_sessions()` → session filenames
 
-Prints 9 rich-formatted key/value lines: `Default provider`, `Default model`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, `Sessions`. Always exits 0 (no error states).
+Prints 10 rich-formatted key/value lines: `Default provider`, `Default model`, `Subagent`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, `Sessions`. Always exits 0 (no error states). The `Subagent` line shows the resolved subagent `provider/model` when `settings.subagent_provider` or `settings.subagent_model` is set, or `same as outo (<provider>/<model>)` when it inherits.
 
 ---
 
@@ -151,6 +155,8 @@ chat_cmd(
     --provider    TEXT,                # override active provider
     --model       TEXT,                # override resolved model
     --style       TEXT,                # override active style
+    --subagent-provider TEXT,          # override the subagent's provider for this call
+    --subagent-model    TEXT,          # override the subagent's model for this call
     --max-tokens  INT,                 # cap output tokens
     --temperature FLOAT,               # sampling temperature
     --reasoning   TEXT,                # override reasoning for this call (effort level / on / none).
@@ -169,6 +175,8 @@ chat_cmd(
 | `--provider` | Override the active provider for this call |
 | `--model` | Override the resolved model for this call |
 | `--style` | Override the active style for this call |
+| `--subagent-provider` | Override the subagent's provider for this call |
+| `--subagent-model` | Override the subagent's model for this call |
 | `--max-tokens` | Cap output tokens |
 | `--temperature` | Sampling temperature |
 | `--reasoning` | Override reasoning for this call: an effort level (`low`/`medium`/`high`/…), `on` (toggle models), or `none`/`off` to disable. Default: the provider's stored `reasoning_effort`, else the lma model default. Resolved per-model via lma `reasoning_options` (see `docs/core.md` step 11); thinking only appears when the provider is asked to reason |
@@ -211,6 +219,21 @@ The active model is chosen by the first match in (matches the README's 4-step li
 2. `settings.model` (legacy per-session override; cleared whenever the TUI model picker saves)
 3. `provider.default_model` (set by `provider add --default-model`, `provider custom add --default-model`, or the TUI model chip)
 4. **error** — no model can be inferred
+
+### Subagent provider/model resolution
+
+The subagent (the nested agent behind `call_subagent`) can run on a different provider/model than outo. Provider, first match wins:
+
+1. `miniouto chat --subagent-provider <name>` (per-call override)
+2. `settings.subagent_provider` (persisted via `miniouto subagent set --provider`)
+3. inherit outo's provider
+
+Model, first match wins:
+
+1. `miniouto chat --subagent-model <name>` (per-call override)
+2. `settings.subagent_model` (persisted via `miniouto subagent set --model`)
+3. the subagent provider's `default_model`
+4. inherit outo's model — only reachable when no subagent provider is set. When a subagent provider **is** set and no model resolves, `resolve_runtime_from_settings` raises `RuntimeError` telling you to set one (`chat --subagent-model` or `miniouto subagent set --model`). An unconfigured subagent provider name likewise raises `RuntimeError`. A model-only override (no subagent provider) is valid — the subagent runs outo's provider with the overridden model.
 
 ---
 
@@ -345,6 +368,26 @@ Iterates `storage.skills.list_skills()` — **hidden skills are excluded** (the 
 
 ---
 
+## `miniouto subagent ...`
+
+File: `cli/subagent.py`. Sub-app `app = typer.Typer(help="Manage the subagent's provider and model.")`.
+
+Manages the persisted subagent provider/model/reasoning override (`settings.subagent_provider` / `settings.subagent_model` / `settings.subagent_reasoning`). Empty settings = the subagent inherits outo's provider and model, and falls back to the subagent provider's `reasoning_effort`.
+
+### `subagent show`
+
+Prints three rich-formatted lines — `Subagent provider`, `Subagent model`, and `Subagent reasoning` — using the same resolution as the runtime: settings values first, then the subagent provider's `default_model`, then `same as outo (<provider>/<model>)` when no override is set. The reasoning line shows `settings.subagent_reasoning` if set, else the resolved subagent provider's `reasoning_effort` if set, else `auto`.
+
+### `subagent set [--provider NAME] [--model NAME] [--reasoning TEXT]`
+
+Persists an override via `settings.update(...)`. At least one of `--provider`/`--model`/`--reasoning` is required — none given → red `✗ Pass at least one of --provider, --model, or --reasoning.` + exit 1. `--provider` is validated against the provider store: unknown name → red `✗ Provider <name> is not configured.` + exit 1. `--reasoning` persists a per-subagent reasoning effort; passing an explicit empty string (`--reasoning ""`) clears it (empty strings can't go through `update()` — the command does `save(replace(load(), subagent_reasoning=""))` directly, the same pattern as `clear`). On success prints `✓ Subagent override saved.` plus the resolved model. If only `--provider` is given and no model is resolvable (no stored `subagent_model` and the provider has no `default_model`), a yellow warning tells you to set one via `miniouto subagent set --model <name>`.
+
+### `subagent clear`
+
+Resets all three settings keys (`subagent_provider`, `subagent_model`, `subagent_reasoning`) to `""` so the subagent inherits outo again. Because `Settings.merge()`/`settings.update()` skip empty-string values, clearing goes through `save(replace(load(), subagent_provider="", subagent_model="", subagent_reasoning=""))` directly. Prints `✓ Subagent override cleared — subagent now inherits outo's provider/model and the provider's reasoning effort.`
+
+---
+
 ## Catalog (lma) endpoint caching
 
 The catalog commands (`provider providers`, `provider models`, `provider add`) and the TUI catalog flows all hit `https://lma.blp.sh` via `core/lma.py`. Responses are cached for 10 minutes (matching lma's server TTL); the cache lives in `core.lma._CACHE` and can be cleared with `core.lma.clear_cache()` (used by tests). See `docs/lma.md` for the full endpoint reference and `sdk_to_format` mapping table.
@@ -370,6 +413,8 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 | `style add` fetch failure | `✗ Failed to fetch styles: {exc}` + `typer.Exit(1) from exc` | 1 |
 | `style update` per-repo fetch failure | `✗ Failed to update <url>: <err>` (printed, remaining repos still attempted; command exits 0) | 0 |
 | `style show` on missing style | `✗ ... is not installed.` + `typer.Exit(1)` | 1 |
+| `subagent set` with no flag | `✗ Pass at least one of --provider, --model, or --reasoning.` + `typer.Exit(1)` | 1 |
+| `subagent set --provider` on unconfigured name | `✗ Provider <name> is not configured.` + `typer.Exit(1)` | 1 |
 | `skill show` on missing skill | `✗ Skill <name> not found.` + `typer.Exit(1)` | 1 |
 | `--version` | print version + `raise typer.Exit()` (no code → 0) | 0 |
 | Typer argument parsing errors | Typer default (red error to stderr) | 2 |
@@ -390,6 +435,7 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.lma, core.providers
                   ├─→ cli/style.py    ─→ storage.paths, storage.settings, storage.styles
                   ├─→ cli/skill.py    ─→ storage.skills
+                  ├─→ cli/subagent.py ─→ storage.providers, storage.settings
                   ├─→ cli/tui.py      ─→ core.{chat,events,lma}, core.providers, storage.{paths,providers,settings,styles,sessions}
                   └─→ cli/chat.py     ─→ core.chat, core.events, storage.settings
 ```

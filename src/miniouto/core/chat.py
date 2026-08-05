@@ -47,6 +47,8 @@ class ChatOptions:
     provider: str | None = None
     model: str | None = None
     style: str | None = None
+    subagent_provider: str | None = None
+    subagent_model: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
     reasoning: str | None = None
@@ -108,7 +110,13 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
     sink = _RecordingSink(raw_sink)
 
     runtime = resolve_runtime_from_settings(
-        ChatOverrides(provider=opts.provider, model=opts.model, style=opts.style)
+        ChatOverrides(
+            provider=opts.provider,
+            model=opts.model,
+            style=opts.style,
+            subagent_provider=opts.subagent_provider,
+            subagent_model=opts.subagent_model,
+        )
     )
     provider_config: dict[str, Any] = {}
     if opts.max_tokens is not None:

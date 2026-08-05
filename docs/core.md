@@ -340,6 +340,7 @@ class RuntimeConfig:
     style_name: str = "default"
     subagent_model: str | None = None      # falls back to `model`
     subagent_provider: str | None = None   # falls back to `provider_name`
+    subagent_reasoning: str | None = None  # falls back to subagent provider's `reasoning_effort`
     session: str | None = None             # defaults to "default"
 ```
 
@@ -353,6 +354,8 @@ class ChatOverrides:
     provider: str | None = None
     model: str | None = None
     style: str | None = None
+    subagent_provider: str | None = None
+    subagent_model: str | None = None
 ```
 
 Per-call overrides from CLI flags. All optional.
@@ -379,7 +382,7 @@ The heart of miniouto. Steps:
    - `ON_THINKING` → `_make_thinking_logger(on_thinking)` (only if `on_thinking` is not None — `chat.run_chat` always supplies one).
    - `ON_PROVIDER_ERROR` → `_make_provider_error_logger(on_provider_error)` (only if `on_provider_error` is not None — `chat.run_chat` always supplies one).
 10. **Finalize the outo config** — `co.get_agent_preset("outo").to_config()`, merge in caller's `provider_config`, instantiate `co.Agent(outo_config)`. Returns the agent.
-11. **Reasoning resolution** — `core.reasoning.resolve_reasoning_passthrough(api_format, model, provider_name, choice)` turns the resolved reasoning choice plus lma's per-model `reasoning_options` into provider-native request kwargs, merged into `provider_passthrough` for both outo and subagent. This is what makes providers return thinking blocks at all (the `ON_THINKING` display path is dead without it). It must go through `provider_passthrough`, not `provider_config`: miniouto registers providers under user-chosen names, and coreouto's `normalize_provider_config` passes config through **untranslated** for unknown provider names — a canonical `reasoning_effort` key would reach the SDK raw and `TypeError`. Precedence (highest wins): `chat --reasoning <v>` > `Provider.reasoning_effort` (stored per provider) > lma's default for the model's option type (effort → `"medium"` or the middle non-`"none"` value; toggle/budget → `"on"`) > off (no kwargs when lma has no reasoning data — no blind defaults). `"none"`/`"off"` always disables. Only two request shapes are ever emitted — an effort value and anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes (`enabled` + `budget_tokens`) are deliberately NOT emitted: many providers reject budget parameters, so lma `budget_tokens` models are driven as a plain toggle and legacy digit choices degrade to `"on"`. Mapping:
+11. **Reasoning resolution** — `core.reasoning.resolve_reasoning_passthrough(api_format, model, provider_name, choice)` turns the resolved reasoning choice plus lma's per-model `reasoning_options` into provider-native request kwargs, merged into `provider_passthrough` for both outo and subagent. This is what makes providers return thinking blocks at all (the `ON_THINKING` display path is dead without it). It must go through `provider_passthrough`, not `provider_config`: miniouto registers providers under user-chosen names, and coreouto's `normalize_provider_config` passes config through **untranslated** for unknown provider names — a canonical `reasoning_effort` key would reach the SDK raw and `TypeError`. Precedence (highest wins) for outo: `chat --reasoning <v>` > `Provider.reasoning_effort` (stored per provider) > lma's default for the model's option type (effort → `"medium"` or the middle non-`"none"` value; toggle/budget → `"on"`) > off (no kwargs when lma has no reasoning data — no blind defaults). For the **subagent**, the choice inserts one extra tier: `chat --reasoning <v>` (applies to both) > `RuntimeConfig.subagent_reasoning` (persisted `settings.subagent_reasoning`, via `miniouto subagent set --reasoning`) > the subagent provider's `reasoning_effort` > lma default. `"none"`/`"off"` always disables. Only two request shapes are ever emitted — an effort value and anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes (`enabled` + `budget_tokens`) are deliberately NOT emitted: many providers reject budget parameters, so lma `budget_tokens` models are driven as a plain toggle and legacy digit choices degrade to `"on"`. Mapping:
 
     | api_format | lma option type | passthrough |
     |---|---|---|
@@ -415,8 +418,12 @@ The heart of miniouto. Steps:
 3. Model: `overrides.model or s.model or provider.default_model`; raises `RuntimeError("No model specified for provider …")` if still missing. (Note the three-level resolution — `settings.model` is priority 2, kept for the `chat --model` CLI flag and legacy sessions.)
 4. Style: `overrides.style or s.style or "default"`.
 5. Session: `s.session or "default"`.
+6. Subagent (`_resolve_subagent`):
+   - Provider: `overrides.subagent_provider or s.subagent_provider or None` — `None` means inherit outo's provider (`build_runtime`'s `runtime.subagent_provider or runtime.provider_name` fallback handles it). When a provider IS resolved but isn't configured in the provider store, raises `RuntimeError("Subagent provider … is not configured. …")`.
+   - Model: `overrides.subagent_model or s.subagent_model or <subagent provider's default_model> or None`. When a subagent provider IS resolved but no model is, raises `RuntimeError("No model specified for subagent provider …")` telling the user to set one via `chat --subagent-model` or `miniouto subagent set --model`. A model-only override (no subagent provider) is valid — the subagent then runs outo's provider with the overridden model. (`None` model only ever reaches `build_runtime` together with a `None` provider, where both inherit outo's.)
+7. Subagent reasoning: `s.subagent_reasoning or None` — populated **independently** of whether a subagent provider/model is set (a reasoning-only subagent override on outo's provider+model is valid). Consumed by `build_runtime`'s `subagent_choice`.
 
-Returns a `RuntimeConfig`. Subagent-related fields (`subagent_model`, `subagent_provider`) are left as `None` here — `build_runtime` fills them by falling back to the outo provider/model.
+Returns a `RuntimeConfig` with `subagent_provider`/`subagent_model`/`subagent_reasoning` populated per the rules above.
 
 ## External API calls & I/O
 
