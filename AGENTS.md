@@ -15,7 +15,7 @@
 
 Three principles from `README.md`: **Minimalism** (no bloat — extend with styles), **Automation-friendly** (full CLI, TUI optional), **Fluidity** (adapts to any environment).
 
-**Version**: `0.6.0` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
+**Version**: `0.7.0` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
 
 ---
 
@@ -48,11 +48,20 @@ CLI flag bag → ChatOptions (core/chat.py)
             → resolve_runtime_from_settings (core/runtime.py)
             → RuntimeConfig
             → build_runtime (core/runtime.py)
-                → coreouto provider registry + tool registry + up to 7 hooks
-                    (BEFORE_TOOL_CALL, AFTER_TOOL_CALL, ON_ITERATION×2,
-                    AFTER_LLM_CALL, ON_THINKING, ON_PROVIDER_ERROR)
+                → coreouto provider registry + tool registry + hooks
+                    (sink loggers on BEFORE/AFTER_TOOL_CALL, ON_ITERATION×2,
+                    AFTER_LLM_CALL, ON_THINKING, ON_PROVIDER_ERROR + watchdog
+                    trackers: activity/loop-progress + BEFORE_LLM_CALL capture)
                 → co.Agent(outo_config)
-            → run_chat(opts, sink) → agent.call_sync(prompt, history=...)
+            → run_chat(opts, sink) → asyncio.run(_run_with_watchdog(agent, ...))
+                → stall watchdog (runtime.supervised_run): 30-min silence
+                  outside a tool call cancels the attempt and restarts it
+                  from the sanitized live history with NO user message
+                  (coreouto >= 0.11.1, examples/27+28; max 3 wakeups).
+                  Every call_subagent invocation gets its own supervisor
+                  (level=depth); a supervisor defers to deeper ones, so a
+                  wedged subagent is recovered in place without tearing
+                  down the parent turn.
                 → Bash/Image/Video/Audio (via tools/registry.py)
                 → call_subagent (delegates to subagent preset; each invocation
                   mints a subagent-<6hex> id tracked via ContextVars)
@@ -124,7 +133,7 @@ coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context. `core/runtime.py` k
 
 `core/chat.py:_actor_label()` combines them into actor labels: `outo` vs `subagent-<6hex>`. Because ContextVars are copied per asyncio task, parallel `call_subagent` invocations each keep their own id — this is the mechanism that makes concurrent subagents distinguishable in output. Subagent start/end is reported through the module-level `_SUBAGENT_OBSERVER` slot (set per turn by `run_chat` via `set_subagent_observer`) — the `BEFORE_TOOL_CALL` hook for `call_subagent` itself still runs in the *parent* context and never sees the id, which is why `_make_tool_call_dispatcher` deliberately emits nothing for `call_subagent`.
 
-If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth/id tracking will be wrong.
+If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth/id tracking — and the per-invocation stall supervision (`supervised_run` at level=depth) — will be wrong.
 
 ### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display)
 `storage/sessions.py` writes `{"version": 2, "history": [...], "turns": [...]}`:
@@ -179,7 +188,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | `__version__ = "0.6.0"` |
+| `__init__.py` | `__version__ = "0.7.0"` |
 | `paths_runtime.py` | `INVOCATION_CWD: Path` (captured cwd at import, used by every tool to absolutize relative paths) |
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
 | `cli/chat.py` | `chat_cmd` — one-shot chat command |
@@ -189,14 +198,14 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `cli/subagent.py` | `subagent show/set/clear` — manage the subagent provider/model override persisted in settings |
 | `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
-| `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
+| `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `_run_with_watchdog` (thin level-0 wrapper over `runtime.supervised_run`), `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
 | `core/events.py` | `LoopEvent` (with `subagent_id`, `detail`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events) |
-| `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) + `default_error_handling(api_format)` |
+| `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) ending with coreouto's `TIMEOUT_ERRORS` preset (>= 0.11, `exc_type` match — the HTTP-level stall wakeup for `API_STALL_TIMEOUT_SECONDS`) + `default_error_handling(api_format)` |
 | `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
 | `core/reasoning.py` | lma `reasoning_options` resolver → `provider_passthrough` kwargs (`resolve_reasoning_passthrough` + UI helpers `reasoning_choices`/`default_reasoning_choice`); google unsupported |
-| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, `LoopCancelledError` + cancel-guard hook (cooperative loop stop via `threading.Event`), subagent tool (per-invocation 6-hex id + lifecycle observer), hooks |
+| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, `LoopCancelledError` + cancel-guard hook (cooperative loop stop via `threading.Event`), `supervised_run` + `sanitize_history` + `LoopStalledError` + `WATCHDOG_*` (stall watchdog, coreouto examples/27+28 — outo runs at level 0, each subagent invocation at level=depth, deeper supervisors win), subagent tool (per-invocation 6-hex id + lifecycle observer), hooks |
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
 | `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
 | `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`, optional `max_context_window`/`max_output_tokens`/`reasoning_effort` overrides) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
@@ -206,7 +215,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
 | `storage/toml_io.py` | `tomllib` + `tomli_w` wrapper |
 | `tools/__init__.py` | Re-exports |
-| `tools/bash.py` | `async bash(command, *, cwd, env)` (no timeout) |
+| `tools/bash.py` | `async bash(command, *, cwd, env)` (1-hour hard cap: `BASH_TIMEOUT_SECONDS`) |
 | `tools/media.py` | `load_image/load_video/load_audio(file_path)` → `LoadedMedia` (pure stdlib; `registry.py` wraps results into `co.ImageBlock`/`VideoBlock`/`AudioBlock`) |
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |
@@ -295,7 +304,7 @@ The test directory doesn't exist yet. Suggested setup in `docs/development.md`. 
 
 | Package | Min version | Role |
 |---|---|---|
-| `coreouto[all]` | 0.10.0 | Agent loop, providers, tool registry, hooks (the runtime). 0.10.0+ required for provider-level `error_handling` (see `core/error_rules.py`); 0.10.0 removed `retry_intervals`/`ON_RETRY` (never used here). Provider-level `stream=True` (see `core/providers.py:_instantiate`) requires 0.9.0+. |
+| `coreouto[all]` | 0.11.1 | Agent loop, providers, tool registry, hooks (the runtime). 0.10.0+ required for provider-level `error_handling` (see `core/error_rules.py`); 0.10.0 removed `retry_intervals`/`ON_RETRY` (never used here). Provider-level `stream=True` (see `core/providers.py:_instantiate`) requires 0.9.0+. 0.11.0+ required for the provider constructor `timeout` param, `ErrorRule.exc_type` matching + the `TIMEOUT_ERRORS` preset, and the contrib tracker hooks (`activity_tracker_hook`/`loop_progress_hook`) the stall watchdog is built on (`examples/27_wakeup.py`). 0.11.1+ required for optional `user_message` — `call(history=...)` alone continues a transcript (`examples/28_resume_interrupted.py`), which is how the watchdog restarts without injecting an artificial user message. |
 | `typer` | 0.12.0 | CLI framework |
 | `rich` | 13.7.0 | Terminal output, tables, markdown |
 | `textual` | 0.80.0 | TUI framework |

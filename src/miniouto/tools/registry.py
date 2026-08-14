@@ -79,7 +79,8 @@ def _audio_handler(file_path: str) -> list:
 def _bash_description() -> str:
     return (
         "Run a shell command. Captures stdout and stderr; exits with the "
-        "command's exit code. No timeout — the command runs to completion. "
+            "command's exit code. Hard 1-hour timeout — a command that exceeds "
+            "it is killed and returns an error. "
         "Output >30KB is truncated with a note. Default cwd is the "
         "directory miniouto was invoked from. This is the ONLY "
         "file-manipulation tool: read "

@@ -16,6 +16,17 @@ from .error_rules import default_error_handling
 
 SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")
 
+# Per-request stall timeout, in seconds — passed to the coreouto provider
+# constructor's `timeout` param (coreouto >= 0.11), which forwards it to
+# the SDK client (google's millisecond HttpOptions conversion is handled
+# inside coreouto). Semantics are the SDKs' httpx-level timeout: the
+# request dies only when no bytes arrive for this long — an actively
+# streaming response is never cut. A timeout surfaces as an SDK exception
+# matched by coreouto's TIMEOUT_ERRORS preset (see core/error_rules.py),
+# and anything it can't catch is covered by the loop watchdog in
+# core/chat.py.
+API_STALL_TIMEOUT_SECONDS = 1800  # 30 minutes
+
 # `None` in the second tuple slot means "do not pin a base_url".
 _SDK_TO_FORMAT: dict[str, tuple[str, str | None]] = {
     "openai": ("openai", None),
@@ -101,6 +112,7 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
 
         return OpenAIProvider(
             api_key=api_key, base_url=base_url or None, stream=True,
+            timeout=API_STALL_TIMEOUT_SECONDS,
             error_handling=error_handling,
         )
 
@@ -109,6 +121,7 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
 
         return OpenAIResponseProvider(
             api_key=api_key, base_url=base_url or None, stream=True,
+            timeout=API_STALL_TIMEOUT_SECONDS,
             error_handling=error_handling,
         )
 
@@ -119,7 +132,9 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
         if url and url.rstrip("/").endswith("/v1"):
             url = url.rstrip("/")[:-3]
         return AnthropicProvider(
-            api_key=api_key, base_url=url, stream=True, error_handling=error_handling
+            api_key=api_key, base_url=url, stream=True,
+            timeout=API_STALL_TIMEOUT_SECONDS,
+            error_handling=error_handling,
         )
 
     if api_format == "google":
@@ -130,6 +145,7 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
             http_options = {"base_url": base_url}
         return GoogleProvider(
             api_key=api_key, http_options=http_options, stream=True,
+            timeout=API_STALL_TIMEOUT_SECONDS,
             error_handling=error_handling,
         )
 

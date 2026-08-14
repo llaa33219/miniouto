@@ -36,7 +36,7 @@ TRUNCATION_NOTE = "<NOTE>Output was truncated to {max} bytes. ...</NOTE>"
 Behavior:
 - Spawns `asyncio.create_subprocess_shell` with `stdout=PIPE, stderr=PIPE`.
 - Captures stdout + stderr.
-- **No timeout** — the command runs to completion (the user can force-stop the loop from the TUI with a double-ESC, which kills the in-flight process: `build_runtime` passes the turn's `cancel_event` into `set_cancel_event`, and `bash()` polls it every 0.1 s while waiting for the process).
+- **1-hour hard timeout** (`BASH_TIMEOUT_SECONDS = 3600`) — a wedged process is killed and the tool raises `BashError`, which coreouto converts into an error `ToolResult`; the loop wakes and the model decides how to proceed. (The user can also force-stop the loop from the TUI with a double-ESC, which kills the in-flight process much sooner: `build_runtime` passes the turn's `cancel_event` into `set_cancel_event`, and `bash()` polls it every 0.1 s while waiting for the process.)
 - Formats output (via `_format_output`) as:
 
   ```
@@ -187,7 +187,7 @@ Each description includes the tool's restrictions inline. Verbatim from `registr
 
 | Tool | Description (verbatim) |
 |---|---|
-| `Bash` | "Run a shell command. Captures stdout and stderr; exits with the command's exit code. No timeout — the command runs to completion. Output >30KB is truncated with a note. Default cwd is the directory miniouto was invoked from. This is the ONLY file-manipulation tool: read with `cat`/`grep`/`find`, create with `cat > file <<'EOF'` or `tee`, edit with `sed -i` or a short Python snippet, delete with `rm`. Also use it for `git`, `pytest`, package managers, etc." |
+| `Bash` | "Run a shell command. Captures stdout and stderr; exits with the command's exit code. Hard 1-hour timeout — a command that exceeds it is killed and returns an error. Output >30KB is truncated with a note. Default cwd is the directory miniouto was invoked from. This is the ONLY file-manipulation tool: read with `cat`/`grep`/`find`, create with `cat > file <<'EOF'` or `tee`, edit with `sed -i` or a short Python snippet, delete with `rm`. Also use it for `git`, `pytest`, package managers, etc." |
 | `Image` | "View an image file and return it to the model so it can actually be seen. Supports PNG, JPEG, GIF, WebP. Capped at 20 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an image content block — the model receives the pixels, not a text description. For unsupported formats or oversized files, convert first with Bash (e.g. ImageMagick `convert`, Pillow)." |
 | `Video` | "View a video file and return it to the model so it can actually be perceived. Supports MP4, MOV, WebM. Capped at 50 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as a video content block. For unsupported formats or oversized files, downsample first with Bash (e.g. ffmpeg)." |
 | `Audio` | "View an audio file and return it to the model so it can actually be heard. Supports WAV, MP3. Capped at 25 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an audio content block. For unsupported formats or oversized files, downsample first with Bash (e.g. sox, ffmpeg)." |

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import secrets
 import threading
@@ -19,7 +20,7 @@ from ..storage import skills as skill_store
 from ..storage import styles as style_store
 from ..tools import bash as bash_tool
 from ..tools import registry as tool_registry
-from .providers import build_coreouto_provider, clear_coreouto_state
+from .providers import API_STALL_TIMEOUT_SECONDS, build_coreouto_provider, clear_coreouto_state
 
 ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]
 
@@ -43,6 +44,146 @@ _SUBAGENT_ID: ContextVar[str | None] = ContextVar("miniouto_subagent_id", defaul
 # (the hooks are global, so this module-level slot is the bridge between
 # the wrapped handler and the active turn's sink). None outside a turn.
 _SUBAGENT_OBSERVER: Callable[[str, str, str], None] | None = None
+
+# Watchdog state (coreouto >= 0.11 contrib trackers), rebuilt by every
+# build_runtime call alongside the hooks that feed them. The supervised
+# runners (`supervised_run`) read them to decide whether a call is wedged:
+#   _ACTIVITY_STATE — seconds since the last loop event of any kind
+#   _PROGRESS_STATE — current phase ("llm_call" / "tool_call" / None)
+#   _LIVE_MESSAGES  — live message lists keyed by actor: "outo" for the
+#                     top-level agent, the 6-hex sid per subagent
+#                     invocation (by reference; the loop keeps mutating
+#                     them, so they are always current)
+_ACTIVITY_STATE: Any = None
+_PROGRESS_STATE: Any = None
+_LIVE_MESSAGES: dict[str, Any] = {}
+
+# Active supervisor levels (0 = outo's turn, >=1 = nested subagent
+# invocations). A supervisor defers to deeper ones: if any level > its own
+# is active, the silence belongs to the deeper call's supervisor, which
+# will do the cancelling and restart. Keys are unique tokens (parallel
+# sibling subagents share a level, so a bare set would collapse them).
+_ACTIVE_SUPERVISORS: dict[object, int] = {}
+
+WATCHDOG_CHECK_SECONDS = 5.0
+WATCHDOG_MAX_WAKEUPS = 3
+
+
+class LoopStalledError(Exception):
+    """A supervisor exhausted its wakeups — the loop re-wedges every time."""
+
+
+def watchdog_states() -> tuple[Any, Any, dict[str, Any]]:
+    """Return (activity_state, progress_state, live_messages) for supervisors."""
+
+    return _ACTIVITY_STATE, _PROGRESS_STATE, _LIVE_MESSAGES
+
+
+def sanitize_history(messages: list[co.Message] | None) -> list[co.Message] | None:
+    """Prepare a cancelled loop's messages for `call(history=...)`.
+
+    From coreouto examples/27+28 (`cut_to_last_answered_turn`): drops
+    system messages (call() prepends its own) and a trailing assistant
+    turn whose tool calls never got their results — providers reject
+    dangling tool calls with HTTP 400. coreouto appends a turn's tool
+    results only after ALL of its tool calls finish, so a cancellation
+    lands either before or after the whole batch — the tail is always a
+    bare assistant message, never a partially-answered one.
+    """
+
+    if not messages:
+        return None
+    history = [m for m in messages if m.role != "system"]
+    for i in range(len(history) - 1, -1, -1):
+        msg = history[i]
+        if msg.role == "assistant" and msg.tool_calls:
+            answered = {m.tool_call_id for m in history[i + 1:] if m.role == "tool"}
+            if {tc.id for tc in msg.tool_calls} - answered:
+                del history[i:]
+            break
+    return history or None
+
+
+async def supervised_run(
+    start: Callable[..., Any],
+    prompt: str,
+    history: list[co.Message] | None,
+    *,
+    live_key: str,
+    level: int,
+    on_wakeup: Callable[[int, float, Any], None],
+    cancel_event: threading.Event | None = None,
+    states: tuple[Any, Any, dict[str, Any]] | None = None,
+) -> Any:
+    """Run `start(prompt, history)` under the stall watchdog (examples/27+28).
+
+    `start(prompt, history)` must return the coroutine for one attempt;
+    `start(None, history)` must resume from a transcript with no user
+    message (coreouto >= 0.11.1). The SDK-level timeout
+    (`API_STALL_TIMEOUT_SECONDS`, wired into every provider constructor)
+    plus coreouto's TIMEOUT_ERRORS rules already turn a hung HTTP call
+    into a retry; this supervisor is the layer above, catching everything
+    that is NOT an in-flight HTTP request — a loop wedged between
+    operations, a deadlocked hook, a stalled call the SDK never flagged.
+
+    When nothing has happened for the stall limit AND the loop is not
+    inside a tool (tools carry their own bounds — Bash has
+    BASH_TIMEOUT_SECONDS) AND no deeper supervisor is active, the attempt
+    task is cancelled, the actor's live message list is sanitized, and
+    the call restarts — transcript-only when anything is recoverable,
+    the original prompt otherwise. Up to WATCHDOG_MAX_WAKEUPS restarts,
+    then LoopStalledError (inside a subagent handler this becomes an
+    error ToolResult, so the parent sees the failure and can re-delegate).
+    The `cancel_event` fast path (outo only) makes ESC ESC responsive
+    during an in-flight LLM call, which the hook-boundary cancel guard
+    alone cannot interrupt.
+    """
+
+    if states is None:
+        states = watchdog_states()
+    activity, progress, live = states
+    if activity is None or progress is None:
+        return await start(prompt, history)
+
+    token = object()
+    _ACTIVE_SUPERVISORS[token] = level
+    try:
+        task = asyncio.create_task(start(prompt, history))
+        wakeups = 0
+        while True:
+            await asyncio.sleep(WATCHDOG_CHECK_SECONDS)
+            if task.done():
+                return task.result()
+            if cancel_event is not None and cancel_event.is_set():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise LoopCancelledError("stopped by user")
+            if any(lv > level for lv in _ACTIVE_SUPERVISORS.values()):
+                continue  # a deeper supervisor owns the current silence
+            silent = activity.seconds_since_last_activity()
+            if silent <= API_STALL_TIMEOUT_SECONDS or progress.phase == "tool_call":
+                continue
+
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            wakeups += 1
+            if wakeups > WATCHDOG_MAX_WAKEUPS:
+                raise LoopStalledError(
+                    f"loop stalled repeatedly ({WATCHDOG_MAX_WAKEUPS} wakeups, "
+                    f"last phase={progress.phase!r}) — giving up"
+                )
+            history = sanitize_history(live.get(live_key)) or history
+            on_wakeup(wakeups, silent, progress.phase)
+            if history:
+                task = asyncio.create_task(start(None, history))
+            else:
+                # Nothing recoverable (wedged before the first LLM call) —
+                # start over with the original prompt.
+                task = asyncio.create_task(start(prompt, history))
+    finally:
+        _ACTIVE_SUPERVISORS.pop(token, None)
 
 
 class LoopCancelledError(Exception):
@@ -100,15 +241,33 @@ def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
     around the inner handler gives the hooks the information they need,
     and minting the id here (this wrapper runs exactly once per subagent
     invocation) gives each invocation a stable `subagent-<6hex>` label.
+
+    The subagent call itself runs under `supervised_run` at level=depth:
+    a wedged subagent is cancelled and resumed from its own sanitized
+    transcript (keyed by sid) without taking the parent turn down with
+    it. The wrapper also pops the invocation's live-messages entry.
     """
 
     async def wrapped(task: str) -> str:
         sid = secrets.token_hex(3)  # 6 hex chars
         depth_token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
         id_token = _SUBAGENT_ID.set(sid)
+        level = _SUBAGENT_DEPTH.get()
         _notify_subagent("start", sid, task)
         try:
-            result = await inner(task)
+            result = await supervised_run(
+                inner,
+                task,
+                None,
+                live_key=sid,
+                level=level,
+                on_wakeup=lambda n, silent, phase: _notify_subagent(
+                    "wakeup",
+                    sid,
+                    f"no activity for {silent:.0f}s (phase={phase!r}) "
+                    f"— restarting ({n}/{WATCHDOG_MAX_WAKEUPS})",
+                ),
+            )
         except Exception as exc:
             _notify_subagent("end", sid, f"error: {type(exc).__name__}: {exc}")
             raise
@@ -116,6 +275,7 @@ def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
             _notify_subagent("end", sid, result or "")
             return result
         finally:
+            _LIVE_MESSAGES.pop(sid, None)
             _SUBAGENT_ID.reset(id_token)
             _SUBAGENT_DEPTH.reset(depth_token)
 
@@ -160,14 +320,16 @@ def _build_subagent_tool(
         "required": ["task"],
     }
 
-    async def handler(task: str) -> str:
-        return (await sub_agent.call(task)).content
+    async def start(task: str | None, history: list[Any] | None = None) -> str:
+        # task=None resumes from the transcript alone (coreouto >= 0.11.1)
+        # — used by the supervisor's wakeup restart.
+        return (await sub_agent.call(task, history=history)).content
 
     return co.Tool(
         name=tool_name,
         description=description,
         parameters=parameters,
-        handler=handler,
+        handler=start,
     )
 
 
@@ -240,9 +402,11 @@ def build_runtime(
     `cancel_event` (optional) is a threading.Event polled at every
     BEFORE_LLM_CALL / BEFORE_TOOL_CALL hook; once set, the hook raises
     LoopCancelledError, terminating the loop at the next hook boundary.
-    An in-flight LLM call is not interrupted; an in-flight Bash call IS
-    killed (tools/bash.py polls the same event, since Bash has no timeout).
-    Other in-flight tools finish — the loop stops cooperatively before the
+    An in-flight Bash call IS killed (tools/bash.py polls the same event —
+    its 1-hour hard cap, BASH_TIMEOUT_SECONDS, is far too slow to serve as
+    the stop mechanism), and the turn watchdog in core/chat.py polls the
+    event every 5 s to hard-cancel even an in-flight LLM call. Other
+    in-flight tools finish — the loop stops cooperatively before the
     next step.
     """
 
@@ -344,6 +508,8 @@ def build_runtime(
     )
     co.register_hook(co.ON_ITERATION, summarize_hook)
 
+    _register_watchdog_trackers()
+
     if on_response is not None:
         co.register_hook(co.AFTER_LLM_CALL, _make_response_logger(on_response))
 
@@ -377,6 +543,46 @@ def build_runtime(
     subagent_config.provider_config.update(subagent_provider_config)
 
     return co.Agent(outo_config)
+
+
+def _register_watchdog_trackers() -> None:
+    """Install the coreouto contrib tracker hooks the loop watchdog reads.
+
+    Follows coreouto examples/27_wakeup.py: the activity tracker resets on
+    every sign of life (LLM responses, tool results, iterations, provider
+    retries, stream chunks — miniouto always streams, so a long healthy
+    stream must count as activity), the progress tracker records which
+    phase the loop is in,     and the BEFORE_LLM_CALL capture keeps a
+    reference to each actor's live message list (keyed by subagent id,
+    "outo" for the top level) so supervisors can recover history after
+    cancelling a wedged call. Subagent entries are popped by the wrapper
+    when the invocation ends, so the dict does not grow across turns.
+    """
+
+    global _ACTIVITY_STATE, _PROGRESS_STATE
+    from coreouto.contrib.hooks import activity_tracker_hook, loop_progress_hook
+
+    activity_hook, _ACTIVITY_STATE = activity_tracker_hook()
+    for event in (
+        co.AFTER_LLM_CALL,
+        co.AFTER_TOOL_CALL,
+        co.ON_ITERATION,
+        co.ON_PROVIDER_ERROR,
+        co.ON_STREAM_TEXT,
+        co.ON_STREAM_THINKING,
+    ):
+        co.register_hook(event, activity_hook)
+
+    progress_hooks, _PROGRESS_STATE = loop_progress_hook()
+    for event, fn in progress_hooks.items():
+        co.register_hook(event, fn)
+
+    _LIVE_MESSAGES.clear()
+
+    def capture_messages(*, messages: Any, **_kwargs: Any) -> None:
+        _LIVE_MESSAGES[_SUBAGENT_ID.get() or "outo"] = messages
+
+    co.register_hook(co.BEFORE_LLM_CALL, capture_messages)
 
 
 def _make_tool_call_logger(callback: Callable[[str, dict[str, Any]], None]):

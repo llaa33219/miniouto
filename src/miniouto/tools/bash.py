@@ -10,14 +10,24 @@ import time
 from ..paths_runtime import INVOCATION_CWD
 
 MAX_OUTPUT_BYTES = 30_000
+
+# Hard cap on a single Bash invocation. A wedged subprocess (NFS hang,
+# forgotten `sleep infinity`, a build stuck on a lock) would otherwise pin
+# the whole agent loop forever — there is no other timeout around tool
+# execution. On expiry the process is killed and the tool returns an error,
+# which wakes the loop: the model sees the failure and decides how to
+# proceed.
+BASH_TIMEOUT_SECONDS = 3600  # 1 hour
 TRUNCATION_NOTE = (
     "\n\n<NOTE>Output was truncated to {max} bytes. "
     "If you need more, narrow the command (e.g. pipe to `head`, `grep`, or write to a file).</NOTE>"
 )
 
-# Per-turn cancel slot, set by core.runtime.build_runtime. Unlike every other
-# tool, Bash has no timeout, so the TUI's ESC ESC cancel must be able to kill
-# an in-flight process — the loop-level cancel guard only fires between steps.
+# Per-turn cancel slot, set by core.runtime.build_runtime. The TUI's
+# ESC ESC cancel must be able to kill an in-flight process promptly —
+# the loop-level cancel guard only fires between steps. (Bash does have a
+# 1-hour hard cap — BASH_TIMEOUT_SECONDS above — but that is far too slow
+# to serve as the user-facing stop mechanism.)
 _CANCEL_EVENT: threading.Event | None = None
 
 
@@ -55,6 +65,14 @@ async def bash(
             await comm
             elapsed = time.monotonic() - start
             raise BashError(f"Command cancelled by user (esc esc) after {elapsed:.1f}s.")
+        if time.monotonic() - start > BASH_TIMEOUT_SECONDS:
+            proc.kill()
+            await comm
+            raise BashError(
+                f"Command timed out after {BASH_TIMEOUT_SECONDS}s and was killed. "
+                "Do not retry the same command unchanged — split it into smaller "
+                "steps or run it in the background (nohup … &) and poll its output."
+            )
         await asyncio.sleep(0.1)
     stdout_b, stderr_b = comm.result()
 

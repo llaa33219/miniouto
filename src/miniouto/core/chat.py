@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import traceback
 from contextlib import suppress
@@ -16,6 +17,7 @@ from ..storage.sessions import TurnRecord
 from .context import get_max_output_tokens
 from .events import EventSink, LoopEvent, NullSink
 from .runtime import (
+    WATCHDOG_MAX_WAKEUPS,
     ChatOverrides,
     LoopCancelledError,
     build_runtime,
@@ -23,14 +25,15 @@ from .runtime import (
     current_subagent_id,
     resolve_runtime_from_settings,
     set_subagent_observer,
+    supervised_run,
 )
 
 # Failure diagnostics still go straight to stderr so a sink-aware caller
 # (e.g. the TUI) doesn't have to opt in to error rendering.
 _fail_console = Console(stderr=True, soft_wrap=False, highlight=False)
 
-# Per-turn diagnostics: the last tool call observed (if any). When
-# `agent.call_sync` raises, we print these to stderr so the user can see
+# Per-turn diagnostics: the last tool call observed (if any). When the
+# turn raises out of the supervised loop, we print these to stderr so the user can see
 # which tool was the proximate cause — most "'NoneType' object is not
 # iterable" / "list index out of range" / "tool not found" errors fire
 # on the *next* operation after a malformed tool call, and without this
@@ -157,7 +160,12 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
     sink.begin_working()
     try:
         try:
-            response = agent.call_sync(opts.prompt, history=core_msgs)
+            response = asyncio.run(
+                _run_with_watchdog(
+                    agent, opts.prompt, core_msgs,
+                    sink=sink, cancel_event=opts.cancel_event,
+                )
+            )
         except LoopCancelledError:
             # User force-stopped the loop — a clean cancel, not a failure:
             # persist the turn but skip the failure diagnostics dump.
@@ -209,6 +217,48 @@ def _persist_turn(
         )
     except Exception:
         pass  # persistence must never mask the turn's real outcome
+
+
+async def _run_with_watchdog(
+    agent: co.Agent,
+    prompt: str,
+    history: list[co.Message] | None,
+    *,
+    sink: EventSink,
+    cancel_event: threading.Event | None,
+    states: tuple[Any, Any, dict[str, Any]] | None = None,
+) -> co.Response:
+    """Run outo's turn under the stall watchdog — see runtime.supervised_run.
+
+    Level 0 supervisor: it defers to any active subagent supervisor, so a
+    wedged subagent is recovered in place (its own sanitized transcript)
+    instead of taking the whole turn down. Emits `watchdog:` loop events
+    on each wakeup and wires the user's cancel_event into the fast path.
+    """
+
+    def on_wakeup(wakeups: int, silent: float, phase: Any) -> None:
+        sink.emit_loop_event(
+            LoopEvent(
+                actor="watchdog",
+                kind="wakeup",
+                text=(
+                    f"no activity for {silent:.0f}s (phase={phase!r}) "
+                    f"— restarting the turn ({wakeups}/{WATCHDOG_MAX_WAKEUPS})"
+                ),
+            )
+        )
+        sink.update_activity("watchdog wakeup")
+
+    return await supervised_run(
+        lambda p, h: agent.call(p, history=h),
+        prompt,
+        history,
+        live_key="outo",
+        level=0,
+        on_wakeup=on_wakeup,
+        cancel_event=cancel_event,
+        states=states,
+    )
 
 
 _MEDIA_BLOCK_TYPES = ("image", "video", "audio", "document")
@@ -354,10 +404,11 @@ def _make_subagent_dispatcher(sink: EventSink):
     """Build the subagent lifecycle callback for `set_subagent_observer`.
 
     Receives (phase, sid, text) from the wrapped `call_subagent` handler —
-    "start" carries the task brief, "end" the final result or error. This
-    is the only place the minted subagent id exists at event level; the
-    BEFORE_TOOL_CALL hook for `call_subagent` itself still runs in the
-    parent context and never sees the id.
+    "start" carries the task brief, "wakeup" a supervisor restart notice,
+    "end" the final result or error. This is the only place the minted
+    subagent id exists at event level; the BEFORE_TOOL_CALL hook for
+    `call_subagent` itself still runs in the parent context and never
+    sees the id.
     """
 
     def on_subagent(phase: str, sid: str, text: str) -> None:
@@ -375,6 +426,12 @@ def _make_subagent_dispatcher(sink: EventSink):
                 )
             )
             sink.update_activity(actor)
+        elif phase == "wakeup":
+            # The subagent's own supervisor restarted it after a stall —
+            # surfaced as a watchdog event attributed to the invocation.
+            sink.emit_loop_event(
+                LoopEvent(actor=actor, kind="wakeup", text=text, subagent_id=sid)
+            )
         else:
             sink.emit_loop_event(
                 LoopEvent(
@@ -484,7 +541,7 @@ def _make_iteration_dispatcher(sink: EventSink):
 def _dump_failure_diagnostics(exc: BaseException, session_name: str) -> None:
     """Print the last tool calls and a traceback to stderr.
 
-    Called when `agent.call_sync` raises. The goal is to give the user enough
+    Called when the turn raises out of the supervised loop. The goal is to
     context to tell whether the failure is in miniouto (bad argument shape,
     missing tool, hook bug) or in coreouto (provider quirk, model output
     parsing) without having to re-run with a debugger attached.

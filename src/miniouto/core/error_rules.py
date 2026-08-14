@@ -20,7 +20,15 @@ must precede generic same-status fallbacks.
 from __future__ import annotations
 
 import coreouto as co
-from coreouto.contrib.error_presets import COMMON_HTTP_ERRORS
+from coreouto.contrib.error_presets import COMMON_HTTP_ERRORS, TIMEOUT_ERRORS
+
+# TIMEOUT_ERRORS (coreouto >= 0.11) matches the SDK timeout exceptions
+# raised by the per-request stall timeout (core.providers
+# API_STALL_TIMEOUT_SECONDS) by `exc_type` — APITimeoutError for
+# openai/anthropic, httpx TimeoutException for google — and retries with
+# backoff. That retry is the HTTP-level stall wakeup: coreouto re-issues
+# the same request instead of letting the turn die. It is appended LAST
+# to every list so the more specific status-code rules above always win.
 
 # OpenAI Chat Completions and the Responses API share the openai SDK's
 # exception hierarchy, so one list covers both api_format values.
@@ -61,6 +69,7 @@ _OPENAI_RULES: list[co.ErrorRule] = [
             "The tool parameters don't match the declared schema."
         ),
     ),
+    *TIMEOUT_ERRORS,
 ]
 
 _ANTHROPIC_RULES: list[co.ErrorRule] = [
@@ -134,6 +143,7 @@ _ANTHROPIC_RULES: list[co.ErrorRule] = [
             "The tool parameters don't match the declared input_schema."
         ),
     ),
+    *TIMEOUT_ERRORS,
 ]
 
 _GOOGLE_RULES: list[co.ErrorRule] = [
@@ -203,6 +213,7 @@ _GOOGLE_RULES: list[co.ErrorRule] = [
         reaction="terminate",
         message="Model not found. Check the model name (e.g. 'gemini-2.0-flash').",
     ),
+    *TIMEOUT_ERRORS,
 ]
 
 

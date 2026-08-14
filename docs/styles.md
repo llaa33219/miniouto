@@ -50,7 +50,7 @@ Every style should include a **Tools available** section that lists the tools th
 
 | Tool | Purpose |
 |---|---|
-| `Bash(command, *, cwd=None)` | Run a shell command — the ONLY file-manipulation tool (read via `cat`/`grep`, write via heredoc/`tee`, edit via `sed -i`/Python, delete via `rm`). No timeout. (`env` is accepted by the underlying `bash()` function but is **not** exposed through the model-facing schema — the registered `_bash_handler` does not accept it.) |
+| `Bash(command, *, cwd=None)` | Run a shell command — the ONLY file-manipulation tool (read via `cat`/`grep`, write via heredoc/`tee`, edit via `sed -i`/Python, delete via `rm`). 1-hour hard timeout (`BASH_TIMEOUT_SECONDS`). (`env` is accepted by the underlying `bash()` function but is **not** exposed through the model-facing schema — the registered `_bash_handler` does not accept it.) |
 | `Image(file_path)` / `Video(file_path)` / `Audio(file_path)` | View/listen to a media file (multimodal blocks). |
 | `call_subagent(task)` | Delegate a self-contained subtask to a fresh-context agent. |
 

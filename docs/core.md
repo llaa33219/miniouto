@@ -51,9 +51,14 @@ build_runtime(runtime, *, style_overrides, provider_config,
 run_chat(ChatOptions, sink=None) → str
    ├─ wrap sink in _RecordingSink (captures LoopEvents for the session turn)
    ├─ load history (if continue_session): session history dicts → co.Message.model_validate
-   ├─ set_subagent_observer(_make_subagent_dispatcher(sink))
-   ├─ agent.call_sync(prompt, history=core_msgs)
-   │     ├─ ON_ITERATION hooks → summarize at 80% (counter resets); emit progress LoopEvent
+    ├─ set_subagent_observer(_make_subagent_dispatcher(sink))
+    ├─ asyncio.run(_run_with_watchdog(agent, prompt, core_msgs, sink=..., cancel_event=...))
+    │     ├─ agent.call() runs as a task; a 5s poll watches the contrib tracker states
+    │     │    (activity / progress / live-messages — installed by build_runtime)
+    │     ├─ silent > API_STALL_TIMEOUT_SECONDS and phase != "tool_call"
+    │     │    → cancel task, sanitize live history, restart with resume prompt (max 3×)
+    │     ├─ cancel_event set → cancel task promptly, raise LoopCancelledError
+    │     ├─ ON_ITERATION hooks → summarize at 80% (counter resets); emit progress LoopEvent
    │     ├─ LLM call → provider → response
    │     ├─ AFTER_LLM_CALL hook → on_response(content, has_tool_calls) → LoopEvent
    │     ├─ ON_THINKING hook → on_thinking(text) → LoopEvent(kind="thinking")
@@ -73,7 +78,7 @@ run_chat(ChatOptions, sink=None) → str
 
 The sink layer — a tiny abstraction so the chat loop can emit progress/trace events without coupling to either the CLI (`rich.Console`) or the TUI (Textual widgets). Introduced when the TUI was added so `run_chat` could drive both surfaces from the same code path.
 
-- **`LoopEvent`** — dataclass with `actor: str` (`"outo"` / `"subagent-<6hex>"` / `"provider"`), `kind: str`, `text: str`, optional `tool_name`, optional `subagent_id` (the 6-hex invocation id, set on every event emitted inside a subagent), optional `detail` (extra payload not shown by the CLI — currently the full untruncated Bash command on `kind="tool"` events). Kinds: `"tool"` / `"tool_result"` / `"response"` / `"thinking"` / `"context"` / `"error"` / `"subagent_start"` / `"subagent_end"`. `to_dict()`/`from_dict()` provide the sparse JSON form stored in session turns (optional fields are only serialized when truthy, so older session files load unchanged).
+- **`LoopEvent`** — dataclass with `actor: str` (`"outo"` / `"subagent-<6hex>"` / `"provider"` / `"watchdog"`), `kind: str`, `text: str`, optional `tool_name`, optional `subagent_id` (the 6-hex invocation id, set on every event emitted inside a subagent), optional `detail` (extra payload not shown by the CLI — currently the full untruncated Bash command on `kind="tool"` events). Kinds: `"tool"` / `"tool_result"` / `"response"` / `"thinking"` / `"context"` / `"error"` / `"wakeup"` / `"subagent_start"` / `"subagent_end"`. `to_dict()`/`from_dict()` provide the sparse JSON form stored in session turns (optional fields are only serialized when truthy, so older session files load unchanged).
 - **`EventSink`** — `Protocol`: `begin_working()`, `update_activity(text)`, `end_working()`, `emit_loop_event(event)`, `emit_final_answer(content, session_name)`.
 - **`NullSink`** — no-op implementation (used when `run_chat` is called without a sink).
 - **`ConsoleEventSink`** — CLI implementation. Renders loop events as `{actor}: {text}` in `orange3`; `kind="thinking"` renders the **full** reasoning text as `{actor}:thinking: {text}` (dim); `subagent_start`/`subagent_end` render as a single-line preview (whitespace-flattened, 120 chars; `subagent_end` dim); `kind="tool_result"` is **ignored** (early return — the events exist for the TUI; CLI output stays byte-identical to the pre-tool_result behavior); runs a `rich.status` spinner updated by `update_activity`; writes the final answer as plain stdout followed by a `------finish------` marker.
@@ -121,10 +126,28 @@ The main entry point. `sink=None` defaults to `NullSink()`; either way the sink 
 3. Builds the sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`) and calls `build_runtime(...)` to get a `co.Agent`.
 4. Loads prior history if `continue_session=True` via `_load_coreouto_history` — session `history` dicts are validated back into `co.Message` objects; invalid entries degrade to plain text (media block lists are flattened via `_flatten_media_blocks`) but **keep `tool_call_id`/`name` for tool messages** so tool_use/tool_result pairing survives even unknown schema drift (without the id the provider 400s the whole request on resume).
 5. Installs `_make_subagent_dispatcher(sink)` as the subagent observer (`set_subagent_observer`), cleared in a `finally` after the call.
-6. Clears `_tool_trace`, calls `agent.call_sync(prompt, history=core_msgs)` inside try/except.
+6. Clears `_tool_trace`, runs the turn as `asyncio.run(_run_with_watchdog(agent, opts.prompt, core_msgs, sink=sink, cancel_event=opts.cancel_event))` inside try/except — see the watchdog subsection below.
 7. On `LoopCancelledError` (the `cancel_event` was set), records the turn with an empty assistant text and re-raises WITHOUT `_dump_failure_diagnostics` — a user force-stop is a clean cancel, not a failure. On any other exception, records the turn the same way, calls `_dump_failure_diagnostics`, re-raises.
 8. `_persist_turn`: rewrites the session `history` with `[_dump_message(m) for m in response.messages if m.role != "system"]` (media blocks flattened to text placeholders, tool pairing fields always preserved) and appends a `TurnRecord(user, assistant, recorded_events)`. Persistence failures are swallowed — they must never mask the turn's outcome.
 9. Calls `sink.emit_final_answer(response.content)`; returns `response.content`.
+
+### `_run_with_watchdog(agent, prompt, history, *, sink, cancel_event, states=None) -> co.Response`
+
+Thin level-0 wrapper around `core/runtime.py:supervised_run` (see below): runs outo's `agent.call()` supervised, emitting `watchdog:` loop events (`kind="wakeup"`) on each restart, and wires the user's `cancel_event` into the fast path (ESC ESC hard-cancels even an in-flight LLM call within one 5 s poll — the hook-boundary cancel guard alone cannot interrupt one).
+
+### `supervised_run(start, prompt, history, *, live_key, level, on_wakeup, cancel_event=None, states=None)` (`core/runtime.py`)
+
+The stall watchdog, following coreouto `examples/27_wakeup.py` + `examples/28_resume_interrupted.py` (coreouto >= 0.11.1). `start(prompt, history)` creates one attempt's coroutine; `start(None, history)` must resume from a transcript alone. Every `call_subagent` invocation runs its own supervisor at `level=depth` (`_wrap_subagent_handler`), and outo's turn runs at `level=0`. A 5-second poll (`WATCHDOG_CHECK_SECONDS`) reads the contrib tracker states installed by `build_runtime` (`activity_tracker_hook` + `loop_progress_hook` + a BEFORE_LLM_CALL live-messages capture keyed by actor — see `_register_watchdog_trackers`):
+
+- **Stall wakeup** — when `activity.seconds_since_last_activity() > API_STALL_TIMEOUT_SECONDS` (30 min) AND `progress.phase != "tool_call"` AND no deeper supervisor is active (`_ACTIVE_SUPERVISORS`), the attempt task is cancelled, the actor's live message list is recovered via `sanitize_history` (drops system messages and any trailing assistant turn with unanswered tool calls — providers 400 on dangling tool calls), `on_wakeup` fires, and the call restarts **without a user message**: coreouto >= 0.11.1's `call(history=...)` sends the sanitized transcript exactly as declared and simply continues. If nothing is recoverable (wedged before the first LLM call), it falls back to the original prompt. Max `WATCHDOG_MAX_WAKEUPS = 3` restarts, then `LoopStalledError`.
+- **Supervisor deferral** — a supervisor stays quiet while any deeper level is active: the deeper call's supervisor owns the silence and does the cancelling/restart in place. This is what keeps a subagent stall from tearing down the parent turn.
+- **Phase exemption** — while `phase == "tool_call"` the watchdog stays quiet: tools carry their own bounds (Bash: `BASH_TIMEOUT_SECONDS`). A healthy nested agent keeps the global activity clock fresh through its own hook firings, so only a genuinely silent tool-free loop wakes a supervisor.
+
+The SDK timeout (`API_STALL_TIMEOUT_SECONDS` on every provider constructor) + `TIMEOUT_ERRORS` rules catch hung HTTP requests; supervisors catch everything else (wedged between operations, deadlocked hook, ...). The resumed call's `Response.messages` is the sanitized transcript plus the new turns — no injected user message, so the persisted session history reads as one uninterrupted conversation.
+
+### `LoopStalledError(Exception)` (`core/runtime.py`)
+
+Raised when a supervisor exhausts its wakeups — the loop re-wedges within the stall limit every time, so something is deterministically wrong (e.g. a deadlocked hook). At outo level it surfaces through the normal failure-diagnostics path; inside a subagent handler it becomes an error `ToolResult` so the parent can re-delegate.
 
 ### `_actor_label() -> (str, str | None)`
 
@@ -169,7 +192,7 @@ Builds the `on_iteration(*, iteration, messages, response, **kwargs)` closure th
 
 ### `_make_provider_error_dispatcher(sink: EventSink)`
 
-Builds the `on_provider_error(*, status_code, error_message, reaction, reaction_message, **kwargs)` closure wired into coreouto's `ON_PROVIDER_ERROR` hook. Emits a `LoopEvent(actor="provider", kind="error", text="HTTP {code} → {reaction}: {message}")` for every rule-matched provider error, and switches the spinner activity to `"provider retry"` for retry reactions. This is the only surface for rule-matched errors — they no longer raise out of `call_sync` (see `core/error_rules.py` below), so without this hook a retry storm or a 401 would be invisible.
+Builds the `on_provider_error(*, status_code, error_message, reaction, reaction_message, **kwargs)` closure wired into coreouto's `ON_PROVIDER_ERROR` hook. Emits a `LoopEvent(actor="provider", kind="error", text="HTTP {code} → {reaction}: {message}")` for every rule-matched provider error, and switches the spinner activity to `"provider retry"` for retry reactions. This is the only surface for rule-matched errors — they no longer raise out of the turn (see `core/error_rules.py` below), so without this hook a retry storm or a 401 would be invisible.
 
 ### `_dump_failure_diagnostics(exc, session_name)`
 
@@ -254,6 +277,9 @@ Single source of truth for the provider-level `error_handling` lists (coreouto >
 - **openai / openai-response** — shared list built on `contrib.error_presets.COMMON_HTTP_ERRORS` (429/500/503 retry, 401/403 terminate) plus 400 splits (`context_length_exceeded` → terminate; `invalid_schema`/`tool` → tool_result), 404+model → terminate, 422 → tool_result.
 - **anthropic** — adds the Anthropic-specific 529 overload retry and 413 terminate; 400+context → terminate; 400+tool → tool_result; 422 → tool_result.
 - **google** — google-genai collapses all 4xx into `ClientError`, so the 400 rules split by `.status`-enum substrings (`tool`/`safety`/`precondition`) ahead of a generic 400 → tool_result fallback, plus 404 → terminate. Ordering matters — the specific matchers precede the fallback.
+- **all formats, last entries** — coreouto's `TIMEOUT_ERRORS` preset (coreouto >= 0.11): matches the SDK timeout exceptions raised by the per-request stall timeout (`API_STALL_TIMEOUT_SECONDS = 1800`, `core/providers.py`) by `exc_type` (MRO class names — `APITimeoutError` for openai/anthropic, `TimeoutException`/`TimeoutError` for google's httpx) and retries with backoff. This retry is the HTTP-level stall **wakeup**: a hung request is aborted by the SDK and coreouto re-issues it instead of the turn dying silently. It stays last so the specific status-code rules above always win. Anything the SDK timeout can't catch (a loop wedged outside an HTTP request) is covered by the watchdog in `core/chat.py:_run_with_watchdog`.
+
+The stall timeout itself is wired through the coreouto >= 0.11 provider constructor `timeout` parameter (seconds) in `_instantiate` — coreouto forwards it to the SDK client and handles google's millisecond `HttpOptions` conversion internally. Semantics are the SDKs' httpx-level timeout: a request dies only when no bytes arrive for 30 minutes — an actively streaming response is never cut. There is deliberately no hard *total*-duration cap; coreouto offers no asyncio-level cancellation point inside `provider.create` (the watchdog cancels from OUTSIDE the call instead).
 
 Rule-matched errors **do not raise** — they surface via the `ON_PROVIDER_ERROR` hook (forwarded to the sink as `provider:` loop events by `_make_provider_error_dispatcher`). Unmatched errors (e.g. network failures with no `status_code`) propagate to `_dump_failure_diagnostics` as before.
 
@@ -318,7 +344,7 @@ Installs/clears the lifecycle observer.
 
 ### `_wrap_subagent_handler(inner)`
 
-Returns an async wrapper that, per invocation: mints `secrets.token_hex(3)` (6 hex chars), sets `_SUBAGENT_DEPTH` + `_SUBAGENT_ID`, notifies the observer `"start"` (task brief) and `"end"` (final result, or `error: {type}: {msg}` on exception), and resets both ContextVars in `finally`. Necessary because `co.BEFORE_TOOL_CALL` is a global hook with no per-agent context — and the wrapper runs exactly once per subagent invocation, which is what makes it the correct mint point for the id.
+Returns an async wrapper that, per invocation: mints `secrets.token_hex(3)` (6 hex chars), sets `_SUBAGENT_DEPTH` + `_SUBAGENT_ID`, notifies the observer `"start"` (task brief), `"wakeup"` (supervisor restart), and `"end"` (final result, or `error: {type}: {msg}` on exception), pops the invocation's `_LIVE_MESSAGES` entry, and resets both ContextVars in `finally`. Necessary because `co.BEFORE_TOOL_CALL` is a global hook with no per-agent context — and the wrapper runs exactly once per subagent invocation, which is what makes it the correct mint point for the id. The subagent call runs through `supervised_run` at `level=depth`, so a wedged subagent is cancelled and resumed from its own sanitized transcript in place — the parent turn is not taken down. If the subagent's supervisor exhausts its wakeups, the raised `LoopStalledError` becomes an error `ToolResult` via coreouto's tool-call wrapper, so the parent sees the failure and can re-delegate.
 
 ### `_build_subagent_tool(preset_name, *, description, provider_config)`
 
@@ -365,7 +391,7 @@ Per-call overrides from CLI flags. All optional.
 The heart of miniouto. Steps:
 
 1. **`clear_coreouto_state()`** — Reset all four coreouto registries.
-   - **`cancel_event` guard** — If a `threading.Event` is passed, a `_make_cancel_guard` hook is registered FIRST on both `BEFORE_LLM_CALL` and `BEFORE_TOOL_CALL`: once the event is set the hook raises `LoopCancelledError`, which coreouto's `trigger` does not swallow, so it propagates out of `agent.call_sync`. This is cooperative cancellation — an in-flight LLM call or tool execution is not interrupted; the loop stops before the next step. Inside a `call_subagent` handler the raise is caught by coreouto's tool-call wrapper and surfaces as an error `ToolResult` (killing the subagent immediately); the outo loop then stops at its next `BEFORE_LLM_CALL`.
+   - **`cancel_event` guard** — If a `threading.Event` is passed, a `_make_cancel_guard` hook is registered FIRST on both `BEFORE_LLM_CALL` and `BEFORE_TOOL_CALL`: once the event is set the hook raises `LoopCancelledError`, which coreouto's `trigger` does not swallow, so it propagates out of the turn. This is cooperative cancellation — the loop stops before the next step; an in-flight tool execution is not interrupted by the guard (Bash polls the same event and kills its own process). Independently, the watchdog's poll (`core/chat.py:_run_with_watchdog`) checks the same event every 5 s and hard-cancels the task, so even an in-flight LLM call is interrupted promptly. Inside a `call_subagent` handler the raise is caught by coreouto's tool-call wrapper and surfaces as an error `ToolResult` (killing the subagent immediately); the outo loop then stops at its next `BEFORE_LLM_CALL`.
 2. **Provider registration** — Look up `runtime.provider_name` in the provider store; raise `RuntimeError` if missing. Call `build_coreouto_provider` for it. Repeat for the subagent provider (which may differ).
 3. **`tools.registry.register_all()`** — Registers `Bash/Image/Video/Audio` tools in coreouto.
 4. **`_resolve_both_styles`** — Loads the named style document (or `builtin_default` for `"default"`), splits at `<subagent>…</subagent>` tags, and prepends active skill content to both halves. Returns `(outo_part, subagent_part)`.
@@ -373,7 +399,7 @@ The heart of miniouto. Steps:
 6. **Register two presets** — `"subagent"` (uses sub-provider + sub-model) and `"outo"` (uses runtime provider + model). Both get `tools=ALL_TOOLS` and `max_iterations=None`.
 7. **Subagent `provider_config`** — Pulls `max_tokens` from `get_max_output_tokens(subagent_model, sub_provider_name)` via lma, so subagent file-writing calls don't hit Anthropic's 1024 default.
 8. **Build `call_subagent` tool** — Via `_build_subagent_tool("subagent", description=_subagent_description(), provider_config=subagent_provider_config)`. The handler is pre-wrapped with `_wrap_subagent_handler` to track depth. Registered via `co.register_tool(name, description=description)(wrapped_handler)` (function-call form, not decorator).
-9. **Register hooks (up to 7):**
+ 9. **Register hooks:**
    - `BEFORE_TOOL_CALL` → `_make_tool_call_logger(on_tool_call)` (only if `on_tool_call` is not None).
    - `AFTER_TOOL_CALL` → `_make_tool_result_logger(on_tool_result)` (only if `on_tool_result` is not None — `chat.run_chat` always supplies one).
    - `ON_ITERATION` → `make_summarize_hook(runtime.model, runtime.session or "default", runtime.provider_name)` — always registered.
@@ -381,6 +407,7 @@ The heart of miniouto. Steps:
    - `AFTER_LLM_CALL` → `_make_response_logger(on_response)` (only if `on_response` is not None).
    - `ON_THINKING` → `_make_thinking_logger(on_thinking)` (only if `on_thinking` is not None — `chat.run_chat` always supplies one).
    - `ON_PROVIDER_ERROR` → `_make_provider_error_logger(on_provider_error)` (only if `on_provider_error` is not None — `chat.run_chat` always supplies one).
+   - **Watchdog trackers** (`_register_watchdog_trackers`, always) — `activity_tracker_hook` on `AFTER_LLM_CALL`/`AFTER_TOOL_CALL`/`ON_ITERATION`/`ON_PROVIDER_ERROR`/`ON_STREAM_TEXT`/`ON_STREAM_THINKING`, all five `loop_progress_hook` entries, and a `BEFORE_LLM_CALL` live-messages capture keyed by actor (`"outo"` or the subagent sid). States are exposed via `watchdog_states()` for `supervised_run`.
 10. **Finalize the outo config** — `co.get_agent_preset("outo").to_config()`, merge in caller's `provider_config`, instantiate `co.Agent(outo_config)`. Returns the agent.
 11. **Reasoning resolution** — `core.reasoning.resolve_reasoning_passthrough(api_format, model, provider_name, choice)` turns the resolved reasoning choice plus lma's per-model `reasoning_options` into provider-native request kwargs, merged into `provider_passthrough` for both outo and subagent. This is what makes providers return thinking blocks at all (the `ON_THINKING` display path is dead without it). It must go through `provider_passthrough`, not `provider_config`: miniouto registers providers under user-chosen names, and coreouto's `normalize_provider_config` passes config through **untranslated** for unknown provider names — a canonical `reasoning_effort` key would reach the SDK raw and `TypeError`. Precedence (highest wins) for outo: `chat --reasoning <v>` > `Provider.reasoning_effort` (stored per provider) > lma's default for the model's option type (effort → `"medium"` or the middle non-`"none"` value; toggle/budget → `"on"`) > off (no kwargs when lma has no reasoning data — no blind defaults). For the **subagent**, the choice inserts one extra tier: `chat --reasoning <v>` (applies to both) > `RuntimeConfig.subagent_reasoning` (persisted `settings.subagent_reasoning`, via `miniouto subagent set --reasoning`) > the subagent provider's `reasoning_effort` > lma default. `"none"`/`"off"` always disables. Only two request shapes are ever emitted — an effort value and anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes (`enabled` + `budget_tokens`) are deliberately NOT emitted: many providers reject budget parameters, so lma `budget_tokens` models are driven as a plain toggle and legacy digit choices degrade to `"on"`. Mapping:
 
@@ -434,7 +461,7 @@ Returns a `RuntimeConfig` with `subagent_provider`/`subagent_model`/`subagent_re
 | `core/providers.py` | `co.register_provider`, `co.clear_*` | coreouto global registry I/O | None caught |
 | `core/runtime.py` | `tool_registry.register_all`, `co.register_agent_preset`, `co.register_tool`, `co.register_hook` | coreouto global registry I/O | None caught |
 | `core/chat.py` | `session_store.record_turn`, `session_store.load` | JSON session persistence (schema v2) | Load is tolerant (never raises); record failures swallowed in `_persist_turn` |
-| `core/chat.py` | `agent.call_sync(prompt, history=core_msgs)` | LLM call (network to configured provider) | Caught locally for diagnostics, re-raised |
+| `core/chat.py` | `_run_with_watchdog` → `agent.call(prompt, history=...)` | LLM call (network to configured provider) | Caught locally for diagnostics, re-raised |
 | `core/chat.py` | `_fail_console.print(...)` | Human-readable diagnostic lines to stderr | None — best-effort |
 
 No file I/O directly inside `core/` — all disk access is delegated to `storage/` (providers, settings, sessions, styles, skills) and `tools/registry.py`.
@@ -452,7 +479,8 @@ No file I/O directly inside `core/` — all disk access is delegated to `storage
 | `RuntimeError("No model specified for provider …")` | `core/runtime.py` | Neither override nor `provider.default_model` is set |
 | `httpx.HTTPError` / `JSONDecodeError` | `core/context.py` | Caught silently inside `_fetch_model_caps` |
 | `Exception` in summarizer | `core/context.py` | Caught, returns static fallback message (never corrupts messages) |
-| `Exception` from `agent.call_sync` | `core/chat.py` | Caught to dump tool trace + traceback, then re-raised |
+| `Exception` from the turn (`_run_with_watchdog`) | `core/chat.py` | Caught to dump tool trace + traceback, then re-raised |
+| `LoopStalledError` | `core/chat.py` | Watchdog exhausted its 3 wakeups — loop re-wedges deterministically; normal failure-diagnostics path |
 | Provider exceptions matching an `ErrorRule` | `core/error_rules.py` + coreouto loop | Absorbed per rule reaction (retry / terminate / tool_result / user_message); surfaced via `ON_PROVIDER_ERROR` → `provider:` loop event, never raised |
 
 ## Defensive patterns worth highlighting
