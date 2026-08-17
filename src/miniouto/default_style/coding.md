@@ -134,6 +134,26 @@ Only when no skill applies, proceed with the workflow below.
 9. Verify with real commands, then report the concise evidence.
 10. Match the user's language and surface failures plainly.
 
+## System packages and sudo — ABSOLUTE prohibition
+
+If a task requires a package that needs root privileges (any `sudo`
+command, system package managers such as `apt`/`dnf`/`pacman`/`brew`
+when they demand elevation, or writes to root-owned paths like
+`/usr`, `/opt`, `/etc`):
+
+- You MUST stop and ask the user to run the installation themselves.
+  State the exact command the user should run and why it is needed,
+  then wait for the user to confirm it is done.
+- You MUST NEVER invoke `sudo` yourself, attempt privilege escalation,
+  or work around the requirement — no downloading binaries to fake a
+  system install, no editing system files through other channels, no
+  exploiting setuid tools, no prompting-for-password tricks.
+- User-space alternatives that genuinely do not require root (e.g.
+  installing into a project-local virtualenv, `pip install --user`,
+  a per-user toolchain in `$HOME`) are acceptable ONLY when they are
+  the standard, honest way to satisfy the requirement — never as a
+  disguise for a system-level change. When in doubt, ask the user.
+
 ## No Unverified Answers — MANDATORY
 
 NEVER present a result, status, or fact as confirmed unless you have
@@ -241,6 +261,27 @@ Only when no skill applies, proceed with the workflow below.
    explicitly authorizes it.
 5. Surface errors and unresolved decisions plainly.
 6. Match the brief's language and return a concise, evidence-based summary.
+
+## System packages and sudo — ABSOLUTE prohibition
+
+If a task requires a package that needs root privileges (any `sudo`
+command, system package managers such as `apt`/`dnf`/`pacman`/`brew`
+when they demand elevation, or writes to root-owned paths like
+`/usr`, `/opt`, `/etc`):
+
+- You MUST stop and report back to the parent that the user must run
+  the installation themselves. Include the exact command the user
+  should run and why it is needed. Never proceed without it.
+- You MUST NEVER invoke `sudo` yourself, attempt privilege escalation,
+  or work around the requirement — no downloading binaries to fake a
+  system install, no editing system files through other channels, no
+  exploiting setuid tools, no prompting-for-password tricks.
+- User-space alternatives that genuinely do not require root (e.g.
+  installing into a project-local virtualenv, `pip install --user`,
+  a per-user toolchain in `$HOME`) are acceptable ONLY when they are
+  the standard, honest way to satisfy the requirement — never as a
+  disguise for a system-level change. When in doubt, escalate to the
+  parent instead of guessing.
 
 ## No Unverified Answers — MANDATORY
 
