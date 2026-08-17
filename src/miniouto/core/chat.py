@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import traceback
 from contextlib import suppress
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ import coreouto as co
 from rich.console import Console
 
 from ..storage import sessions as session_store
-from ..storage.sessions import TurnRecord
+from ..storage.sessions import STATUS_DONE, STATUS_INTERRUPTED
 from .context import get_max_output_tokens
 from .events import EventSink, LoopEvent, NullSink
 from .runtime import (
@@ -24,6 +25,7 @@ from .runtime import (
     current_subagent_depth,
     current_subagent_id,
     resolve_runtime_from_settings,
+    sanitize_history,
     set_subagent_observer,
     supervised_run,
 )
@@ -83,6 +85,9 @@ class _RecordingSink:
     def __init__(self, inner: EventSink) -> None:
         self._inner = inner
         self.events: list[dict[str, Any]] = []
+        # Set by run_chat once the session name is known: called with each
+        # recorded event so the persister can flush it to disk.
+        self.on_event: Any = None
 
     def begin_working(self) -> None:
         self._inner.begin_working()
@@ -95,10 +100,67 @@ class _RecordingSink:
 
     def emit_loop_event(self, event: LoopEvent) -> None:
         self.events.append(event.to_dict())
+        if self.on_event is not None:
+            self.on_event(event)
         self._inner.emit_loop_event(event)
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
         self._inner.emit_final_answer(content, session_name)
+
+
+class _TurnPersister:
+    """Incrementally persist the in-flight turn so a force-kill loses nothing.
+
+    `run_chat` used to write the session only after the loop returned, so
+    a SIGKILL / terminal close / hard crash mid-turn erased the whole turn
+    — reopening the session showed the *previous* turn's answer as the
+    last thing that happened. Instead we:
+
+    - append the turn as `status="running"` before the loop starts;
+    - rewrite its events as they stream in (throttled for high-frequency,
+      low-value `thinking`/`context` events; structural events flush
+      immediately);
+    - snapshot the sanitized live history at every outo iteration
+      (`persist_history`), so a resumed session continues from real
+      mid-turn progress instead of rolling back to the previous turn.
+
+    Combined with the atomic session save, the worst case on SIGKILL is a
+    missing sub-second thinking line. Every method swallows its own
+    errors — persistence must never break or mask the agent loop.
+    """
+
+    _THROTTLED_KINDS = ("thinking", "context")
+    _MIN_INTERVAL_SECONDS = 0.5
+
+    def __init__(self, session_name: str) -> None:
+        self._session = session_name
+        self._events: list[dict[str, Any]] = []
+        self._last_write = 0.0
+
+    def begin(self, prompt: str) -> None:
+        with suppress(Exception):
+            session_store.begin_turn(self._session, prompt)
+
+    def on_event(self, event: LoopEvent) -> None:
+        with suppress(Exception):
+            now = time.monotonic()
+            throttled = event.kind in self._THROTTLED_KINDS
+            if throttled and now - self._last_write < self._MIN_INTERVAL_SECONDS:
+                return
+            self._last_write = now
+            session_store.update_turn_events(self._session, self._events)
+
+    def track(self, events: list[dict[str, Any]]) -> None:
+        self._events = events
+
+    def persist_history(self, messages: Any) -> None:
+        with suppress(Exception):
+            clean = sanitize_history(messages)
+            if not clean:
+                return
+            session_store.update_history(
+                self._session, [_dump_message(m) for m in clean]
+            )
 
 
 def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
@@ -135,7 +197,24 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
     if opts.temperature is not None:
         provider_config["temperature"] = opts.temperature
 
+    session_name = opts.session or runtime.session
+    core_msgs = _load_coreouto_history(session_name, opts.continue_session)
+
+    persister = _TurnPersister(session_name)
+    persister.track(sink.events)
+    persister.begin(opts.prompt)
+    sink.on_event = persister.on_event
+
     on_tool_call = _make_tool_call_dispatcher(sink)
+
+    base_on_iteration = _make_iteration_dispatcher(sink)
+
+    def on_iteration(*, iteration: int, messages: Any, response: Any) -> None:
+        base_on_iteration(iteration=iteration, messages=messages, response=response)
+        # Hooks are global — a subagent's iterations fire this too, but
+        # their transcript is not the session's restorable history.
+        if current_subagent_depth() == 0:
+            persister.persist_history(messages)
 
     agent = build_runtime(
         runtime,
@@ -143,15 +222,12 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         on_tool_call=on_tool_call,
         on_response=_make_response_dispatcher(sink),
         on_thinking=_make_thinking_dispatcher(sink),
-        on_iteration=_make_iteration_dispatcher(sink),
+        on_iteration=on_iteration,
         on_provider_error=_make_provider_error_dispatcher(sink),
         on_tool_result=_make_tool_result_dispatcher(sink),
         reasoning=opts.reasoning,
         cancel_event=opts.cancel_event,
     )
-
-    session_name = opts.session or runtime.session
-    core_msgs = _load_coreouto_history(session_name, opts.continue_session)
 
     with _tool_trace_lock:
         _tool_trace.clear()
@@ -170,11 +246,19 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
             # User force-stopped the loop — a clean cancel, not a failure:
             # persist the turn but skip the failure diagnostics dump.
             sink.end_working()
-            _persist_turn(session_name, None, opts, sink, assistant="")
+            _finish_turn(session_name, None, opts, sink, status=STATUS_INTERRUPTED)
             raise
         except Exception as exc:
             sink.end_working()
-            _persist_turn(session_name, None, opts, sink, assistant="")
+            # Record-only (not emitted live — the caller renders its own
+            # error line) so a session reload shows why the turn ended.
+            sink.events.append(
+                LoopEvent(
+                    actor="miniouto", kind="error",
+                    text=f"{type(exc).__name__}: {exc}",
+                ).to_dict()
+            )
+            _finish_turn(session_name, None, opts, sink, status=STATUS_INTERRUPTED)
             _dump_failure_diagnostics(exc, session_name)
             raise
     finally:
@@ -182,38 +266,42 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         set_subagent_observer(None)
 
     final = response.content
-    _persist_turn(session_name, response, opts, sink, assistant=final)
+    _finish_turn(session_name, response, opts, sink, status=STATUS_DONE, assistant=final)
     sink.emit_final_answer(final, session_name)
     return final
 
 
-def _persist_turn(
+def _finish_turn(
     session_name: str,
     response: Any,
     opts: ChatOptions,
     sink: _RecordingSink,
     *,
-    assistant: str,
+    status: str,
+    assistant: str = "",
 ) -> None:
-    """Rewrite restorable history and append the display turn.
+    """Stamp the running turn finished and rewrite restorable history.
 
     History = `Response.messages` minus system messages (coreouto always
     prepends a fresh system prompt on the next call, so persisting it
     would duplicate it every turn — see coreouto examples/21). On a failed
-    turn (response=None) the previous on-disk history is kept as-is.
+    or cancelled turn (response=None) the incrementally persisted on-disk
+    history is kept — it already reflects real mid-turn progress.
     """
 
     try:
+        history = None
         if response is not None:
             history = [
                 _dump_message(m) for m in response.messages if m.role != "system"
             ]
-        else:
-            history = session_store.load(session_name).history
-        session_store.record_turn(
+        session_store.finish_turn(
             session_name,
+            prompt=opts.prompt,
+            assistant=assistant,
+            status=status,
+            events=sink.events,
             history=history,
-            turn=TurnRecord(user=opts.prompt, assistant=assistant, events=sink.events),
         )
     except Exception:
         pass  # persistence must never mask the turn's real outcome

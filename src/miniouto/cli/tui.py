@@ -1813,7 +1813,8 @@ class ChatTUI(App):
             self._spinner_status(f"No models found for {provider.name!r} in catalog.")
             return
 
-        options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in models]
+        # lma returns oldest-first; reverse so the newest models sit on top.
+        options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in reversed(models)]
         current = provider.default_model
         current_disp = next(
             (opt for opt in options if opt.split(" — ", 1)[0] == current),
@@ -1994,7 +1995,8 @@ class ChatTUI(App):
             self._spinner_status(f"No models found for {provider.name!r} in catalog.")
             return
 
-        options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in models]
+        # lma returns oldest-first; reverse so the newest models sit on top.
+        options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in reversed(models)]
         s = settings_store.load()
         current = s.subagent_model if s.subagent_provider == provider.name else ""
         current_disp = next(
@@ -2148,7 +2150,7 @@ class ChatTUI(App):
         )
 
     def _open_session_picker(self) -> None:
-        sessions = session_store.list_sessions()
+        sessions = session_store.list_sessions_by_mtime()
         s = settings_store.load()
         current = s.session if self._chat_started else ""
 
@@ -2209,6 +2211,15 @@ class ChatTUI(App):
                 self._replay_event(LoopEvent.from_dict(ev_dict))
             if turn.assistant:
                 self._mount_row(AnswerRow(Markdown(turn.assistant)))
+            elif turn.status in ("running", "interrupted"):
+                # A "running" turn on disk means its writer died mid-turn
+                # (SIGKILL/crash); either way there is no final answer to
+                # render — mark the gap explicitly instead of leaving the
+                # previous turn's answer looking like the response.
+                self._post_system(
+                    "turn interrupted — progress above was saved; "
+                    "send a message to continue"
+                )
             self._mount_row(Static(""))
 
     def _replay_event(self, event: LoopEvent) -> None:

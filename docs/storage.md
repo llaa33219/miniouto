@@ -255,6 +255,7 @@ class TurnRecord:                # one user→assistant exchange + its loop even
     assistant: str = ""
     events: list[dict[str, Any]] = field(default_factory=list)   # LoopEvent dicts
     ts: str = ""                 # auto-filled with UTC ISO seconds + "Z"
+    status: str = "done"         # "running" | "done" | "interrupted"
 
 @dataclass
 class SessionData:
@@ -267,13 +268,19 @@ class SessionData:
 |---|---|---|
 | `path_for(name)` | `Path` | |
 | `load(name)` | `SessionData` | empty on missing/corrupt; migrates v1 files on the fly |
-| `save(name, data)` | `None` | full envelope rewrite |
-| `record_turn(name, *, history, turn)` | `None` | load → replace `history` wholesale → append `turn` → save. The per-turn entry point used by `core/chat.py` |
+| `save(name, data)` | `None` | full envelope rewrite, **atomic** (tmp file + `os.replace`) so a force-kill mid-write never leaves torn JSON |
+| `begin_turn(name, prompt)` | `None` | append a `status="running"` turn; reaps any stale running turn (dead writer) to `"interrupted"` first |
+| `update_turn_events(name, events)` | `None` | rewrite the running turn's events — called on nearly every loop event (throttled in `core/chat.py`) |
+| `update_history(name, history)` | `None` | persist a sanitized mid-loop history snapshot for crash resumption |
+| `finish_turn(name, *, prompt, assistant, status, events, history)` | `None` | stamp the running turn `"done"`/`"interrupted"`; `history=None` keeps the on-disk (incrementally persisted) transcript |
 | `create(name)` | `None` | touch an empty session (no-op if the file exists) |
 | `clear(name)` | `None` | deletes the file |
-| `list_sessions()` | `list[str]` | sorted |
+| `list_sessions()` | `list[str]` | sorted by name |
+| `list_sessions_by_mtime()` | `list[str]` | most recently written first (TUI picker order) |
 
-`TurnRecord.to_dict()` omits an empty `events` list; `from_dict` ignores unknown keys and coerces garbage to defaults.
+**Turn lifecycle / crash safety:** `core/chat.py` calls `begin_turn` before the loop starts, rewrites the running turn's `events` as they stream in, snapshots the sanitized live history at every outo iteration (`update_history`), and calls `finish_turn` at the end. A turn still marked `"running"` on disk therefore means the process was force-killed mid-turn — the TUI renders it with an explicit "turn interrupted" marker instead of a (nonexistent) final answer, and the persisted partial history lets `--continue` resume from real progress.
+
+`TurnRecord.to_dict()` omits an empty `events` list and a `"done"` status; `from_dict` ignores unknown keys and coerces garbage to defaults.
 
 ### `storage.styles`
 

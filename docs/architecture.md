@@ -222,8 +222,11 @@ ChatOptions (CLI flags)
                │    + installs the subagent lifecycle observer
                ├─ calls agent.call_sync(prompt, history=core_msgs)
                ├─ on exception: _dump_failure_diagnostics
-               └─ record_turn: rewrite history from Response.messages (minus system)
-                  + append TurnRecord(user, assistant, events)
+               └─ incremental persistence: begin_turn before the loop,
+                  event + sanitized-history snapshots during it, then
+                  finish_turn stamps the running turn done/interrupted
+                  (success also rewrites history from Response.messages
+                  minus system)
 ```
 
 ## External dependencies

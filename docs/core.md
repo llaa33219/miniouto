@@ -67,9 +67,10 @@ run_chat(ChatOptions, sink=None) → str
    │          ├─ BEFORE_TOOL_CALL → _make_tool_call_logger bridges to on_tool_call closure
    │          ├─ handler(**args)
    │          └─ AFTER_TOOL_CALL → on_tool_result(name, result) → LoopEvent(kind="tool_result")
-   ├─ on exception → record turn with empty assistant → _dump_failure_diagnostics (re-raise)
-   └─ _persist_turn: history = Response.messages minus system (full rewrite);
-      append TurnRecord(user, assistant, recorded events)
+    ├─ on exception → finish turn as "interrupted" (record-only error event)
+    │   → _dump_failure_diagnostics (re-raise)
+    └─ _finish_turn: history = Response.messages minus system (full rewrite);
+       stamp the running TurnRecord done (assistant + recorded events)
 ```
 
 ---
@@ -127,9 +128,18 @@ The main entry point. `sink=None` defaults to `NullSink()`; either way the sink 
 4. Loads prior history if `continue_session=True` via `_load_coreouto_history` — session `history` dicts are validated back into `co.Message` objects; invalid entries degrade to plain text (media block lists are flattened via `_flatten_media_blocks`) but **keep `tool_call_id`/`name` for tool messages** so tool_use/tool_result pairing survives even unknown schema drift (without the id the provider 400s the whole request on resume).
 5. Installs `_make_subagent_dispatcher(sink)` as the subagent observer (`set_subagent_observer`), cleared in a `finally` after the call.
 6. Clears `_tool_trace`, runs the turn as `asyncio.run(_run_with_watchdog(agent, opts.prompt, core_msgs, sink=sink, cancel_event=opts.cancel_event))` inside try/except — see the watchdog subsection below.
-7. On `LoopCancelledError` (the `cancel_event` was set), records the turn with an empty assistant text and re-raises WITHOUT `_dump_failure_diagnostics` — a user force-stop is a clean cancel, not a failure. On any other exception, records the turn the same way, calls `_dump_failure_diagnostics`, re-raises.
-8. `_persist_turn`: rewrites the session `history` with `[_dump_message(m) for m in response.messages if m.role != "system"]` (media blocks flattened to text placeholders, tool pairing fields always preserved) and appends a `TurnRecord(user, assistant, recorded_events)`. Persistence failures are swallowed — they must never mask the turn's outcome.
+7. On `LoopCancelledError` (the `cancel_event` was set), finishes the turn as `status="interrupted"` and re-raises WITHOUT `_dump_failure_diagnostics` — a user force-stop is a clean cancel, not a failure. On any other exception, appends a record-only `kind="error"` LoopEvent (so a session reload shows why the turn ended), finishes the turn as `"interrupted"`, calls `_dump_failure_diagnostics`, re-raises.
+8. `_finish_turn`: on success rewrites the session `history` with `[_dump_message(m) for m in response.messages if m.role != "system"]` (media blocks flattened to text placeholders, tool pairing fields always preserved) and stamps the running `TurnRecord` done with `assistant` + recorded events; on cancel/error the incrementally persisted on-disk history is kept (it already reflects mid-turn progress). Persistence failures are swallowed — they must never mask the turn's outcome.
 9. Calls `sink.emit_final_answer(response.content)`; returns `response.content`.
+
+### Incremental persistence (`_TurnPersister`)
+
+The session is written **throughout** the turn, not just at the end, so a force-killed process (SIGKILL, terminal close, hard crash) leaves a fully reloadable record instead of rolling back to the previous turn:
+
+- `begin_turn` appends the turn as `status="running"` before the loop starts (and reaps stale running turns from dead writers).
+- `_RecordingSink.on_event` → `update_turn_events` on nearly every loop event; `thinking`/`context` events are throttled to one write per 0.5 s, structural events flush immediately.
+- The `ON_ITERATION` dispatcher additionally calls `persist_history`, which runs `sanitize_history` (drops the trailing assistant message whose tool calls have no results yet — ON_ITERATION fires before tool execution) and stores it via `update_history`. Guarded by `current_subagent_depth() == 0` — hooks are global, and a subagent's transcript is not the session's restorable history.
+- Combined with the atomic `sessions.save` (tmp file + `os.replace`), the worst-case loss on SIGKILL is a sub-second thinking line.
 
 ### `_run_with_watchdog(agent, prompt, history, *, sink, cancel_event, states=None) -> co.Response`
 
@@ -460,7 +470,7 @@ Returns a `RuntimeConfig` with `subagent_provider`/`subagent_model`/`subagent_re
 | `core/context.py` | (via `core.lma.get_model`) | Fetch `context_window` + `max_output_tokens` for a model | Caught, caches `{}` in `_MODEL_CACHE` (no TTL — process lifetime), returns 16K default |
 | `core/providers.py` | `co.register_provider`, `co.clear_*` | coreouto global registry I/O | None caught |
 | `core/runtime.py` | `tool_registry.register_all`, `co.register_agent_preset`, `co.register_tool`, `co.register_hook` | coreouto global registry I/O | None caught |
-| `core/chat.py` | `session_store.record_turn`, `session_store.load` | JSON session persistence (schema v2) | Load is tolerant (never raises); record failures swallowed in `_persist_turn` |
+| `core/chat.py` | `session_store.begin_turn/update_turn_events/update_history/finish_turn`, `session_store.load` | JSON session persistence (schema v2, incremental) | Load is tolerant (never raises); write failures swallowed (`_TurnPersister`, `_finish_turn`) |
 | `core/chat.py` | `_run_with_watchdog` → `agent.call(prompt, history=...)` | LLM call (network to configured provider) | Caught locally for diagnostics, re-raised |
 | `core/chat.py` | `_fail_console.print(...)` | Human-readable diagnostic lines to stderr | None — best-effort |
 

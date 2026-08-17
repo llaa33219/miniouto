@@ -65,8 +65,10 @@ CLI flag bag → ChatOptions (core/chat.py)
                 → Bash/Image/Video/Audio (via tools/registry.py)
                 → call_subagent (delegates to subagent preset; each invocation
                   mints a subagent-<6hex> id tracked via ContextVars)
-            → record_turn: rewrite session history from Response.messages
-              (minus system) + append TurnRecord(user, assistant, events)
+            → incremental persistence: begin_turn before the loop, event +
+              sanitized-history snapshots during it, then finish_turn stamps
+              the turn done (history rewritten from Response.messages minus
+              system) or interrupted (incremental history kept)
 ```
 
 ---
@@ -135,11 +137,13 @@ coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context. `core/runtime.py` k
 
 If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth/id tracking — and the per-invocation stall supervision (`supervised_run` at level=depth) — will be wrong.
 
-### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display)
+### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display), persisted incrementally
 `storage/sessions.py` writes `{"version": 2, "history": [...], "turns": [...]}`:
 
-- `history` = coreouto `Message.model_dump` dicts **minus system messages** (coreouto prepends a fresh system prompt every `call()` — persisting it duplicates it per turn; see coreouto `examples/21_loop_history.py`), **with media blocks flattened to text placeholders** (`_dump_message` — coreouto persists media tool results as provider wire dicts that fail `Message` validation on reload; the flatten also keeps `tool_call_id`/`name` so tool pairing never breaks — dropping it makes the provider HTTP 400 the whole restored request). Rewritten in full every turn from `Response.messages`, so it stays consistent with in-loop summarize-hook compaction.
+- `history` = coreouto `Message.model_dump` dicts **minus system messages** (coreouto prepends a fresh system prompt every `call()` — persisting it duplicates it per turn; see coreouto `examples/21_loop_history.py`), **with media blocks flattened to text placeholders** (`_dump_message` — coreouto persists media tool results as provider wire dicts that fail `Message` validation on reload; the flatten also keeps `tool_call_id`/`name` so tool pairing never breaks — dropping it makes the provider HTTP 400 the whole restored request). Rewritten in full every turn from `Response.messages`, so it stays consistent with in-loop summarize-hook compaction. **Additionally snapshotted mid-turn**: the `ON_ITERATION` dispatcher persists `sanitize_history(messages)` via `update_history` (outo depth only), so a force-killed process leaves a resumable transcript instead of rolling back to the previous turn.
 - `turns` = display-only `TurnRecord`s (user, assistant, `LoopEvent` dicts). **Thinking lives only here** — coreouto providers never put thinking into history `Message` objects; it's captured via the `ON_THINKING` hook.
+
+Turn lifecycle: `begin_turn` appends a `status="running"` turn before the loop starts (reaping stale running turns from dead writers to `"interrupted"`); `_RecordingSink.on_event` → `update_turn_events` streams events to disk as they happen (throttled for `thinking`/`context`); `finish_turn` stamps the turn `"done"` (with the authoritative history rewrite) or `"interrupted"` (keeping the incremental history). A turn still `"running"` on disk means the writer died mid-turn — the TUI renders an explicit "turn interrupted" marker in place of the missing final answer. All session saves are atomic (tmp file + `os.replace`) because they now happen on nearly every loop event.
 
 `load()` migrates v1 files and never raises on corrupt content. If you change the schema again, bump `SCHEMA_VERSION` and extend the migration — do not break old files.
 
@@ -198,7 +202,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `cli/subagent.py` | `subagent show/set/clear` — manage the subagent provider/model override persisted in settings |
 | `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
-| `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `_run_with_watchdog` (thin level-0 wrapper over `runtime.supervised_run`), `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
+| `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `_run_with_watchdog` (thin level-0 wrapper over `runtime.supervised_run`), `_TurnPersister` (incremental session persistence), `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
 | `core/events.py` | `LoopEvent` (with `subagent_id`, `detail`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events) |
 | `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) ending with coreouto's `TIMEOUT_ERRORS` preset (>= 0.11, `exc_type` match — the HTTP-level stall wakeup for `API_STALL_TIMEOUT_SECONDS`) + `default_error_handling(api_format)` |
@@ -209,7 +213,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
 | `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
 | `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`, optional `max_context_window`/`max_output_tokens`/`reasoning_effort` overrides) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
-| `storage/sessions.py` | `SessionData` + `TurnRecord` (schema v2: restorable `history` + display `turns`) + JSON CRUD with v1 migration |
+| `storage/sessions.py` | `SessionData` + `TurnRecord` (schema v2: restorable `history` + display `turns`, `status` running/done/interrupted) + JSON CRUD with v1 migration + incremental turn persistence (`begin_turn`/`update_turn_events`/`update_history`/`finish_turn`, atomic saves) |
 | `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`, `subagent_provider`, `subagent_model`) + TOML CRUD |
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
 | `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
