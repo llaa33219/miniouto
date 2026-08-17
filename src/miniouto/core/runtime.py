@@ -104,6 +104,136 @@ def sanitize_history(messages: list[co.Message] | None) -> list[co.Message] | No
     return history or None
 
 
+def _repair_pairing(messages: list[Any]) -> bool:
+    """Gentle in-place repair of tool-call pairing; True if anything changed.
+
+    Two fixes, both about making the request payload structurally valid:
+
+    - Drop duplicate tool-result messages (same `tool_call_id` answered
+      twice). Strict providers reject duplicates with a 400, and the old
+      `tool_result` error reaction used to pile them up — a session
+      persisted mid-poisoning can still carry them.
+    - Fill dangling tool calls on the LAST assistant tool-call turn with
+      error results (coreouto examples/29 shape A). coreouto appends a
+      turn's results as one batch, so only the tail can dangle; an
+      interrupted turn restored from disk is the usual source. Filling
+      beats cutting here: the turn's earlier work is kept.
+    """
+
+    changed = False
+    seen: set[str] = set()
+    deduped: list[Any] = []
+    for m in messages:
+        if m.role == "tool":
+            call_id = getattr(m, "tool_call_id", None)
+            if call_id is not None:
+                if call_id in seen:
+                    changed = True
+                    continue
+                seen.add(call_id)
+        deduped.append(m)
+    if changed:
+        messages[:] = deduped
+
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.role == "assistant" and msg.tool_calls:
+            answered = {m.tool_call_id for m in messages[i + 1:] if m.role == "tool"}
+            for tc in msg.tool_calls:
+                if tc.id not in answered:
+                    messages.append(
+                        co.Message(
+                            role="tool",
+                            content=(
+                                "This tool call never completed (the turn was "
+                                "interrupted before a result was recorded). Do "
+                                "not assume it succeeded; redo the work if needed."
+                            ),
+                            tool_call_id=tc.id,
+                            name=tc.name,
+                        )
+                    )
+                    changed = True
+            break
+    return changed
+
+
+def _cut_poisoned_turn(messages: list[Any]) -> bool:
+    """Cut the last assistant tool-call turn and say why, in place.
+
+    coreouto examples/29 shape B: a malformed tool call sitting in the
+    history (bad argument types, broken JSON, schema violation) makes the
+    provider reject EVERY request that includes it, so no synthetic
+    result can ever help — the offending assistant message AND its tool
+    results must go (orphaned results are rejected too). A user message
+    replaces the turn so the model knows what happened and continues
+    with full context instead of repeating the call.
+    """
+
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.role == "assistant" and msg.tool_calls:
+            del messages[i:]
+            messages.append(
+                co.Message(
+                    role="user",
+                    content=(
+                        "Your previous tool call was rejected by the provider "
+                        "(HTTP 400: the call itself was malformed), so that "
+                        "turn was removed from the history. Continue the task "
+                        "without repeating that call; re-issue it with valid "
+                        "arguments if the work is still needed."
+                    ),
+                )
+            )
+            return True
+    return False
+
+
+def _make_history_repair_hook():
+    """Build the ON_PROVIDER_ERROR hook that repairs history before retries.
+
+    Pairs with `core.error_rules`: the 400/422 tool-call rules there use
+    `reaction="retry"`, and coreouto fires ON_PROVIDER_ERROR before each
+    retry attempt, then re-calls `provider.create()` with the CURRENT
+    messages. This hook gets the live list and repairs it in place so the
+    retry actually reaches the model instead of resending the poison.
+
+    Two escalating passes, tracked per live message list (keyed by
+    `id(messages)` — each agent instance owns its list for the duration
+    of its turn, and the dict is rebuilt with the hook on every
+    `build_runtime`, so state never leaks across turns):
+
+    1. `_repair_pairing` — dedupe results, fill dangling calls. If this
+       changed anything, the retry may already pass, so stop there.
+    2. `_cut_poisoned_turn` — the payload is still (or inherently)
+       malformed, so excise the offending turn and tell the model why.
+
+    Gated to `reaction == "retry"` with status 400/422 so rate-limit and
+    overload retries (which need no repair) pass through untouched.
+    """
+
+    passes: dict[int, int] = {}
+
+    def hook(
+        *,
+        status_code: int | None,
+        reaction: str,
+        messages: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        if status_code not in (400, 422) or reaction != "retry" or messages is None:
+            return
+        key = id(messages)
+        attempt = passes.get(key, 0)
+        passes[key] = attempt + 1
+        if attempt == 0 and _repair_pairing(messages):
+            return
+        _cut_poisoned_turn(messages)
+
+    return hook
+
+
 async def supervised_run(
     start: Callable[..., Any],
     prompt: str,
@@ -509,6 +639,9 @@ def build_runtime(
     co.register_hook(co.ON_ITERATION, summarize_hook)
 
     _register_watchdog_trackers()
+
+    # Unconditional (unlike the sink loggers): repair makes the retry rules recover.
+    co.register_hook(co.ON_PROVIDER_ERROR, _make_history_repair_hook())
 
     if on_response is not None:
         co.register_hook(co.AFTER_LLM_CALL, _make_response_logger(on_response))

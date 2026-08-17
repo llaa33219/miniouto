@@ -15,6 +15,20 @@ matches to the event sink as `provider:` loop events.
 
 Rule ordering is significant: more specific `content_contains` matchers
 must precede generic same-status fallbacks.
+
+Why there is no `tool_result` reaction here: for a 400/422 caused by a
+malformed tool call, the poison is IN the request history, so appending
+a synthetic tool result and resending the same payload loops forever
+(coreouto examples/29_malformed_tool_call.py — each repetition also
+piles a duplicate result onto the same tool call, its own 400 reason).
+These rules use `reaction="retry"` instead: coreouto fires
+`ON_PROVIDER_ERROR` before every retry attempt and re-calls
+`provider.create()` with the CURRENT messages, which gives
+`core.runtime`'s history-repair hook a chance to fix the history in
+place (pair/dedupe first, then cut the poisoned turn) so the retry
+actually reaches the model. `retry_max=2` buys exactly two repair
+passes; if both fail, the exception raises and the turn ends instead of
+spinning.
 """
 
 from __future__ import annotations
@@ -43,17 +57,23 @@ _OPENAI_RULES: list[co.ErrorRule] = [
     co.ErrorRule(
         status_code=400,
         content_contains="invalid_schema",
-        reaction="tool_result",
+        reaction="retry",
+        retry_after=0.0,
+        retry_backoff=1.0,
+        retry_max=2,
         message=(
             "Tool arguments failed schema validation. "
-            "Check parameter types and required fields."
+            "Repairing history and retrying."
         ),
     ),
     co.ErrorRule(
         status_code=400,
         content_contains="tool",
-        reaction="tool_result",
-        message="Invalid tool call. Verify the tool name exists and try again.",
+        reaction="retry",
+        retry_after=0.0,
+        retry_backoff=1.0,
+        retry_max=2,
+        message="Invalid tool call. Repairing history and retrying.",
     ),
     co.ErrorRule(
         status_code=404,
@@ -63,10 +83,13 @@ _OPENAI_RULES: list[co.ErrorRule] = [
     ),
     co.ErrorRule(
         status_code=422,
-        reaction="tool_result",
+        reaction="retry",
+        retry_after=0.0,
+        retry_backoff=1.0,
+        retry_max=2,
         message=(
             "Request schema validation failed. "
-            "The tool parameters don't match the declared schema."
+            "Repairing history and retrying."
         ),
     ),
     *TIMEOUT_ERRORS,
@@ -127,8 +150,11 @@ _ANTHROPIC_RULES: list[co.ErrorRule] = [
     co.ErrorRule(
         status_code=400,
         content_contains="tool",
-        reaction="tool_result",
-        message="Invalid tool call. Check the tool name and argument schema.",
+        reaction="retry",
+        retry_after=0.0,
+        retry_backoff=1.0,
+        retry_max=2,
+        message="Invalid tool call. Repairing history and retrying.",
     ),
     co.ErrorRule(
         status_code=413,
@@ -137,10 +163,13 @@ _ANTHROPIC_RULES: list[co.ErrorRule] = [
     ),
     co.ErrorRule(
         status_code=422,
-        reaction="tool_result",
+        reaction="retry",
+        retry_after=0.0,
+        retry_backoff=1.0,
+        retry_max=2,
         message=(
             "Schema validation failed. "
-            "The tool parameters don't match the declared input_schema."
+            "Repairing history and retrying."
         ),
     ),
     *TIMEOUT_ERRORS,
@@ -188,8 +217,11 @@ _GOOGLE_RULES: list[co.ErrorRule] = [
     co.ErrorRule(
         status_code=400,
         content_contains="tool",
-        reaction="tool_result",
-        message="Invalid tool call. Check function name and argument schema.",
+        reaction="retry",
+        retry_after=0.0,
+        retry_backoff=1.0,
+        retry_max=2,
+        message="Invalid tool call. Repairing history and retrying.",
     ),
     co.ErrorRule(
         status_code=400,
@@ -205,8 +237,11 @@ _GOOGLE_RULES: list[co.ErrorRule] = [
     ),
     co.ErrorRule(
         status_code=400,
-        reaction="tool_result",
-        message="Invalid request (Google API). Check your tool arguments and request format.",
+        reaction="retry",
+        retry_after=0.0,
+        retry_backoff=1.0,
+        retry_max=2,
+        message="Invalid request (Google API). Repairing history and retrying.",
     ),
     co.ErrorRule(
         status_code=404,
