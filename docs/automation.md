@@ -38,13 +38,9 @@ In other words, a single `miniouto status` creates the entire `~/.miniouto/` str
 ~/.miniouto/
 ├── providers.toml         ← created on first provider registration
 ├── settings.toml          ← created on first settings change
-├── style/                 ← ensure_dirs() auto-copies the six bundles
+├── style/                 ← ensure_dirs() auto-copies the two bundles
 │   ├── default.md
-│   ├── claude.md
-│   ├── codex.md
-│   ├── opencode.md
-│   ├── oh-my-opencode.md
-│   └── codebuff.md
+│   └── coding.md
 ├── style_repos.toml       ← created on first `style add` (absent initially)
 ├── sessions/              ← empty directory
 └── logs/                  ← empty directory (currently unused, reserved)
@@ -66,11 +62,11 @@ if BUNDLED_STYLE_DIR.is_dir():
 
 Behavior summary:
 
-- If an installed file **shares a name** with one of the six bundled `.md` files and the contents differ → overwrite with the bundled content.
+- If an installed file **shares a name** with one of the two bundled `.md` files and the contents differ → overwrite with the bundled content.
 - User-created styles whose names **don't match** a bundle (`my-custom.md`, etc.) are left untouched.
 - After a miniouto version upgrade, the next run automatically refreshes the bundled styles to the latest.
 
-> To preserve a customized bundled style, **copy it to a different name** before editing. Example: `cp ~/.miniouto/style/claude.md ~/.miniouto/style/my-claude.md`.
+> To preserve a customized bundled style, **copy it to a different name** before editing. Example: `cp ~/.miniouto/style/coding.md ~/.miniouto/style/my-coding.md`.
 
 ---
 
@@ -243,7 +239,7 @@ Set the active provider separately in `settings.toml`:
 ```toml
 # ~/.miniouto/settings.toml
 provider = "anthropic"
-style = "claude"
+style = "coding"
 session = "default"
 ```
 
@@ -368,7 +364,7 @@ miniouto style set my-prompt
 # or write style = "my-prompt" directly into settings.toml
 ```
 
-> Warning: if the file name matches one of the six bundles (default, claude, codex, opencode, oh-my-opencode, codebuff), the next `ensure_dirs()` call **overwrites** it with the bundled content. Custom styles must use a different name.
+> Warning: if the file name matches one of the two bundles (default, coding), the next `ensure_dirs()` call **overwrites** it with the bundled content. Custom styles must use a different name.
 
 ### Method B — fetch from a remote repo (`style add`)
 

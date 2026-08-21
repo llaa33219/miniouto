@@ -70,19 +70,14 @@ The `continue_loop` tool is referenced in styles but not actually wired into the
 
 ## Bundled templates
 
-All seven bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
+The two bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
 
-| File | Size | Persona | Orchestrator? | Sub-roles |
-|---|---|---|---|---|
-| `default.md` | ~4 KB | "**outo**" — minimal, sparse | No (deliberately) | n/a |
-| `claude.md` | ~14 KB | Claude Code-style | Yes (mild) | Explore / Plan / General-purpose |
-| `codex.md` | ~16 KB | OpenAI Codex CLI-style | Yes | File picker / Code searcher / Researcher / Editor / Code reviewer / Basher |
-| `opencode.md` | ~9 KB | OpenCode-style | No | (delegates ad-hoc) |
-| `oh-my-opencode.md` | ~11 KB | "**Sisyphus**" | **Aggressive** | Explorer / Researcher / Planner / Advisor / Reviewer / Editor / Basher |
-| `codebuff.md` | ~10 KB | "**Buffy**" | Yes | File picker / Code searcher / Researcher / Editor / Code reviewer / Basher |
-| `coding.md` | ~14 KB | "**coding expert**" orchestrator | **Aggressive** | (delegates ad-hoc, parallel) |
+| File | Size | Persona | Orchestrator? |
+|---|---|---|---|
+| `default.md` | ~4 KB | "**outo**" — minimal, sparse | No (deliberately) |
+| `coding.md` | ~14 KB | "**coding expert**" orchestrator | **Aggressive** |
 
-The orchestration styles (claude/codex/codebuff/oh-my-opencode/coding) include explicit guidance on when and how to delegate via `call_subagent`. `default.md` and `opencode.md` are more minimal.
+`coding.md` includes explicit guidance on when and how to delegate via `call_subagent`; `default.md` is deliberately minimal.
 
 ### `default.md` — minimal fallback
 
@@ -91,45 +86,6 @@ The original "outo" prompt. Short, opinionated, deliberately sparse. Used when n
 Key points:
 - 7 outo operating principles: be brief, lead with the answer, finish with text + no tool call (or use `continue_loop`), treat tool results as loop input, match delegation scope to task size, never invent outputs, match the user's language, pass paths correctly when delegating.
 - 10 subagent principles: treat the brief as the whole spec (no clarifying questions), be terse, prefer targeted `sed`/Python edits over full-file rewrites, read first, return useful extracted output (not full dumps), plan + execute + synthesize for multi-step work, use `call_subagent` only when the subtask deserves its own context, finish with text + no tool call, tool results are loop input, match brief language, surface errors verbatim.
-
-### `claude.md` — Claude Code-style
-
-Long, structured, opinionated about communication style. Identity: "an interactive agent that helps users with software engineering tasks."
-
-Sections include: harness, communication style, outcome-first communication, executing actions with care, code editing mandates, doing tasks, comment guidelines. Includes a description of a `claude.md` CWD memory file (**not actually wired up** — see Known issues below).
-
-### `codex.md` — OpenAI Codex CLI-style
-
-The longest style. Personality: "precise, safe, helpful." Strong emphasis on preamble messages before tool calls.
-
-Includes: preamble messages culture, editing constraints (ASCII default, dirty worktree rules, never `git reset --hard`, never `git checkout --`), frontend tasks (anti-AI-slop rules on typography/color/motion/backgrounds), validating your work, presenting your work, file references (clickable paths with line/column).
-
-### `opencode.md` — OpenCode-style
-
-Concise. Identity: "an interactive CLI tool that helps users with software engineering tasks."
-
-Tone-and-style section is the strongest part: extremely short answers (1–3 sentences preferred, fewer than 4 lines by default, one-word answers are best). Proactiveness rules are clear: proactive when asked, don't surprise the user.
-
-### `oh-my-opencode.md` — Sisyphus orchestrator
-
-The most aggressively orchestrator-focused. Critical identity constraint: "YOU ARE AN ORCHESTRATOR. YOU PLAN AND DELEGATE. YOU DO NOT WRITE CODE DIRECTLY (unless trivially simple)."
-
-Seven sub-agent roles with explicit operating modes:
-- **Explorer** (READ-ONLY) — search codebase, return ABSOLUTE paths.
-- **Researcher** (READ-ONLY) — web/docs; date awareness required.
-- **Planner** (READ-ONLY) — 5–7 word step headings.
-- **Advisor** (READ-ONLY) — three-tier response (Essential / Expanded / Edge cases); confidence signal.
-- **Reviewer** (READ-ONLY) — blockers only (max 3), APPROVE-biased.
-- **Editor** — implementer; conventions, targeted Bash edits (`sed -i`, heredocs).
-- **Basher** — shell runner.
-
-Includes a Decision Framework (effort tag: Quick<1h / Short 1-4h / Medium 1-2d / Large 3d+) and AI-Slop Avoidance section.
-
-### `codebuff.md` — Buffy orchestrator
-
-"Buffy, a strategic assistant that orchestrates complex coding tasks through specialized sub-agents."
-
-Same six sub-agent roles as codex (no Planner/Advisor). Stronger emphasis on quality-over-speed: "fewer, well-informed agents > many rushed ones."
 
 ### `coding.md`: coding expert orchestrator
 
@@ -212,6 +168,5 @@ Just `cp ~/.miniouto/style/<name>.md some/path.md`. The file is fully self-conta
 
 ## Known issues
 
-1. **CWD memory files are described but not implemented.** Four styles (`claude.md`, `codex.md`, `opencode.md`, `oh-my-opencode.md`) describe a `<style-name>.md` file in the user's CWD that the agent should read/write as persistent memory. **No such loader exists in miniouto.** If you want this feature, implement it in `core/runtime.py:_load_active_skills()` (or a sibling) and update the styles to match the actual file name.
-2. **`continue_loop` tool is referenced but not registered.** All bundled styles mention it as the way to "send progress to the user while still planning more tool calls." The coreouto integration would need a no-op tool registered in `tools/registry.py` and added to `core/runtime.ALL_TOOLS`. Models currently improvise (often emitting a tool-shaped message with no actual call), which can confuse some coreouto versions.
-3. **Style override semantics for `<subagent>` are asymmetric.** Missing `<subagent>` → uses `_fallback_style("subagent")` (hardcoded minimal prompt). Missing `<outo>` → uses the whole document. If you author a style without `<subagent>` and rely on the fallback, check `core/runtime.py:_fallback_style("subagent")` to confirm what the subagent actually receives.
+1. **`continue_loop` tool is referenced but not registered.** All bundled styles mention it as the way to "send progress to the user while still planning more tool calls." The coreouto integration would need a no-op tool registered in `tools/registry.py` and added to `core/runtime.ALL_TOOLS`. Models currently improvise (often emitting a tool-shaped message with no actual call), which can confuse some coreouto versions.
+2. **Style override semantics for `<subagent>` are asymmetric.** Missing `<subagent>` → uses `_fallback_style("subagent")` (hardcoded minimal prompt). Missing `<outo>` → uses the whole document. If you author a style without `<subagent>` and rely on the fallback, check `core/runtime.py:_fallback_style("subagent")` to confirm what the subagent actually receives.

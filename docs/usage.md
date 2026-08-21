@@ -20,7 +20,7 @@ A cookbook of real-world examples for every CLI command — flags, output shapes
 
 ## Getting started (first-time setup)
 
-The first `miniouto` invocation (any subcommand) runs `storage/paths.py:ensure_dirs()`, which creates the `~/.miniouto/` skeleton and seeds the six bundled styles automatically. After that you register one provider, set it as default, and you're ready to chat.
+The first `miniouto` invocation (any subcommand) runs `storage/paths.py:ensure_dirs()`, which creates the `~/.miniouto/` skeleton and seeds the two bundled styles automatically. After that you register one provider, set it as default, and you're ready to chat.
 
 **Path A — pull from the lma catalog (recommended):**
 
@@ -39,9 +39,9 @@ miniouto provider add OpenAI --api-key sk-... --default-model gpt-5.5
 # 4. Set as default
 miniouto provider default anthropic
 
-# 5. Pick a style (all six bundles are already installed)
+# 5. Pick a style (both bundles are already installed)
 miniouto style list
-miniouto style set claude
+miniouto style set coding
 
 # 6. First chat
 miniouto chat "hello"
@@ -87,11 +87,11 @@ Example output shape:
 ```
 Default provider: anthropic
 Default model:    claude-sonnet-4
-Active style:     claude
+Active style:     coding
 Session:          default
 Storage:          /home/luke/.miniouto
 Providers:        anthropic, openai, my-local
-Styles:           claude, codebuff, codex, default, oh-my-opencode, opencode
+Styles:           coding, default
 Skills:           git-master, frontend
 Sessions:         default, chat-20260702-103045-a1b2c3
 ```
@@ -194,11 +194,11 @@ miniouto chat "just a quick classification" --model gpt-5.5-mini
 miniouto chat "hello" --provider openai
 
 # Use a different style just for this call
-miniouto chat "review this code" --style codex
-miniouto chat "orchestrate this for me" --style oh-my-opencode
+miniouto chat "review this code" --style default
+miniouto chat "orchestrate this for me" --style coding
 
 # Combinable
-miniouto chat "summarize" --provider anthropic --model claude-sonnet-4 --style claude
+miniouto chat "summarize" --provider anthropic --model claude-sonnet-4 --style coding
 ```
 
 Model resolution order (first match wins, see [`README.md`](../README.md#model-resolution)):
@@ -307,20 +307,16 @@ miniouto provider remove my-local
 A style is a markdown system prompt at `~/.miniouto/style/<name>.md`. The `<outo>...</outo>` and (optional) `<subagent>...</subagent>` tags split the two agents' prompts. Format details in [`styles.md`](./styles.md).
 
 ```bash
-# Six bundles are pre-installed: default, claude, codex, opencode, oh-my-opencode, codebuff
+# Two bundles are pre-installed: default, coding
 miniouto style list
-#   - claude
-#   - codebuff
-#   - codex
+#   - coding
 #   - default ●          ← active style
-#   - oh-my-opencode
-#   - opencode
 
 # Switch the active style
-miniouto style set claude
+miniouto style set coding
 
 # Print a style's contents
-miniouto style show claude
+miniouto style show coding
 
 # Fetch styles from a remote repo's /style-md/ directory
 # (GitHub / GitLab / HTML directory index auto-detected)

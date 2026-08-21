@@ -207,12 +207,11 @@ Then visit the printed URL.
 ## Known sharp edges (the easy-to-miss stuff)
 
 1. **No tests directory exists.** Don't assume one is being created behind the scenes.
-2. **Four of the six bundled styles** describe a `claude.md` / `codex.md` / `oh-my-opencode.md` / `opencode.md` CWD memory file. **No such loader exists in miniouto.** Either implement it or edit the styles to remove the misleading references.
-3. **`tui/` and `utils/` are empty.** They look like package directories but contain no code. Don't add modules there without first deciding whether the contents should be moved into the proper package (TUI lives in `cli/tui.py`, utilities are scattered).
-4. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
-5. **`continue_loop` tool is referenced in every bundled style** but **not** registered in `tools/registry.py`. Models currently improvise. To enable, register a no-op `continue_loop` handler and add the name to `core/runtime.ALL_TOOLS`.
-6. **`core/runtime.py:_SUBAGENT_DEPTH` is a module-level `ContextVar`** that is set inside `_wrap_subagent_handler`. If you add new async tools that themselves call subagents (recursive delegation), make sure they go through the wrapper or the depth tracking will be wrong.
-7. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code; do not rely on them affecting model behavior.
+2. **`tui/` and `utils/` are empty.** They look like package directories but contain no code. Don't add modules there without first deciding whether the contents should be moved into the proper package (TUI lives in `cli/tui.py`, utilities are scattered).
+3. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
+4. **`continue_loop` tool is referenced in every bundled style** but **not** registered in `tools/registry.py`. Models currently improvise. To enable, register a no-op `continue_loop` handler and add the name to `core/runtime.ALL_TOOLS`.
+5. **`core/runtime.py:_SUBAGENT_DEPTH` is a module-level `ContextVar`** that is set inside `_wrap_subagent_handler`. If you add new async tools that themselves call subagents (recursive delegation), make sure they go through the wrapper or the depth tracking will be wrong.
+6. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code; do not rely on them affecting model behavior.
 
 ## Common modifications
 
@@ -249,4 +248,4 @@ Only one place: `src/miniouto/storage/paths.py`. Update the `ROOT` constant to r
 - Don't add new top-level dependencies without discussion. `coreouto`, `typer`, `rich`, `textual`, `pydantic`, `httpx`, `tomli-w` is the entire runtime footprint.
 - Don't refactor while fixing — open separate PRs.
 - If you change a tool's behavior, update the corresponding `_<name>_description` in `tools/registry.py` (the description is what the LLM sees).
-- If you change a style's structure, re-test all six bundled templates for consistency.
+- If you change a style's structure, re-test both bundled templates for consistency.

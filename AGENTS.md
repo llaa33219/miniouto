@@ -37,7 +37,7 @@ src/miniouto/
 ├── core/     ← chat loop, runtime assembly, subagent dispatch, event sinks
 ├── storage/  ← the only layer that touches disk (apart from tools/)
 ├── tools/    ← Bash + media loaders (only bash is async)
-├── default_style/  ← 6 bundled .md templates, force-refreshed on every run
+├── default_style/  ← 2 bundled .md templates, force-refreshed on every run
 └── __init__.py, paths_runtime.py
 ```
 
@@ -223,11 +223,6 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `tools/media.py` | `load_image/load_video/load_audio(file_path)` → `LoadedMedia` (pure stdlib; `registry.py` wraps results into `co.ImageBlock`/`VideoBlock`/`AudioBlock`) |
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |
-| `default_style/claude.md` | Claude Code-style (~14 KB) |
-| `default_style/codex.md` | OpenAI Codex CLI-style (~16 KB) |
-| `default_style/opencode.md` | OpenCode-style (~9 KB) |
-| `default_style/oh-my-opencode.md` | "Sisyphus" orchestrator (~11 KB) |
-| `default_style/codebuff.md` | "Buffy" orchestrator (~10 KB) |
 | `default_style/coding.md` | Coding-expert orchestrator (~14 KB) — delegation-first, parallel `call_subagent`, `.miniouto/plans/` lifecycle |
 | `tui/` | **EMPTY placeholder** — TUI code lives in `cli/tui.py` |
 | `utils/` | **EMPTY placeholder** — no code anywhere |
@@ -299,8 +294,7 @@ The test directory doesn't exist yet. Suggested setup in `docs/development.md`. 
 ### Bugs / cleanup opportunities
 
 1. **No tests directory exists.** The codebase has zero automated test coverage. `tools/bash.py` and `core/context.py:make_summarize_hook` are the highest-value test targets.
-2. **Four of the six bundled styles** (`claude.md`, `codex.md`, `opencode.md`, `oh-my-opencode.md`) describe a `claude.md` / `codex.md` / `oh-my-opencode.md` / `opencode.md` CWD memory file. **No such loader exists in miniouto.** Either implement it (in `core/runtime.py:_load_active_skills` or a sibling) or edit the styles to remove the misleading references.
-3. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code.
+2. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code.
 
 ---
 

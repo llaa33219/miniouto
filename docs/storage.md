@@ -13,11 +13,7 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 ├── style_repos.toml              # recorded repo URLs added via `style add` (re-fetched by `style update`)
 ├── style/
 │   ├── default.md                # seeded + force-refreshed from src/miniouto/default_style/default.md
-│   ├── claude.md                 # force-refreshed
-│   ├── codex.md                  # force-refreshed
-│   ├── opencode.md               # force-refreshed
-│   ├── oh-my-opencode.md         # force-refreshed
-│   └── codebuff.md               # force-refreshed
+│   └── coding.md                 # force-refreshed from src/miniouto/default_style/coding.md
 ├── sessions/
 │   └── <name>.json               # conversation history per session
 └── logs/                         # reserved (currently unused by code)

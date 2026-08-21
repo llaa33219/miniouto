@@ -6,7 +6,7 @@
 
 1. A CLI (`miniouto`) and an optional Textual TUI for interactive use.
 2. File-driven configuration (TOML for providers/settings, Markdown for styles, JSON for sessions).
-3. Bundled agent "style" templates (six personas, including orchestrators).
+3. Bundled agent "style" templates (two personas: a minimal default and an orchestrator).
 4. A minimal tool surface (Bash + Image/Video/Audio media viewers, `call_subagent`).
 5. Persistence of session history.
 6. Per-turn diagnostic output to stderr.
@@ -253,8 +253,7 @@ ChatOptions (CLI flags)
 ## Known sharp edges (don't refactor without checking)
 
 1. **No tests directory exists.** There are zero tests at the time of writing.
-2. **Four of the six bundled styles** describe a `claude.md` / `codex.md` / `oh-my-opencode.md` / `opencode.md` CWD memory file. **No such loader exists in miniouto.** Either implement it or remove the misleading references.
-3. **`tui/` and `utils/` are empty.** They look like package directories but contain no code.
-4. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
-5. **`tools/registry.py:_register_if_missing` silently discards the `schema` parameter** — only the handler's type hints and the `description` string reach the model. The `_xxx_schema()` dicts are dead code.
-6. **`core/runtime.py` can register `ON_ITERATION` twice.** `summarize_hook` (always) and `_make_iteration_logger(on_iteration)` (when `on_iteration` is supplied, which `chat.run_chat` always does). Both fire on every iteration.
+2. **`tui/` and `utils/` are empty.** They look like package directories but contain no code.
+3. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
+4. **`tools/registry.py:_register_if_missing` silently discards the `schema` parameter** — only the handler's type hints and the `description` string reach the model. The `_xxx_schema()` dicts are dead code.
+5. **`core/runtime.py` can register `ON_ITERATION` twice.** `summarize_hook` (always) and `_make_iteration_logger(on_iteration)` (when `on_iteration` is supplied, which `chat.run_chat` always does). Both fire on every iteration.
