@@ -248,4 +248,4 @@ Only one place: `src/miniouto/storage/paths.py`. Update the `ROOT` constant to r
 - Don't add new top-level dependencies without discussion. `coreouto`, `typer`, `rich`, `textual`, `pydantic`, `httpx`, `tomli-w` is the entire runtime footprint.
 - Don't refactor while fixing — open separate PRs.
 - If you change a tool's behavior, update the corresponding `_<name>_description` in `tools/registry.py` (the description is what the LLM sees).
-- If you change a style's structure, re-test both bundled templates for consistency.
+- If you change a style's structure, re-test all three bundled templates for consistency.

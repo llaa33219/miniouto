@@ -6,7 +6,7 @@
 
 1. A CLI (`miniouto`) and an optional Textual TUI for interactive use.
 2. File-driven configuration (TOML for providers/settings, Markdown for styles, JSON for sessions).
-3. Bundled agent "style" templates (two personas: a minimal default and an orchestrator).
+3. Bundled agent "style" templates (three personas: a minimal default and two orchestrators).
 4. A minimal tool surface (Bash + Image/Video/Audio media viewers, `call_subagent`).
 5. Persistence of session history.
 6. Per-turn diagnostic output to stderr.

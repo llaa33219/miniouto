@@ -70,14 +70,15 @@ The `continue_loop` tool is referenced in styles but not actually wired into the
 
 ## Bundled templates
 
-The two bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
+The three bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
 
 | File | Size | Persona | Orchestrator? |
 |---|---|---|---|
 | `default.md` | ~4 KB | "**outo**" — minimal, sparse | No (deliberately) |
 | `coding.md` | ~14 KB | "**coding expert**" orchestrator | **Aggressive** |
+| `pro.md` | ~25 KB | "**pro**" — senior staff engineer orchestrator | **Aggressive** (with a delegate-vs-DIY decision framework) |
 
-`coding.md` includes explicit guidance on when and how to delegate via `call_subagent`; `default.md` is deliberately minimal.
+`coding.md` and `pro.md` include explicit guidance on when and how to delegate via `call_subagent`; `default.md` is deliberately minimal.
 
 ### `default.md` — minimal fallback
 
@@ -108,6 +109,41 @@ production-grade software work. It requires the following behaviors:
 - **Quality and verification**: hold subagents to the same professional bar,
   read before editing, follow project conventions, and report only results
   confirmed by real build, lint, typecheck, test, or execution runs.
+
+### `pro.md`: senior staff engineer orchestrator
+
+The most complete bundled style. Persona: "**pro**, a senior staff engineer"
+that is "a teammate, not a tutor." It requires the following behaviors:
+
+- **12 core operating principles**: lead with the answer, match depth to the
+  task, delegate by default, parallelize independent work, verify with real
+  evidence, surgical minimal changes, read before editing, preserve user work,
+  no fabrication, match the user's language, stop and ask on material
+  decisions, loop until done or hard-blocked.
+- **Delegate-vs-DIY decision framework**: a signal table (one quick read → do
+  it yourself; multi-file/multi-step/investigative → `call_subagent`; two or
+  more independent subtasks → parallel calls in the same turn), with an
+  explicit ban on stringing together many small direct actions to avoid
+  delegation.
+- **Five-stage execution loop**: EXPLORE → PLAN → EXECUTE → VERIFY → LOOP,
+  with a project onboarding sweep for first contact.
+- **Plan-file lifecycle**: same `./.miniouto/plans/<name>.md` convention as
+  `coding.md`, plus optional `CHECKPOINTS.md` and `DECISIONS.md` companions
+  (mirrors Karpathy's PLAN / EXPERIMENTS / NOTES pattern).
+- **6-section delegation brief**: every `call_subagent(task)` must carry TASK,
+  EXPECTED OUTCOME, REQUIRED TOOLS, MUST DO, MUST NOT DO, CONTEXT — the
+  subagent has no conversation history, so the brief is its entire spec.
+- **Definition of done**: an explicit checklist (build/lint/typecheck/test
+  exit 0, minimal diff, plan file updated, subagent claims confirmed by
+  reading changed files).
+- **Status update format**: Checkpoint / Verified / Changed / Remaining /
+  Blocked — vague updates like "working on it" are forbidden.
+- **Hard blocks**: no sudo or system-level changes (must hand the command to
+  the user), no mass or destructive operations without authorization, no
+  fabrication, no silent scope expansion, no commit/push/publish without
+  explicit instruction, no silent destruction of user work.
+- Unlike the other two bundles, `pro.md` has **no Web access section** — it
+  relies on the skill catalog and plain `curl` judgment.
 
 ---
 
@@ -158,7 +194,7 @@ Every bundled template includes a **Skills — MANDATORY first check** section i
 
 ### Web access guidance in bundled styles
 
-Every bundled template includes a **Web access (search & fetch)** section in both its `<outo>` and `<subagent>` halves. It is **skill-first**: the agent must check whether an available skill covers the web interaction (browser automation, scraping, search, platform-specific APIs) and follow that skill when one applies. Only when no skill applies does it fall back to `curl` via Bash — searching the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from any bundled template.
+The `default.md` and `coding.md` templates include a **Web access (search & fetch)** section in both their `<outo>` and `<subagent>` halves (`pro.md` does not — see its section above). It is **skill-first**: the agent must check whether an available skill covers the web interaction (browser automation, scraping, search, platform-specific APIs) and follow that skill when one applies. Only when no skill applies does it fall back to `curl` via Bash — searching the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from any bundled template.
 
 ### Export / share a style
 

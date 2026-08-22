@@ -37,7 +37,7 @@ src/miniouto/
 ├── core/     ← chat loop, runtime assembly, subagent dispatch, event sinks
 ├── storage/  ← the only layer that touches disk (apart from tools/)
 ├── tools/    ← Bash + media loaders (only bash is async)
-├── default_style/  ← 2 bundled .md templates, force-refreshed on every run
+├── default_style/  ← 3 bundled .md templates, force-refreshed on every run
 └── __init__.py, paths_runtime.py
 ```
 
@@ -224,6 +224,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |
 | `default_style/coding.md` | Coding-expert orchestrator (~14 KB) — delegation-first, parallel `call_subagent`, `.miniouto/plans/` lifecycle |
+| `default_style/pro.md` | Senior staff engineer orchestrator (~25 KB) — delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, hard blocks (no sudo / no mass delete / no unprompted commit-push) |
 | `tui/` | **EMPTY placeholder** — TUI code lives in `cli/tui.py` |
 | `utils/` | **EMPTY placeholder** — no code anywhere |
 
