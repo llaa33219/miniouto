@@ -26,9 +26,10 @@ These rules use `reaction="retry"` instead: coreouto fires
 `provider.create()` with the CURRENT messages, which gives
 `core.runtime`'s history-repair hook a chance to fix the history in
 place (pair/dedupe first, then cut the poisoned turn) so the retry
-actually reaches the model. `retry_max=2` buys exactly two repair
-passes; if both fail, the exception raises and the turn ends instead of
-spinning.
+actually reaches the model. `retry_max=3` buys three repair passes —
+enough for the cut pass to walk past a couple of healthy turns and reach
+a poisoned one buried mid-history; if all fail, the exception raises and
+the turn ends instead of spinning.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ _OPENAI_RULES: list[co.ErrorRule] = [
         reaction="retry",
         retry_after=0.0,
         retry_backoff=1.0,
-        retry_max=2,
+        retry_max=3,
         message=(
             "Tool arguments failed schema validation. "
             "Repairing history and retrying."
@@ -72,7 +73,7 @@ _OPENAI_RULES: list[co.ErrorRule] = [
         reaction="retry",
         retry_after=0.0,
         retry_backoff=1.0,
-        retry_max=2,
+        retry_max=3,
         message="Invalid tool call. Repairing history and retrying.",
     ),
     co.ErrorRule(
@@ -86,7 +87,7 @@ _OPENAI_RULES: list[co.ErrorRule] = [
         reaction="retry",
         retry_after=0.0,
         retry_backoff=1.0,
-        retry_max=2,
+        retry_max=3,
         message=(
             "Request schema validation failed. "
             "Repairing history and retrying."
@@ -153,7 +154,7 @@ _ANTHROPIC_RULES: list[co.ErrorRule] = [
         reaction="retry",
         retry_after=0.0,
         retry_backoff=1.0,
-        retry_max=2,
+        retry_max=3,
         message="Invalid tool call. Repairing history and retrying.",
     ),
     co.ErrorRule(
@@ -166,7 +167,7 @@ _ANTHROPIC_RULES: list[co.ErrorRule] = [
         reaction="retry",
         retry_after=0.0,
         retry_backoff=1.0,
-        retry_max=2,
+        retry_max=3,
         message=(
             "Schema validation failed. "
             "Repairing history and retrying."
@@ -220,7 +221,7 @@ _GOOGLE_RULES: list[co.ErrorRule] = [
         reaction="retry",
         retry_after=0.0,
         retry_backoff=1.0,
-        retry_max=2,
+        retry_max=3,
         message="Invalid tool call. Repairing history and retrying.",
     ),
     co.ErrorRule(
@@ -240,7 +241,7 @@ _GOOGLE_RULES: list[co.ErrorRule] = [
         reaction="retry",
         retry_after=0.0,
         retry_backoff=1.0,
-        retry_max=2,
+        retry_max=3,
         message="Invalid request (Google API). Repairing history and retrying.",
     ),
     co.ErrorRule(

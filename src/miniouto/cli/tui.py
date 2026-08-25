@@ -168,6 +168,18 @@ _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇"
 _SPINNER_INTERVAL = 0.08
 _SPINNER_DEFAULT_TEXT = "Working…"
 
+# Chat-log windowing. Mounting every row of a long session makes Textual
+# lay out thousands of widgets on each reflow (the reported slowdown), so
+# only a contiguous suffix of `ChatTUI._rows` is mounted at a time; older
+# rows mount in chunks as the user scrolls toward the top. Row objects
+# are kept alive off-DOM, so collapse state, tool results, and subagent
+# status survive eviction.
+_WINDOW_INITIAL_ROWS = 100  # tail rows mounted on session load
+_WINDOW_CHUNK_ROWS = 50  # rows prepended per top-edge chunk load
+_WINDOW_MAX_ROWS = 300  # soft cap; excess evicted from the top
+_TOP_LOAD_LINES = 10  # scroll_y at/below which a chunk load triggers
+_EVICT_MARGIN_LINES = 60  # rows this close above the viewport are kept
+
 # Logo: 180x36 packed bitmap from logo.png. _render_logo() scales to fit.
 _LOGO_PIX_W = 180
 _LOGO_PIX_H = 36
@@ -954,6 +966,128 @@ class AnswerRow(RowStatic):
     """
 
 
+class _RowWindow:
+    """Windowed row mounting for one scrollable log.
+
+    All rows ever added live in `rows` (widget objects, so collapse /
+    result / spinner state survives), but only the contiguous suffix
+    starting at `first` is mounted — Textual lays out every mounted child
+    on each reflow, so an unbounded log gets slower the longer the
+    session runs. Older rows mount in chunks as the user scrolls toward
+    the top (`maybe_load_older`), and rows far above the viewport are
+    evicted again once the window overflows (`evict`).
+
+    Scroll compensation: adding rows ABOVE the viewport shifts the viewed
+    content down, removing them shifts it up — both are countered by
+    adjusting `scroll_y` by the exact pixel height of the rows involved,
+    measured after the reflow that lays them out/tears them down.
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[Static] = []
+        self.first = 0
+        self._loading_chunk = False
+
+    def reset(self) -> None:
+        self.rows.clear()
+        self.first = 0
+
+    def append(self, log: VerticalScroll, widget: Static, *, defer_mount: bool) -> None:
+        self.rows.append(widget)
+        if defer_mount:
+            return
+        log.mount(widget)
+        # No scroll_end: the log's anchor() follows the tail while the
+        # user is at the bottom and stays put when they've scrolled up.
+        self.evict(log)
+
+    def mount_tail(self, log: VerticalScroll) -> None:
+        """After a bulk fill, mount only the trailing window."""
+
+        self.first = max(0, len(self.rows) - _WINDOW_INITIAL_ROWS)
+        for row in self.rows[self.first:]:
+            if not row.is_attached:
+                log.mount(row)
+        log.scroll_end(animate=False)
+
+    def maybe_load_older(self, log: VerticalScroll, scroll_y: float) -> None:
+        if scroll_y <= _TOP_LOAD_LINES and self.first > 0:
+            self._load_older(log)
+
+    def _load_older(self, log: VerticalScroll) -> None:
+        if self._loading_chunk or self.first <= 0:
+            return
+        self._loading_chunk = True
+        start = max(0, self.first - _WINDOW_CHUNK_ROWS)
+        new_rows = self.rows[start:self.first]
+        self.first = start
+        first_mounted = self.rows[start + len(new_rows)]
+        for row in new_rows:
+            if not row.is_attached:
+                log.mount(row, before=first_mounted)
+        log.call_after_refresh(self._finish_older, log, new_rows)
+
+    def _finish_older(self, log: VerticalScroll, new_rows: list[Static]) -> None:
+        self._loading_chunk = False
+        added = sum(row.outer_size.height for row in new_rows if row.is_attached)
+        if added:
+            log.scroll_to(y=log.scroll_y + added, animate=False)
+
+    def evict(self, log: VerticalScroll) -> None:
+        excess = (len(self.rows) - self.first) - _WINDOW_MAX_ROWS
+        if excess <= 0:
+            return
+        viewport_top = log.scroll_y
+        removed_height = 0.0
+        victims: list[Static] = []
+        for row in self.rows[self.first:]:
+            if len(victims) >= excess:
+                break
+            height = row.outer_size.height
+            if removed_height + height > viewport_top - _EVICT_MARGIN_LINES:
+                break
+            removed_height += height
+            victims.append(row)
+        if not victims:
+            return
+        self.first += len(victims)
+        for row in victims:
+            row.remove()
+        # At the bottom the anchor re-pins to the tail on the next reflow,
+        # so only an up-scrolled view needs the shift compensated.
+        if removed_height and log.scroll_y < log.max_scroll_y - 1:
+            log.call_after_refresh(self._fix_scroll_after_evict, log, removed_height)
+
+    def _fix_scroll_after_evict(self, log: VerticalScroll, removed_height: float) -> None:
+        log.scroll_to(y=max(0.0, log.scroll_y - removed_height), animate=False)
+
+
+class ChatScroll(VerticalScroll):
+    """Scrollable log with anchored follow and top-edge reporting.
+
+    Textual's built-in `anchor()` pins the scroll position to the bottom
+    on every reflow until the user scrolls away (and re-engages when they
+    scroll back to the bottom) — this replaces the old unconditional
+    `scroll_end` on every row mount, so reading history while a turn is
+    streaming no longer yanks the view back down. `watch_scroll_y` feeds
+    the scroll position to the owning screen (a modal detail screen) or,
+    for the main log, the app, so it can mount older row chunks as the
+    user approaches the top of the loaded window.
+    """
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        callback = None
+        try:
+            callback = getattr(self.screen, "_on_log_scroll", None)
+            if callback is None:
+                callback = getattr(self.app, "_on_log_scroll", None)
+        except Exception:
+            callback = None
+        if callback is not None:
+            callback(new_value)
+
+
 class SubagentDetailScreen(ModalScreen[None]):
     """One subagent invocation, rendered like the main chat notation.
 
@@ -1004,31 +1138,40 @@ class SubagentDetailScreen(ModalScreen[None]):
         self._live = live
         self._timer: Timer | None = None
         self._rendered = 0
+        self._window = _RowWindow()
+        self._log: VerticalScroll | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="subagent-dialog"):
             yield Label(f"subagent-{self._sid}", id="subagent-title")
-            yield VerticalScroll(id="subagent-log")
+            yield ChatScroll(id="subagent-log")
             yield Label("Esc to go back", id="subagent-hint")
 
     def on_mount(self) -> None:
+        self._log = self.query_one("#subagent-log", VerticalScroll)
+        self._log.anchor()
         self._refresh_log()
         if self._live:
             self._timer = self.set_interval(0.3, self._refresh_log)
 
     def _refresh_log(self) -> None:
-        try:
-            log = self.query_one("#subagent-log", VerticalScroll)
-        except Exception:
+        if self._log is None:
             return
         new_events = self._events[self._rendered:]
+        if not new_events:
+            return
+        initial = not self._window.rows
         for ev in new_events:
             widget = self._event_widget(ev)
             if widget is not None:
-                log.mount(widget)
-        if new_events:
-            self._rendered = len(self._events)
-            log.scroll_end(animate=False)
+                self._window.append(self._log, widget, defer_mount=initial)
+        self._rendered = len(self._events)
+        if initial:
+            self._window.mount_tail(self._log)
+
+    def _on_log_scroll(self, scroll_y: float) -> None:
+        if self._log is not None:
+            self._window.maybe_load_older(self._log, scroll_y)
 
     def _event_widget(self, ev: LoopEvent) -> Static | None:
         theme = self.app.current_theme
@@ -1237,6 +1380,8 @@ class ChatTUI(App):
         self._subagent_events: dict[str, list[LoopEvent]] = {}
         self._subagent_rows: dict[str, SubagentRow] = {}
         self._pending_tool_rows: list[ToolRow] = []
+        self._window = _RowWindow()
+        self._bulk_loading = False
         self._cancel_event: threading.Event | None = None
         self._last_escape = 0.0
         self._esc_hint: str | None = None
@@ -1245,7 +1390,7 @@ class ChatTUI(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Vertical(id="main-area"):
-            self._log = VerticalScroll(id="chat")
+            self._log = ChatScroll(id="chat")
             yield self._log
             self._input = ChatInput(id="input")
             yield self._input
@@ -1264,6 +1409,7 @@ class ChatTUI(App):
         self.sub_title = f"miniouto v{__version__}"
         self._refresh_chips()
         self._log = self.query_one("#chat", VerticalScroll)
+        self._log.anchor()
         saved = settings_store.load()
         if saved.theme:
             self.theme = saved.theme
@@ -1275,6 +1421,7 @@ class ChatTUI(App):
         if self._log is None:
             return
         self._log.remove_children()
+        self._reset_rows()
         width = self.size.width if self.size.width > 0 else 80
         self._log.mount(Static(Text(_render_logo(width - 2), style=self.current_theme.accent)))
         self._log.mount(Static(""))
@@ -2196,31 +2343,38 @@ class ChatTUI(App):
         if self._log is None:
             return
         self._log.remove_children()
+        self._reset_rows()
         self._logo_shown = False
         self._subagent_events.clear()
         self._subagent_rows.clear()
         self._pending_tool_rows.clear()
         data = session_store.load(session_name)
-        if not data.turns:
-            self._mount_row(Static(Text("(empty session)", style="dim")))
-            return
-        for turn in data.turns:
-            if turn.user:
-                self._post_user(turn.user)
-            for ev_dict in turn.events:
-                self._replay_event(LoopEvent.from_dict(ev_dict))
-            if turn.assistant:
-                self._mount_row(AnswerRow(Markdown(turn.assistant)))
-            elif turn.status in ("running", "interrupted"):
-                # A "running" turn on disk means its writer died mid-turn
-                # (SIGKILL/crash); either way there is no final answer to
-                # render — mark the gap explicitly instead of leaving the
-                # previous turn's answer looking like the response.
-                self._post_system(
-                    "turn interrupted — progress above was saved; "
-                    "send a message to continue"
-                )
-            self._mount_row(Static(""))
+        # Bulk: rows are only collected here; `_mount_tail_window` mounts
+        # just the trailing window instead of the whole history.
+        self._bulk_loading = True
+        try:
+            if not data.turns:
+                self._mount_row(Static(Text("(empty session)", style="dim")))
+            for turn in data.turns:
+                if turn.user:
+                    self._post_user(turn.user)
+                for ev_dict in turn.events:
+                    self._replay_event(LoopEvent.from_dict(ev_dict))
+                if turn.assistant:
+                    self._mount_row(AnswerRow(Markdown(turn.assistant)))
+                elif turn.status in ("running", "interrupted"):
+                    # A "running" turn on disk means its writer died mid-turn
+                    # (SIGKILL/crash); either way there is no final answer to
+                    # render — mark the gap explicitly instead of leaving the
+                    # previous turn's answer looking like the response.
+                    self._post_system(
+                        "turn interrupted — progress above was saved; "
+                        "send a message to continue"
+                    )
+                self._mount_row(Static(""))
+        finally:
+            self._bulk_loading = False
+        self._mount_tail_window()
 
     def _replay_event(self, event: LoopEvent) -> None:
         """Re-render one recorded turn event (session reload path).
@@ -2299,13 +2453,19 @@ class ChatTUI(App):
         self._input.text = ""
         if self._logo_shown and self._log is not None:
             self._log.remove_children()
+            self._reset_rows()
             self._logo_shown = False
         self._post_user(text)
+        if self._log is not None:
+            # Re-engage the follow anchor: submitting a new prompt always
+            # jumps to the tail, even if the user was reading history.
+            self._log.anchor()
         self.run_worker(self._dispatch(text), exclusive=True)
 
     def action_clear_log(self) -> None:
         if self._log is not None:
             self._log.remove_children()
+            self._reset_rows()
 
     def action_copy_text(self) -> None:
         text = self.screen.get_selected_text()
@@ -2332,11 +2492,25 @@ class ChatTUI(App):
 
     # ── chat log rows ───────────────────────────────────────────────────────
 
+    def _reset_rows(self) -> None:
+        """Drop the row list alongside `remove_children()` (logo/clear/load)."""
+
+        self._window.reset()
+
     def _mount_row(self, widget: Static) -> None:
         if self._log is None:
             return
-        self._log.mount(widget)
-        self._log.scroll_end(animate=False)
+        self._window.append(self._log, widget, defer_mount=self._bulk_loading)
+
+    def _mount_tail_window(self) -> None:
+        """After a bulk load, mount only the trailing window of rows."""
+
+        if self._log is not None:
+            self._window.mount_tail(self._log)
+
+    def _on_log_scroll(self, scroll_y: float) -> None:
+        if self._log is not None:
+            self._window.maybe_load_older(self._log, scroll_y)
 
     def _add_event_row(self, event: LoopEvent) -> None:
         if event.kind == "thinking":
@@ -2413,7 +2587,10 @@ class ChatTUI(App):
 
     def _tick_subagent_rows(self, frame: str) -> None:
         for row in self._subagent_rows.values():
-            row.set_frame(frame)
+            # Evicted rows keep their state off-DOM; painting them would be
+            # wasted work at 12.5fps per subagent.
+            if row.is_attached:
+                row.set_frame(frame)
 
     def on_subagent_row_opened(self, event: SubagentRow.Opened) -> None:
         sid = event.row.sid

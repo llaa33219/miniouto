@@ -216,6 +216,15 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         if current_subagent_depth() == 0:
             persister.persist_history(messages)
 
+    def on_history_repair(messages: Any) -> None:
+        # The 400/422 repair hook mutates the live list in place; without
+        # this bridge the fix would be in-memory only and the NEXT turn
+        # would reload the same poisoned history from disk (and 400
+        # again). Depth-gated like on_iteration: a subagent's repaired
+        # transcript is not the session's history.
+        if current_subagent_depth() == 0:
+            persister.persist_history(messages)
+
     agent = build_runtime(
         runtime,
         provider_config=provider_config,
@@ -224,6 +233,7 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         on_thinking=_make_thinking_dispatcher(sink),
         on_iteration=on_iteration,
         on_provider_error=_make_provider_error_dispatcher(sink),
+        on_history_repair=on_history_repair,
         on_tool_result=_make_tool_result_dispatcher(sink),
         reasoning=opts.reasoning,
         cancel_event=opts.cancel_event,
@@ -401,13 +411,33 @@ def _dump_message(m: Any) -> dict[str, Any]:
         if tcs:
             with suppress(Exception):
                 d["tool_calls"] = [tc.model_dump(mode="json") for tc in tcs]
+        _coerce_dumped_tool_args(d)
         return d
+    _coerce_dumped_tool_args(dumped)
     content = dumped.get("content")
     if isinstance(content, list) and any(
         isinstance(b, dict) and b.get("type") in _MEDIA_BLOCK_TYPES for b in content
     ):
         dumped["content"] = _flatten_media_blocks(content)
     return dumped
+
+
+def _coerce_dumped_tool_args(dumped: dict[str, Any]) -> None:
+    """Rewrite non-dict tool_call `arguments` to {} in a dumped message.
+
+    A malformed call (arguments: null) can reach the live message list via
+    coreouto's validation-bypassing constructors. Persisting it as-is
+    poisons the session: the record fails `Message.model_validate` on the
+    next load, and the old fallback silently dropped the tool calls. With
+    the coercion, the record round-trips; if the provider still rejects
+    the empty object, the runtime repair hook cuts the turn.
+    """
+
+    tcs = dumped.get("tool_calls")
+    if isinstance(tcs, list):
+        for tc in tcs:
+            if isinstance(tc, dict) and not isinstance(tc.get("arguments"), dict):
+                tc["arguments"] = {}
 
 
 def _make_tool_call_dispatcher(sink: EventSink):
@@ -690,6 +720,33 @@ def _load_coreouto_history(session: str, continue_session: bool) -> list[co.Mess
             if role == "tool":
                 kwargs["tool_call_id"] = d.get("tool_call_id")
                 kwargs["name"] = d.get("name")
+            # Same for assistant tool calls: validation fails when any
+            # `arguments` is not a dict (e.g. the model emitted null and
+            # the turn died before the repair hook could cut it). Coerce
+            # to {} instead of dropping the calls — dropping them erases
+            # what the assistant was doing (the "session lost" symptom)
+            # and orphans the matching tool results, while a {} call is
+            # handled by the repair hook's malformed-turn cut if the
+            # provider still rejects it.
+            if role == "assistant":
+                tcs = d.get("tool_calls")
+                if isinstance(tcs, list):
+                    clean_tcs = []
+                    for tc in tcs:
+                        if not isinstance(tc, dict):
+                            continue
+                        args = tc.get("arguments")
+                        if not isinstance(args, dict):
+                            args = {}
+                        clean_tcs.append(
+                            {
+                                "id": tc.get("id") or "",
+                                "name": tc.get("name") or "",
+                                "arguments": args,
+                            }
+                        )
+                    if clean_tcs:
+                        kwargs["tool_calls"] = clean_tcs
             out.append(co.Message(**kwargs))
     return out or None
 
