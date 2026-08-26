@@ -20,7 +20,7 @@ A cookbook of real-world examples for every CLI command — flags, output shapes
 
 ## Getting started (first-time setup)
 
-The first `miniouto` invocation (any subcommand) runs `storage/paths.py:ensure_dirs()`, which creates the `~/.miniouto/` skeleton and seeds the three bundled styles automatically. After that you register one provider, set it as default, and you're ready to chat.
+The first `miniouto` invocation (any subcommand) runs `storage/paths.py:ensure_dirs()`, which creates the `~/.miniouto/` skeleton and seeds the four bundled styles automatically. After that you register one provider, set it as default, and you're ready to chat.
 
 **Path A — pull from the lma catalog (recommended):**
 
@@ -39,7 +39,7 @@ miniouto provider add OpenAI --api-key sk-... --default-model gpt-5.5
 # 4. Set as default
 miniouto provider default anthropic
 
-# 5. Pick a style (all three bundles are already installed)
+# 5. Pick a style (all four bundles are already installed)
 miniouto style list
 miniouto style set coding
 

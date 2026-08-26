@@ -38,10 +38,11 @@ In other words, a single `miniouto status` creates the entire `~/.miniouto/` str
 ~/.miniouto/
 ├── providers.toml         ← created on first provider registration
 ├── settings.toml          ← created on first settings change
-├── style/                 ← ensure_dirs() auto-copies the three bundles
+├── style/                 ← ensure_dirs() auto-copies the four bundles
 │   ├── default.md
 │   ├── coding.md
-│   └── pro.md
+│   ├── pro.md
+│   └── ultra.md
 ├── style_repos.toml       ← created on first `style add` (absent initially)
 ├── sessions/              ← empty directory
 └── logs/                  ← empty directory (currently unused, reserved)

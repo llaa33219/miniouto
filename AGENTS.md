@@ -15,7 +15,7 @@
 
 Three principles from `README.md`: **Minimalism** (no bloat — extend with styles), **Automation-friendly** (full CLI, TUI optional), **Fluidity** (adapts to any environment).
 
-**Version**: `0.7.0` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
+**Version**: `0.7.7` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
 
 ---
 
@@ -37,7 +37,7 @@ src/miniouto/
 ├── core/     ← chat loop, runtime assembly, subagent dispatch, event sinks
 ├── storage/  ← the only layer that touches disk (apart from tools/)
 ├── tools/    ← Bash + media loaders (only bash is async)
-├── default_style/  ← 3 bundled .md templates, force-refreshed on every run
+├── default_style/  ← 4 bundled .md templates, force-refreshed on every run
 └── __init__.py, paths_runtime.py
 ```
 
@@ -192,7 +192,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | `__version__ = "0.7.0"` |
+| `__init__.py` | `__version__ = "0.7.7"` |
 | `paths_runtime.py` | `INVOCATION_CWD: Path` (captured cwd at import, used by every tool to absolutize relative paths) |
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
 | `cli/chat.py` | `chat_cmd` — one-shot chat command |
@@ -224,7 +224,8 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |
 | `default_style/coding.md` | Coding-expert orchestrator (~14 KB) — delegation-first, parallel `call_subagent`, `.miniouto/plans/` lifecycle |
-| `default_style/pro.md` | Senior staff engineer orchestrator (~25 KB) — delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, hard blocks (no sudo / no mass delete / no unprompted commit-push) |
+| `default_style/pro.md` | Senior staff engineer orchestrator (~32 KB) — AGENTS.md startup read, delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, parallel tool-call batching mechanics, hard blocks (no sudo / no mass delete / no unprompted commit-push) |
+| `default_style/ultra.md` | MAX-mode execution orchestrator (~81 KB) — zero-excuse protocol, layered subagent fan-out (3+ file-pickers, best-of-N editors, multi-focus reviewers), named subagent roster, canonical layer sequence 0–9, `.miniouto/docs/` documentation system, worktree-by-default, boulder state |
 | `tui/` | **EMPTY placeholder** — TUI code lives in `cli/tui.py` |
 | `utils/` | **EMPTY placeholder** — no code anywhere |
 
