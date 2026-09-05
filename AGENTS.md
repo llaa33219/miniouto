@@ -15,7 +15,7 @@
 
 Three principles from `README.md`: **Minimalism** (no bloat — extend with styles), **Automation-friendly** (full CLI, TUI optional), **Fluidity** (adapts to any environment).
 
-**Version**: `0.7.7` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
+**Version**: `0.7.8` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
 
 ---
 
@@ -192,7 +192,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | `__version__ = "0.7.7"` |
+| `__init__.py` | `__version__ = "0.7.8"` |
 | `paths_runtime.py` | `INVOCATION_CWD: Path` (captured cwd at import, used by every tool to absolutize relative paths) |
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
 | `cli/chat.py` | `chat_cmd` — one-shot chat command |
@@ -219,7 +219,7 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
 | `storage/toml_io.py` | `tomllib` + `tomli_w` wrapper |
 | `tools/__init__.py` | Re-exports |
-| `tools/bash.py` | `async bash(command, *, cwd, env)` (1-hour hard cap: `BASH_TIMEOUT_SECONDS`) |
+| `tools/bash.py` | `async bash(command, *, cwd, env)` — stdin is `/dev/null` (never inherited; a stdin-reading command would block forever), `start_new_session=True` + `os.killpg` so timeout/cancel kills the whole process group, and a `PIPE_GRACE_SECONDS` (5 s) grace kills pipe-holding background children after the shell exits (1-hour hard cap: `BASH_TIMEOUT_SECONDS`) |
 | `tools/media.py` | `load_image/load_video/load_audio(file_path)` → `LoadedMedia` (pure stdlib; `registry.py` wraps results into `co.ImageBlock`/`VideoBlock`/`AudioBlock`) |
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
 | `default_style/default.md` | Minimal fallback style |

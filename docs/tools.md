@@ -28,15 +28,20 @@ Async shell tool.
 
 ```python
 MAX_OUTPUT_BYTES = 30_000
+BASH_TIMEOUT_SECONDS = 3600   # 1-hour hard cap
+PIPE_GRACE_SECONDS = 5.0      # grace for pipe-holding background children
 TRUNCATION_NOTE = "<NOTE>Output was truncated to {max} bytes. ...</NOTE>"
 ```
 
 ### `async bash(command: str, *, cwd: str | None = None, env: dict[str, str] | None = None) -> str`
 
 Behavior:
-- Spawns `asyncio.create_subprocess_shell` with `stdout=PIPE, stderr=PIPE`.
-- Captures stdout + stderr.
-- **1-hour hard timeout** (`BASH_TIMEOUT_SECONDS = 3600`) — a wedged process is killed and the tool raises `BashError`, which coreouto converts into an error `ToolResult`; the loop wakes and the model decides how to proceed. (The user can also force-stop the loop from the TUI with a double-ESC, which kills the in-flight process much sooner: `build_runtime` passes the turn's `cancel_event` into `set_cancel_event`, and `bash()` polls it every 0.1 s while waiting for the process.)
+- Spawns `asyncio.create_subprocess_shell` with `stdin=DEVNULL, stdout=PIPE, stderr=PIPE, start_new_session=True`.
+  - **stdin is `/dev/null`, never inherited** — a command that reads stdin (`cat` with no args, `sudo`, an ssh host-key prompt) would otherwise block forever on input that can never arrive (in TUI mode Textual owns the tty). Such reads now hit EOF immediately and the command fails fast instead of hanging.
+  - **`start_new_session=True`** puts the shell in its own process group, so timeout/cancel can `os.killpg(SIGKILL)` the children too. Killing only the shell (the old behavior) orphaned a running child, which kept the captured pipes open and deadlocked the output readers — the kill path itself hung.
+- Captures stdout + stderr with two `_drain` reader tasks (not `communicate()`), so the shell's exit and pipe EOF are tracked separately.
+- **Pipe-grace rule**: pipe fds are inherited across fork/exec, so when the shell has exited but a surviving background child still holds stdout/stderr open (`server &` without a redirect, a sloppy daemon), the pipes never reach EOF and collection would hang. After `PIPE_GRACE_SECONDS` (5 s) the whole process group is killed and the call returns the output captured so far plus a `<NOTE>` explaining what happened. A properly redirected background job (`nohup … > /tmp/out.log 2>&1 &`) releases the pipes at spawn, returns immediately, and the child survives — this is the supported way to launch daemons.
+- **1-hour hard timeout** (`BASH_TIMEOUT_SECONDS = 3600`) — a wedged process's whole group is killed and the tool raises `BashError` (with any partial output attached), which coreouto converts into an error `ToolResult`; the loop wakes and the model decides how to proceed. (The user can also force-stop the loop from the TUI with a double-ESC, which kills the in-flight process much sooner: `build_runtime` passes the turn's `cancel_event` into `set_cancel_event`, and `bash()` polls it every 0.1 s while waiting for the process.)
 - Formats output (via `_format_output`) as:
 
   ```
@@ -187,7 +192,7 @@ Each description includes the tool's restrictions inline. Verbatim from `registr
 
 | Tool | Description (verbatim) |
 |---|---|
-| `Bash` | "Run a shell command. Captures stdout and stderr; exits with the command's exit code. Hard 1-hour timeout — a command that exceeds it is killed and returns an error. Output >30KB is truncated with a note. Default cwd is the directory miniouto was invoked from. This is the ONLY file-manipulation tool: read with `cat`/`grep`/`find`, create with `cat > file <<'EOF'` or `tee`, edit with `sed -i` or a short Python snippet, delete with `rm`. Also use it for `git`, `pytest`, package managers, etc." |
+| `Bash` | "Run a shell command. Captures stdout and stderr; exits with the command's exit code. stdin is /dev/null, so commands that prompt for input fail fast — pass input via flags or files instead. Hard 1-hour timeout — a command that exceeds it is killed (with its whole process group) and returns an error. To run something in the background, ALWAYS redirect its output (nohup … > /tmp/out.log 2>&1 &) and poll the log file; a background process that keeps stdout/stderr open is killed shortly after the shell exits. Output >30KB is truncated with a note. Default cwd is the directory miniouto was invoked from. This is the ONLY file-manipulation tool: read with `cat`/`grep`/`find`, create with `cat > file <<'EOF'` or `tee`, edit with `sed -i` or a short Python snippet, delete with `rm`. Also use it for `git`, `pytest`, package managers, etc." |
 | `Image` | "View an image file and return it to the model so it can actually be seen. Supports PNG, JPEG, GIF, WebP. Capped at 20 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an image content block — the model receives the pixels, not a text description. For unsupported formats or oversized files, convert first with Bash (e.g. ImageMagick `convert`, Pillow)." |
 | `Video` | "View a video file and return it to the model so it can actually be perceived. Supports MP4, MOV, WebM. Capped at 50 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as a video content block. For unsupported formats or oversized files, downsample first with Bash (e.g. ffmpeg)." |
 | `Audio` | "View an audio file and return it to the model so it can actually be heard. Supports WAV, MP3. Capped at 25 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an audio content block. For unsupported formats or oversized files, downsample first with Bash (e.g. sox, ffmpeg)." |
