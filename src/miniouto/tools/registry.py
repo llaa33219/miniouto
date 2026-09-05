@@ -79,8 +79,14 @@ def _audio_handler(file_path: str) -> list:
 def _bash_description() -> str:
     return (
         "Run a shell command. Captures stdout and stderr; exits with the "
-            "command's exit code. Hard 1-hour timeout — a command that exceeds "
-            "it is killed and returns an error. "
+            "command's exit code. stdin is /dev/null, so commands that "
+            "prompt for input fail fast — pass input via flags or files "
+            "instead. Hard 1-hour timeout — a command that exceeds it is "
+            "killed (with its whole process group) and returns an error. "
+            "To run something in the background, ALWAYS redirect its "
+            "output (nohup … > /tmp/out.log 2>&1 &) and poll the log file; "
+            "a background process that keeps stdout/stderr open is killed "
+            "shortly after the shell exits. "
         "Output >30KB is truncated with a note. Default cwd is the "
         "directory miniouto was invoked from. This is the ONLY "
         "file-manipulation tool: read "
