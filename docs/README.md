@@ -53,13 +53,11 @@ src/miniouto/
 │   ├── skills.py            # Skill dataclass + ~/.agents/skills/ discovery
 │   ├── styles.py            # style CRUD + add_from_repo + record_repo/list_repos + split_style
 │   └── toml_io.py           # tiny tomllib + tomliw wrapper
-├── tools/                   # File/bash tools                 → see tools.md
+├── tools/                   # Bash + media + computer tools  → see tools.md
 │   ├── __init__.py
-│   ├── _normalize.py        # smart-quote/dash/NBSP/zero-width normalization
 │   ├── bash.py              # async bash(command, …)
-│   ├── delete.py            # delete(file_path)
-│   ├── edit.py              # edit(file_path, edits)
-│   ├── write.py             # write(file_path, content)
+│   ├── media.py             # load_image/load_video/load_audio → LoadedMedia
+│   ├── computer.py          # computer(action, …) — virtual-display GUI control (optional extra)
 │   └── registry.py          # register_all() — wires tools into coreouto
 ├── default_style/           # Bundled .md prompts             → see styles.md
 │   ├── default.md           # minimal fallback

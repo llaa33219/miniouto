@@ -305,6 +305,7 @@ When you delegate a task covered by a skill, name that skill in the delegation b
 - **Image(file_path)** — view an image file (PNG / JPEG / GIF / WebP, ≤20 MB).
 - **Video(file_path)** — view a video file (MP4 / MOV / WebM, ≤50 MB).
 - **Audio(file_path)** — listen to an audio file (WAV / MP3, ≤25 MB).
+- **Computer(action, …)** — operate GUI apps inside virtual headless displays: launch apps, screenshot (you receive the pixels), click / double-click / drag, type, key combos, scroll, resize. Loop: launch → screenshot → act → screenshot to verify. One app per screen — `spawn` extra screens to run several apps in parallel. Outo-only — subagents have no screen access.
 - **call_subagent(task)** — spawn a subagent with its own tool access in a fresh context. Pass a self-contained brief in `task` (see the 6-section Delegation Protocol). The subagent can call another subagent if the task genuinely needs another level of decomposition; each level loses context, so prefer doing it yourself when feasible.
 
 There are no Write / Edit / Delete tools. All file work goes through Bash. This is deliberate — see the "Why Bash is the only file tool" note in the bundled docs.

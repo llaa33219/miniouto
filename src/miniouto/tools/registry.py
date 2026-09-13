@@ -1,29 +1,51 @@
-"""Register the bash/media tools as coreouto tools."""
+"""Register the bash/media/computer tools as coreouto tools."""
 
 from __future__ import annotations
 
 import coreouto as co
 
 from .bash import bash
+from .computer import (
+    ComputerAction,
+    Screenshot,
+    ScrollDirection,
+    computer,
+    computer_supported,
+)
 from .media import load_audio, load_image, load_video
 
 
 def register_all() -> None:
-    """Register Bash, Image, Video, Audio as coreouto tools.
+    """Register Bash, Image, Video, Audio, Computer as coreouto tools.
 
-    Idempotent: if a name is already registered, leave it alone.
+    Idempotent: if a name is already registered, leave it alone. Computer
+    is registered only when `computer_supported()` — on platforms where the
+    bundled compositor cannot run, the tool is never advertised to the model.
     """
 
     _register_if_missing("Bash", _bash_handler, _bash_schema(), _bash_description())
     _register_if_missing("Image", _image_handler, _image_schema(), _image_description())
     _register_if_missing("Video", _video_handler, _video_schema(), _video_description())
     _register_if_missing("Audio", _audio_handler, _audio_schema(), _audio_description())
+    if computer_supported():
+        # parallelizable=False: the virtual screen is one shared, order-
+        # sensitive resource — it must never run concurrently with another
+        # tool call.
+        _register_if_missing(
+            "Computer",
+            _computer_handler,
+            _computer_schema(),
+            _computer_description(),
+            parallelizable=False,
+        )
 
 
-def _register_if_missing(name: str, handler, schema: dict, description: str) -> None:
+def _register_if_missing(
+    name: str, handler, schema: dict, description: str, *, parallelizable: bool = True
+) -> None:
     if co.get_tool(name) is not None:
         return
-    co.register_tool(name, description=description)(handler)
+    co.register_tool(name, description=description, parallelizable=parallelizable)(handler)
 
 
 async def _bash_handler(command: str, cwd: str | None = None) -> str:
@@ -181,3 +203,141 @@ def _audio_schema() -> dict:
         },
         "required": ["file_path"],
     }
+
+
+def _computer_handler(
+    action: ComputerAction,
+    coordinate: list[int] | None = None,
+    end_coordinate: list[int] | None = None,
+    text: str | None = None,
+    scroll_direction: ScrollDirection | None = None,
+    scroll_amount: int = 3,
+    duration: float = 1.0,
+    screen: str | None = None,
+) -> str | list:
+    result = computer(
+        action,
+        coordinate=coordinate,
+        end_coordinate=end_coordinate,
+        text=text,
+        scroll_direction=scroll_direction,
+        scroll_amount=scroll_amount,
+        duration=duration,
+        screen=screen,
+    )
+    if isinstance(result, Screenshot):
+        # Same multimodal contract as the media handlers above: the model
+        # must receive the pixels, not a description of them.
+        return [
+            co.TextBlock(
+                text=(
+                    f"Screenshot of the virtual display "
+                    f"({result.width}x{result.height} pixels). "
+                    "Click coordinates for the next action refer to this "
+                    "image; (0, 0) is the top-left corner."
+                )
+            ),
+            co.ImageBlock(data=result.data, mime_type=result.mime_type),
+        ]
+    return result
+
+
+def _computer_description() -> str:
+    return (
+        "Operate GUI applications inside virtual headless displays "
+        "(screens). One screen runs ONE app; screens are spawned lazily "
+        "(default 1280x720) and shared across calls. "
+        "Core loop: `launch` an app, then repeat screenshot -> act -> "
+        "screenshot. ALWAYS take a screenshot before clicking anything — "
+        "click coordinates come from the latest screenshot; (0, 0) is the "
+        "top-left corner, units are screen pixels, positions are clamped "
+        "to the screen. After any action that changes the screen, "
+        "screenshot again rather than assuming the result. "
+        "Multiple apps: spawn an extra screen per app (action=spawn, "
+        "text=optional label used as its id, coordinate=optional "
+        "[width, height]) and pass screen=\"<id>\" on every action "
+        "targeting it. With exactly one screen up you may omit screen; "
+        "with several, omitting it is an error. "
+        "Actions and their fields: "
+        "screenshot: capture the screen; you receive the image itself. "
+        "launch: start a GUI app (text = command line, e.g. \"firefox\" "
+        "or \"code --new-window\"). One app per screen — close_app "
+        "before launching another on the same screen, or spawn a new "
+        "screen. Apps take a moment to appear: wait, then screenshot. "
+        "close_app: terminate the launched app. "
+        "mouse_move: move the pointer to coordinate [x, y]. "
+        "left_click / right_click / middle_click / double_click: click at "
+        "coordinate, or at the current pointer position when coordinate "
+        "is omitted. "
+        "left_click_drag: drag from coordinate to end_coordinate. "
+        "scroll: scroll_direction up/down/left/right, scroll_amount wheel "
+        "detents (default 3); coordinate moves the pointer first because "
+        "scroll goes to whatever is under the pointer. "
+        "type: type text literally (US layout; shift symbols handled; "
+        "\"\\n\" = Enter). "
+        "key: press a key or combo, xdotool style in text: \"enter\", "
+        "\"tab\", \"f5\", \"ctrl+s\", \"alt+f4\", \"ctrl+shift+t\". "
+        "wait: pause duration seconds (default 1, max 30) to let the app "
+        "react. "
+        "resize: resize the screen to coordinate [width, height] "
+        "(16..16384); the app window is reconfigured. "
+        "screen_info: the screen's size, display name, running app pid, "
+        "and the env vars for attaching extra apps from Bash. "
+        "spawn: create another screen (text = optional label, "
+        "coordinate = optional [width, height]). "
+        "kill: tear down a screen and its app (screen = id). "
+        "list: show every screen with its size, app pid, and attach env "
+        "vars. "
+        "Requires a vision-capable model: screenshots are returned as "
+        "image content."
+    )
+
+
+def _computer_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "enum": [
+                    "screenshot",
+                    "launch",
+                    "close_app",
+                    "mouse_move",
+                    "left_click",
+                    "right_click",
+                    "middle_click",
+                    "double_click",
+                    "left_click_drag",
+                    "scroll",
+                    "type",
+                    "key",
+                    "wait",
+                    "resize",
+                    "screen_info",
+                    "spawn",
+                    "kill",
+                    "list",
+                ],
+            },
+            "coordinate": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "[x, y] screen pixels; (0, 0) is top-left.",
+            },
+            "end_coordinate": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Drag destination [x, y].",
+            },
+            "text": {"type": "string"},
+            "scroll_direction": {"enum": ["up", "down", "left", "right"]},
+            "scroll_amount": {"type": "integer"},
+            "duration": {"type": "number"},
+            "screen": {
+                "type": "string",
+                "description": "Target screen id (from spawn/list).",
+            },
+        },
+        "required": ["action"],
+    }
+

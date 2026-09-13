@@ -36,7 +36,7 @@ src/miniouto/
 ├── cli/      ← Typer commands + Textual TUI
 ├── core/     ← chat loop, runtime assembly, subagent dispatch, event sinks
 ├── storage/  ← the only layer that touches disk (apart from tools/)
-├── tools/    ← Bash + media loaders (only bash is async)
+├── tools/    ← Bash + media loaders + Computer (only bash is async)
 ├── default_style/  ← 4 bundled .md templates, force-refreshed on every run
 └── __init__.py, paths_runtime.py
 ```
@@ -62,7 +62,7 @@ CLI flag bag → ChatOptions (core/chat.py)
                   (level=depth); a supervisor defers to deeper ones, so a
                   wedged subagent is recovered in place without tearing
                   down the parent turn.
-                → Bash/Image/Video/Audio (via tools/registry.py)
+                → Bash/Image/Video/Audio/Computer (via tools/registry.py)
                 → call_subagent (delegates to subagent preset; each invocation
                   mints a subagent-<6hex> id tracked via ContextVars)
             → incremental persistence: begin_turn before the loop, event +
@@ -151,7 +151,7 @@ Turn lifecycle: `begin_turn` appends a `status="running"` turn before the loop s
 There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (error-prone; the agent reached for Bash anyway). **Do not reintroduce them without explicit discussion.** To add any other tool, follow the "Add a new tool" recipe below.
 
 ### 9. Async only where needed
-`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop. **Don't make the media loaders async** — they don't need to be, and it complicates the TUI dispatch.
+`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The Computer tool is sync too (py-Vwayland's blocking IPC; coreouto runs sync handlers via `asyncio.to_thread`). The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop. **Don't make the media loaders async** — they don't need to be, and it complicates the TUI dispatch.
 
 ### 10. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention), NOT from `~/.miniouto/`. Skills are portable content, not per-installation config. **Do not move them into `~/.miniouto/`.**
@@ -171,6 +171,14 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 
 ### 13. lma cache lives in `core.lma._CACHE`
 `core/lma.py` mirrors lma's 10-minute server-side TTL with a module-level dict. Cache keys are explicit (`"providers"`, `f"models:{provider.lower()}"`, `f"model:{provider.lower()}:{model.lower()}"` — both segments are lowercased); a cached `None` payload is meaningful (means "lma returned 404"). `core.lma.clear_cache()` exists for tests / manual refresh. **Do not cache anything other than `None` and successful payloads** — a transient transport error must not pollute the cache for 10 minutes.
+
+### 14. Computer tool: screen registry, outo-only, auto-detected
+The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual screens from a **module-level registry** (`_SCREENS`) — one compositor == one screen == one app, so multi-app work means explicitly spawning multiple screens (`spawn`/`kill`/`list` actions, `screen=` targeting; omission resolves lazily when zero or one screen is up, errors when several are). All screens are killed at process exit by vwayland's own atexit hook. Four rules follow:
+
+- It is visible to the **outo preset only** (`core/runtime.py:OUTO_ONLY_TOOLS`) — parallel subagents acting on one shared screen would interleave clicks/keystrokes unpredictably. The outo preset filters that list down to what actually got registered, so an unregistered Computer never reaches the preset.
+- Every action runs under one module lock and the tool is registered `parallelizable=False` — vwayland opens a fresh IPC socket per call and its upstream spawn bookkeeping is not thread-safe, so without serialization concurrent tool calls could race (even across different screens).
+- py-Vwayland is a **default dependency** (its wheel is pure-Python packaging with a bundled native binary, so it installs everywhere) but the compositor only runs on Linux x86_64 glibc ≥ 2.28. `tools/computer.py:computer_supported()` probes the platform once per process (cached) and `tools/registry.py:register_all` registers the tool only when supported — **unsupported platforms never advertise the tool to the model** (no schema tokens burned, no runtime failure). `MINIOUTO_COMPUTER=0` disables it explicitly; `=1` skips the probe (e.g. aarch64 source builds).
+- The bundled styles still mention Computer unconditionally; on unsupported platforms a stray model call to it fails with coreouto's unknown-tool error, which is an acceptable teaching signal.
 
 ---
 
@@ -221,7 +229,8 @@ Note: the source string remains the literal `"lma"` (it predates the "catalog" U
 | `tools/__init__.py` | Re-exports |
 | `tools/bash.py` | `async bash(command, *, cwd, env)` — stdin is `/dev/null` (never inherited; a stdin-reading command would block forever), `start_new_session=True` + `os.killpg` so timeout/cancel kills the whole process group, and a `PIPE_GRACE_SECONDS` (5 s) grace kills pipe-holding background children after the shell exits (1-hour hard cap: `BASH_TIMEOUT_SECONDS`) |
 | `tools/media.py` | `load_image/load_video/load_audio(file_path)` → `LoadedMedia` (pure stdlib; `registry.py` wraps results into `co.ImageBlock`/`VideoBlock`/`AudioBlock`) |
-| `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio into coreouto |
+| `tools/computer.py` | `computer(action, …)` — virtual-display GUI control via py-Vwayland; module-level screen registry (`spawn`/`kill`/`list`, one app per screen) + lock; `computer_supported()` platform probe gates registration (`MINIOUTO_COMPUTER=0` disables); returns `str` or `Screenshot` |
+| `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio/Computer into coreouto (Computer with `parallelizable=False`) |
 | `default_style/default.md` | Minimal fallback style |
 | `default_style/coding.md` | Coding-expert orchestrator (~14 KB) — delegation-first, parallel `call_subagent`, `.miniouto/plans/` lifecycle |
 | `default_style/pro.md` | Senior staff engineer orchestrator (~32 KB) — AGENTS.md startup read, delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, parallel tool-call batching mechanics, hard blocks (no sudo / no mass delete / no unprompted commit-push) |
@@ -277,7 +286,7 @@ See `docs/tools.md` § "Adding a new tool". TL;DR:
 Only one place: `src/miniouto/storage/paths.py`. Update the `ROOT` constant.
 
 ### "Change the active tool set"
-`src/miniouto/core/runtime.py:ALL_TOOLS`. Both presets share this list (both `register_agent_preset("outo", tools=ALL_TOOLS, …)` and `register_agent_preset("subagent", tools=ALL_TOOLS, …)` reference it). If you need asymmetric visibility, create separate lists and edit the `tools=` argument in each `register_agent_preset` call. (Do **not** confuse this with `_resolve_both_styles`, which only resolves the style *prompts*, not the tool lists.)
+`src/miniouto/core/runtime.py:ALL_TOOLS` is shared by both presets; `OUTO_ONLY_TOOLS` (currently just `Computer`) is appended for the outo preset only, because the virtual screen is a single shared resource. For any other asymmetric visibility, edit the `tools=` argument in each `register_agent_preset` call. (Do **not** confuse this with `_resolve_both_styles`, which only resolves the style *prompts*, not the tool lists.)
 
 ### "Add tests"
 The test directory doesn't exist yet. Suggested setup in `docs/development.md`. Start with `tools/edit.py` — highest-value, easiest to break with refactors.
@@ -311,8 +320,9 @@ The test directory doesn't exist yet. Suggested setup in `docs/development.md`. 
 | `pydantic` | 2.0 | Data models (used by coreouto) |
 | `httpx` | 0.27.0 | HTTP client (`lma` REST client, style repo fetcher) |
 | `tomli-w` | 1.0.0 | TOML serializer (paired with stdlib `tomllib`) |
+| `py-Vwayland` | 0.1.0 | Virtual Wayland compositor behind the `Computer` tool; wheel installs anywhere, bundled binary runs on Linux x86_64 glibc ≥ 2.28 only (registration-time probe gates the tool) |
 
-The `[all]` extra on `coreouto` pulls in all four provider SDKs. Anything beyond these seven packages should be discussed before adding.
+The `[all]` extra on `coreouto` pulls in all four provider SDKs. Anything beyond these eight packages should be discussed before adding.
 
 ---
 

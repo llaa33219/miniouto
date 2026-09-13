@@ -455,11 +455,12 @@ def _make_tool_call_dispatcher(sink: EventSink):
             # with the minted id right after, which is the canonical line
             # (`subagent-<6hex>: <task preview>`) in both CLI and TUI.
             return
-        if name in ("Bash", "Image", "Video", "Audio"):
+        if name in ("Bash", "Image", "Video", "Audio", "Computer"):
             preview = _short_arg_summary(name, arguments)
             # detail carries the FULL untruncated command for Bash (the
             # preview flattens newlines; the TUI detail view wants the
-            # verbatim input). Media tools have no useful extra payload.
+            # verbatim input). Media/Computer tools have no useful extra
+            # payload.
             detail = arguments.get("command") if name == "Bash" else None
             sink.emit_loop_event(
                 LoopEvent(
@@ -476,7 +477,7 @@ def _make_tool_call_dispatcher(sink: EventSink):
     return on_tool_call
 
 
-_TOOL_RESULT_NAMES = ("Bash", "Image", "Video", "Audio")
+_TOOL_RESULT_NAMES = ("Bash", "Image", "Video", "Audio", "Computer")
 _TOOL_RESULT_MAX = 4000
 
 
@@ -752,7 +753,7 @@ def _load_coreouto_history(session: str, continue_session: bool) -> list[co.Mess
 
 
 _LOGGABLE_TOOL_NAMES = (
-    "Bash", "Image", "Video", "Audio", "call_subagent"
+    "Bash", "Image", "Video", "Audio", "Computer", "call_subagent"
 )
 
 
@@ -799,4 +800,16 @@ def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
         return cmd
     if name in ("Image", "Video", "Audio"):
         return args.get("file_path", "?")
+    if name == "Computer":
+        parts = [str(args.get("action") or "?")]
+        scr = args.get("screen")
+        if scr:
+            parts.append(f"@{scr}")
+        coord = args.get("coordinate")
+        if isinstance(coord, (list, tuple)) and len(coord) == 2:
+            parts.append(f"[{coord[0]},{coord[1]}]")
+        text = args.get("text")
+        if text:
+            parts.append(str(text).replace("\n", " ")[:80])
+        return " ".join(parts)
     return str(args)[:120]

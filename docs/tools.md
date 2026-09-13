@@ -84,7 +84,7 @@ The handler `_bash_handler(command, cwd=None)` likewise has no `env` parameter, 
 
 ### Why `bash` is the only async tool
 
-`asyncio.create_subprocess_shell` integrates cleanly with the TUI's event loop. The media loaders are pure file I/O — running them with `asyncio.to_thread` from the TUI works fine. Keeping `bash` async avoids spawning an extra thread for every shell command.
+`asyncio.create_subprocess_shell` integrates cleanly with the TUI's event loop. The media loaders are pure file I/O — running them with `asyncio.to_thread` from the TUI works fine. Keeping `bash` async avoids spawning an extra thread for every shell command. The Computer tool is sync for the same reason as the media loaders (py-Vwayland exposes a blocking IPC API); coreouto runs sync handlers via `asyncio.to_thread`, so even a 60 s screenshot does not stall the event loop.
 
 ---
 
@@ -159,17 +159,68 @@ On a non-multimodal provider, the tool call succeeds (the loader runs, the block
 
 ---
 
+## `tools/computer.py`
+
+Computer use: operate GUI applications inside **virtual headless displays** so the agent can click, type, and see the screens. Backed by [py-Vwayland](https://github.com/llaa33219/py-Vwayland) (import name `vwayland`) — a bundled Rust/Smithay compositor using pixman CPU rendering: no GPU, no display server, works over SSH and in containers. The exposed surface is a **single `Computer` tool** with an `action` enum (one schema instead of ~10, which keeps the per-request prompt overhead minimal and matches the computer-use convention models are trained on).
+
+**Default dependency, auto-detected**: py-Vwayland is a hard dependency, but its wheel is pure-Python packaging around a bundled native compositor binary that runs only on **Linux x86_64, glibc ≥ 2.28** — so it *installs* everywhere and *works* on one platform. `computer_supported()` probes the platform once per process (cached) and `register_all()` registers the `Computer` tool only when the probe passes: unsupported platforms never advertise the tool to the model (no schema tokens burned, no runtime failure). The outo preset's tool list is filtered down to actually-registered tools, so an unregistered `Computer` never reaches the preset. Overrides: `MINIOUTO_COMPUTER=0` disables the tool explicitly; `MINIOUTO_COMPUTER=1` skips the probe (e.g. an aarch64 source build of py-Vwayland). Note the probe is static (platform + libc); if the first real `spawn` still fails (sandbox `noexec`, read-only tmp), the call raises `ComputerUseError` with the compositor's log tail and the reset-and-retry semantics below apply.
+
+**Layer rule**: like `media.py`, this module never imports coreouto. It returns a `str` (ordinary actions) or a `Screenshot` dataclass (screenshot action); `registry.py` wraps the latter into `[TextBlock, ImageBlock]` so the model receives the actual pixels.
+
+### Screens (multi-instance registry)
+
+One compositor == one virtual screen == **one app**. `computer.py` keeps a module-level registry (`_SCREENS: id -> Compositor`) so the model can run several GUI apps at once by managing screens explicitly:
+
+- `spawn` creates a screen (`text` = optional label used as its id, e.g. `"browser"`; `coordinate` = optional `[w, h]`, default 1280x720). `kill` tears one down (its app dies with it). `list` shows every screen with size, app pid, and the `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` env vars for attaching extra apps from Bash.
+- Every other action takes an optional `screen` id. When omitted: zero screens → a default screen is spawned lazily (the simple single-app workflow needs no screen management); exactly one → that one; several → a `ComputerUseError` listing the ids so the model re-issues with `screen=`.
+- Screens persist across calls *and* chat turns — GUI app state must survive between actions and between user messages in the TUI.
+- All screens are torn down automatically at process exit via vwayland's own `kill_on_exit` atexit hook.
+- A screen whose compositor dies mid-session is pruned from the registry and the next call raises `ComputerUseError("Screen '<id>' died… spawn it again…")`.
+- One app per screen (`launch` raises while another app runs on that screen — `close_app` first, or `spawn` another screen).
+
+### Concurrency
+
+Every action runs under one module lock (vwayland opens a fresh IPC socket per call and its upstream `_spawned` bookkeeping is not thread-safe, so without the lock concurrent calls could race — even across different screens), and the tool is registered with `parallelizable=False`. The tool is also **outo-preset-only** (`core/runtime.py:OUTO_ONLY_TOOLS`) — parallel subagents driving the screens would click/type over each other.
+
+### `computer(action, coordinate=None, end_coordinate=None, text=None, scroll_direction=None, scroll_amount=3, duration=1.0, screen=None) -> str | Screenshot`
+
+| `action` | Extra fields | Effect |
+|---|---|---|
+| `screenshot` | — | Fresh frame → `Screenshot` (PNG) → model sees the image |
+| `launch` | `text` = command line | Starts a GUI app, returns pid; app stdout/stderr → `<runtime_dir>/app.log` |
+| `close_app` | — | SIGTERM the app (returns a note if it survives the timeout) |
+| `mouse_move` | `coordinate` | Move pointer to `[x, y]` |
+| `left_click` / `right_click` / `middle_click` / `double_click` | `coordinate` optional | Click at `[x, y]`, or at the current pointer position when omitted |
+| `left_click_drag` | `coordinate`, `end_coordinate` | Drag between two points |
+| `scroll` | `scroll_direction`, `scroll_amount` (detents, default 3), `coordinate` optional (moves pointer first — scroll goes to whatever is under the pointer) | Wheel scroll; `dy > 0` = up |
+| `type` | `text` | Types literally, US layout; shift-symbols handled, `"\n"` = Enter |
+| `key` | `text` | xdotool-style key spec: `"enter"`, `"f5"`, `"ctrl+s"`, `"alt+f4"`. Aliases mapped: `control→ctrl`, `cmd/command→super`, `option→alt`, `pgup/pgdn`, `del/ins` |
+| `wait` | `duration` (0 < s ≤ 30) | Sleep so the app can react |
+| `resize` | `coordinate` = `[w, h]` | Resize the target screen (16..16384); the app is reconfigured |
+| `screen_info` | — | Target screen's size, display name, app pid, env vars for Bash-attached apps |
+| `spawn` | `text` = optional label (becomes the id), `coordinate` = optional `[w, h]` | Create another screen (for a second app) |
+| `kill` | `screen` = id | Tear down a screen and its app |
+| `list` | — | Every screen: id, size, app pid, attach env vars |
+
+All actions except `spawn`/`list` accept `screen` (target screen id); the omission rules are in "Screens" above. Coordinates are **logical screen pixels**, `(0, 0)` top-left, clamped to the screen bounds. All argument errors (missing `coordinate`, unknown key name, unknown screen id, bad size) raise `ComputerUseError` with an actionable message; vwayland's own exceptions are wrapped into `ComputerUseError` as well.
+
+### Provider support
+
+`screenshot` returns an `ImageBlock`, so computer use needs a **vision-capable** provider — the same matrix as the Image tool above (Anthropic/Google yes; OpenAI Responses yes; OpenAI Chat Completions rejects all multimodal blocks). On a non-vision provider the screenshot call succeeds but the *next* LLM call raises `ValueError`.
+
+---
+
 ## `tools/registry.py`
 
-Wires the bash/media tools into coreouto's tool registry.
+Wires the bash/media/computer tools into coreouto's tool registry.
 
 ### `register_all()`
 
-Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`. (The `call_subagent` tool is registered separately in `core.runtime.build_runtime` because it needs the subagent config to be built first.)
+Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`, and — only when `computer_supported()` — `Computer` (with `parallelizable=False`). (The `call_subagent` tool is registered separately in `core.runtime.build_runtime` because it needs the subagent config to be built first.)
 
-### `_register_if_missing(name, handler, schema, description)`
+### `_register_if_missing(name, handler, schema, description, *, parallelizable=True)`
 
-Skips if `co.get_tool(name)` is already set; otherwise calls `co.register_tool(name, description=description)(handler)` — **the `schema` parameter is accepted but silently discarded**. This is what makes repeated `build_runtime` calls safe in TUI mode.
+Skips if `co.get_tool(name)` is already set; otherwise calls `co.register_tool(name, description=description, parallelizable=parallelizable)(handler)` — **the `schema` parameter is accepted but silently discarded**. This is what makes repeated `build_runtime` calls safe in TUI mode.
 
 #### A note on schemas (dead code)
 
@@ -183,6 +234,7 @@ The `_xxx_schema()` functions are invoked at registration time (`_register_if_mi
 | `Image` | `_image_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, ImageBlock]` |
 | `Video` | `_video_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, VideoBlock]` |
 | `Audio` | `_audio_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, AudioBlock]` |
+| `Computer` | `_computer_handler(action, coordinate=None, end_coordinate=None, text=None, scroll_direction=None, scroll_amount=3, duration=1.0) -> str \| list` | sync; returns `str` for ordinary actions, **multimodal** `[TextBlock, ImageBlock]` for `screenshot` |
 
 The media handlers are the **only** handlers in this file that return something other than `str`. They delegate the file read to `tools.media.load_*` (which returns a `LoadedMedia`), then build a two-element block list: a `TextBlock` caption (path + byte count + MIME) and the binary block. coreouto forwards the list to the provider as a multimodal tool result. Do **not** refactor these to return `str` — that would discard the media payload and silently degrade the tools to "the file exists" no-ops. Contract: [coreouto `tools.md` — Multimodal tool results](https://github.com/llaa33219/coreouto/blob/main/docs/tools.md#multimodal-tool-results).
 
@@ -196,6 +248,7 @@ Each description includes the tool's restrictions inline. Verbatim from `registr
 | `Image` | "View an image file and return it to the model so it can actually be seen. Supports PNG, JPEG, GIF, WebP. Capped at 20 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an image content block — the model receives the pixels, not a text description. For unsupported formats or oversized files, convert first with Bash (e.g. ImageMagick `convert`, Pillow)." |
 | `Video` | "View a video file and return it to the model so it can actually be perceived. Supports MP4, MOV, WebM. Capped at 50 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as a video content block. For unsupported formats or oversized files, downsample first with Bash (e.g. ffmpeg)." |
 | `Audio` | "View an audio file and return it to the model so it can actually be heard. Supports WAV, MP3. Capped at 25 MB. Pass an absolute path, or a path relative to the directory miniouto was invoked from. The file's raw bytes are uploaded to the provider as an audio content block. For unsupported formats or oversized files, downsample first with Bash (e.g. sox, ffmpeg)." |
+| `Computer` | "Operate a GUI application inside a virtual 1280x720 display (headless; one screen shared across calls, spawned lazily on first use). Core loop: `launch` an app, then repeat screenshot -> act -> screenshot. ALWAYS take a screenshot before clicking anything — click coordinates come from the latest screenshot; (0, 0) is the top-left corner, units are screen pixels, positions are clamped to the screen. After any action that changes the screen, screenshot again rather than assuming the result. …" (followed by the per-action field list, the vision-provider requirement, and the `computer`-extra install hint — see `_computer_description()` in `registry.py` for the full verbatim text) |
 
 > **Why no provider names in the descriptions**: the agent cannot introspect which provider it is running on, so telling it "OpenAI Chat Completions rejects video" is not actionable — it cannot classify itself. If a provider rejects a multimodal block, the `ValueError` surfaces at call time and that error message is the teaching signal. The full provider support matrix for human operators lives in the `tools/media.py` section below.
 

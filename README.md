@@ -49,6 +49,10 @@ miniouto chat "hello"
 miniouto                              # TUI mode
 ```
 
+## Computer use (GUI control)
+
+The outo agent can operate GUI applications inside a virtual headless display (via [py-Vwayland](https://github.com/llaa33219/py-Vwayland)): launch apps, take screenshots, click, type, scroll, drag. Enabled automatically on Linux x86_64 (glibc ≥ 2.28) — no setup needed; the tool simply doesn't appear on unsupported platforms. Set `MINIOUTO_COMPUTER=0` to disable it explicitly. Requires a vision-capable model so the agent can see its screenshots.
+
 ## Model resolution
 
 The active model is chosen by the first match in:

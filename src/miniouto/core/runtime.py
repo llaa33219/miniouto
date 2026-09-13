@@ -24,6 +24,14 @@ from .providers import API_STALL_TIMEOUT_SECONDS, build_coreouto_provider, clear
 
 ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]
 
+# Computer is outo-only: it drives a single shared virtual screen, and
+# parallel subagents clicking/typing on that screen would interleave
+# unpredictably. Subagents that need GUI work must ask outo to do it.
+# Registration itself is conditional (see tools.registry.register_all), so
+# the preset below filters this list down to what actually got registered —
+# on unsupported platforms the outo preset simply has no Computer tool.
+OUTO_ONLY_TOOLS = ["Computer"]
+
 # Tracks how deep we are inside a `call_subagent` invocation. 0 = outo (or
 # after `build_runtime` has just been called), >=1 = inside a subagent.
 # Read by `core.chat` dispatchers to decide whether a tool call came
@@ -643,7 +651,7 @@ def build_runtime(
         model=runtime.model,
         provider=runtime.provider_name,
         system_prompt=outo_prompt,
-        tools=ALL_TOOLS,
+        tools=ALL_TOOLS + [t for t in OUTO_ONLY_TOOLS if co.get_tool(t) is not None],
         max_iterations=None,
     )
 
