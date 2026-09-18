@@ -772,6 +772,8 @@ class ToolRow(EventRow):
 
     Detail (multi-line command) and result are each capped at ~4000 chars
     on display as a safety net even though the core layer already truncates.
+    Subagent result boxes opt out via `unbounded_result=True` — the
+    subagent's returned answer must read in full, not stop mid-sentence.
     """
 
     can_focus = True
@@ -797,6 +799,7 @@ class ToolRow(EventRow):
         *,
         detail: str | None = None,
         tool_name: str | None = None,
+        unbounded_result: bool = False,
     ) -> None:
         super().__init__(Text(f"▸ {header}"))
         self._header = header
@@ -805,6 +808,7 @@ class ToolRow(EventRow):
         self._is_error = False
         self._expanded = False
         self._tool_name = tool_name
+        self._unbounded_result = unbounded_result
 
     @property
     def tool_name(self) -> str | None:
@@ -863,7 +867,7 @@ class ToolRow(EventRow):
         if self._result is not None:
             pieces.append(("\n── output ──\n", "dim"))
             result = self._result
-            if len(result) > self._MAX_RESULT_CHARS:
+            if not self._unbounded_result and len(result) > self._MAX_RESULT_CHARS:
                 result = result[: self._MAX_RESULT_CHARS] + "\n…(truncated)"
             pieces.append((result, ""))
         self.update(Text.assemble(*pieces))
@@ -2573,13 +2577,16 @@ class ChatTUI(App):
         # Mount a collapsible result box below the SubagentRow so users see
         # the full returned text inline (the SubagentRow itself stays
         # focused on the task summary and still opens the detail screen on
-        # click). Skip when the result is empty or a no-op sentinel like
-        # `"done"`.
+        # click). The box is unbounded: a subagent answer cut mid-way at
+        # the display cap is exactly what the user is trying to read. Skip
+        # when the result is empty or a no-op sentinel like `"done"`.
         if sid:
             text = event.text or ""
             stripped = text.strip()
             if stripped and stripped.lower() != "done":
-                result_row = ToolRow(f"subagent-{sid} result")
+                result_row = ToolRow(
+                    f"subagent-{sid} result", unbounded_result=True
+                )
                 result_row.set_result(
                     text, is_error=text.startswith("error:")
                 )

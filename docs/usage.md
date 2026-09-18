@@ -393,7 +393,7 @@ The three chips in the bottom panel:
 
 > There is no session chip in the TUI. Change sessions via `Ctrl+P` → "Pick session" / "New session".
 
-The Header shows the current working directory on the left and `miniouto v<version>` on the right (the same version also appears under the splash logo). Tool calls (Bash / Image / Video / Audio) and subagent results render as **collapsible boxes** in the chat log: each box starts collapsed as a single `▸ <summary>` line and expands on click or `Enter` to show the full command and, once the call finishes, its output (capped at ~4000 chars on display). Errors gain a red border-left and a subtle `✗` marker on the header. The SubagentRow itself keeps its own behavior (click still opens the internal-step detail screen); the collapsible result box below it shows the subagent's final returned text inline.
+The Header shows the current working directory on the left and `miniouto v<version>` on the right (the same version also appears under the splash logo). Tool calls (Bash / Image / Video / Audio) and subagent results render as **collapsible boxes** in the chat log: each box starts collapsed as a single `▸ <summary>` line and expands on click or `Enter` to show the full command and, once the call finishes, its output (tool rows cap the display at ~4000 chars; subagent result boxes are uncapped — the returned answer always displays in full). Errors gain a red border-left and a subtle `✗` marker on the header. The SubagentRow itself keeps its own behavior (click still opens the internal-step detail screen); the collapsible result box below it shows the subagent's final returned text inline.
 
 ---
 
