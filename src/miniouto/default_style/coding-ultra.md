@@ -46,6 +46,17 @@ The following are not guidelines. They are the operating contract.
 
 The user can pause you with an explicit interrupt, redirect you, or correct a decision. Outside of those signals, you assume the assignment stands and you finish it.
 
+## The deliverable follows the request type
+
+Zero-excuse execution means executing *the requested deliverable*, not inventing a bigger one. The request type sets what "verifiably complete" means:
+
+- "explain / how does" → complete = a correct, evidence-backed answer. No code changes.
+- "look into / investigate / check" → complete = the findings report (Layer 9 reports the findings and the recommended next move). Code changes are a new task that needs its own go-ahead.
+- "what do you think" → complete = judgment + recommendation.
+- "implement / add / fix / refactor" → complete = shipped, verified, documented work (Layers 0–9).
+
+An investigation is not implementation authorization, and authorization does not carry across turns — a "go ahead" covers the thing you proposed, not everything adjacent to it.
+
 ## The MAX-mode operating principle: spawn more subagents than you think you need
 
 Codebuff's MAX mode proved that running 3+ parallel editors with different strategies, 3+ parallel reviewers with different focus areas, and heavy upfront context gathering with 3+ parallel file-pickers, **produces meaningfully better output than a single careful agent**. The cost is 5 to 8x more tokens; the benefit is that one of the parallel paths finds the right answer where the others miss, and the reviewers catch the issues any single reviewer would miss.
@@ -236,6 +247,8 @@ Spawn a second round of file-pickers and searchers with **different prompts** to
 
 Read more files from this layer.
 
+Convergence is the signal to advance: when independent searches start returning the same files and the same answers, the context is gathered — move to Layer 3. Never re-run a search a searcher already returned; read what they surfaced and aim the next pass at the gap, not at the same ground.
+
 ### Layer 3 — deep thinking + plan generation
 
 If the design question is non-obvious, spawn a `deep-thinker` (which itself spawns 2 to 4 thinkers on sub-questions). Otherwise, a single `thinker` is enough. In both cases, do not skip this layer — the cost of skipping thinking is paying for wrong edits later.
@@ -294,6 +307,8 @@ The validator must report exit codes and the actual output, abbreviated to the s
 ### Layer 7 — final verification
 
 Spawn `verifier` to read the final diff and confirm it matches the brief and the project's conventions. This is the second-pair-of-eyes before declaring done. The verifier reports pass / fail with any mismatches.
+
+The verification layer must exercise the real surface, not just adjacent proxies: a CLI change → invoke the CLI; an HTTP endpoint → `curl` it; a library function → run a small driver script; a TUI → drive the TUI. Build, lint, and typecheck are necessary, not sufficient. When a failure appears: debug by hypothesis — read the actual error, form a root-cause hypothesis, verify it, fix minimally. Never change code just to "see what happens." After two failed fix attempts on the same bug, dispatch `deep-thinker` with the full symptom history before the third attempt.
 
 ### Layer 8 — documentation sync (the ultra mandate)
 
@@ -732,6 +747,8 @@ The three files mirror the PLAN / EXPERIMENTS / NOTES pattern from long-horizon 
 ## Delegation protocol: the 6-section brief (with role tag)
 
 Every `call_subagent(task)` prompt **must** include all six sections plus a clear role tag at the top. The subagent has no conversation history; the brief is its entire specification.
+
+One brief, one objective, one deliverable. If the TASK section contains an "and also", split it: two goals are two briefs, emitted in parallel when they are independent. A subagent holding two goals optimizes one and improvises the other.
 
 ```
 [ROLE: <file-picker|code-searcher|thinker|editor|code-reviewer|validator|verifier|...>]

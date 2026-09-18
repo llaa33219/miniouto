@@ -159,6 +159,8 @@ that is "a teammate, not a tutor." It requires the following behaviors:
   the user), no mass or destructive operations without authorization, no
   fabrication, no silent scope expansion, no commit/push/publish without
   explicit instruction, no silent destruction of user work.
+- **Match the response to the request**: a deliverable-type table — "explain" → answer; "look into" → findings report then **stop** (an investigation is not implementation authorization, and authorization does not carry across turns); "what do you think" → judgment; "implement/fix" → shipped work.
+- **Execution know-how**: destination / constraints / stopping-condition triad named before acting; delegated searches never duplicated (stop when sources converge); verification exercises the real surface (invoke the CLI, `curl` the endpoint, drive the TUI — build/lint/typecheck are necessary, not sufficient); hypothesis-driven debugging with a `thinker` consult after two failed fixes; one objective per brief (an "and also" in TASK = split it); final reports state residual risk.
 - Like `coding-ultra.md` (and unlike `default.md`/`coding.md`), `coding-pro.md`
   has **no Web access section** — it relies on the skill catalog and plain
   `curl` judgment.
@@ -232,6 +234,8 @@ It requires the following behaviors:
   Remaining / Blocked; nothing is "done" until the real commands pass; no
   sudo, no mass delete, no fabrication, no silent scope expansion, no
   unprompted commit/push/publish).
+- **Match the response to the request**: a deliverable-type table — "explain" → answer; "look into" → findings report then **stop** (an investigation is not implementation authorization, and authorization does not carry across turns); "what do you think" → judgment; "implement/fix" → shipped work.
+- **Execution know-how**: destination / constraints / stopping-condition triad named before acting; delegated searches never duplicated (stop when sources converge); verification exercises the real surface (invoke the CLI, `curl` the endpoint, drive the TUI — build/lint/typecheck are necessary, not sufficient); hypothesis-driven debugging with a `thinker` consult after two failed fixes; one objective per brief (an "and also" in TASK = split it); final reports state residual risk.
 - Like `coding-pro.md` and `coding-ultra.md`, it has **no Web access
   section** — its researcher role covers external lookups via the skill
   catalog and Bash `curl` judgment.
@@ -301,6 +305,8 @@ are decided autonomously). It requires the following behaviors:
 - **Hard blocks**: the same absolute prohibitions as `coding-pro.md` (no
   sudo, no mass delete, no fabrication, no silent scope expansion, no
   unprompted commit/push/publish, no silent destruction of user work).
+- **The deliverable follows the request type**: zero-excuse execution targets the *requested* deliverable — investigations complete as findings reports (Layer 9), and authorization does not carry across turns.
+- **Execution know-how**: convergence as the layer-advance signal (never re-run a search a searcher returned); Layer 7 exercises the real surface; hypothesis-driven debugging with a `deep-thinker` consult after two failed fixes; one objective per brief.
 - Like `coding-pro.md`, `coding-ultra.md` has **no Web access section** — its
   researcher-docs / researcher-web roles rely on the skill catalog and Bash
   `curl` judgment.
