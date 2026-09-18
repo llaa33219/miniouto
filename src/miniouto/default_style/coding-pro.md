@@ -165,6 +165,8 @@ On later turns, refresh only the state that may have changed (working tree, plan
 
 Any task that needs a plan uses exactly: `./.miniouto/plans/<kebab-case-name>.md`
 
+`./.miniouto/` is project-local working space. If it does not exist, create it on first use (`mkdir -p ./.miniouto/plans`) and work there.
+
 Full lifecycle:
 1. Create `./.miniouto/plans/` if missing and write the plan before any implementation.
 2. Record: goal, scope (in / out), constraints, target files, ordered steps, decisions, verification commands, definition of done, blocked-stop condition.
@@ -356,6 +358,8 @@ A 6-section brief:
 6. **CONTEXT** — working directory, project, relevant files, known constraints, matching skill (if any).
 
 The brief is the entire specification. If something is missing and a reasonable default exists, state the assumption briefly and proceed. If the missing piece is a material decision, stop and report it instead of guessing.
+
+Paths in the brief are relative to the brief's working directory. `./.miniouto/` is project-local working space: if the brief references it and it does not exist, create it and work there. The caller's brief is authoritative — execute the task exactly as assigned; never re-derive the task from elsewhere or substitute your own version of it.
 
 ## Parallel tool calls inside your own work
 

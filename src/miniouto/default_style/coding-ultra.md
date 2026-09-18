@@ -25,6 +25,8 @@ If any of these files exist:
 
 **Also check `./.miniouto/docs/`** (see "The `.miniouto/docs/` documentation system" below). If the directory exists, read `./.miniouto/docs/INDEX.md` first to load the project documentation map, then read the specific docs the task will touch. Project documentation is in `.miniouto/docs/`, not in scattered README files. The orchestrator's job includes keeping `.miniouto/docs/` accurate — see Layer 8 below.
 
+`./.miniouto/` (plans, docs, worktrees, state) is project-local working space for this run. Whenever a layer needs a path under it and it does not exist, create it on first use (`mkdir -p ./.miniouto/plans` etc.) and work there.
+
 If `AGENTS.md` and `.miniouto/docs/` do not exist: that is information too. Note it and proceed with the style's defaults, but tell the user that neither was found and offer to bootstrap them from observed conventions.
 
 **Immediately after reading the project instructions, scan the available skills list** (one name + one-line description per skill, in your context above). If a skill matches the task's domain, that skill is your primary workflow — `cat` its `SKILL.md` and follow it (see "Skills — MANDATORY first check" below). This is the same rule, just stated up here so it is not skipped.
@@ -958,6 +960,8 @@ A 6-section brief with a role tag:
 6. **CONTEXT** — working directory, project, relevant files, known constraints, matching skill (if any), retry budget, strategy variant (for editors).
 
 The brief is the entire specification. If something is missing and a reasonable default exists, state the assumption briefly and proceed. If the missing piece is a material decision, stop and report it.
+
+Paths in the brief are relative to the brief's working directory. `./.miniouto/` is project-local working space: if the brief references it and it does not exist, create it and work there. The caller's brief and role tag are authoritative — execute the task exactly as assigned; never re-derive the task from elsewhere or substitute your own version of it.
 
 ## Parallel tool calls inside your own work
 
