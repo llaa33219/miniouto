@@ -15,7 +15,7 @@ This directory contains a complete reference for the project. Read [`architectur
 | [`storage.md`](./storage.md) | `~/.miniouto/` filesystem layout, TOML/JSON schemas, style/skills storage. The persistence layer. |
 | [`core.md`](./core.md) | Chat loop, `RuntimeConfig` resolution, provider construction, context-window management, subagent dispatch. |
 | [`tools.md`](./tools.md) | The Bash + media tools — handlers, schemas, multimodal blocks. |
-| [`styles.md`](./styles.md) | Style document format, `<outo>` / `<subagent>` tags, the four bundled templates. |
+| [`styles.md`](./styles.md) | Style document format, `<outo>` / `<subagent>` tags, the five bundled templates. |
 | [`skills.md`](./skills.md) | Skill discovery from `~/.agents/skills/`, frontmatter schema. |
 | [`lma.md`](./lma.md) | lma (llm-model-api) integration: provider/model discovery, context caps, the `provider providers/models/add` CLI commands, TUI add flows. |
 | [`development.md`](./development.md) | Install, build, lint, release, contributing notes, known issues. |
@@ -63,6 +63,7 @@ src/miniouto/
 │   ├── default.md           # minimal fallback
 │   ├── coding.md            # expert coding agent, minimal
 │   ├── coding-pro.md        # senior staff engineer orchestrator
+│   ├── coding-work.md        # pragmatic senior engineer orchestrator
 │   └── coding-ultra.md      # MAX-mode execution orchestrator
 ├── tui/                     # EMPTY placeholder (TUI lives in cli/tui.py)
 └── utils/                   # EMPTY placeholder

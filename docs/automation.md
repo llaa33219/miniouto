@@ -38,10 +38,11 @@ In other words, a single `miniouto status` creates the entire `~/.miniouto/` str
 ~/.miniouto/
 ├── providers.toml         ← created on first provider registration
 ├── settings.toml          ← created on first settings change
-├── style/                 ← ensure_dirs() auto-copies the four bundles
+├── style/                 ← ensure_dirs() auto-copies the five bundles
 │   ├── default.md
 │   ├── coding.md
 │   ├── coding-pro.md
+│   ├── coding-work.md
 │   └── coding-ultra.md
 ├── style_repos.toml       ← created on first `style add` (absent initially)
 ├── sessions/              ← empty directory
@@ -366,7 +367,7 @@ miniouto style set my-prompt
 # or write style = "my-prompt" directly into settings.toml
 ```
 
-> Warning: if the file name matches one of the four bundles (default, coding, coding-pro, coding-ultra), the next `ensure_dirs()` call **overwrites** it with the bundled content. Custom styles must use a different name.
+> Warning: if the file name matches one of the five bundles (default, coding, coding-pro, coding-work, coding-ultra), the next `ensure_dirs()` call **overwrites** it with the bundled content. Custom styles must use a different name.
 
 ### Method B — fetch from a remote repo (`style add`)
 

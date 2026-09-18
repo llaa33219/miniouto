@@ -20,7 +20,7 @@ A cookbook of real-world examples for every CLI command — flags, output shapes
 
 ## Getting started (first-time setup)
 
-The first `miniouto` invocation (any subcommand) runs `storage/paths.py:ensure_dirs()`, which creates the `~/.miniouto/` skeleton and seeds the four bundled styles automatically. After that you register one provider, set it as default, and you're ready to chat.
+The first `miniouto` invocation (any subcommand) runs `storage/paths.py:ensure_dirs()`, which creates the `~/.miniouto/` skeleton and seeds the five bundled styles automatically. After that you register one provider, set it as default, and you're ready to chat.
 
 **Path A — pull from the lma catalog (recommended):**
 
@@ -39,7 +39,7 @@ miniouto provider add OpenAI --api-key sk-... --default-model gpt-5.5
 # 4. Set as default
 miniouto provider default anthropic
 
-# 5. Pick a style (all four bundles are already installed)
+# 5. Pick a style (all five bundles are already installed)
 miniouto style list
 miniouto style set coding
 
@@ -91,7 +91,7 @@ Active style:     coding
 Session:          default
 Storage:          /home/luke/.miniouto
 Providers:        anthropic, openai, my-local
-Styles:           coding, coding-pro, coding-ultra, default
+Styles:           coding, coding-pro, coding-ultra, coding-work, default
 Skills:           git-master, frontend
 Sessions:         default, chat-20260702-103045-a1b2c3
 ```
@@ -307,11 +307,12 @@ miniouto provider remove my-local
 A style is a markdown system prompt at `~/.miniouto/style/<name>.md`. The `<outo>...</outo>` and (optional) `<subagent>...</subagent>` tags split the two agents' prompts. Format details in [`styles.md`](./styles.md).
 
 ```bash
-# Four bundles are pre-installed: default, coding, coding-pro, coding-ultra
+# Five bundles are pre-installed: default, coding, coding-pro, coding-work, coding-ultra
 miniouto style list
 #   - coding
 #   - coding-pro
 #   - coding-ultra
+#   - coding-work
 #   - default ●          ← active style
 
 # Switch the active style

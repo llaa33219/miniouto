@@ -15,6 +15,7 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 │   ├── default.md                # seeded + force-refreshed from src/miniouto/default_style/default.md
 │   ├── coding.md                 # force-refreshed from src/miniouto/default_style/coding.md
 │   ├── coding-pro.md             # force-refreshed from src/miniouto/default_style/coding-pro.md
+│   ├── coding-work.md             # force-refreshed from src/miniouto/default_style/coding-work.md
 │   └── coding-ultra.md            # force-refreshed from src/miniouto/default_style/coding-ultra.md
 ├── sessions/
 │   └── <name>.json               # conversation history per session

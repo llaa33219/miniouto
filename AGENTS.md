@@ -37,7 +37,7 @@ src/miniouto/
 ├── core/     ← chat loop, runtime assembly, subagent dispatch, event sinks
 ├── storage/  ← the only layer that touches disk (apart from tools/)
 ├── tools/    ← Bash + media loaders + Computer (only bash is async)
-├── default_style/  ← 4 bundled .md templates, force-refreshed on every run
+├── default_style/  ← 5 bundled .md templates, force-refreshed on every run
 └── __init__.py, paths_runtime.py
 ```
 
@@ -234,6 +234,7 @@ The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual 
 | `default_style/default.md` | Minimal fallback style |
 | `default_style/coding.md` | Expert coding agent (~1.6 KB, deliberately minimal) — Bash-only file work, self-contained subagent briefs, verify-don't-fabricate, ask-before-destructive |
 | `default_style/coding-pro.md` | Senior staff engineer orchestrator (~32 KB) — AGENTS.md startup read, delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, parallel tool-call batching mechanics, hard blocks (no sudo / no mass delete / no unprompted commit-push). Renamed from `pro.md` at 0.8.1 (stale seeds + `settings.style` migrated by `ensure_dirs`) |
+| `default_style/coding-work.md` | Pragmatic senior engineer orchestrator (~38 KB) — full autonomy protocol (never ask mid-loop, soft blocks decided + logged, three-strike rule, four true hard blocks), five-phase workflow (EXPLORE/PLAN/EXECUTE/REVIEW/VERIFY), 8-role subagent roster with `[ROLE: …]`-tagged 6-section briefs, one editor per slice + one single-focus reviewer when warranted |
 | `default_style/coding-ultra.md` | MAX-mode execution orchestrator (~81 KB) — zero-excuse protocol, layered subagent fan-out (3+ file-pickers, best-of-N editors, multi-focus reviewers), named subagent roster, canonical layer sequence 0–9, `.miniouto/docs/` documentation system, worktree-by-default, boulder state. Renamed from `ultra.md` at 0.8.1 |
 | `tui/` | **EMPTY placeholder** — TUI code lives in `cli/tui.py` |
 | `utils/` | **EMPTY placeholder** — no code anywhere |
