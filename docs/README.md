@@ -61,9 +61,9 @@ src/miniouto/
 │   └── registry.py          # register_all() — wires tools into coreouto
 ├── default_style/           # Bundled .md prompts             → see styles.md
 │   ├── default.md           # minimal fallback
-│   ├── coding.md            # coding-expert orchestrator
-│   ├── pro.md               # senior staff engineer orchestrator
-│   └── ultra.md             # MAX-mode execution orchestrator
+│   ├── coding.md            # expert coding agent, minimal
+│   ├── coding-pro.md        # senior staff engineer orchestrator
+│   └── coding-ultra.md      # MAX-mode execution orchestrator
 ├── tui/                     # EMPTY placeholder (TUI lives in cli/tui.py)
 └── utils/                   # EMPTY placeholder
 ```

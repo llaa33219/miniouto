@@ -72,14 +72,17 @@ The `continue_loop` tool is referenced in styles but not actually wired into the
 
 The four bundled templates live in `src/miniouto/default_style/`. They are seeded into `~/.miniouto/style/` by `storage/paths.ensure_dirs`. Bundled styles are **force-refreshed**: every `ensure_dirs()` call overwrites any installed file whose name matches a bundled template with the current bundled content (written only when the content differs, to avoid needless disk churn). To customize a bundled style, copy it to a new name (e.g. `cp default.md mydefault.md`) — files whose names do not match a bundled template are never touched. Repo-added styles (via `style add`) are refreshed on demand with `style update`.
 
+**Rename history (0.8.1)**: `pro.md` → `coding-pro.md` and `ultra.md` → `coding-ultra.md`. `ensure_dirs()` removes an old-name seeded copy only while it still matches the renamed bundle byte-for-byte (a user-customized old file survives as a regular user style) and repoints `settings.style` to the new name when it referenced the old one.
+
 | File | Size | Persona | Orchestrator? |
 |---|---|---|---|
 | `default.md` | ~4 KB | "**outo**" — minimal, sparse | No (deliberately) |
-| `coding.md` | ~14 KB | "**coding expert**" orchestrator | **Aggressive** |
-| `pro.md` | ~32 KB | "**pro**" — senior staff engineer orchestrator | **Aggressive** (with a delegate-vs-DIY decision framework) |
-| `ultra.md` | ~81 KB | "**ultra**" — relentless MAX-mode execution orchestrator | **Aggressive** (layered subagent fan-out, best-of-N editors, multi-focus review) |
+| `coding.md` | ~1.6 KB | "**outo**" — expert coding agent, minimal ruleset | Light (delegation for non-trivial work) |
+| `coding-pro.md` | ~32 KB | "**pro**" — senior staff engineer orchestrator | **Aggressive** (with a delegate-vs-DIY decision framework) |
+| `coding-work.md` | ~38 KB | "**coding-work**" — pragmatic senior engineer orchestrator | **Aggressive but proportionate** (one subagent per slice, one reviewer when warranted) |
+| `coding-ultra.md` | ~81 KB | "**ultra**" — relentless MAX-mode execution orchestrator | **Aggressive** (layered subagent fan-out, best-of-N editors, multi-focus review) |
 
-`coding.md`, `pro.md`, and `ultra.md` include explicit guidance on when and how to delegate via `call_subagent`; `default.md` is deliberately minimal.
+`coding-pro.md` and `coding-ultra.md` include explicit guidance on when and how to delegate via `call_subagent`; `default.md` and `coding.md` are deliberately minimal.
 
 ### `default.md` — minimal fallback
 
@@ -89,29 +92,26 @@ Key points:
 - 7 outo operating principles: be brief, lead with the answer, finish with text + no tool call (or use `continue_loop`), treat tool results as loop input, match delegation scope to task size, never invent outputs, match the user's language, pass paths correctly when delegating.
 - 10 subagent principles: treat the brief as the whole spec (no clarifying questions), be terse, prefer targeted `sed`/Python edits over full-file rewrites, read first, return useful extracted output (not full dumps), plan + execute + synthesize for multi-step work, use `call_subagent` only when the subtask deserves its own context, finish with text + no tool call, tool results are loop input, match brief language, surface errors verbatim.
 
-### `coding.md`: coding expert orchestrator
+### `coding.md`: expert coding agent, minimal
 
-A professional coding expert orchestrator focused on flawless, systematic,
-production-grade software work. It requires the following behaviors:
+A deliberately terse style (~1.6 KB) — an "expert coding agent" persona with
+only the load-bearing rules. Both halves are a short ruleset:
 
-- **Delegation-first**: delegate any task that is even slightly complex,
-  including multi-file, multi-step, non-obvious, investigative, planned, or
-  higher-risk work, through `call_subagent(task)`.
-- **Parallel calls**: issue independent `call_subagent` invocations in the
-  same turn, rather than handling independent subtasks sequentially.
-- **Project onboarding**: on first contact, survey the directory layout,
-  project state, build and test configuration, README, and any `AGENT.md`,
-  `AGENTS.md`, `CURSOR.md`, or `CLAUDE.md` files before doing the work.
-- **Plan-file lifecycle**: write planned work to exactly
-  `./.miniouto/plans/<name>.md`, keep it updated with progress and revisions,
-  and delete it only after the task is fully complete and verified.
-- **Ask the user**: stop and ask a plain-text final question when a required
-  design or intent decision cannot be resolved from evidence. Never guess.
-- **Quality and verification**: hold subagents to the same professional bar,
-  read before editing, follow project conventions, and report only results
-  confirmed by real build, lint, typecheck, test, or execution runs.
+- **Identity**: "expert coding agent. Be precise, minimal, and verified."
+- **Tools**: one line each — Bash as the ONLY file tool (with the
+  read/create/edit/delete command forms), media viewers, Computer
+  (outo-only), and `call_subagent` with self-contained briefs (parallel for
+  independent tasks).
+- **Seven rules** (outo half): follow matching skills; read before editing
+  and follow project conventions; smallest change; verify with real
+  commands and never fabricate; fetch web content instead of recalling it;
+  ask before destructive/ambiguous moves; match the user's language.
+- **Six rules** (subagent half): same core — brief is the whole spec, read
+  first, Bash-only file work, verified reporting (files changed, commands
+  + output, blockers), no unauthorized destructive actions, match the
+  brief's language.
 
-### `pro.md`: senior staff engineer orchestrator
+### `coding-pro.md`: senior staff engineer orchestrator
 
 A senior staff engineer orchestrator. Persona: "**pro**, a senior staff engineer"
 that is "a teammate, not a tutor." It requires the following behaviors:
@@ -142,9 +142,10 @@ that is "a teammate, not a tutor." It requires the following behaviors:
   ban on stringing together many small direct actions to avoid delegation.
 - **Five-stage execution loop**: EXPLORE → PLAN → EXECUTE → VERIFY → LOOP,
   with a project onboarding sweep for first contact.
-- **Plan-file lifecycle**: same `./.miniouto/plans/<name>.md` convention as
-  `coding.md`, plus optional `CHECKPOINTS.md` and `DECISIONS.md` companions
-  (mirrors Karpathy's PLAN / EXPERIMENTS / NOTES pattern).
+- **Plan-file lifecycle**: work that needs a plan goes to
+  `./.miniouto/plans/<name>.md`, plus optional `CHECKPOINTS.md` and
+  `DECISIONS.md` companions (mirrors Karpathy's PLAN / EXPERIMENTS / NOTES
+  pattern).
 - **6-section delegation brief**: every `call_subagent(task)` must carry TASK,
   EXPECTED OUTCOME, REQUIRED TOOLS, MUST DO, MUST NOT DO, CONTEXT — the
   subagent has no conversation history, so the brief is its entire spec.
@@ -158,11 +159,11 @@ that is "a teammate, not a tutor." It requires the following behaviors:
   the user), no mass or destructive operations without authorization, no
   fabrication, no silent scope expansion, no commit/push/publish without
   explicit instruction, no silent destruction of user work.
-- Like `ultra.md` (and unlike `default.md`/`coding.md`), `pro.md` has **no
-  Web access section** — it relies on the skill catalog and plain `curl`
-  judgment.
+- Like `coding-ultra.md` (and unlike `default.md`/`coding.md`), `coding-pro.md`
+  has **no Web access section** — it relies on the skill catalog and plain
+  `curl` judgment.
 
-### `ultra.md`: MAX-mode execution orchestrator
+### `coding-ultra.md`: MAX-mode execution orchestrator
 
 The largest bundled style. Persona: "**ultra**, a relentless execution
 engine" — it does not stop, does not negotiate, and does not ask the user
@@ -170,7 +171,7 @@ mid-task; it picks reasonable defaults, documents them, and loops until the
 task is **verifiably complete** or hits a **true hard block** (soft blocks
 are decided autonomously). It requires the following behaviors:
 
-- **Startup step**: same AGENTS.md-first read as `pro.md`, **plus**
+- **Startup step**: same AGENTS.md-first read as `coding-pro.md`, **plus**
   `./.miniouto/docs/` — if that directory exists, read its `INDEX.md` and the
   docs relevant to the task before acting.
 - **Zero-excuse protocol** (load-bearing): never stop early, never ask
@@ -187,7 +188,7 @@ are decided autonomously). It requires the following behaviors:
   performance / edge cases / test coverage / API design), a thinker or
   deep-thinker for non-obvious design decisions, a validator, and a verifier.
   Stated cost: 5–8x more tokens in exchange for meaningfully better output.
-- **PARALLEL TOOL CALLS mechanics**: an expanded version of `pro.md`'s
+- **PARALLEL TOOL CALLS mechanics**: an expanded version of `coding-pro.md`'s
   section — every layer's N subagents go out as N `call_subagent` tool_use
   blocks in ONE assistant response, with a concrete worked example (a
   six-block spawn batch for "add rate limiting to the auth endpoints") and a
@@ -224,10 +225,10 @@ are decided autonomously). It requires the following behaviors:
   retry protocol (fresh spawn in a new layer, never chained), and a
   self-correction protocol (recognize serialization, single-subagent layers,
   skipped doc sync, etc. and fix them).
-- **Hard blocks**: the same absolute prohibitions as `pro.md` (no sudo, no
-  mass delete, no fabrication, no silent scope expansion, no
+- **Hard blocks**: the same absolute prohibitions as `coding-pro.md` (no
+  sudo, no mass delete, no fabrication, no silent scope expansion, no
   unprompted commit/push/publish, no silent destruction of user work).
-- Like `pro.md`, `ultra.md` has **no Web access section** — its
+- Like `coding-pro.md`, `coding-ultra.md` has **no Web access section** — its
   researcher-docs / researcher-web roles rely on the skill catalog and Bash
   `curl` judgment.
 
@@ -276,11 +277,11 @@ Re-seeds all bundled styles from the miniouto package (same force-refresh that `
 
 ### Skills guidance in bundled styles
 
-Every bundled template includes a **Skills — MANDATORY first check** section in both its `<outo>` and `<subagent>` halves (immediately before the tools list). It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from `~/.agents/skills/`) before starting any task, and — when a skill matches the task's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in delegation briefs so the subagent follows it too. Keep this section when authoring a custom style; it is what makes installed skills actually get used.
+The larger templates (`default.md`, `coding-pro.md`, `coding-ultra.md`) include a **Skills — MANDATORY first check** section in both their `<outo>` and `<subagent>` halves (immediately before the tools list). It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from `~/.agents/skills/`) before starting any task, and — when a skill matches the task's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in delegation briefs so the subagent follows it too. The minimal `coding.md` compresses this to a single rule ("if a listed skill matches the task, read its SKILL.md and follow it") in each half. Keep some form of this guidance when authoring a custom style; it is what makes installed skills actually get used.
 
 ### Web access guidance in bundled styles
 
-The `default.md` and `coding.md` templates include a **Web access (search & fetch)** section in both their `<outo>` and `<subagent>` halves (`pro.md` and `ultra.md` do not — see their sections above). It is **skill-first**: the agent must check whether an available skill covers the web interaction (browser automation, scraping, search, platform-specific APIs) and follow that skill when one applies. Only when no skill applies does it fall back to `curl` via Bash — searching the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from any bundled template.
+The `default.md` template includes a full **Web access (search & fetch)** section in both its `<outo>` and `<subagent>` halves (`coding-pro.md` and `coding-ultra.md` do not; `coding.md` compresses it to one rule). It is **skill-first**: the agent must check whether an available skill covers the web interaction (browser automation, scraping, search, platform-specific APIs) and follow that skill when one applies. Only when no skill applies does it fall back to `curl` via Bash — searching the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from `default.md`.
 
 ### Export / share a style
 

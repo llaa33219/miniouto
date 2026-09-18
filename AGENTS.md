@@ -232,9 +232,9 @@ The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual 
 | `tools/computer.py` | `computer(action, …)` — virtual-display GUI control via py-Vwayland; module-level screen registry (`spawn`/`kill`/`list`, one app per screen) + lock; `computer_supported()` platform probe gates registration (`MINIOUTO_COMPUTER=0` disables); returns `str` or `Screenshot` |
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio/Computer into coreouto (Computer with `parallelizable=False`) |
 | `default_style/default.md` | Minimal fallback style |
-| `default_style/coding.md` | Coding-expert orchestrator (~14 KB) — delegation-first, parallel `call_subagent`, `.miniouto/plans/` lifecycle |
-| `default_style/pro.md` | Senior staff engineer orchestrator (~32 KB) — AGENTS.md startup read, delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, parallel tool-call batching mechanics, hard blocks (no sudo / no mass delete / no unprompted commit-push) |
-| `default_style/ultra.md` | MAX-mode execution orchestrator (~81 KB) — zero-excuse protocol, layered subagent fan-out (3+ file-pickers, best-of-N editors, multi-focus reviewers), named subagent roster, canonical layer sequence 0–9, `.miniouto/docs/` documentation system, worktree-by-default, boulder state |
+| `default_style/coding.md` | Expert coding agent (~1.6 KB, deliberately minimal) — Bash-only file work, self-contained subagent briefs, verify-don't-fabricate, ask-before-destructive |
+| `default_style/coding-pro.md` | Senior staff engineer orchestrator (~32 KB) — AGENTS.md startup read, delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, parallel tool-call batching mechanics, hard blocks (no sudo / no mass delete / no unprompted commit-push). Renamed from `pro.md` at 0.8.1 (stale seeds + `settings.style` migrated by `ensure_dirs`) |
+| `default_style/coding-ultra.md` | MAX-mode execution orchestrator (~81 KB) — zero-excuse protocol, layered subagent fan-out (3+ file-pickers, best-of-N editors, multi-focus reviewers), named subagent roster, canonical layer sequence 0–9, `.miniouto/docs/` documentation system, worktree-by-default, boulder state. Renamed from `ultra.md` at 0.8.1 |
 | `tui/` | **EMPTY placeholder** — TUI code lives in `cli/tui.py` |
 | `utils/` | **EMPTY placeholder** — no code anywhere |
 

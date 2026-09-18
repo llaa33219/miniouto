@@ -91,7 +91,7 @@ Active style:     coding
 Session:          default
 Storage:          /home/luke/.miniouto
 Providers:        anthropic, openai, my-local
-Styles:           coding, default, pro
+Styles:           coding, coding-pro, coding-ultra, default
 Skills:           git-master, frontend
 Sessions:         default, chat-20260702-103045-a1b2c3
 ```
@@ -195,7 +195,7 @@ miniouto chat "hello" --provider openai
 
 # Use a different style just for this call
 miniouto chat "review this code" --style default
-miniouto chat "orchestrate this for me" --style pro
+miniouto chat "orchestrate this for me" --style coding-pro
 
 # Combinable
 miniouto chat "summarize" --provider anthropic --model claude-sonnet-4 --style coding
@@ -307,11 +307,12 @@ miniouto provider remove my-local
 A style is a markdown system prompt at `~/.miniouto/style/<name>.md`. The `<outo>...</outo>` and (optional) `<subagent>...</subagent>` tags split the two agents' prompts. Format details in [`styles.md`](./styles.md).
 
 ```bash
-# Three bundles are pre-installed: default, coding, pro
+# Four bundles are pre-installed: default, coding, coding-pro, coding-ultra
 miniouto style list
 #   - coding
+#   - coding-pro
+#   - coding-ultra
 #   - default ●          ← active style
-#   - pro
 
 # Switch the active style
 miniouto style set coding
