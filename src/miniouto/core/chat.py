@@ -207,7 +207,12 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
 
     on_tool_call = _make_tool_call_dispatcher(sink)
 
-    base_on_iteration = _make_iteration_dispatcher(sink)
+    # Shared per-actor buffer stashing intermediate response text from
+    # AFTER_LLM_CALL until ON_ITERATION flushes it — this is what keeps
+    # thinking rows above the model text they belong to.
+    pending_responses: dict[str, tuple[str, str, str | None]] = {}
+
+    base_on_iteration = _make_iteration_dispatcher(sink, pending_responses)
 
     def on_iteration(*, iteration: int, messages: Any, response: Any) -> None:
         base_on_iteration(iteration=iteration, messages=messages, response=response)
@@ -229,7 +234,7 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
         runtime,
         provider_config=provider_config,
         on_tool_call=on_tool_call,
-        on_response=_make_response_dispatcher(sink),
+        on_response=_make_response_dispatcher(sink, pending_responses),
         on_thinking=_make_thinking_dispatcher(sink),
         on_iteration=on_iteration,
         on_provider_error=_make_provider_error_dispatcher(sink),
@@ -576,21 +581,31 @@ def _make_thinking_dispatcher(sink: EventSink):
     return on_thinking
 
 
-def _make_response_dispatcher(sink: EventSink):
+def _make_response_dispatcher(
+    sink: EventSink,
+    pending: dict[str, tuple[str, str, str | None]],
+):
     """Build the per-LLM-response callback wired into the AFTER_LLM_CALL hook.
 
     Only intermediate responses (those followed by a tool call) are emitted.
     The terminal response is rendered separately via `sink.emit_final_answer`
     so we don't print the answer twice.
+
+    The event is NOT emitted here. coreouto fires AFTER_LLM_CALL *before*
+    ON_THINKING for the same response, so emitting immediately would mount
+    the model's text above its own thinking row (thinking reads as arriving
+    "after" the answer). Instead the text is stashed in `pending` — keyed
+    by actor ("" for outo, the subagent id inside a subagent invocation,
+    which keeps parallel subagent streams self-consistent) — and flushed by
+    the ON_ITERATION dispatcher, which coreouto guarantees fires after
+    ON_THINKING. Every sink therefore sees thinking first, then the text.
     """
 
     def on_response(content: str, has_tool_calls: bool) -> None:
         if not content or not has_tool_calls:
             return
         actor, sid = _actor_label()
-        sink.emit_loop_event(
-            LoopEvent(actor=actor, kind="response", text=content, subagent_id=sid)
-        )
+        pending[sid or ""] = (actor, content, sid)
 
     return on_response
 
@@ -629,8 +644,17 @@ def _make_provider_error_dispatcher(sink: EventSink):
     return on_provider_error
 
 
-def _make_iteration_dispatcher(sink: EventSink):
+def _make_iteration_dispatcher(
+    sink: EventSink,
+    pending: dict[str, tuple[str, str, str | None]],
+):
     """Build the per-iteration callback wired into the ON_ITERATION hook.
+
+    First flushes any response text stashed by the AFTER_LLM_CALL
+    dispatcher for the current actor — ON_ITERATION always fires after
+    ON_THINKING, so the flushed text lands *below* the thinking row and
+    above this context line, restoring the natural reading order
+    (thinking → text → progress).
 
     Emits a `context` loop event with the iteration number and cumulative
     token usage so the user sees the agent is making progress even between
@@ -642,6 +666,13 @@ def _make_iteration_dispatcher(sink: EventSink):
     cumulative: list[int] = [0]
 
     def on_iteration(*, iteration: int, messages: Any, response: Any, **_kwargs: Any) -> None:
+        actor, sid = _actor_label()
+        stashed = pending.pop(sid or "", None)
+        if stashed is not None:
+            s_actor, s_text, s_sid = stashed
+            sink.emit_loop_event(
+                LoopEvent(actor=s_actor, kind="response", text=s_text, subagent_id=s_sid)
+            )
         usage = getattr(response, "usage", None) if response else None
         tokens = getattr(usage, "total_tokens", None) if usage else None
         if isinstance(tokens, int) and tokens > 0:

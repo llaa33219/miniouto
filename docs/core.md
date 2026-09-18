@@ -192,13 +192,13 @@ Builds the `(phase, sid, text)` lifecycle callback installed via `set_subagent_o
 
 Builds the `on_thinking(thinking)` closure wired into coreouto's `ON_THINKING` hook. Emits `LoopEvent(kind="thinking", text=thinking)` with the current actor/subagent id — reasoning fires inside subagent loops too and is labeled `subagent-<6hex>` automatically. The full text is preserved in the event (and thus in the session turn); sinks decide how much to display.
 
-### `_make_response_dispatcher(sink: EventSink)`
+### `_make_response_dispatcher(sink: EventSink, pending: dict)`
 
-Builds the `on_response(content, has_tool_calls)` closure. When `has_tool_calls` is true (intermediate LLM response that triggers a tool call), emits a `LoopEvent(kind="response", text=content)` so the sink can render the model's intermediate text.
+Builds the `on_response(content, has_tool_calls)` closure. When `has_tool_calls` is true (intermediate LLM response that triggers a tool call), the text is **stashed in `pending`** (keyed by actor: `""` for outo, the subagent id inside a subagent) instead of being emitted immediately — coreouto fires `AFTER_LLM_CALL` *before* `ON_THINKING`, so an immediate emit would place the model's text above its own thinking row. The stash is flushed by `_make_iteration_dispatcher` (below), which `ON_ITERATION` guarantees runs after `ON_THINKING` — every sink therefore sees `thinking` → `response` in that order. The stashed tuple carries the actor/subagent id captured at stash time, so parallel subagent streams stay self-consistent.
 
-### `_make_iteration_dispatcher(sink: EventSink)`
+### `_make_iteration_dispatcher(sink: EventSink, pending: dict)`
 
-Builds the `on_iteration(*, iteration, messages, response, **kwargs)` closure that emits a `LoopEvent(kind="context", text=...)` for progress reporting. (Summarization logic lives separately in `make_summarize_hook`, registered as a second `ON_ITERATION` hook.)
+Builds the `on_iteration(*, iteration, messages, response, **kwargs)` closure that first flushes any response text stashed for the current actor (emitting the deferred `LoopEvent(kind="response")`), then emits a `LoopEvent(kind="context", text=...)` for progress reporting — net display order per iteration is thinking → model text → context line. (Summarization logic lives separately in `make_summarize_hook`, registered as a second `ON_ITERATION` hook.)
 
 ### `_make_provider_error_dispatcher(sink: EventSink)`
 
