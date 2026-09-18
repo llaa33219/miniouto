@@ -168,12 +168,18 @@ that is "a teammate, not a tutor." It requires the following behaviors:
 A pragmatic senior-software-engineer orchestrator (~38 KB) positioned between
 `coding-pro.md` and `coding-ultra.md`: the autonomy of the heaviest execution
 styles (never stop early, never ask permission mid-loop, decide soft blocks
-yourself, three-strike rule) with **proportionate machinery** — one focused
-subagent per slice, one reviewer only when the change warrants it, no
-documentation empire, no worktrees for everyday patches, no best-of-N editor
-tournaments. Persona: "**coding-work**, a pragmatic senior software engineer"
-that "ships, then tells the user what it shipped and the evidence." It
-requires the following behaviors:
+yourself, three-strike rule) with **proportionate machinery** — the work is
+**distributed by its scale**: what the orchestrator can read, understand, and
+execute within a modest number of calls is done end-to-end itself (batched
+parallel reads, direct edits, no subagent ceremony on small tasks);
+large-scale understanding (unfamiliar codebase too broad to survey directly)
+goes to parallel context subagents; large or multi-site changes go to one
+focused editor subagent per independent slice — parallel spawns for
+genuinely independent sites — with one reviewer when the change warrants it.
+No documentation empire, no worktrees for everyday patches, no best-of-N
+editor tournaments. Persona: "**coding-work**, a pragmatic senior software
+engineer" that "ships, then tells the user what it shipped and the evidence."
+It requires the following behaviors:
 
 - **Startup step — read AGENTS.md before anything else**: same sweep as
   `coding-pro.md` (repo root, `./.agents/`, `./docs/`, nested copies;
@@ -187,17 +193,30 @@ requires the following behaviors:
   the only four **true hard blocks** (missing credentials, unauthorized
   destructive action, contradictory instructions, unreachable verification
   surface) — everything else is decided autonomously.
-- **PARALLEL TOOL CALLS mechanics**: the same wrong/right patterns and
-  self-check as `coding-pro.md`, mirrored in the subagent half for its own
-  batched reads.
-- **Five-phase workflow**: EXPLORE (parallel role-tagged onboarding sweep on
-  first contact) → PLAN (`./.miniouto/plans/<name>.md` with soft-block
-  decisions logged) → EXECUTE (one `editor` subagent per slice; parallel
-  editors only for genuinely independent slices, never overlapping edit
-  ownership) → REVIEW (one `reviewer` subagent with a **single** focus area
-  for risky changes — auth, money, concurrency, public API, migrations;
-  self-review for routine ones) → VERIFY (real commands, read the diff
-  yourself, loop).
+- **PARALLEL TOOL CALLS mechanics, two flavors**: Flavor 1 — batch your own
+  independent reads/commands as N tool_use blocks in one response (the
+  small-task case); Flavor 2 — parallel `call_subagent` blocks in one
+  response for large splittable work (parallel context searches with
+  different angles on a broad codebase, or one editor per independent site
+  of a multi-site change). Ceremony on small tasks is the named
+  anti-pattern; the self-check counts tool_use blocks after each batch.
+- **Scale-based decision framework**: "read it, understand it, do it
+  directly within a modest number of calls → do it yourself" is the first
+  row; large-scale understanding, non-trivial execution, multi-site
+  modification, and independent checking each map to their delegation
+  action. The closing rule runs both directions — subagent ceremony on
+  small tasks and hand-grinding oversized work are the same failure.
+- **Five-phase workflow**: EXPLORE (direct batched-read exploration — the
+  onboarding sweep runs as ONE batched block of read-only commands by the
+  orchestrator itself; parallel context subagents when the tree is
+  genuinely too broad to survey) → PLAN (`./.miniouto/plans/<name>.md` with
+  soft-block decisions logged) → EXECUTE (read-and-do work goes direct;
+  otherwise one `editor` subagent per slice — a multi-site change is one
+  editor per independent site, emitted as one parallel batch, never
+  overlapping edit ownership) → REVIEW (one `reviewer` subagent with a
+  **single** focus area for risky changes — auth, money, concurrency,
+  public API, migrations; self-review for routine ones) → VERIFY (real
+  commands, read the diff yourself, loop).
 - **Subagent roster**: eight named roles — file-picker, code-searcher,
   directory-lister, researcher (fetch real sources with `curl`), thinker,
   editor (the only role that modifies files), reviewer (one focus area,
