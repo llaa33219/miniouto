@@ -93,27 +93,100 @@ def get_max_output_tokens(model: str, provider_name: str | None = None) -> int:
 
 
 def make_summarize_hook(model: str, session_name: str, provider_name: str | None = None) -> Any:
-    """Create a hook that summarizes when context window is 80% full.
+    """Create a hook that compacts the live message list at 80% context.
 
-    Calls the LLM to produce a structured summary of the conversation:
-    - What was done so far
-    - What is currently in progress
-    - What needs to be done next
+    The compaction is a **context handoff**, not a prose summary: the agent
+    continues the task with ONLY the compacted message, so everything it
+    still needs — the verbatim task, file paths, commands run, decisions,
+    errors, next steps — must survive inside it. Three hard-won rules:
+
+    - The conversation fed to the summarizer LLM must include the tool
+      CALLS (which command produced which result), not just truncated
+      result tails — otherwise the handoff cannot name what was done.
+    - The compacted message embeds the current task verbatim (extracted
+      deterministically, never LLM-paraphrased) and an explicit frame
+      telling the agent this is the authoritative record: hunting session
+      files or a global `.miniouto` for "the lost transcript" is a known
+      confusion failure this frame exists to prevent.
+    - The summarizer agent gets its own `max_tokens` — without it the
+      active provider's low default (Anthropic: 1024) silently truncates
+      the handoff mid-section, which is the same confusion by another door.
 
     Reimplements `coreouto.contrib.hooks.auto_summarize_hook` with one
-    critical difference: if `summarize_fn` ever returns a non-iterable
+    critical difference: if the summarizer ever returns a non-iterable
     (None, dict, scalar), coreouto's stock hook does
     `messages.clear(); messages.extend(summarized)` which both wipes the
     conversation AND raises `'NoneType' object is not iterable`. Our
     wrapper refuses to clear messages unless the summarizer returned a
     real list, so a single buggy summarizer can't destroy a turn.
+
+    Returns `(on_iteration, before_llm_call)` — two hooks. The compaction
+    itself runs in `before_llm_call`, NOT in `on_iteration`: coreouto
+    fires ON_ITERATION *before* executing the response's tool calls, so
+    compacting there would wipe the just-appended assistant tool_use and
+    leave the upcoming tool results orphaned (provider 400: "tool result's
+    tool id not found"). BEFORE_LLM_CALL of the next iteration is the
+    safe point — every tool-call pair in the list is complete.
     """
 
     window = get_context_window(model, provider_name)
     if not window:
-        return lambda **kwargs: None
+        noop = lambda **kwargs: None  # noqa: E731
+        return noop, noop
 
     threshold = int(window * SUMMARIZE_THRESHOLD)
+
+    def _compact_frame(task_verbatim: str, handoff: str) -> str:
+        frame = (
+            "[Summary — compacted context]\n"
+            "The earlier conversation was compacted to fit the context "
+            "window. This message REPLACES that transcript and is the "
+            "authoritative record of everything that happened so far — "
+            "everything still relevant is already in here.\n"
+            "Rules:\n"
+            "- Do NOT search the filesystem for the original conversation, "
+            "session files, transcripts, or a `.miniouto` directory to "
+            "'recover' context — there is nothing more to recover, and "
+            "hunting for it only wastes turns.\n"
+            "- If a detail you need is genuinely absent, re-derive it from "
+            "the actual project files on disk (they are the ground truth "
+            "and already reflect all completed work), or ask the user.\n"
+            "- Continue the task from the NEXT section of the handoff.\n"
+        )
+        parts = [frame]
+        if task_verbatim:
+            parts.append(f"\n## Current task (verbatim, do not re-ask)\n{task_verbatim}")
+        parts.append(f"\n## Context handoff\n{handoff}")
+        return "".join(parts)
+
+    def _serialize_conversation(
+        existing_summary: str | None, msgs_to_summarize: list[Any]
+    ) -> str:
+        import json
+
+        lines: list[str] = []
+        if existing_summary:
+            lines.append(f"Previous compaction (already summarized; carry its facts forward):\n{existing_summary}")
+
+        for m in msgs_to_summarize:
+            if m.role == "user" and m.content:
+                lines.append(f"User: {m.content}")
+            elif m.role == "assistant":
+                if m.content:
+                    lines.append(f"Agent: {m.content}")
+                # The tool CALLS are the record of what was actually done —
+                # without them the results below are unattributable output.
+                for tc in getattr(m, "tool_calls", None) or []:
+                    try:
+                        args = json.dumps(tc.arguments or {}, ensure_ascii=False)
+                    except Exception:
+                        args = repr(getattr(tc, "arguments", None))
+                    lines.append(f"Agent tool call: {tc.name}({args})")
+            elif m.role == "tool" and m.content:
+                name = getattr(m, "name", None) or "tool"
+                text = m.content if isinstance(m.content, str) else str(m.content)
+                lines.append(f"Tool result [{name}]: {text[:4000]}")
+        return "\n".join(lines)
 
     def summarizer(messages: list[Any]) -> list[Any]:
         if len(messages) <= 2:
@@ -131,28 +204,40 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
             else:
                 msgs_to_summarize.append(m)
 
-        conversation_text: list[str] = []
-        if existing_summary:
-            conversation_text.append(f"Previous summary:\n{existing_summary}")
+        # Deterministic verbatim task extraction — never trust the LLM to
+        # preserve the user's exact request.
+        task_verbatim = ""
+        for m in reversed(msgs_to_summarize):
+            if m.role == "user" and m.content and not m.content.startswith("[Summary"):
+                task_verbatim = m.content
+                break
 
-        for m in msgs_to_summarize:
-            if m.role == "user" and m.content:
-                conversation_text.append(f"User: {m.content}")
-            elif m.role == "assistant" and m.content:
-                conversation_text.append(f"Agent: {m.content}")
-            elif m.role == "tool" and m.content:
-                conversation_text.append(f"Tool: {m.content[:500]}")
-
-        conversation = "\n".join(conversation_text)
+        conversation = _serialize_conversation(existing_summary, msgs_to_summarize)
 
         summary_prompt = (
-            "Summarize the following conversation into three sections:\n"
-            "1. DONE: What has been completed so far\n"
-            "2. IN PROGRESS: What is currently being worked on\n"
-            "3. NEXT: What needs to be done next\n\n"
-            "Be concise but specific. Include file paths, command names, "
-            "and concrete details.\n\n"
-            f"Conversation:\n{conversation}"
+            "You are writing a CONTEXT HANDOFF that will REPLACE the "
+            "conversation for the working agent. The agent continues the "
+            "task with ONLY this document — every detail it still needs "
+            "must survive here. Write it for the agent, not for a human "
+            "reviewer.\n\n"
+            "Produce exactly these sections:\n"
+            "1. TASK — what the user asked for, in order; keep key "
+            "phrasing verbatim (requests, constraints, preferences)\n"
+            "2. DONE — completed work: file paths, commands run, outcomes\n"
+            "3. IN PROGRESS — the exact step in flight when compaction "
+            "happened\n"
+            "4. FILES — every file read/created/modified: path + one line "
+            "on its role and what changed in it\n"
+            "5. DECISIONS — design choices made, alternatives rejected, "
+            "user-imposed constraints, forbidden actions\n"
+            "6. ERRORS — failures hit, root causes identified, fixes "
+            "applied, unresolved ones\n"
+            "7. NEXT — remaining steps in order, plus the verification "
+            "commands that will prove completion\n\n"
+            "Rules: paths, commands, and identifiers verbatim — never "
+            "paraphrased. Specifics over prose. No preamble, no "
+            "meta-commentary.\n\n"
+            f"Conversation to compact:\n{conversation}"
         )
 
         from coreouto._types import Message
@@ -162,35 +247,49 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
             summary_agent = co.Agent(co.AgentConfig(
                 name="summarizer",
                 model=model,
-                provider="",
-                system_prompt="You are a conversation summarizer. Produce concise, structured summaries.",
+                provider=provider_name or "",
+                system_prompt=(
+                    "You are a context-compaction engine. You produce "
+                    "complete, dense, structured handoff documents for a "
+                    "working agent. You never chat."
+                ),
                 max_iterations=1,
+                provider_config={"max_tokens": 8192},
             ))
             result = summary_agent.call_sync(summary_prompt)
-            summary_content = f"[Summary]\n{result.content}"
+            handoff = result.content or ""
         except Exception:
-            summary_content = (
-                "[Summary]\n"
-                "Unable to generate LLM summary. Continuing with truncated context."
+            # Deterministic fallback: a truncated recent tail of the real
+            # transcript preserves far more than a content-free apology.
+            handoff = (
+                "(LLM summarization failed — verbatim tail of the recent "
+                f"conversation follows)\n{conversation[-6000:]}"
             )
 
-        summary_msg = Message(role="user", content=summary_content)
+        summary_msg = Message(role="user", content=_compact_frame(task_verbatim, handoff))
         return [*system_msgs, summary_msg]
 
     total: list[int] = [0]
+    pending: list[bool] = [False]
 
-    def hook(*, iteration: int, messages: list[Any], response: Any, **_kwargs: Any) -> None:
+    def on_iteration(*, iteration: int, messages: list[Any], response: Any, **_kwargs: Any) -> None:
         if response is None or getattr(response, "usage", None) is None:
             return
         total[0] += response.usage.total_tokens
-        if total[0] < threshold:
+        if total[0] >= threshold:
+            pending[0] = True
+
+    def before_llm_call(*, messages: list[Any], **_kwargs: Any) -> None:
+        if not pending[0]:
             return
+        pending[0] = False
         summarized = summarizer(messages)
         if not isinstance(summarized, list):
             from rich.console import Console
             Console(stderr=True).print(
-                f"[yellow]⚠ summarize_fn returned {type(summarized).__name__} "
-                f"(expected list); keeping original messages.[/yellow]",
+                "[yellow]⚠ summarize_fn returned "
+                f"{type(summarized).__name__} (expected list); "
+                "keeping original messages.[/yellow]",
                 highlight=False,
             )
             return
@@ -201,4 +300,4 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
         # LLM summarizer, turning one compaction into a per-iteration tax.
         total[0] = 0
 
-    return hook
+    return on_iteration, before_llm_call

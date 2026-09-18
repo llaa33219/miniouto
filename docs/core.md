@@ -41,7 +41,7 @@ build_runtime(runtime, *, style_overrides, provider_config,
    │  │    └─ _wrap_subagent_handler: mints subagent-<6hex> id per invocation
    │  ├─ co.register_hook(BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
    │  ├─ co.register_hook(AFTER_TOOL_CALL, _make_tool_result_logger(on_tool_result))
-   │  ├─ co.register_hook(ON_ITERATION, make_summarize_hook(model, session, provider))
+   │  ├─ co.register_hook(ON_ITERATION, make_summarize_hook(...) → (on_iteration, before_llm_call)) + BEFORE_LLM_CALL compaction hook
     │  ├─ co.register_hook(ON_ITERATION, _make_iteration_logger(on_iteration))
     │  ├─ co.register_hook(AFTER_LLM_CALL, _make_response_logger(on_response))
     │  ├─ co.register_hook(ON_THINKING, _make_thinking_logger(on_thinking))
@@ -252,22 +252,27 @@ Resolution order (highest wins):
 
 No ceiling clamp. See `docs/lma.md` for rationale.
 
-### `make_summarize_hook(model, session_name, provider_name=None) -> Callable`
+### `make_summarize_hook(model, session_name, provider_name=None) -> tuple[Callable, Callable]`
 
-Returns the `ON_ITERATION` hook (registered alongside `_make_iteration_logger`, so two `ON_ITERATION` hooks fire per iteration). The `session_name` argument is captured but currently unused in the body. `provider_name` (optional) is threaded into `get_context_window` for a more accurate lookup.
+Returns `(on_iteration, before_llm_call)` — a hook pair (registered as a second `ON_ITERATION` hook alongside `_make_iteration_logger`, plus a `BEFORE_LLM_CALL` hook). The `session_name` argument is captured but currently unused in the body. `provider_name` is threaded into `get_context_window` for an accurate lookup **and** used as the summarizer agent's provider (guaranteed registered by `build_runtime`).
 
-- If no context window is known, returns a no-op hook.
-- Otherwise returns a closure with two parts:
+- If no context window is known, returns two no-op hooks.
+- The compaction is a **context handoff**, not a prose summary — the agent continues with ONLY the compacted message, so it must carry everything still relevant.
 
-  **`summarizer(messages) -> list[co.Message]`** — Builds a structured "DONE / IN PROGRESS / NEXT" summary by:
+  **`on_iteration(*, iteration, messages, response, **_kwargs)`** — Accumulates `response.usage.total_tokens`. When the cumulative total reaches 80% of the window it only **arms a pending flag**; it never compacts here. coreouto fires `ON_ITERATION` *before* executing the response's tool calls, so compacting at that point would wipe the just-appended assistant tool_use and orphan the tool results that follow (provider 400: "tool result's tool id not found").
+
+  **`before_llm_call(*, messages, **_kwargs)`** — When armed, runs the summarizer and replaces the message list. `BEFORE_LLM_CALL` of the next iteration is the safe point: every tool-call pair in the list is complete. Registered before the watchdog's `capture_messages` hook so the watchdog captures the post-compaction list.
+
+  **`summarizer(messages) -> list[co.Message]`** — Builds the handoff by:
   1. Splitting out system messages.
-  2. Detecting and preserving any previous `"[Summary…"` user message.
-  3. Flattening user/assistant/tool messages into text, truncating tool content at 500 chars.
-  4. Calling a separate `co.Agent(name="summarizer", max_iterations=1)` with the summary prompt.
-  5. On any failure, returns a static `"[Summary] Unable to generate LLM summary…"` message.
-  6. **Always** returns `[*system_msgs, summary_msg]` — never overwrites with garbage.
+  2. Detecting and carrying forward any previous `"[Summary…"` user message ("Previous compaction" — facts survive repeated compactions).
+  3. Flattening user/assistant/tool messages into text **including the assistant's tool CALLS** (`Agent tool call: Bash({...})` — without them the results are unattributable) with tool results truncated at 4000 chars.
+  4. Extracting the current task **verbatim in code** (never LLM-paraphrased).
+  5. Calling a separate `co.Agent(name="summarizer", provider=provider_name, max_iterations=1, provider_config={"max_tokens": 8192})` with a 7-section handoff prompt (TASK / DONE / IN PROGRESS / FILES / DECISIONS / ERRORS / NEXT; paths and commands verbatim).
+  6. On failure, falling back to a deterministic verbatim tail of the recent conversation — never a content-free apology.
+  7. Wrapping the result in a frame that (a) declares the compacted message the authoritative record, (b) explicitly forbids hunting session files / transcripts / a global `.miniouto` to "recover" context (the confusion failure this exists to prevent — missing details are re-derived from the files on disk, which are ground truth), and (c) embeds the verbatim task. **Always** returns `[*system_msgs, summary_msg]` — never overwrites with garbage.
 
-  **`hook(*, iteration, messages, response, **_kwargs)`** — Accumulates `response.usage.total_tokens`. When total ≥ 80% of window, runs `summarizer(messages)`. **Critical guard:** if the summarizer returns a non-list, prints a yellow warning to stderr and keeps the original messages (this is the divergence from `coreouto.contrib.hooks.auto_summarize_hook`, which would `clear()` and `extend()` with the non-iterable and both corrupt the turn *and* raise `TypeError`). **The counter resets to 0 after each compaction** (coreouto `examples/23` pattern) — without the reset, every later iteration that reports usage re-triggers the LLM summarizer.
+  **Critical guard:** if the summarizer returns a non-list, prints a yellow warning to stderr and keeps the original messages (this is the divergence from `coreouto.contrib.hooks.auto_summarize_hook`, which would `clear()` and `extend()` with the non-iterable and both corrupt the turn *and* raise `TypeError`). **The counter resets to 0 after each compaction** (coreouto `examples/23` pattern) — without the reset, every later iteration that reports usage re-triggers the LLM summarizer.
 
 ---
 

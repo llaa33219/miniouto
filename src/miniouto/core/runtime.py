@@ -699,10 +699,15 @@ def build_runtime(
         co.register_hook(co.AFTER_TOOL_CALL, _make_tool_result_logger(on_tool_result))
 
     from .context import make_summarize_hook
-    summarize_hook = make_summarize_hook(
+    summarize_on_iteration, summarize_before_llm = make_summarize_hook(
         runtime.model, runtime.session or "default", runtime.provider_name
     )
-    co.register_hook(co.ON_ITERATION, summarize_hook)
+    co.register_hook(co.ON_ITERATION, summarize_on_iteration)
+    # Compaction runs at BEFORE_LLM_CALL (all tool-call pairs complete) —
+    # see make_summarize_hook's docstring for why ON_ITERATION is unsafe.
+    # Registered before the watchdog's capture hook below, so the captured
+    # list is the post-compaction one.
+    co.register_hook(co.BEFORE_LLM_CALL, summarize_before_llm)
 
     _register_watchdog_trackers()
 
