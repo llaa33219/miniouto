@@ -127,6 +127,11 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
     leave the upcoming tool results orphaned (provider 400: "tool result's
     tool id not found"). BEFORE_LLM_CALL of the next iteration is the
     safe point — every tool-call pair in the list is complete.
+    `before_llm_call` (and the summarizer it awaits) must be **async**:
+    the hook fires inside coreouto's running event loop, where a
+    synchronous `call_sync` (its own `asyncio.run`) raises "cannot be
+    called from a running event loop" — with the old sync hook the LLM
+    handoff silently never worked and every compaction fell back.
     """
 
     window = get_context_window(model, provider_name)
@@ -188,7 +193,7 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
                 lines.append(f"Tool result [{name}]: {text[:4000]}")
         return "\n".join(lines)
 
-    def summarizer(messages: list[Any]) -> list[Any]:
+    async def summarizer(messages: list[Any]) -> list[Any]:
         if len(messages) <= 2:
             return messages
 
@@ -244,6 +249,14 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
 
         try:
             import coreouto as co
+            # Resolve the output cap the same way the main agent does
+            # (provider TUI override > lma max_output_tokens > lma
+            # context_window > DEFAULT_MAX_OUTPUT_TOKENS floor), fresh at
+            # compaction time so mid-session override edits apply. A
+            # hardcoded value either truncates the handoff (too small) or
+            # gets the request rejected by the provider (too large — the
+            # failure mode observed with 8192 on providers whose real cap
+            # is lower).
             summary_agent = co.Agent(co.AgentConfig(
                 name="summarizer",
                 model=model,
@@ -254,11 +267,22 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
                     "working agent. You never chat."
                 ),
                 max_iterations=1,
-                provider_config={"max_tokens": 8192},
+                provider_config={
+                    "max_tokens": get_max_output_tokens(model, provider_name)
+                },
             ))
-            result = summary_agent.call_sync(summary_prompt)
+            result = await summary_agent.call(summary_prompt)
             handoff = result.content or ""
-        except Exception:
+        except Exception as exc:
+            # Visible, not silent: a summarizer that fails every compaction
+            # silently degrades every long turn to the fallback tail.
+            from rich.console import Console
+            Console(stderr=True).print(
+                f"[yellow]⚠ LLM summarization failed "
+                f"({type(exc).__name__}: {exc}); falling back to verbatim "
+                "tail.[/yellow]",
+                highlight=False,
+            )
             # Deterministic fallback: a truncated recent tail of the real
             # transcript preserves far more than a content-free apology.
             handoff = (
@@ -279,11 +303,11 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
         if total[0] >= threshold:
             pending[0] = True
 
-    def before_llm_call(*, messages: list[Any], **_kwargs: Any) -> None:
+    async def before_llm_call(*, messages: list[Any], **_kwargs: Any) -> None:
         if not pending[0]:
             return
         pending[0] = False
-        summarized = summarizer(messages)
+        summarized = await summarizer(messages)
         if not isinstance(summarized, list):
             from rich.console import Console
             Console(stderr=True).print(
