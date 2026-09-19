@@ -348,7 +348,7 @@ Helper that bundles the two dicts under the keys coreouto's `AgentConfig` expect
 
 - `ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]` — the fixed tool set used for both presets.
 - `_SUBAGENT_DEPTH: ContextVar[int]` — defaults to 0. Read by `chat.py` dispatchers (via `current_subagent_depth()`) as a defensive fallback label. Mutated only by `_wrap_subagent_handler`.
-- `_SUBAGENT_ID: ContextVar[str | None]` — defaults to None. The 6-hex id of the innermost active subagent invocation; read by `chat._actor_label()` to build `subagent-<6hex>` labels. ContextVars are copied per asyncio task, so parallel `call_subagent` invocations each see their own id — this is what makes concurrent subagents distinguishable.
+- `_SUBAGENT_ID: ContextVar[str | None]` — defaults to None. The 6-hex id of the innermost active subagent invocation; read by `chat._actor_label()` to build `subagent-<6hex>` labels. ContextVars are copied per asyncio task, so the per-brief coroutines of one multi-brief `call_subagent` (and separate invocations) each see their own id — this is what makes concurrent subagents distinguishable.
 - `_SUBAGENT_OBSERVER` — module-level `(phase, sid, text) -> None` slot set per turn by `chat.run_chat` via `set_subagent_observer()`. Because coreouto's hooks are global, this slot is the bridge between the wrapped `call_subagent` handler and the active turn's sink. Observer exceptions are suppressed (`contextlib.suppress`) so a sink can never break the subagent loop.
 
 ### `current_subagent_depth() -> int` / `current_subagent_id() -> str | None`
@@ -361,7 +361,11 @@ Installs/clears the lifecycle observer.
 
 ### `_wrap_subagent_handler(inner)`
 
-Returns an async wrapper that, per invocation: mints `secrets.token_hex(3)` (6 hex chars), sets `_SUBAGENT_DEPTH` + `_SUBAGENT_ID`, notifies the observer `"start"` (task brief), `"wakeup"` (supervisor restart), and `"end"` (final result, or `error: {type}: {msg}` on exception), pops the invocation's `_LIVE_MESSAGES` entry, and resets both ContextVars in `finally`. Necessary because `co.BEFORE_TOOL_CALL` is a global hook with no per-agent context — and the wrapper runs exactly once per subagent invocation, which is what makes it the correct mint point for the id. The subagent call runs through `supervised_run` at `level=depth`, so a wedged subagent is cancelled and resumed from its own sanitized transcript in place — the parent turn is not taken down. If the subagent's supervisor exhausts its wakeups, the raised `LoopStalledError` becomes an error `ToolResult` via coreouto's tool-call wrapper, so the parent sees the failure and can re-delegate.
+Returns an async wrapper accepting **`task` (a single brief, legacy) and `tasks` (an array of briefs)** — the multi-brief fan-out. Per brief, `_run_one`: mints `secrets.token_hex(3)` (6 hex chars), sets `_SUBAGENT_DEPTH` + `_SUBAGENT_ID` (ContextVars are copied per asyncio task, so the concurrent briefs of one call each keep their own id), notifies the observer `"start"` (task brief), `"wakeup"` (supervisor restart), and `"end"` (final result, or `error: {type}: {msg}` on exception), pops the invocation's `_LIVE_MESSAGES` entry, and resets both ContextVars in `finally`. Necessary because `co.BEFORE_TOOL_CALL` is a global hook with no per-agent context — and `_run_one` runs exactly once per brief, which is what makes it the correct mint point for the id. Each brief runs through `supervised_run` at `level=depth`, so a wedged subagent is cancelled and resumed from its own sanitized transcript in place — the parent turn is not taken down; concurrent briefs each get their own supervisor.
+
+A single brief returns its result unchanged (legacy shape). Multiple briefs run under `asyncio.gather(..., return_exceptions=True)` and return **ONE combined tool result, numbered per brief** (`[1/N] task: <preview>` sections) — the model made one tool call, so it gets one result; a failed brief degrades to an `error:` section instead of failing its siblings. An invocation with neither usable `task` nor `tasks` raises a `ValueError` with a clear message.
+
+**Why multi-brief exists**: current models emit at most one tool call per assistant response, so "spawn N subagents as N `call_subagent` tool_use blocks in one turn" never materializes — the blocks come out serialized across turns no matter what the styles say. Parallel delegation therefore lives inside a single invocation. **This is a workaround, not a design goal: if models learn to emit several tool_use blocks in one response naturally, revert to one brief per call and remove the `tasks` parameter** (rollback note also lives in the `_wrap_subagent_handler` docstring and `AGENTS.md` invariant 5).
 
 ### `_build_subagent_tool(preset_name, *, description, provider_config)`
 
@@ -370,7 +374,7 @@ Reimplements `coreouto.contrib.agent_as_tool` for one specific reason: the stock
 1. Fetches the preset, gets its config.
 2. Merges `provider_config` (which always contains at least `max_tokens`) into `config.provider_config`.
 3. Builds a new `co.Agent(config)` and wraps it as a `co.Tool` named `call_<preset_name>` (so the tool becomes `call_subagent`).
-4. The `parameters` schema is hardcoded: `{"task": {"type": "string"}}`, required: `["task"]`.
+4. The `parameters` schema declares both `tasks` (array of strings — multiple briefs run in parallel, one combined numbered result) and `task` (single brief). Note the schema dict itself is dead code today — the model sees the handler's type hints plus the description string (see `docs/development.md` known issues).
 5. The async handler returns `sub_agent.call(task).content`.
 
 ### `RuntimeConfig`

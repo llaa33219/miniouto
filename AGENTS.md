@@ -122,8 +122,10 @@ If you touch `get_max_output_tokens`, you must preserve the floor. Always thread
 
 There is **one** deliberate precedence tier above lma: a per-provider `max_output_tokens` override (field on the `Provider` dataclass, set via the TUI custom-model editor). `_provider_caps_override` consults `provider_store` on every call (no caching — the TUI is long-lived and edits these mid-session). The override wins over lma. The CLI `chat --max-tokens` flag still wins over the override. Precedence: `--max-tokens` > provider override > lma `max_output_tokens` > lma `context_window` > `DEFAULT_MAX_OUTPUT_TOKENS`. The same override path exists for `max_context_window` via `get_context_window`.
 
-### 5. Subagent is a re-implemented `agent_as_tool`
+### 5. Subagent is a re-implemented `agent_as_tool` — with multi-brief fan-out
 `core/runtime.py:_build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()` — that means subagent file-writing calls inherit the provider's low hard cap (1024 for Anthropic → silent truncation). This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
+
+The tool accepts BOTH `task` (a single brief, legacy) and `tasks` (an array of briefs): `_wrap_subagent_handler` runs every brief as its own supervised subagent concurrently (`asyncio.gather`) and returns ONE combined, numbered tool result; a failed brief degrades to an `error:` section instead of failing its siblings. **Why**: current models emit at most one tool call per assistant response, so N-parallel-blocks never materializes — parallel delegation has to live inside a single invocation. **This is a workaround, not a design goal: if models learn to emit several tool_use blocks per response naturally, revert to one brief per call and remove `tasks`** (rollback note also lives in the `_wrap_subagent_handler` docstring and `docs/core.md`).
 
 **Do not "simplify" this back to `coreouto.contrib.agent_as_tool`.**
 

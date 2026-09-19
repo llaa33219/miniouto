@@ -424,22 +424,38 @@ def _notify_subagent(phase: str, sid: str, text: str) -> None:
 
 
 def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap `call_subagent`'s handler so depth + id ContextVars track it.
+    """Wrap `call_subagent`'s handler: multi-brief fan-out + tracking.
 
-    coreouto's `BEFORE_TOOL_CALL` hook is global and does not carry agent
-    context, so without this we cannot tell whether a Bash/Image/etc. call
-    came from outo or from a subagent. Setting/resetting the ContextVars
-    around the inner handler gives the hooks the information they need,
-    and minting the id here (this wrapper runs exactly once per subagent
-    invocation) gives each invocation a stable `subagent-<6hex>` label.
+    WHY multi-brief: current models reliably emit at most ONE tool call
+    per assistant response, so "spawn N subagents as N `call_subagent`
+    tool_use blocks in one turn" never materializes — the blocks come out
+    serialized across turns no matter what the styles say. Parallel
+    delegation therefore lives INSIDE a single invocation: the handler
+    accepts `tasks` (an array of self-contained briefs) alongside the
+    legacy `task` string and runs every brief as its own supervised
+    subagent concurrently, returning ONE combined, numbered tool result
+    (the model made one tool call). A failed brief degrades to an
+    `error:` section instead of failing its siblings.
 
-    The subagent call itself runs under `supervised_run` at level=depth:
+    Per-brief mechanics are unchanged from the single-brief era: each
+    brief gets its own 6-hex id (ContextVars are copied per asyncio task,
+    so concurrent briefs attribute events to their own `subagent-<6hex>`
+    label), its own stall supervisor (`supervised_run` at level=depth —
     a wedged subagent is cancelled and resumed from its own sanitized
-    transcript (keyed by sid) without taking the parent turn down with
-    it. The wrapper also pops the invocation's live-messages entry.
+    transcript without taking the parent turn down), and its own
+    start/end observer notifications. Depth + id ContextVars are also
+    what tells the global BEFORE_TOOL_CALL hook whether a Bash/Image/etc.
+    call came from outo or from a subagent.
+
+    ROLLBACK NOTE: this array-parameter fan-out is a workaround for
+    single-tool-call-per-turn models, not a design goal — it bends the
+    one-tool-call-one-subagent shape the codebase otherwise prefers. If
+    models learn to emit several tool_use blocks in one response
+    naturally, revert to one brief per call and remove the `tasks`
+    parameter (see docs/core.md § `call_subagent`).
     """
 
-    async def wrapped(task: str) -> str:
+    async def _run_one(task: str) -> str:
         sid = secrets.token_hex(3)  # 6 hex chars
         depth_token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
         id_token = _SUBAGENT_ID.set(sid)
@@ -469,6 +485,33 @@ def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
             _LIVE_MESSAGES.pop(sid, None)
             _SUBAGENT_ID.reset(id_token)
             _SUBAGENT_DEPTH.reset(depth_token)
+
+    async def wrapped(task: str = "", tasks: list[str] | None = None) -> str:
+        briefs = [
+            t
+            for t in ([task] if task else []) + list(tasks or [])
+            if isinstance(t, str) and t.strip()
+        ]
+        if not briefs:
+            raise ValueError(
+                "call_subagent requires `task` (a single brief) or `tasks` "
+                "(an array of briefs); neither was usable."
+            )
+        if len(briefs) == 1:
+            return await _run_one(briefs[0])
+        n = len(briefs)
+        results = await asyncio.gather(
+            *[_run_one(b) for b in briefs], return_exceptions=True
+        )
+        parts: list[str] = []
+        for i, (brief, res) in enumerate(zip(briefs, results), 1):
+            if isinstance(res, BaseException):
+                res = f"error: {type(res).__name__}: {res}"
+            preview = " ".join(brief.split())
+            if len(preview) > 120:
+                preview = preview[:120] + "…"
+            parts.append(f"[{i}/{n}] task: {preview}\n{res or '(empty result)'}")
+        return "\n\n".join(parts)
 
     return wrapped
 
@@ -503,12 +546,20 @@ def _build_subagent_tool(
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
+            "tasks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "One or more self-contained task briefs. Multiple "
+                    "briefs run in parallel as separate subagents and "
+                    "return one combined, numbered result."
+                ),
+            },
             "task": {
                 "type": "string",
-                "description": "The task description to pass to the sub-agent.",
-            }
+                "description": "A single self-contained brief (same as tasks: [brief]).",
+            },
         },
-        "required": ["task"],
     }
 
     async def start(task: str | None, history: list[Any] | None = None) -> str:
@@ -891,12 +942,16 @@ def _make_thinking_logger(callback: Callable[[str], None]):
 
 def _subagent_description() -> str:
     return (
-        "Delegate a self-contained task to the subagent. The subagent "
-        "has its own tool access (Bash/Image/Video/Audio) "
-        "and a fresh context. Pass the full brief in the `task` argument. "
-        "The tool blocks until the subagent terminates the loop (a turn "
-        "with no tool calls) and returns the subagent's final text as the "
-        "result."
+        "Delegate self-contained task briefs to subagent(s). Each brief "
+        "runs in a fresh context with its own tool access "
+        "(Bash/Image/Video/Audio) and blocks until it terminates; the "
+        "final text is the result. Pass ONE brief for a single delegation, "
+        "or an ARRAY of briefs in `tasks` to run several subagents in "
+        "parallel — independent briefs (different targets, no shared "
+        "state) should go out together in one call; you receive one "
+        "combined result numbered per brief. Every brief is a complete "
+        "specification on its own — goal, paths, context, constraints, "
+        "expected result — the subagent sees nothing else."
     )
 
 
