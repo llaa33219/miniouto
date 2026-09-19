@@ -104,10 +104,11 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
       CALLS (which command produced which result), not just truncated
       result tails — otherwise the handoff cannot name what was done.
     - The compacted message embeds the current task verbatim (extracted
-      deterministically, never LLM-paraphrased) and an explicit frame
-      telling the agent this is the authoritative record: hunting session
-      files or a global `.miniouto` for "the lost transcript" is a known
-      confusion failure this frame exists to prevent.
+      deterministically, never LLM-paraphrased) inside a minimal positive
+      frame — the conversation was compacted, read the handoff and
+      continue naturally. No prohibitions: naming forbidden recovery
+      behavior (sessions, `.miniouto`, transcripts) plants the very idea,
+      and a handoff that carries everything leaves nothing to recover.
     - The summarizer agent gets its own `max_tokens` — without it the
       active provider's low default (Anthropic: 1024) silently truncates
       the handoff mid-section, which is the same confusion by another door.
@@ -144,23 +145,13 @@ def make_summarize_hook(model: str, session_name: str, provider_name: str | None
     def _compact_frame(task_verbatim: str, handoff: str) -> str:
         frame = (
             "[Summary — compacted context]\n"
-            "The earlier conversation was compacted to fit the context "
-            "window. This message REPLACES that transcript and is the "
-            "authoritative record of everything that happened so far — "
-            "everything still relevant is already in here.\n"
-            "Rules:\n"
-            "- Do NOT search the filesystem for the original conversation, "
-            "session files, transcripts, or a `.miniouto` directory to "
-            "'recover' context — there is nothing more to recover, and "
-            "hunting for it only wastes turns.\n"
-            "- If a detail you need is genuinely absent, re-derive it from "
-            "the actual project files on disk (they are the ground truth "
-            "and already reflect all completed work), or ask the user.\n"
-            "- Continue the task from the NEXT section of the handoff.\n"
+            "The earlier conversation was compacted into the handoff "
+            "below. Read it carefully, then continue the task naturally "
+            "from where it stands.\n"
         )
         parts = [frame]
         if task_verbatim:
-            parts.append(f"\n## Current task (verbatim, do not re-ask)\n{task_verbatim}")
+            parts.append(f"\n## Current task (verbatim)\n{task_verbatim}")
         parts.append(f"\n## Context handoff\n{handoff}")
         return "".join(parts)
 
