@@ -351,14 +351,14 @@ wheels = [
 
 [[package]]
 name = "coreouto"
-version = "0.11.2"
+version = "0.11.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/95/70/de573e6b564b08428be4162709d39825db5ee3b58e4a419874cf8cc5f585/coreouto-0.11.2.tar.gz", hash = "sha256:e1333570858180264869fca0107bdac40d68b63b55543fc18cf8700207d12a81", size = 122200, upload-time = "2026-08-17T08:32:25.26Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/15/207e41f49d3e0c156e9240831e47f01210a61d4a3d6d50a31cc7fb13a0f6/coreouto-0.11.3.tar.gz", hash = "sha256:dea25d39915476e5c8db37192576323bd0a627b2a80a5acef0d9084be2ee9fa9", size = 124766, upload-time = "2026-09-20T13:07:22.839Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2f/31/591d9fa925aad85260ae7be1f5b867bbec55e9464f07ba307c2325513091/coreouto-0.11.2-py3-none-any.whl", hash = "sha256:440884e5603b4e12fe606ab8e9e4d48a4cb3d6db6e8fdff15aa584ddf050b436", size = 39228, upload-time = "2026-08-17T08:32:23.832Z" },
+    { url = "https://files.pythonhosted.org/packages/31/4e/4f1f95301ad3f33433edfa3aabc23d5cc90a67437786bdae4bea83fff0a0/coreouto-0.11.3-py3-none-any.whl", hash = "sha256:1a0dd3c43a5d76d8ecdf09cd09ad56c7c52542f2d18842a7caaa26b7b1a7e015", size = 39547, upload-time = "2026-09-20T13:07:21.601Z" },
 ]
 
 [package.optional-dependencies]

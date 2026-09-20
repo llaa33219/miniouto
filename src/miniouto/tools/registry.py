@@ -5,7 +5,13 @@ from __future__ import annotations
 import coreouto as co
 
 from .bash import bash
-from .computer import Screenshot, computer, computer_supported
+from .computer import (
+    ComputerAction,
+    Screenshot,
+    ScrollDirection,
+    computer,
+    computer_supported,
+)
 from .media import load_audio, load_image, load_video
 
 
@@ -230,11 +236,11 @@ def _make_computer_handler(api_format: str | None):
         return _computer_handler
 
     def without_screenshots(
-        action: str,
+        action: ComputerAction,
         coordinate: list[int] | None = None,
         end_coordinate: list[int] | None = None,
         text: str | None = None,
-        scroll_direction: str | None = None,
+        scroll_direction: ScrollDirection | None = None,
         scroll_amount: int = 3,
         duration: float = 1.0,
         screen: str | None = None,
@@ -256,17 +262,18 @@ def _make_computer_handler(api_format: str | None):
 
 
 def _computer_handler(
-    # `str`, not Literal: the registered handler's annotations ARE the tool
-    # schema the model sees, and coreouto's generator emits type-less enums
-    # for Literals ("properties.x: type is not defined" → HTTP 400 on strict
-    # providers such as moonshot's flavored JSON schema — reported
-    # upstream). Values are validated at runtime by computer(): an unknown
-    # action or scroll direction raises ComputerUseError.
-    action: str,
+    # Literals are safe again since coreouto >= 0.11.3 (its schema
+    # generator now emits {"type": "string", "enum": [...]} for str-based
+    # Literals — 0.11.2 and earlier omitted the type, which strict
+    # validators such as moonshot's flavored JSON schema rejected with a
+    # 400). Hence the >=0.11.3 floor in pyproject. Values are still
+    # validated at runtime by computer(): an unknown action or scroll
+    # direction raises ComputerUseError.
+    action: ComputerAction,
     coordinate: list[int] | None = None,
     end_coordinate: list[int] | None = None,
     text: str | None = None,
-    scroll_direction: str | None = None,
+    scroll_direction: ScrollDirection | None = None,
     scroll_amount: int = 3,
     duration: float = 1.0,
     screen: str | None = None,
