@@ -5,13 +5,7 @@ from __future__ import annotations
 import coreouto as co
 
 from .bash import bash
-from .computer import (
-    ComputerAction,
-    Screenshot,
-    ScrollDirection,
-    computer,
-    computer_supported,
-)
+from .computer import Screenshot, computer, computer_supported
 from .media import load_audio, load_image, load_video
 
 
@@ -19,30 +13,26 @@ def register_all(api_format: str | None = None) -> None:
     """Register Bash, Image, Video, Audio, Computer as coreouto tools.
 
     Idempotent: if a name is already registered, leave it alone. Computer
-    is registered only when BOTH gates pass:
-
-    - `computer_supported()` — on platforms where the bundled compositor
-      cannot run, the tool is never advertised to the model.
-    - `api_format != "openai"` — openai Chat Completions rejects multimodal
-      tool results (the provider raises "does not support multimodal tool
-      results (image block detected)" while formatting the request), so a
-      `screenshot` would kill the whole turn. anthropic / openai-response /
-      google all accept image tool results. Not advertising the tool on
-      such providers trades a mid-turn crash for coreouto's unknown-tool
-      teaching error — the same philosophy as the platform gate.
+    is registered whenever `computer_supported()` (platform gate). The
+    outo provider's `api_format` does NOT gate registration — it selects
+    the handler variant: on openai (Chat Completions), which cannot carry
+    multimodal tool results, `screenshot` returns an explanatory notice
+    instead of an image (every other action is a text result and works
+    unchanged); anthropic / openai-response / google return the image as
+    always.
     """
 
     _register_if_missing("Bash", _bash_handler, _bash_schema(), _bash_description())
     _register_if_missing("Image", _image_handler, _image_schema(), _image_description())
     _register_if_missing("Video", _video_handler, _video_schema(), _video_description())
     _register_if_missing("Audio", _audio_handler, _audio_schema(), _audio_description())
-    if computer_supported() and api_format != "openai":
+    if computer_supported():
         # parallelizable=False: the virtual screen is one shared, order-
         # sensitive resource — it must never run concurrently with another
         # tool call.
         _register_if_missing(
             "Computer",
-            _computer_handler,
+            _make_computer_handler(api_format),
             _computer_schema(),
             _computer_description(),
             parallelizable=False,
@@ -214,12 +204,69 @@ def _audio_schema() -> dict:
     }
 
 
+_SCREENSHOT_UNSUPPORTED = (
+    "Screenshot unavailable: this model runs on an openai chat-completions "
+    "provider, which cannot receive image tool results — the agent cannot "
+    "view the screen. Relay this to the user exactly: GUI control actions "
+    "(launch / click / type / scroll) still work, but the agent cannot SEE "
+    "screenshots on this provider; visual verification requires a provider "
+    "whose api_format carries image tool results (anthropic, "
+    "openai-response, or google). Do not retry screenshot on this provider."
+)
+
+
+def _make_computer_handler(api_format: str | None):
+    """Pick the Computer handler variant for the outo provider's format.
+
+    openai (Chat Completions) rejects multimodal tool results while the
+    provider formats the request — a screenshot there used to raise
+    ValueError and kill the whole turn. The degraded variant returns the
+    explanatory notice above instead (a plain text result the model relays
+    to the user); every other action is a text result and passes through
+    unchanged. All other formats get the real image-returning handler.
+    """
+
+    if api_format != "openai":
+        return _computer_handler
+
+    def without_screenshots(
+        action: str,
+        coordinate: list[int] | None = None,
+        end_coordinate: list[int] | None = None,
+        text: str | None = None,
+        scroll_direction: str | None = None,
+        scroll_amount: int = 3,
+        duration: float = 1.0,
+        screen: str | None = None,
+    ) -> str | list:
+        if action == "screenshot":
+            return _SCREENSHOT_UNSUPPORTED
+        return _computer_handler(
+            action=action,
+            coordinate=coordinate,
+            end_coordinate=end_coordinate,
+            text=text,
+            scroll_direction=scroll_direction,
+            scroll_amount=scroll_amount,
+            duration=duration,
+            screen=screen,
+        )
+
+    return without_screenshots
+
+
 def _computer_handler(
-    action: ComputerAction,
+    # `str`, not Literal: the registered handler's annotations ARE the tool
+    # schema the model sees, and coreouto's generator emits type-less enums
+    # for Literals ("properties.x: type is not defined" → HTTP 400 on strict
+    # providers such as moonshot's flavored JSON schema — reported
+    # upstream). Values are validated at runtime by computer(): an unknown
+    # action or scroll direction raises ComputerUseError.
+    action: str,
     coordinate: list[int] | None = None,
     end_coordinate: list[int] | None = None,
     text: str | None = None,
-    scroll_direction: ScrollDirection | None = None,
+    scroll_direction: str | None = None,
     scroll_amount: int = 3,
     duration: float = 1.0,
     screen: str | None = None,
@@ -257,7 +304,9 @@ def _computer_description() -> str:
         "(screens). One screen runs ONE app; screens are spawned lazily "
         "(default 1280x720) and shared across calls. "
         "Core loop: `launch` an app, then repeat screenshot -> act -> "
-        "screenshot. ALWAYS take a screenshot before clicking anything — "
+        "screenshot. On providers whose format cannot carry image tool "
+        "results, `screenshot` returns an explanatory notice instead of "
+        "an image; all other actions are unaffected. ALWAYS take a screenshot before clicking anything — "
         "click coordinates come from the latest screenshot; (0, 0) is the "
         "top-left corner, units are screen pixels, positions are clamped "
         "to the screen. After any action that changes the screen, "

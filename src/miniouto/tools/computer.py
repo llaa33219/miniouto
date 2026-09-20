@@ -360,7 +360,7 @@ def _dispatch(
         return f"Dragged from ({x1}, {y1}) to ({x2}, {y2})."
 
     if action == "scroll":
-        if scroll_direction is None:
+        if scroll_direction not in _SCROLL_VECTORS:
             raise ComputerUseError(
                 "action 'scroll' requires scroll_direction: up/down/left/right."
             )

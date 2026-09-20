@@ -682,9 +682,10 @@ def build_runtime(
         raise RuntimeError(f"Subagent provider {sub_provider_name!r} is not configured.")
     build_coreouto_provider(sub_provider)
 
-    # Provider-format gate: Computer's screenshot returns an image tool
-    # result, which openai Chat Completions rejects outright — on that
-    # format the tool is never advertised (see tools/registry.register_all).
+    # api_format selects the Computer handler variant: openai Chat
+    # Completions cannot carry image tool results, so screenshot there
+    # returns an explanatory notice instead of an image (see
+    # tools/registry._make_computer_handler).
     tool_registry.register_all(api_format=provider.api_format)
 
     outo_style, subagent_style = _resolve_both_styles(runtime.style_name, style_overrides)
