@@ -19,14 +19,18 @@ def register_all(api_format: str | None = None) -> None:
     """Register Bash, Image, Video, Audio, Computer as coreouto tools.
 
     Idempotent: if a name is already registered, leave it alone. Computer
-    is registered whenever `computer_supported()` (platform gate). The
-    outo provider's `api_format` does NOT gate registration — it selects
-    the handler variant: on openai (Chat Completions), which cannot carry
-    multimodal tool results, `screenshot` returns an explanatory notice
-    instead of an image (every other action is a text result and works
-    unchanged); anthropic / openai-response / google return the image as
-    always.
+    is registered whenever `computer_supported()` (platform gate) with ONE
+    handler; screenshot availability is decided AT CALL TIME from
+    `_SCREENSHOTS_SUPPORTED`, which this function refreshes on every
+    invocation (build_runtime runs per turn — including after a mid-session
+    provider switch in the long-lived TUI): on openai (Chat Completions),
+    which cannot carry multimodal tool results, `screenshot` returns the
+    explanatory notice instead of an image; every other action is a text
+    result and works unchanged; anthropic / openai-response / google return
+    the image as always.
     """
+    global _SCREENSHOTS_SUPPORTED
+    _SCREENSHOTS_SUPPORTED = api_format != "openai"
 
     _register_if_missing("Bash", _bash_handler, _bash_schema(), _bash_description())
     _register_if_missing("Image", _image_handler, _image_schema(), _image_description())
@@ -38,7 +42,7 @@ def register_all(api_format: str | None = None) -> None:
         # tool call.
         _register_if_missing(
             "Computer",
-            _make_computer_handler(api_format),
+            _computer_handler,
             _computer_schema(),
             _computer_description(),
             parallelizable=False,
@@ -210,55 +214,22 @@ def _audio_schema() -> dict:
     }
 
 
+# Refreshed by register_all() on every build_runtime (per turn). Kept as a
+# module flag so the one registered Computer handler can react to mid-session
+# provider switches without depending on re-registration timing.
+_SCREENSHOTS_SUPPORTED = True
+
+
 _SCREENSHOT_UNSUPPORTED = (
-    "Screenshot unavailable: this model runs on an openai chat-completions "
-    "provider, which cannot receive image tool results — the agent cannot "
-    "view the screen. Relay this to the user exactly: GUI control actions "
-    "(launch / click / type / scroll) still work, but the agent cannot SEE "
-    "screenshots on this provider; visual verification requires a provider "
-    "whose api_format carries image tool results (anthropic, "
-    "openai-response, or google). Do not retry screenshot on this provider."
+    "Screenshot unavailable RIGHT NOW: the CURRENT provider uses the openai "
+    "chat-completions format, which cannot receive image tool results. "
+    "Relay to the user: on this provider the agent cannot view the screen "
+    "(GUI control actions — launch / click / type / scroll — still work); "
+    "seeing screenshots needs a provider whose api_format carries image "
+    "tool results (anthropic, openai-response, or google). This is a "
+    "property of the CURRENT provider only — if the provider has been "
+    "switched since, call screenshot again and it will work."
 )
-
-
-def _make_computer_handler(api_format: str | None):
-    """Pick the Computer handler variant for the outo provider's format.
-
-    openai (Chat Completions) rejects multimodal tool results while the
-    provider formats the request — a screenshot there used to raise
-    ValueError and kill the whole turn. The degraded variant returns the
-    explanatory notice above instead (a plain text result the model relays
-    to the user); every other action is a text result and passes through
-    unchanged. All other formats get the real image-returning handler.
-    """
-
-    if api_format != "openai":
-        return _computer_handler
-
-    def without_screenshots(
-        action: ComputerAction,
-        coordinate: list[int] | None = None,
-        end_coordinate: list[int] | None = None,
-        text: str | None = None,
-        scroll_direction: ScrollDirection | None = None,
-        scroll_amount: int = 3,
-        duration: float = 1.0,
-        screen: str | None = None,
-    ) -> str | list:
-        if action == "screenshot":
-            return _SCREENSHOT_UNSUPPORTED
-        return _computer_handler(
-            action=action,
-            coordinate=coordinate,
-            end_coordinate=end_coordinate,
-            text=text,
-            scroll_direction=scroll_direction,
-            scroll_amount=scroll_amount,
-            duration=duration,
-            screen=screen,
-        )
-
-    return without_screenshots
 
 
 def _computer_handler(
@@ -278,6 +249,8 @@ def _computer_handler(
     duration: float = 1.0,
     screen: str | None = None,
 ) -> str | list:
+    if action == "screenshot" and not _SCREENSHOTS_SUPPORTED:
+        return _SCREENSHOT_UNSUPPORTED
     result = computer(
         action,
         coordinate=coordinate,
