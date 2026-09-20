@@ -15,19 +15,28 @@ from .computer import (
 from .media import load_audio, load_image, load_video
 
 
-def register_all() -> None:
+def register_all(api_format: str | None = None) -> None:
     """Register Bash, Image, Video, Audio, Computer as coreouto tools.
 
     Idempotent: if a name is already registered, leave it alone. Computer
-    is registered only when `computer_supported()` — on platforms where the
-    bundled compositor cannot run, the tool is never advertised to the model.
+    is registered only when BOTH gates pass:
+
+    - `computer_supported()` — on platforms where the bundled compositor
+      cannot run, the tool is never advertised to the model.
+    - `api_format != "openai"` — openai Chat Completions rejects multimodal
+      tool results (the provider raises "does not support multimodal tool
+      results (image block detected)" while formatting the request), so a
+      `screenshot` would kill the whole turn. anthropic / openai-response /
+      google all accept image tool results. Not advertising the tool on
+      such providers trades a mid-turn crash for coreouto's unknown-tool
+      teaching error — the same philosophy as the platform gate.
     """
 
     _register_if_missing("Bash", _bash_handler, _bash_schema(), _bash_description())
     _register_if_missing("Image", _image_handler, _image_schema(), _image_description())
     _register_if_missing("Video", _video_handler, _video_schema(), _video_description())
     _register_if_missing("Audio", _audio_handler, _audio_schema(), _audio_description())
-    if computer_supported():
+    if computer_supported() and api_format != "openai":
         # parallelizable=False: the virtual screen is one shared, order-
         # sensitive resource — it must never run concurrently with another
         # tool call.
