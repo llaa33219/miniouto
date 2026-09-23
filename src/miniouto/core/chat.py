@@ -24,6 +24,7 @@ from .runtime import (
     build_runtime,
     current_subagent_depth,
     current_subagent_id,
+    current_subagent_name,
     resolve_runtime_from_settings,
     sanitize_history,
     set_subagent_observer,
@@ -67,13 +68,17 @@ def _actor_label() -> tuple[str, str | None]:
     """Return (actor_label, subagent_id) for the current hook context.
 
     Inside a subagent invocation the id ContextVar is always set, so the
-    label is `subagent-<6hex>`; the depth-only fallback exists solely for
-    defensive robustness (the two vars are set together in the wrapper).
+    label is `<name>-<6hex>` (name comes from the named subagent persona
+    in the style; legacy single `<subagent>` blocks resolve to the name
+    `"subagent"`, which preserves the old `subagent-<sid>` display).
+    The depth-only fallback exists solely for defensive robustness (the
+    vars are set together in the wrapper).
     """
 
     sid = current_subagent_id()
     if sid:
-        return f"subagent-{sid}", sid
+        name = current_subagent_name() or "subagent"
+        return f"{name}-{sid}", sid
     if current_subagent_depth() > 0:
         return "subagent", None
     return "outo", None
@@ -527,16 +532,18 @@ def _make_tool_result_dispatcher(sink: EventSink):
 def _make_subagent_dispatcher(sink: EventSink):
     """Build the subagent lifecycle callback for `set_subagent_observer`.
 
-    Receives (phase, sid, text) from the wrapped `call_subagent` handler —
-    "start" carries the task brief, "wakeup" a supervisor restart notice,
-    "end" the final result or error. This is the only place the minted
-    subagent id exists at event level; the BEFORE_TOOL_CALL hook for
-    `call_subagent` itself still runs in the parent context and never
-    sees the id.
+    Receives (phase, sid, name, text) from the wrapped `call_subagent`
+    handler — "start" carries the task brief, "wakeup" a supervisor
+    restart notice, "end" the final result or error. `name` is the named
+    subagent persona from the active style (legacy `<subagent>` blocks
+    resolve to the name `"subagent"`, which preserves the old
+    `subagent-<sid>` display). This is the only place the minted subagent
+    id exists at event level; the BEFORE_TOOL_CALL hook for `call_subagent`
+    itself still runs in the parent context and never sees the id.
     """
 
-    def on_subagent(phase: str, sid: str, text: str) -> None:
-        actor = f"subagent-{sid}"
+    def on_subagent(phase: str, sid: str, name: str, text: str) -> None:
+        actor = f"{name}-{sid}"
         # The full text goes into the event (and thus the session turn and
         # the TUI detail screen); sinks truncate for their own display.
         if phase == "start":
@@ -547,6 +554,7 @@ def _make_subagent_dispatcher(sink: EventSink):
                     text=text,
                     tool_name="call_subagent",
                     subagent_id=sid,
+                    subagent_name=name,
                 )
             )
             sink.update_activity(actor)
@@ -554,7 +562,13 @@ def _make_subagent_dispatcher(sink: EventSink):
             # The subagent's own supervisor restarted it after a stall —
             # surfaced as a watchdog event attributed to the invocation.
             sink.emit_loop_event(
-                LoopEvent(actor=actor, kind="wakeup", text=text, subagent_id=sid)
+                LoopEvent(
+                    actor=actor,
+                    kind="wakeup",
+                    text=text,
+                    subagent_id=sid,
+                    subagent_name=name,
+                )
             )
         else:
             sink.emit_loop_event(
@@ -563,6 +577,7 @@ def _make_subagent_dispatcher(sink: EventSink):
                     kind="subagent_end",
                     text=text or "done",
                     subagent_id=sid,
+                    subagent_name=name,
                 )
             )
 
@@ -843,4 +858,24 @@ def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
         if text:
             parts.append(str(text).replace("\n", " ")[:80])
         return " ".join(parts)
+    if name == "call_subagent":
+        label = args.get("name") or "subagent"
+        brief: str | None = None
+        task = args.get("task")
+        if isinstance(task, str):
+            brief = task
+        if brief is None:
+            tasks = args.get("tasks")
+            if isinstance(tasks, list) and tasks and isinstance(tasks[0], str):
+                brief = tasks[0]
+        if brief is None:
+            briefs = args.get("briefs")
+            if isinstance(briefs, list) and briefs and isinstance(briefs[0], dict):
+                t = briefs[0].get("task")
+                if isinstance(t, str):
+                    brief = t
+        preview = " ".join((brief or "").split())
+        if len(preview) > 80:
+            preview = preview[:80] + "…"
+        return f"{label} {preview}" if preview else label
     return str(args)[:120]
