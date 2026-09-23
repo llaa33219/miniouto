@@ -25,9 +25,9 @@ Three principles from `README.md`: **Minimalism** (no bloat — extend with styl
 ~/.miniouto/                     ← user's storage (override via $MINIOUTO_HOME)
 ├── providers.toml               ← LLM API connections (one top-level table per provider)
 ├── settings.toml                ← active provider / model / style / session / theme
-├── style/*.md                   ← system prompts (outo + subagent halves)
+├── style/*.md                   ← system prompts (outo body + N named subagent bodies)
 ├── sessions/*.json              ← schema v2: restorable history + display turns
-└── logs/                        ← reserved (currently unused)
+└── logs/                        ← reserved (default)
 
 ~/.agents/skills/                ← skills (NOT under ~/.miniouto/)
 └── <name>/SKILL.md              ← YAML frontmatter + markdown body
@@ -63,8 +63,11 @@ CLI flag bag → ChatOptions (core/chat.py)
                   wedged subagent is recovered in place without tearing
                   down the parent turn.
                 → Bash/Image/Video/Audio/Computer (via tools/registry.py)
-                → call_subagent (delegates to subagent preset; each invocation
-                  mints a subagent-<6hex> id tracked via ContextVars)
+                → call_subagent (registered only when the active style
+                  declares ≥1 named subagent; dispatches to the named
+                  preset by `name=`/`task`/`tasks`/`briefs`; each
+                  invocation mints a `<name>-<6hex>` id tracked via
+                  ContextVars)
             → incremental persistence: begin_turn before the loop, event +
               sanitized-history snapshots during it, then finish_turn stamps
               the turn done (history rewritten from Response.messages minus
@@ -96,13 +99,18 @@ These rules hold throughout the codebase. Breaking any of them silently degrades
 ### 1. Provider registry is rebuilt every turn
 `core/runtime.py:build_runtime` calls `core.providers.clear_coreouto_state()` at the very start, then re-registers providers, presets, tools, hooks. This makes `build_runtime` **idempotent across CLI invocations** — necessary because TUI mode is a long-lived process that re-enters the function many times. **Do not remove `clear_coreouto_state()`.**
 
-### 2. Style documents are split into two halves
-`storage/styles.py:split_style` parses each `.md` into `(outo_part, subagent_part)` using `<outo>...</outo>` and `<subagent>...</subagent>` tags:
+### 2. Style documents are parsed top-level — the tag name IS the subagent name
+`storage/styles.py:parse_style(content) -> tuple[str, list[SubagentSpec]]` parses each `.md` with a single sequential scan over the document's top level. `SubagentSpec` is a frozen dataclass with `name: str` (the tag name) and `prompt: str` (the tag body, used as that subagent's system prompt). Rules:
 
-- `<outo>` is required (or the whole document is used).
-- `<subagent>` is **optional** — if absent, `core/runtime.py:_fallback_style("subagent")` provides a hardcoded minimal prompt.
+- `<outo>...</outo>` is the outo prompt. If absent, the **whole document** is the outo prompt (unchanged from the old behavior).
+- **Each** `<name>...</name>` pair at the top level, outside `<outo>`, is one **named subagent** — the tag name IS the name. Tag names match `[A-Za-z][A-Za-z0-9_-]*` (hyphens allowed: `file-picker`, `researcher-docs`).
+- `outo` is reserved (always the outo prompt).
+- **Legacy compat**: a `<subagent>...</subagent>` block is parsed as a subagent named `"subagent"`. Old style files keep working unchanged — they get one named subagent called `subagent`, and actor labels stay `subagent-<6hex>`.
+- **Zero named subagents → no subagent preset, no `call_subagent` tool registered**. There is no fallback subagent prompt anymore. An outo-only style does not advertise delegation to the model at all.
+- Parse is **top-level only**: a pair nested inside another tag body is treated as content, not as a subagent. Stray prose outside any tag is ignored.
+- Duplicate names at the top level raise `ValueError`.
 
-If you change the tag format, update `split_style`, `default_style/*.md`, and `docs/styles.md`.
+If you change the tag format, update `parse_style`, `default_style/*.md`, and `docs/styles.md`. (`split_style` is gone — do not reintroduce it.)
 
 ### 3. Two-layer prompt assembly (skills are lazy-loaded)
 The final prompt the outo model sees, top to bottom:
@@ -110,7 +118,7 @@ The final prompt the outo model sees, top to bottom:
 2. **A skill catalog** from `~/.agents/skills/` — a `# Available Skills` block listing each skill as `- <name>: <description>` plus a note that full instructions live at `~/.agents/skills/<name>/SKILL.md`. Bodies are **not** injected; the agent reads them on demand via Bash (lazy loading).
 3. **The `<outo>` section** of the active style (or whole-document fallback).
 
-Subagent mirrors this with `<subagent>` content and a different cwd preamble. The cwd preamble is regenerated on every call (not persisted).
+Each named subagent mirrors this with its own tag body and a different cwd preamble. The cwd preamble is regenerated on every call (not persisted).
 
 ### 4. Context-window safety
 `core/context.py` enforces a **16K-token output floor** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`):
@@ -122,22 +130,30 @@ If you touch `get_max_output_tokens`, you must preserve the floor. Always thread
 
 There is **one** deliberate precedence tier above lma: a per-provider `max_output_tokens` override (field on the `Provider` dataclass, set via the TUI custom-model editor). `_provider_caps_override` consults `provider_store` on every call (no caching — the TUI is long-lived and edits these mid-session). The override wins over lma. The CLI `chat --max-tokens` flag still wins over the override. Precedence: `--max-tokens` > provider override > lma `max_output_tokens` > lma `context_window` > `DEFAULT_MAX_OUTPUT_TOKENS`. The same override path exists for `max_context_window` via `get_context_window`.
 
-### 5. Subagent is a re-implemented `agent_as_tool` — with multi-brief fan-out
-`core/runtime.py:_build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()` — that means subagent file-writing calls inherit the provider's low hard cap (1024 for Anthropic → silent truncation). This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
+### 5. Subagent is a re-implemented `agent_as_tool` — with multi-brief fan-out (same-name and mixed-name)
+`core/runtime.py:_build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()` — that means subagent file-writing calls inherit the provider's low hard cap (1024 for Anthropic → silent truncation). This implementation explicitly merges `provider_config` (containing `max_tokens`) and `provider_passthrough` (containing the resolved reasoning kwargs) into EVERY named subagent's `AgentConfig`. The single tool the model sees is named `call_subagent`, dispatched by `name=`:
 
-The tool accepts BOTH `task` (a single brief, legacy) and `tasks` (an array of briefs): `_wrap_subagent_handler` runs every brief as its own supervised subagent concurrently (`asyncio.gather`) and returns ONE combined, numbered tool result; a failed brief degrades to an `error:` section instead of failing its siblings. **Why**: current models emit at most one tool call per assistant response, so N-parallel-blocks never materializes — parallel delegation has to live inside a single invocation. **This is a workaround, not a design goal: if models learn to emit several tool_use blocks per response naturally, revert to one brief per call and remove `tasks`** (rollback note also lives in the `_wrap_subagent_handler` docstring and `docs/core.md`).
+- `name`: which persona; `""` resolves to `"subagent"` if declared, else the sole subagent if exactly one, else an error listing the available names.
+- `task`: a single self-contained brief (legacy shape).
+- `tasks`: N parallel briefs, ALL to the same `name` (legacy multi-brief fan-out).
+- `briefs`: `list[{"name": …, "task": …}]` — N parallel briefs each with its OWN name. **This is the mixed-role fan-out primitive**: a single `call_subagent` invocation can spawn an editor, a reviewer, and a validator concurrently.
+
+All briefs (from `task` / `tasks` / `briefs`) merge into one `(name, brief)` list and run concurrently under `asyncio.gather` inside `_wrap_subagent_handler`; ONE combined, numbered tool result is returned; a failed brief degrades to an `error:` section instead of failing its siblings. **Why multi-brief exists**: current models emit at most one tool call per assistant response, so N-parallel-blocks never materializes — parallel delegation has to live inside a single invocation. This is a workaround, not a design goal: if models learn to emit several `tool_use` blocks per response naturally, revert to one brief per call and remove both `tasks` and `briefs` (rollback note also lives in the `_wrap_subagent_handler` docstring and `docs/core.md`).
+
+**Conditional registration**: `build_runtime` only registers `call_subagent` when the active style declares at least one named subagent. An outo-only style does not advertise the delegation surface at all.
 
 **Do not "simplify" this back to `coreouto.contrib.agent_as_tool`.**
 
-### 6. `BEFORE_TOOL_CALL` is global — depth + id tracked via ContextVars
-coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context. `core/runtime.py` keeps **two** ContextVars, both set only inside `_wrap_subagent_handler` (which runs exactly once per subagent invocation):
+### 6. `BEFORE_TOOL_CALL` is global — depth + name + id tracked via ContextVars
+coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context. `core/runtime.py` keeps **three** ContextVars, all set only inside `_wrap_subagent_handler` (which runs exactly once per subagent invocation):
 
 - `_SUBAGENT_DEPTH: ContextVar[int]` — "are we inside a subagent?" (defensive fallback label)
+- `_SUBAGENT_NAME: ContextVar[str | None]` — the persona name (`"editor"`, `"subagent"`, …) for this invocation; default `None`.
 - `_SUBAGENT_ID: ContextVar[str | None]` — the invocation's 6-hex id (`secrets.token_hex(3)`)
 
-`core/chat.py:_actor_label()` combines them into actor labels: `outo` vs `subagent-<6hex>`. Because ContextVars are copied per asyncio task, parallel `call_subagent` invocations each keep their own id — this is the mechanism that makes concurrent subagents distinguishable in output. Subagent start/end is reported through the module-level `_SUBAGENT_OBSERVER` slot (set per turn by `run_chat` via `set_subagent_observer`) — the `BEFORE_TOOL_CALL` hook for `call_subagent` itself still runs in the *parent* context and never sees the id, which is why `_make_tool_call_dispatcher` deliberately emits nothing for `call_subagent`.
+`core/chat.py:_actor_label()` combines them into actor labels: `outo` vs `subagent-<6hex>` for the legacy `"subagent"` name vs `{name}-{6hex}` for every other named subagent (so `"editor-abc123"`, `"reviewer-def456"`). Because ContextVars are copied per asyncio task, parallel `call_subagent` invocations each keep their own name + id — this is the mechanism that makes concurrent subagents distinguishable in output. The lifecycle observer signature is `(phase, name, sid, text)` so the start/end events carry the name explicitly. Subagent start/end is reported through the module-level `_SUBAGENT_OBSERVER` slot (set per turn by `run_chat` via `set_subagent_observer`) — the `BEFORE_TOOL_CALL` hook for `call_subagent` itself still runs in the *parent* context and never sees the id, which is why `_make_tool_call_dispatcher` deliberately emits nothing for `call_subagent`.
 
-If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth/id tracking — and the per-invocation stall supervision (`supervised_run` at level=depth) — will be wrong.
+If you add a new async tool that itself calls subagents, route it through `_wrap_subagent_handler` or the depth/name/id tracking — and the per-invocation stall supervision (`supervised_run` at level=depth) — will be wrong.
 
 ### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display), persisted incrementally
 `storage/sessions.py` writes `{"version": 2, "history": [...], "turns": [...]}`:
@@ -210,24 +226,24 @@ The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual 
 | `cli/provider.py` | `provider providers/models/add` (catalog browse + add) + `provider custom add` + `provider list/remove/default` |
 | `cli/style.py` | `style list/set/add/update/show` |
 | `cli/skill.py` | `skill list/show` (read-only) |
-| `cli/subagent.py` | `subagent show/set/clear` — manage the subagent provider/model override persisted in settings |
+| `cli/subagent.py` | `subagent show/set/clear` — manage the subagent provider/model/reasoning override persisted in settings (shared by every named subagent) |
 | `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results) with windowed mounting (`_RowWindow` + `ChatScroll`, shared by the main log and `SubagentDetailScreen`: only a trailing window of rows is mounted, older chunks mount on scroll-up, far-above-viewport rows evict; follow-mode via Textual's built-in `anchor()`), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
 | `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `_run_with_watchdog` (thin level-0 wrapper over `runtime.supervised_run`), `_TurnPersister` (incremental session persistence), `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
-| `core/events.py` | `LoopEvent` (with `subagent_id`, `detail`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events) |
+| `core/events.py` | `LoopEvent` (with `subagent_id`, `subagent_name`, `detail`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events) |
 | `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) ending with coreouto's `TIMEOUT_ERRORS` preset (>= 0.11, `exc_type` match — the HTTP-level stall wakeup for `API_STALL_TIMEOUT_SECONDS`) + `default_error_handling(api_format)`. Tool-call 400/422s use `reaction="retry"` (NOT `tool_result` — that loops forever on malformed calls; coreouto examples/29) paired with the history-repair hook in `core/runtime.py` |
 | `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |
 | `core/reasoning.py` | lma `reasoning_options` resolver → `provider_passthrough` kwargs (`resolve_reasoning_passthrough` + UI helpers `reasoning_choices`/`default_reasoning_choice`); google unsupported |
-| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, `LoopCancelledError` + cancel-guard hook (cooperative loop stop via `threading.Event`), `supervised_run` + `sanitize_history` + `LoopStalledError` + `WATCHDOG_*` (stall watchdog, coreouto examples/27+28 — outo runs at level 0, each subagent invocation at level=depth, deeper supervisors win), history-repair hook (`_make_history_repair_hook` + `_repair_pairing`/`_cut_poisoned_turn`, coreouto examples/29 — repairs poisoned tool-call history in place before each 400/422 retry; each fire pairs first, then cuts ONE suspect turn — malformed-arguments turns first — and `on_history_repair` persists the repaired history so the next turn doesn't reload the poison), subagent tool (per-invocation 6-hex id + lifecycle observer), hooks |
+| `core/runtime.py` | `RuntimeConfig`, `ChatOverrides`, `build_runtime`, `LoopCancelledError` + cancel-guard hook (cooperative loop stop via `threading.Event`), `supervised_run` + `sanitize_history` + `LoopStalledError` + `WATCHDOG_*` (stall watchdog, coreouto examples/27+28 — outo runs at level 0, each subagent invocation at level=depth, deeper supervisors win), history-repair hook (`_make_history_repair_hook` + `_repair_pairing`/`_cut_poisoned_turn`, coreouto examples/29 — repairs poisoned tool-call history in place before each 400/422 retry; each fire pairs first, then cuts ONE suspect turn — malformed-arguments turns first — and `on_history_repair` persists the repaired history so the next turn doesn't reload the poison), subagent tool (per-invocation name + 6-hex id + lifecycle observer), hooks |
 | `storage/__init__.py` | Re-exports submodules (NOT `skills`) |
 | `storage/paths.py` | Path constants (incl. `STYLE_REPOS_FILE`) + `ensure_dirs()` (force-refreshes bundled styles) |
 | `storage/providers.py` | `Provider` dataclass (with `source: SOURCE_CUSTOM \| SOURCE_LMA`, optional `max_context_window`/`max_output_tokens`/`reasoning_effort` overrides) + `SOURCE_*`/`VALID_SOURCES` constants + TOML CRUD |
 | `storage/sessions.py` | `SessionData` + `TurnRecord` (schema v2: restorable `history` + display `turns`, `status` running/done/interrupted) + JSON CRUD with v1 migration + incremental turn persistence (`begin_turn`/`update_turn_events`/`update_history`/`finish_turn`, atomic saves) |
-| `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`, `subagent_provider`, `subagent_model`) + TOML CRUD |
+| `storage/settings.py` | `Settings` (`provider`, `model`, `style`, `session`, `theme`, `subagent_provider`, `subagent_model`, `subagent_reasoning`) + TOML CRUD |
 | `storage/skills.py` | `Skill` discovery from `~/.agents/skills/` (NOT in `__all__`) |
-| `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `split_style` + `builtin_default` |
+| `storage/styles.py` | Style CRUD + `add_from_repo` (records repo in `style_repos.toml`) + `record_repo`/`list_repos` + `parse_style` (-> `(outo_prompt, list[SubagentSpec])`) + `SubagentSpec` (frozen: `name`, `prompt`) + `builtin_default` |
 | `storage/toml_io.py` | `tomllib` + `tomli_w` wrapper |
 | `tools/__init__.py` | Re-exports |
 | `tools/bash.py` | `async bash(command, *, cwd, env)` — stdin is `/dev/null` (never inherited; a stdin-reading command would block forever), `start_new_session=True` + `os.killpg` so timeout/cancel kills the whole process group, and a `PIPE_GRACE_SECONDS` (5 s) grace kills pipe-holding background children after the shell exits (1-hour hard cap: `BASH_TIMEOUT_SECONDS`) |
@@ -236,9 +252,9 @@ The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual 
 | `tools/registry.py` | `register_all()` — wires Bash/Image/Video/Audio/Computer into coreouto (Computer with `parallelizable=False`) |
 | `default_style/default.md` | Minimal fallback style |
 | `default_style/coding.md` | Expert coding agent (~1.6 KB, deliberately minimal) — Bash-only file work, self-contained subagent briefs, verify-don't-fabricate, ask-before-destructive |
-| `default_style/coding-pro.md` | Senior staff engineer orchestrator (~32 KB) — AGENTS.md startup read, delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, parallel tool-call batching mechanics, hard blocks (no sudo / no mass delete / no unprompted commit-push). Renamed from `pro.md` at 0.8.1 (stale seeds + `settings.style` migrated by `ensure_dirs`) |
-| `default_style/coding-work.md` | Pragmatic senior engineer orchestrator (~38 KB) — full autonomy protocol (never ask mid-loop, soft blocks decided + logged, three-strike rule, four true hard blocks), scale-based distribution: read-and-do work goes direct with batched reads (no subagent ceremony on small tasks), large-scale understanding goes to parallel context subagents, multi-site changes go to one editor per independent slice as parallel spawns; five-phase workflow (EXPLORE/PLAN/EXECUTE/REVIEW/VERIFY), 8-role roster with `[ROLE: …]`-tagged 6-section briefs + one single-focus reviewer when warranted |
-| `default_style/coding-ultra.md` | MAX-mode execution orchestrator (~81 KB) — zero-excuse protocol, layered subagent fan-out (3+ file-pickers, best-of-N editors, multi-focus reviewers), named subagent roster, canonical layer sequence 0–9, `.miniouto/docs/` documentation system, worktree-by-default, boulder state. Renamed from `ultra.md` at 0.8.1 |
+| `default_style/coding-pro.md` | Senior staff engineer orchestrator (~32 KB) — AGENTS.md startup read, delegate-vs-DIY decision framework, 5-stage loop, 6-section delegation brief, parallel tool-call batching mechanics, hard blocks (no sudo / no mass delete / no unprompted commit-push). Renamed from `pro.md` at 0.8.1 (stale seeds + `settings.style` migrated by `ensure_dirs`). Named subagent roster declared as top-level tags (the pinned roster: file-picker / thinker / editor / reviewer / validator) |
+| `default_style/coding-work.md` | Pragmatic senior engineer orchestrator (~38 KB) — full autonomy protocol (never ask mid-loop, soft blocks decided + logged, three-strike rule, four true hard blocks), scale-based distribution: read-and-do work goes direct with batched reads (no subagent ceremony on small tasks), large-scale understanding goes to parallel context subagents, multi-site changes go to one editor per independent slice as parallel spawns; five-phase workflow (EXPLORE/PLAN/EXECUTE/REVIEW/VERIFY). Named subagent roster declared as top-level tags (the pinned roster: file-picker / code-searcher / directory-lister / researcher / thinker / editor / reviewer / validator — 8 roles) |
+| `default_style/coding-ultra.md` | MAX-mode execution orchestrator (~81 KB) — zero-excuse protocol, layered subagent fan-out (3+ file-pickers, best-of-N editors, multi-focus reviewers), canonical layer sequence 0–9, `.miniouto/docs/` documentation system, worktree-by-default, boulder state. Renamed from `ultra.md` at 0.8.1. Named subagent roster declared as top-level tags (the pinned roster: 17 roles spanning context gathering, editing, multi-focus review, validation, verification, and doc sync) |
 | `tui/` | **EMPTY placeholder** — TUI code lives in `cli/tui.py` |
 | `utils/` | **EMPTY placeholder** — no code anywhere |
 
@@ -270,13 +286,13 @@ The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual 
 See `docs/tools.md` § "Adding a new tool". TL;DR:
 1. `src/miniouto/tools/<name>.py` with the function (pure stdlib — no coreouto import; return a plain data structure if multimodal, like `media.py`'s `LoadedMedia`).
 2. `tools/registry.py`: schema, description, handler, `_register_if_missing` call. For multimodal tools the handler returns `list[co.ContentBlock]` — see the `Image`/`Video`/`Audio` handlers.
-3. `core/runtime.py`: add name to `ALL_TOOLS` (visible to both presets) or a new list.
+3. `core/runtime.py`: add name to `BASE_TOOLS` (visible to both presets) or `OUTO_ONLY_TOOLS` (outo preset only). `call_subagent` is not in either list — it's registered conditionally based on the active style.
 4. `core/chat.py`: add the name to `_LOGGABLE_TOOL_NAMES`, the tool-name set in `_make_tool_call_dispatcher`, and a branch in `_short_arg_summary` so loop events + failure diagnostics render the tool.
 5. Update `default_style/*.md` if the tool's name or behavior should be documented to the model.
 6. If the tool returns multimodal content, note that provider support varies (OpenAI Chat Completions rejects all multimodal blocks; OpenAI Responses API rejects video/audio). **Do not** put provider names in the description or style prompts — the agent cannot introspect its provider, so such hints are unactionable. Let provider rejections surface as `ValueError` at call time. Document the matrix in `docs/tools.md` for human operators.
 
 ### "Add a new bundled style"
-1. Create `src/miniouto/default_style/<name>.md` (use the `<outo>` / `<subagent>` structure).
+1. Create `src/miniouto/default_style/<name>.md` (use the tag-as-name structure: a single top-level `<outo>...</outo>` block plus zero or more `<name>...</name>` blocks — one per named subagent).
 2. It auto-seeds into `~/.miniouto/style/` and is force-refreshed on every `ensure_dirs()` call (overwrites any same-name installed file when content differs). To let users customize it, copy to a new name rather than editing the bundled one.
 3. Document in `docs/styles.md`.
 
@@ -290,10 +306,10 @@ See `docs/tools.md` § "Adding a new tool". TL;DR:
 Only one place: `src/miniouto/storage/paths.py`. Update the `ROOT` constant.
 
 ### "Change the active tool set"
-`src/miniouto/core/runtime.py:ALL_TOOLS` is shared by both presets; `OUTO_ONLY_TOOLS` (currently just `Computer`) is appended for the outo preset only, because the virtual screen is a single shared resource. For any other asymmetric visibility, edit the `tools=` argument in each `register_agent_preset` call. (Do **not** confuse this with `_resolve_both_styles`, which only resolves the style *prompts*, not the tool lists.)
+`src/miniouto/core/runtime.py:BASE_TOOLS` is shared by both presets; `OUTO_ONLY_TOOLS` (currently just `Computer`) is appended for the outo preset only, because the virtual screen is a single shared resource. `call_subagent` is registered conditionally per turn when the active style declares ≥1 named subagent — it is not in either list. For any other asymmetric visibility, edit the `tools=` argument in each `register_agent_preset` call. (Do **not** confuse this with `parse_style`, which only resolves the style *prompts*, not the tool lists.)
 
 ### "Add tests"
-The test directory doesn't exist yet. Suggested setup in `docs/development.md`. Start with `tools/edit.py` — highest-value, easiest to break with refactors.
+`tests/test_styles.py` exists and covers `parse_style`. Suggested setup in `docs/development.md`. Start with `tools/edit.py` — highest-value, easiest to break with refactors.
 
 ---
 
@@ -304,11 +320,11 @@ The test directory doesn't exist yet. Suggested setup in `docs/development.md`. 
 - **`tui/` and `utils/` are empty** — placeholder directories from an older layout. The TUI code is in `cli/tui.py`. Don't add code to those empty dirs without first deciding the right home for it.
 - **`core/context.py` is not in `core/__init__.py`'s `__all__`** — it's an implementation detail of `runtime.build_runtime`.
 - **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly as `skill_store`.
-- **`continue_loop` is referenced in every bundled style** but **not registered** in `tools/registry.py`. Models improvise. If you want this to actually work, register a no-op tool and add it to `ALL_TOOLS`.
+- **`continue_loop` is referenced in every bundled style** but **not registered** in `tools/registry.py`. Models improvise. If you want this to actually work, register a no-op tool and add it to `BASE_TOOLS`.
 
 ### Bugs / cleanup opportunities
 
-1. **No tests directory exists.** The codebase has zero automated test coverage. `tools/bash.py` and `core/context.py:make_summarize_hook` are the highest-value test targets.
+1. **Test coverage is thin.** `tests/test_styles.py` exists for `parse_style`, but the codebase has no other automated test coverage. `tools/bash.py` and `core/context.py:make_summarize_hook` are the highest-value remaining targets.
 2. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code.
 
 ---

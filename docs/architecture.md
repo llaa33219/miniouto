@@ -7,7 +7,7 @@
 1. A CLI (`miniouto`) and an optional Textual TUI for interactive use.
 2. File-driven configuration (TOML for providers/settings, Markdown for styles, JSON for sessions).
 3. Bundled agent "style" templates (three personas: a minimal default and two orchestrators).
-4. A minimal tool surface (Bash + Image/Video/Audio media viewers, `call_subagent`).
+4. A minimal tool surface (Bash + Image/Video/Audio media viewers, plus `call_subagent` when the active style declares ≥1 named subagent).
 5. Persistence of session history.
 6. Per-turn diagnostic output to stderr.
 
@@ -115,10 +115,12 @@ cli/__init__.py:app (Typer)
   │                     ├─► runtime.build_runtime
   │                     │     ├─► core.providers.build_coreouto_provider (×2: outo + subagent)
   │                     │     ├─► tools.registry.register_all
-  │                     │     ├─► storage.styles.split_style + skills
+  │                     │     ├─► storage.styles.parse_style (→ outo body + N SubagentSpec) + skills
   │                     │     ├─► coreouto.register_agent_preset("outo")
-  │                     │     ├─► coreouto.register_agent_preset("subagent")
+  │                     │     ├─► coreouto.register_agent_preset(<name> for each subagent)
   │                     │     ├─► _build_subagent_tool + _wrap_subagent_handler
+  │                     │     │     (registered only when ≥1 SubagentSpec;
+  │                     │     │      single tool name "call_subagent" with name/task/tasks/briefs dispatch)
   │                     │     ├─► coreouto.register_hook(BEFORE_TOOL_CALL, _make_tool_call_logger)
   │                     │     ├─► coreouto.register_hook(ON_ITERATION, make_summarize_hook)
   │                     │     ├─► coreouto.register_hook(ON_ITERATION, _make_iteration_logger)
@@ -145,13 +147,16 @@ These are non-obvious rules that hold throughout the codebase. **Breaking any of
 ### 1. Provider registry is rebuilt every turn
 `core/runtime.build_runtime` calls `core.providers.clear_coreouto_state()` (which calls `co.clear_providers()`, `co.clear_agent_presets()`, `co.clear_tools()`, `co.clear_hooks()`) at the very start, then re-registers everything. This makes `build_runtime` **idempotent across CLI invocations** (necessary because TUI mode is a long-lived process that re-enters the function many times).
 
-### 2. Style documents are split into two halves
-Each style file is parsed by `storage.styles.split_style()` into a tuple `(outo_part, subagent_part)` using the tags `<outo>...</outo>` and `<subagent>...</subagent>`:
+### 2. Style documents are parsed top-level — the tag name IS the subagent name
+Each style file is parsed by `storage.styles.parse_style(content) -> tuple[str, list[SubagentSpec]]` with a single sequential scan over the document's top level. `SubagentSpec` is a frozen dataclass with `name: str` (the tag name) and `prompt: str` (the tag body, used as that subagent's system prompt). Rules:
 
-- `<outo>...</outo>` is required (or the whole document is treated as the outo prompt).
-- `<subagent>...</subagent>` is **optional** — if absent, the subagent gets a hardcoded fallback prompt (see `core.runtime._fallback_style("subagent")`).
-
-Both halves then have active skills prepended, and a cwd preamble prepended on top of that.
+- `<outo>...</outo>` is the outo prompt. If absent, the **whole document** is the outo prompt.
+- Each **top-level** `<name>...</name>` pair outside `<outo>` is one named subagent; the tag name IS the name. Tag names match `[A-Za-z][A-Za-z0-9_-]*` (hyphens allowed).
+- `outo` is reserved (always the outo prompt).
+- A legacy `<subagent>...</subagent>` block is parsed as a subagent named `"subagent"`. Old style files keep working unchanged; their actor labels stay `subagent-<6hex>`.
+- **Zero named subagents → no subagent preset, no `call_subagent` tool registered**. An outo-only style does not advertise the delegation surface at all. There is no fallback subagent prompt anymore.
+- Parse is **top-level only**: a pair nested inside another tag body is content, not a subagent.
+- Duplicate names at the top level raise `ValueError`.
 
 ### 3. Two-layer prompt assembly (in order)
 The final prompt the outo model sees, top to bottom:
@@ -159,7 +164,7 @@ The final prompt the outo model sees, top to bottom:
 2. All active skills from `~/.agents/skills/` (joined with `\n\n---\n\n`).
 3. The `<outo>` section of the active style (or whole-document fallback).
 
-The subagent prompt mirrors this with `<subagent>` content and a different cwd preamble.
+Each named subagent mirrors this with its own tag body and a different cwd preamble.
 
 ### 4. Context-window safety
 `core/context.py` enforces a **16K-token output floor** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`):
@@ -167,11 +172,16 @@ The subagent prompt mirrors this with `<subagent>` content and a different cwd p
 - **Floor:** `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates long tool calls (e.g. heredoc file writes).
 - **No ceiling.** The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
-### 5. Subagent is a re-implemented `agent_as_tool`
-`core.runtime._build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()`, which means subagent file-writing calls inherit the provider's low hard cap. This implementation explicitly merges `provider_config` (containing `max_tokens`) into the subagent's `AgentConfig`.
+### 5. Subagent is a re-implemented `agent_as_tool` — with multi-brief fan-out (same-name and mixed-name)
+`core.runtime._build_subagent_tool` does NOT use `coreouto.contrib.agent_as_tool`. The stock helper drops `provider_config` when calling `preset.to_config()`, which means subagent file-writing calls inherit the provider's low hard cap. This implementation explicitly merges `provider_config` (containing `max_tokens`) and `provider_passthrough` (containing the resolved reasoning kwargs) into EVERY named subagent's `AgentConfig`. The single tool the model sees is `call_subagent`, dispatched by `name=`:
 
-### 6. `BEFORE_TOOL_CALL` is global — depth + id tracked via ContextVars
-coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context, so `core.runtime` keeps two ContextVars set only inside `_wrap_subagent_handler` (runs exactly once per subagent invocation): `_SUBAGENT_DEPTH` ("are we inside a subagent?") and `_SUBAGENT_ID` (the invocation's 6-hex id). `core.chat._actor_label()` combines them into `outo` vs `subagent-<6hex>` labels; ContextVars are copied per asyncio task, so parallel subagents each keep their own id. Start/end lifecycle is reported through the module-level `_SUBAGENT_OBSERVER` slot set per turn by `run_chat` — the `BEFORE_TOOL_CALL` hook for `call_subagent` itself runs in the parent context and never sees the id, which is why the tool-call dispatcher emits nothing for `call_subagent`.
+- `name=""` resolves to `"subagent"` if declared, else the sole subagent if exactly one, else an error listing available names.
+- `task`: a single brief. `tasks`: N parallel briefs to the same `name`. `briefs`: N parallel briefs each with its OWN name (mixed-role fan-out in one invocation).
+
+All briefs (from `task` / `tasks` / `briefs`) merge into one `(name, brief)` list and run concurrently under `asyncio.gather`; one combined, numbered tool result is returned; a failed brief degrades to an `error:` section instead of failing siblings. **Registration is conditional**: `build_runtime` only registers `call_subagent` when the active style declares at least one named subagent. An outo-only style does not advertise delegation.
+
+### 6. `BEFORE_TOOL_CALL` is global — depth + name + id tracked via ContextVars
+coreouto's `BEFORE_TOOL_CALL` hook has no per-agent context, so `core.runtime` keeps **three** ContextVars set only inside `_wrap_subagent_handler` (runs exactly once per subagent invocation): `_SUBAGENT_DEPTH` ("are we inside a subagent?"), `_SUBAGENT_NAME` (the persona name for this invocation — `None` outside), and `_SUBAGENT_ID` (the invocation's 6-hex id). `core.chat._actor_label()` combines them into `outo` vs `subagent-<6hex>` (legacy `subagent` name) vs `{name}-{6hex}` (every other named subagent — `editor-abc123`, `reviewer-def456`); ContextVars are copied per asyncio task, so parallel subagents each keep their own name + id. The lifecycle observer signature is `(phase, name, sid, text)`. Start/end is reported through the module-level `_SUBAGENT_OBSERVER` slot set per turn by `run_chat` — the `BEFORE_TOOL_CALL` hook for `call_subagent` itself runs in the parent context and never sees the id, which is why the tool-call dispatcher emits nothing for `call_subagent`.
 
 ### 7. Sessions are schema v2: `history` (restorable) vs `turns` (display)
 `storage/sessions.py` writes `{"version": 2, "history": [...], "turns": [...]}`. `history` = raw coreouto `Message` dumps minus system messages, rewritten in full every turn from `Response.messages` (consistent with summarize-hook compaction). `turns` = display-only `TurnRecord`s including `LoopEvent` dicts — thinking lives only there (providers never put thinking into history messages). `load()` migrates v1 files and never raises on corrupt content.
@@ -191,13 +201,13 @@ There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all fi
 |---|---|---|
 | **Provider** | `storage/providers.py` | LLM API connection: `name`, `api_format` (openai/openai-response/anthropic/google), `base_url`, `api_key`, `default_model`, `source` (`SOURCE_CUSTOM`/`SOURCE_LMA`), `extra` |
 | **Settings** | `storage/settings.py` | Active `provider`, `model` (legacy), `style`, `session`, `theme` |
-| **Style** | `storage/styles.py` | Markdown system prompt, optionally split into outo + subagent sections via `<subagent>…</subagent>` tags |
+| **Style** | `storage/styles.py` | Markdown system prompt, parsed into an outo body and zero or more named subagent bodies via `parse_style` (top-level tag-as-name) |
 | **Skill** | `storage/skills.py` | YAML-frontmatter markdown, discovered from `~/.agents/skills/`, prepended to every style |
 | **Session** | `storage/sessions.py` | Schema-v2 JSON: restorable `history` + display `turns`, keyed by name |
 | **SessionData / TurnRecord** | `storage/sessions.py` | `SessionData`: `name`, `history` (coreouto Message dicts), `turns`. `TurnRecord`: `user`, `assistant`, `events` (LoopEvent dicts), `ts` |
 | **RuntimeConfig** | `core/runtime.py` | Resolved per-call configuration (provider, model, style, session) |
 | **ChatOptions** | `core/chat.py` | Raw CLI flag bag for a single chat turn |
-| **LoopEvent** | `core/events.py` | Single trace event (actor=`outo`/`subagent-<6hex>`/`provider`, kind, text, optional `subagent_id`) emitted via the `EventSink` |
+| **LoopEvent** | `core/events.py` | Single trace event (actor=`outo` / `{name}-{sid}` / `provider`, kind, text, optional `subagent_id` and `subagent_name`) emitted via the `EventSink` |
 | **EventSink** | `core/events.py` | Protocol implemented by `NullSink` (no-op) and `ConsoleEventSink` (CLI rendering) |
 | **ToolCallArgsError** | `core/chat.py` | Local exception for malformed LLM tool arguments |
 
@@ -211,9 +221,10 @@ ChatOptions (CLI flags)
               └─> build_runtime (runtime.py)
                     ├─ build_coreouto_provider (providers.py)
                     ├─ tool_registry.register_all()
-                    ├─ _resolve_both_styles + _load_active_skills
-                    ├─ registers "outo" + "subagent" presets
-                    ├─ builds call_subagent tool (preserves max_tokens)
+                    ├─ parse_style + _load_active_skills
+                    │    → registers "outo" preset + one preset per SubagentSpec
+                    ├─ builds call_subagent tool
+                    │    (registered only when ≥1 SubagentSpec; preserves max_tokens)
                      └─ installs up to 6 hooks (BEFORE_TOOL_CALL, ON_ITERATION ×2, AFTER_LLM_CALL, ON_THINKING, ON_PROVIDER_ERROR)
                      └─ returns co.Agent(outo_config)
         └─> run_chat (chat.py)
