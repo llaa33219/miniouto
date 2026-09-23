@@ -876,9 +876,12 @@ class ToolRow(EventRow):
 class SubagentRow(RowStatic):
     """Clickable subagent status line with a live braille spinner.
 
-    Shows `⠿ subagent-<6hex> <task>` while running (frame ticked by the
-    app spinner timer), then `✓`/`✗` on completion. Click or Enter opens
-    the subagent's internal-step detail screen.
+    Shows `⠿ <name>-<6hex> <task>` while running (frame ticked by the
+    app spinner timer), then `✓`/`✗` on completion. The label uses the
+    persona name from the style (e.g. `editor`, `reviewer`); legacy
+    styles whose single `<subagent>` block lands as `name="subagent"`
+    render as `subagent-<6hex>` exactly as before. Click or Enter
+    opens the subagent's internal-step detail screen.
     """
 
     can_focus = True
@@ -906,15 +909,32 @@ class SubagentRow(RowStatic):
             super().__init__()
             self.row = row
 
-    def __init__(self, sid: str, task_preview: str, *, running: bool = True) -> None:
+    def __init__(
+        self,
+        sid: str,
+        task_preview: str,
+        *,
+        running: bool = True,
+        name: str = "subagent",
+    ) -> None:
         super().__init__()
         self.sid = sid
+        # `name` and `_name` are both reserved by Textual (`Widget.name` is
+        # a read-only DOM-id property backed by `Widget._name`); the
+        # persona name lives at `_subagent_name` to avoid shadowing either.
+        # `SubagentDetailScreen` keeps `_name` since `ModalScreen` is not
+        # queried as a DOM node.
+        self._subagent_name = name or "subagent"
         # MessagePump owns `_task` (the pump's asyncio Task) and `_running`
         # (flipped True on mount), so widget state must avoid both names.
         self._task_preview = task_preview
         self._active = running
         self._failed = False
         self._frame = _SPINNER_FRAMES[0]
+
+    @property
+    def _label(self) -> str:
+        return f"{self._subagent_name}-{self.sid}"
 
     @property
     def running(self) -> bool:
@@ -944,7 +964,7 @@ class SubagentRow(RowStatic):
         self.update(
             Text.assemble(
                 (f"{glyph} ", glyph_style),
-                (f"subagent-{self.sid}", f"bold {theme.accent}"),
+                (self._label, f"bold {theme.accent}"),
                 (f"  {' '.join(self._task_preview.split())}", theme.foreground),
             )
         )
@@ -1135,9 +1155,17 @@ class SubagentDetailScreen(ModalScreen[None]):
     }
     """
 
-    def __init__(self, sid: str, events: list[LoopEvent], *, live: bool) -> None:
+    def __init__(
+        self,
+        sid: str,
+        events: list[LoopEvent],
+        *,
+        live: bool,
+        name: str = "subagent",
+    ) -> None:
         super().__init__()
         self._sid = sid
+        self._name = name or "subagent"
         self._events = events
         self._live = live
         self._timer: Timer | None = None
@@ -1147,7 +1175,7 @@ class SubagentDetailScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="subagent-dialog"):
-            yield Label(f"subagent-{self._sid}", id="subagent-title")
+            yield Label(f"{self._name}-{self._sid}", id="subagent-title")
             yield ChatScroll(id="subagent-log")
             yield Label("Esc to go back", id="subagent-hint")
 
@@ -2396,7 +2424,12 @@ class ChatTUI(App):
         if event.subagent_id:
             self._record_subagent_event(event)
         if event.kind == "subagent_start":
-            row = SubagentRow(event.subagent_id or "??????", event.text, running=False)
+            row = SubagentRow(
+                event.subagent_id or "??????",
+                event.text,
+                running=False,
+                name=event.subagent_name or "subagent",
+            )
             self._subagent_rows[row.sid] = row
             self._mount_row(row)
         elif event.kind == "subagent_end":
@@ -2564,7 +2597,9 @@ class ChatTUI(App):
     def _add_subagent_row(self, event: LoopEvent) -> None:
         if not event.subagent_id:
             return
-        row = SubagentRow(event.subagent_id, event.text)
+        row = SubagentRow(
+            event.subagent_id, event.text, name=event.subagent_name or "subagent"
+        )
         self._subagent_rows[event.subagent_id] = row
         self._subagent_events.setdefault(event.subagent_id, [])
         self._mount_row(row)
@@ -2581,11 +2616,13 @@ class ChatTUI(App):
         # the display cap is exactly what the user is trying to read. Skip
         # when the result is empty or a no-op sentinel like `"done"`.
         if sid:
+            row_name = row._subagent_name if row is not None else None
+            name = event.subagent_name or row_name or "subagent"
             text = event.text or ""
             stripped = text.strip()
             if stripped and stripped.lower() != "done":
                 result_row = ToolRow(
-                    f"subagent-{sid} result", unbounded_result=True
+                    f"{name}-{sid} result", unbounded_result=True
                 )
                 result_row.set_result(
                     text, is_error=text.startswith("error:")
@@ -2603,7 +2640,9 @@ class ChatTUI(App):
         sid = event.row.sid
         events = self._subagent_events.get(sid, [])
         live = sid in self._subagent_rows and self._subagent_rows[sid].running
-        self.push_screen(SubagentDetailScreen(sid, events, live=live))
+        self.push_screen(
+            SubagentDetailScreen(sid, events, live=live, name=event.row._subagent_name)
+        )
 
     def _post_user(self, text: str) -> None:
         self._mount_row(
