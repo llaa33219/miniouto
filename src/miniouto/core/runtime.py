@@ -18,11 +18,19 @@ from ..storage import providers as provider_store
 from ..storage import settings as settings_store
 from ..storage import skills as skill_store
 from ..storage import styles as style_store
+from ..storage.styles import SubagentSpec
 from ..tools import bash as bash_tool
 from ..tools import registry as tool_registry
 from .providers import API_STALL_TIMEOUT_SECONDS, build_coreouto_provider, clear_coreouto_state
 
-ALL_TOOLS = ["Bash", "Image", "Video", "Audio", "call_subagent"]
+# Tools visible to both presets. The subagent tool is appended per-preset
+# only when the active style declares ≥1 named subagent (see build_runtime).
+BASE_TOOLS = ["Bash", "Image", "Video", "Audio"]
+SUBAGENT_TOOL_NAME = "call_subagent"
+# ALL_TOOLS kept for any external imports; the per-preset tool lists below
+# compose BASE_TOOLS + (subagent tool when registered) explicitly so a
+# zero-subagent style exposes no subagent tool at all.
+ALL_TOOLS = [*BASE_TOOLS, SUBAGENT_TOOL_NAME]
 
 # Computer is outo-only: it drives a single shared virtual screen, and
 # parallel subagents clicking/typing on that screen would interleave
@@ -47,11 +55,24 @@ _SUBAGENT_DEPTH: ContextVar[int] = ContextVar("miniouto_subagent_depth", default
 # concurrent `call_subagent` handlers each see their own id.
 _SUBAGENT_ID: ContextVar[str | None] = ContextVar("miniouto_subagent_id", default=None)
 
-# Lifecycle observer for subagent invocations: callable(phase, sid, text)
-# where phase is "start" or "end". Set per-turn by `core.chat.run_chat`
-# (the hooks are global, so this module-level slot is the bridge between
-# the wrapped handler and the active turn's sink). None outside a turn.
-_SUBAGENT_OBSERVER: Callable[[str, str, str], None] | None = None
+# Name of the innermost active subagent's spec ("editor", "file-picker",
+# "subagent", ...). None outside a `call_subagent` invocation. Feeds the
+# actor label the sinks render (`name-<sid>` — e.g. `editor-abc123`); the
+# `subagent-<sid>` shape is preserved for the legacy `subagent` spec by
+# construction (the tag name IS the subagent name, and legacy
+# `<subagent>...</subagent>` blocks are parsed as a spec named `subagent`).
+_SUBAGENT_NAME: ContextVar[str | None] = ContextVar(
+    "miniouto_subagent_name", default=None
+)
+
+# Lifecycle observer for subagent invocations:
+# callable(phase, sid, name, text) where phase ∈ {"start", "wakeup", "end"}.
+# `name` is the spec name of the subagent running this invocation
+# ("subagent" for legacy <subagent> blocks). Set per-turn by
+# `core.chat.run_chat` (the hooks are global, so this module-level slot
+# is the bridge between the wrapped handler and the active turn's sink).
+# None outside a turn.
+_SUBAGENT_OBSERVER: Callable[[str, str, str, str], None] | None = None
 
 # Watchdog state (coreouto >= 0.11 contrib trackers), rebuilt by every
 # build_runtime call alongside the hooks that feed them. The supervised
@@ -408,170 +429,302 @@ def current_subagent_id() -> str | None:
     return _SUBAGENT_ID.get()
 
 
-def set_subagent_observer(observer: Callable[[str, str, str], None] | None) -> None:
+def current_subagent_name() -> str | None:
+    """Return the innermost active subagent spec name, or None for outo.
+
+    The actor label format the sinks render is `f"{name}-{sid}"`, which
+    for a legacy `<subagent>` block (spec name "subagent") produces the
+    historical `subagent-<sid>` shape by construction.
+    """
+
+    return _SUBAGENT_NAME.get()
+
+
+def set_subagent_observer(
+    observer: Callable[[str, str, str, str], None] | None,
+) -> None:
     """Install (or clear, with None) the subagent lifecycle observer."""
 
     global _SUBAGENT_OBSERVER
     _SUBAGENT_OBSERVER = observer
 
 
-def _notify_subagent(phase: str, sid: str, text: str) -> None:
+def _notify_subagent(phase: str, sid: str, name: str, text: str) -> None:
     observer = _SUBAGENT_OBSERVER
     if observer is not None:
         # an observer must never break the subagent loop
         with contextlib.suppress(Exception):
-            observer(phase, sid, text)
+            observer(phase, sid, name, text)
 
 
-def _wrap_subagent_handler(inner: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap `call_subagent`'s handler: multi-brief fan-out + tracking.
+def _wrap_subagent_handler(
+    dispatch: Callable[..., Any],
+    specs: list[SubagentSpec],
+) -> Callable[..., Any]:
+    """Wrap `call_subagent`'s handler: name-aware dispatch + multi-brief fan-out.
+
+    `dispatch(name, brief, history=None)` is the per-name inner handler
+    produced by `_build_subagent_tool`: it picks the right per-spec Agent
+    and runs the brief. This wrapper turns the model's flat
+    `(name, task, tasks, briefs)` parameter bag into a list of
+    `(name, brief)` pairs and fans them out under `_run_one` per pair.
 
     WHY multi-brief: current models reliably emit at most ONE tool call
     per assistant response, so "spawn N subagents as N `call_subagent`
     tool_use blocks in one turn" never materializes — the blocks come out
     serialized across turns no matter what the styles say. Parallel
     delegation therefore lives INSIDE a single invocation: the handler
-    accepts `tasks` (an array of self-contained briefs) alongside the
-    legacy `task` string and runs every brief as its own supervised
-    subagent concurrently, returning ONE combined, numbered tool result
-    (the model made one tool call). A failed brief degrades to an
-    `error:` section instead of failing its siblings.
+    accepts `tasks` (an array of briefs, all run by the resolved call-
+    level `name`) and `briefs` (an array of {task, name?}, where the
+    optional per-brief name overrides the call-level default — mixed-
+    role fan-out in one call), alongside the single `task` string, and
+    runs every brief as its own supervised subagent concurrently,
+    returning ONE combined, numbered tool result (the model made one
+    tool call). A failed brief degrades to an `error:` section instead of
+    failing its siblings.
 
     Per-brief mechanics are unchanged from the single-brief era: each
     brief gets its own 6-hex id (ContextVars are copied per asyncio task,
-    so concurrent briefs attribute events to their own `subagent-<6hex>`
+    so concurrent briefs attribute events to their own `<name>-<6hex>`
     label), its own stall supervisor (`supervised_run` at level=depth —
     a wedged subagent is cancelled and resumed from its own sanitized
     transcript without taking the parent turn down), and its own
-    start/end observer notifications. Depth + id ContextVars are also
-    what tells the global BEFORE_TOOL_CALL hook whether a Bash/Image/etc.
-    call came from outo or from a subagent.
+    start/end observer notifications. Depth / id / name ContextVars are
+    also what tells the global BEFORE_TOOL_CALL hook whether a
+    Bash/Image/etc. call came from outo or from which named subagent.
 
-    ROLLBACK NOTE: this array-parameter fan-out is a workaround for
+    ROLLBACK NOTE: the array-parameter fan-out is a workaround for
     single-tool-call-per-turn models, not a design goal — it bends the
     one-tool-call-one-subagent shape the codebase otherwise prefers. If
     models learn to emit several tool_use blocks in one response
-    naturally, revert to one brief per call and remove the `tasks`
-    parameter (see docs/core.md § `call_subagent`).
+    naturally, revert to one brief per call and remove the `tasks` and
+    `briefs` parameters (see docs/core.md § `call_subagent`). The
+    `briefs` parameter exists specifically for mixed-role fan-out — when
+    models DO start emitting multiple tool_use blocks, drop `briefs`
+    alongside `tasks` so each tool call stays one role / one role only.
     """
 
-    async def _run_one(task: str) -> str:
+    def _resolve(requested: str) -> str:
+        """Resolve a name to one of `specs`. Empty → fallback rules.
+
+        Fallback: a spec literally named `subagent` (legacy compat),
+        else the sole declared spec, else ValueError. The fallback only
+        kicks in for the call-level empty `name`; a per-brief empty
+        name inherits whatever the wrapper resolved for the call.
+        """
+
+        if requested:
+            if not any(s.name == requested for s in specs):
+                raise ValueError(
+                    f"Unknown subagent name {requested!r}. "
+                    f"Available names: {', '.join(s.name for s in specs)}"
+                )
+            return requested
+        if any(s.name == "subagent" for s in specs):
+            return "subagent"
+        if len(specs) == 1:
+            return specs[0].name
+        raise ValueError(
+            "`name` is required when multiple subagents are declared. "
+            f"Available names: {', '.join(s.name for s in specs)}"
+        )
+
+    async def _run_one(raw_name: str, brief: str, default_name: str) -> str:
+        resolved = _resolve(raw_name) if raw_name else default_name
         sid = secrets.token_hex(3)  # 6 hex chars
         depth_token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
         id_token = _SUBAGENT_ID.set(sid)
+        name_token = _SUBAGENT_NAME.set(resolved)
         level = _SUBAGENT_DEPTH.get()
-        _notify_subagent("start", sid, task)
+        _notify_subagent("start", sid, resolved, brief)
         try:
             result = await supervised_run(
-                inner,
-                task,
+                lambda prompt, history: dispatch(resolved, prompt, history),
+                brief,
                 None,
                 live_key=sid,
                 level=level,
                 on_wakeup=lambda n, silent, phase: _notify_subagent(
                     "wakeup",
                     sid,
+                    resolved,
                     f"no activity for {silent:.0f}s (phase={phase!r}) "
                     f"— restarting ({n}/{WATCHDOG_MAX_WAKEUPS})",
                 ),
             )
         except Exception as exc:
-            _notify_subagent("end", sid, f"error: {type(exc).__name__}: {exc}")
+            _notify_subagent(
+                "end", sid, resolved, f"error: {type(exc).__name__}: {exc}"
+            )
             raise
         else:
-            _notify_subagent("end", sid, result or "")
+            _notify_subagent("end", sid, resolved, result or "")
             return result
         finally:
             _LIVE_MESSAGES.pop(sid, None)
+            _SUBAGENT_NAME.reset(name_token)
             _SUBAGENT_ID.reset(id_token)
             _SUBAGENT_DEPTH.reset(depth_token)
 
-    async def wrapped(task: str = "", tasks: list[str] | None = None) -> str:
-        briefs = [
-            t
-            for t in ([task] if task else []) + list(tasks or [])
-            if isinstance(t, str) and t.strip()
-        ]
-        if not briefs:
+    async def wrapped(
+        name: str = "",
+        task: str = "",
+        tasks: list[str] | None = None,
+        briefs: list[dict[str, str]] | None = None,
+    ) -> str:
+        pairs: list[tuple[str, str]] = []
+        if isinstance(task, str) and task.strip():
+            pairs.append(("", task))
+        for t in tasks or []:
+            if isinstance(t, str) and t.strip():
+                pairs.append(("", t))
+        for b in briefs or []:
+            if not isinstance(b, dict):
+                continue
+            brief_text = b.get("task")
+            if not isinstance(brief_text, str) or not brief_text.strip():
+                continue
+            pairs.append((b.get("name") or "", brief_text))
+
+        if not pairs:
             raise ValueError(
-                "call_subagent requires `task` (a single brief) or `tasks` "
-                "(an array of briefs); neither was usable."
+                "call_subagent requires `task` (a single brief), `tasks` "
+                "(an array of briefs, all under the resolved `name`), or "
+                "`briefs` (a list of {task, name?}); none were usable."
             )
-        if len(briefs) == 1:
-            return await _run_one(briefs[0])
-        n = len(briefs)
+
+        # Resolve the call-level default lazily. An explicit `name` is
+        # always validated (typos fail fast); the fallback rules run only
+        # when a brief actually needs them (raw name empty). This is what
+        # lets `briefs=[{name: ...}, ...]` mixed-role fan-out work with an
+        # omitted call-level `name` — the fallback ("subagent" spec, else
+        # the sole spec) must not be required when every brief names its
+        # own persona.
+        if name:
+            default_name = _resolve(name)
+        elif any(not raw for raw, _ in pairs):
+            default_name = _resolve("")
+        else:
+            default_name = ""
+
+        if len(pairs) == 1:
+            return await _run_one(pairs[0][0], pairs[0][1], default_name)
+
+        n = len(pairs)
         results = await asyncio.gather(
-            *[_run_one(b) for b in briefs], return_exceptions=True
+            *[_run_one(raw, brief, default_name) for raw, brief in pairs],
+            return_exceptions=True,
         )
         parts: list[str] = []
-        for i, (brief, res) in enumerate(zip(briefs, results), 1):
+        for i, ((raw_name, brief), res) in enumerate(zip(pairs, results, strict=True), 1):
             if isinstance(res, BaseException):
-                res = f"error: {type(res).__name__}: {res}"
+                res_str = f"error: {type(res).__name__}: {res}"
+            else:
+                res_str = res or "(empty result)"
             preview = " ".join(brief.split())
             if len(preview) > 120:
                 preview = preview[:120] + "…"
-            parts.append(f"[{i}/{n}] task: {preview}\n{res or '(empty result)'}")
+            label = raw_name or default_name
+            parts.append(
+                f"[{i}/{n}] name={label!r} task: {preview}\n{res_str}"
+            )
         return "\n\n".join(parts)
 
     return wrapped
 
 
 def _build_subagent_tool(
-    preset_name: str,
     *,
+    specs: list[SubagentSpec],
     description: str,
     provider_config: dict[str, Any],
     provider_passthrough: dict[str, Any] | None = None,
 ) -> Any:
-    """Build the subagent tool with a non-empty provider_config.
+    """Build the `call_subagent` tool with one Agent per named spec.
 
-    coreouto's `agent_as_tool` calls `preset.to_config()` and silently
-    drops any provider_config we might want to inject — meaning the
-    subagent runs with `max_tokens` unset, and Anthropic's 1024 hard
-    default silently truncates any long tool call (e.g. a heredoc file
-    write). We
-    rebuild the same `Tool` shape here, but with our own Agent instance
-    built from a config whose `provider_config` carries the cap.
+    Invariant 5 — DO NOT simplify to `coreouto.contrib.agent_as_tool`:
+    that helper drops `provider_config` when calling `preset.to_config()`,
+    so the subagent would inherit the provider's low hard default
+    (Anthropic: 1024 tokens) and silently truncate long tool calls
+    (heredoc writes). We rebuild the same `Tool` shape ourselves so every
+    per-name Agent carries our `provider_config` (incl. `max_tokens`) AND
+    `provider_passthrough` (incl. reasoning).
+
+    Each spec becomes one `co.Agent`, built from a deep copy of the
+    shared "subagent" preset's config with that spec's `prompt` set as
+    `system_prompt`. `dispatch(name, brief, history)` is the inner
+    `(prompt, history)` shape `_wrap_subagent_handler` consumes; the
+    wrapper supplies `name` per invocation, and the agent runs the brief
+    under it. `history=None` resumes from the transcript alone (coreouto
+    >= 0.11.1) — used by `supervised_run`'s wakeup restart.
     """
 
-    preset = co.get_agent_preset(preset_name)
-    config = preset.to_config()
+    preset = co.get_agent_preset("subagent")
+    base_config = preset.to_config()
     if provider_config:
-        config.provider_config.update(provider_config)
+        base_config.provider_config.update(provider_config)
     if provider_passthrough:
-        config.provider_passthrough.update(provider_passthrough)
-    sub_agent = co.Agent(config)
+        base_config.provider_passthrough.update(provider_passthrough)
 
-    tool_name = f"call_{preset_name}"
+    agents: dict[str, co.Agent] = {}
+    for spec in specs:
+        cfg = base_config.model_copy(deep=True)
+        cfg.system_prompt = spec.prompt
+        agents[spec.name] = co.Agent(cfg)
+
+    async def dispatch(name: str, brief: str, history: list[Any] | None = None) -> str:
+        return (await agents[name].call(brief, history=history)).content
+
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "tasks": {
-                "type": "array",
-                "items": {"type": "string"},
+            "name": {
+                "type": "string",
                 "description": (
-                    "One or more self-contained task briefs. Multiple "
-                    "briefs run in parallel as separate subagents and "
-                    "return one combined, numbered result."
+                    "Subagent name to dispatch to (see `Available names` "
+                    "in the tool description). Omit to fall back to a "
+                    'spec named `subagent` if one exists, else the sole '
+                    "declared spec."
                 ),
             },
             "task": {
                 "type": "string",
-                "description": "A single self-contained brief (same as tasks: [brief]).",
+                "description": (
+                    "A single self-contained brief (same shape as one "
+                    "entry of `tasks` or `briefs`)."
+                ),
+            },
+            "tasks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Parallel briefs, ALL run under the resolved `name`."
+                ),
+            },
+            "briefs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string"},
+                        "name": {"type": "string"},
+                    },
+                    "required": ["task"],
+                },
+                "description": (
+                    "Parallel briefs, each an object with `task` and an "
+                    "optional `name` (overrides the call-level `name` for "
+                    "that brief). Use for mixed-role fan-out in one call."
+                ),
             },
         },
     }
 
-    async def start(task: str | None, history: list[Any] | None = None) -> str:
-        # task=None resumes from the transcript alone (coreouto >= 0.11.1)
-        # — used by the supervisor's wakeup restart.
-        return (await sub_agent.call(task, history=history)).content
-
     return co.Tool(
-        name=tool_name,
+        name=SUBAGENT_TOOL_NAME,
         description=description,
         parameters=parameters,
-        handler=start,
+        handler=dispatch,
     )
 
 
@@ -676,76 +829,105 @@ def build_runtime(
         )
     build_coreouto_provider(provider)
 
-    sub_provider_name = runtime.subagent_provider or runtime.provider_name
-    sub_provider = provider_store.get(sub_provider_name)
-    if sub_provider is None:
-        raise RuntimeError(f"Subagent provider {sub_provider_name!r} is not configured.")
-    build_coreouto_provider(sub_provider)
-
     # api_format selects the Computer handler variant: openai Chat
     # Completions cannot carry image tool results, so screenshot there
     # returns an explanatory notice instead of an image (see
     # tools/registry._make_computer_handler).
     tool_registry.register_all(api_format=provider.api_format)
 
-    outo_style, subagent_style = _resolve_both_styles(runtime.style_name, style_overrides)
+    outo_style, parsed_specs = _resolve_both_styles(runtime.style_name, style_overrides)
     outo_prompt = _with_cwd("outo", outo_style)
-    subagent_prompt = _with_cwd("subagent", subagent_style)
+    # Per-spec cwd prepending happens here, not in _resolve_both_styles —
+    # cwd is a runtime-derived value (INVOCATION_CWD) regenerated every
+    # build_runtime call, so it must not be baked into the style loader.
+    specs = [
+        SubagentSpec(name=spec.name, prompt=_with_cwd("subagent", spec.prompt))
+        for spec in parsed_specs
+    ]
 
-    co.register_agent_preset(
-        "subagent",
-        model=runtime.subagent_model or runtime.model,
-        provider=sub_provider_name,
-        system_prompt=subagent_prompt,
-        tools=ALL_TOOLS,
-        max_iterations=None,
-    )
+    # outo preset is always registered. The subagent tool is added to its
+    # tool list ONLY when the active style declared ≥1 subagent; otherwise
+    # outo exposes no subagent tool and the model never sees it in its
+    # schema. OUTO_ONLY_TOOLS (Computer) is filtered by registration —
+    # unsupported platforms never see it.
+    outo_tools: list[str] = list(BASE_TOOLS)
+    if specs:
+        outo_tools.append(SUBAGENT_TOOL_NAME)
+    outo_tools.extend(t for t in OUTO_ONLY_TOOLS if co.get_tool(t) is not None)
 
     co.register_agent_preset(
         "outo",
         model=runtime.model,
         provider=runtime.provider_name,
         system_prompt=outo_prompt,
-        tools=ALL_TOOLS + [t for t in OUTO_ONLY_TOOLS if co.get_tool(t) is not None],
+        tools=outo_tools,
         max_iterations=None,
     )
 
-    # Subagent runs the same model (or its override) and must share the
-    # output-token cap, otherwise long tool calls it issues (heredoc file
-    # writes) get truncated at
-    # the provider's low default (1024 for Anthropic) and we end up with
-    # a half-written file and an "I cut off mid-function" loop. We pull
-    # the cap from the same lma endpoint as outo so it tracks the
-    # subagent's model when one is configured.
-    from .context import get_max_output_tokens
-    from .reasoning import resolve_reasoning_passthrough
+    # Per-turn conditional registration. Because `clear_coreouto_state()`
+    # wipes providers/presets/tools/hooks at the top of every call, the
+    # TUI's mid-session style switches (a style with subagents → one
+    # without, or vice versa) correctly add or remove the tool and the
+    # preset between turns. No extra caching of specs across turns.
+    if specs:
+        sub_provider_name = runtime.subagent_provider or runtime.provider_name
+        sub_provider = provider_store.get(sub_provider_name)
+        if sub_provider is None:
+            raise RuntimeError(
+                f"Subagent provider {sub_provider_name!r} is not configured."
+            )
+        build_coreouto_provider(sub_provider)
 
-    subagent_model = runtime.subagent_model or runtime.model
-    subagent_provider_config = dict(provider_config or {})
-    subagent_provider_config.setdefault(
-        "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
-    )
-    subagent_choice = (
-        reasoning
-        if reasoning is not None
-        else (runtime.subagent_reasoning or sub_provider.reasoning_effort)
-    )
-    subagent_passthrough = resolve_reasoning_passthrough(
-        sub_provider.api_format,
-        subagent_model,
-        sub_provider_name,
-        subagent_choice,
-    )
+        # The "subagent" preset is a config carrier: it provides the
+        # model/provider/tools base that `_build_subagent_tool` deep-copies
+        # once per spec to build one Agent per named subagent. Its own
+        # system_prompt is never seen by the model (every per-spec Agent
+        # overrides it with that spec's prompt).
+        co.register_agent_preset(
+            "subagent",
+            model=runtime.subagent_model or runtime.model,
+            provider=sub_provider_name,
+            system_prompt=parsed_specs[0].prompt,
+            tools=[*BASE_TOOLS, SUBAGENT_TOOL_NAME],
+            max_iterations=None,
+        )
 
-    subagent_tool = _build_subagent_tool(
-        "subagent",
-        description=_subagent_description(),
-        provider_config=subagent_provider_config,
-        provider_passthrough=subagent_passthrough,
-    )
-    co.register_tool(subagent_tool.name, description=subagent_tool.description)(
-        _wrap_subagent_handler(subagent_tool.handler)
-    )
+        # Subagent runs the same model (or its override) and must share
+        # the output-token cap, otherwise long tool calls it issues
+        # (heredoc file writes) get truncated at the provider's low
+        # default (1024 for Anthropic) and we end up with a half-written
+        # file and an "I cut off mid-function" loop. Pull the cap from
+        # the same lma endpoint as outo so it tracks the subagent's
+        # model when one is configured.
+        from .context import get_max_output_tokens
+        from .reasoning import resolve_reasoning_passthrough
+
+        subagent_model = runtime.subagent_model or runtime.model
+        subagent_provider_config = dict(provider_config or {})
+        subagent_provider_config.setdefault(
+            "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
+        )
+        subagent_choice = (
+            reasoning
+            if reasoning is not None
+            else (runtime.subagent_reasoning or sub_provider.reasoning_effort)
+        )
+        subagent_passthrough = resolve_reasoning_passthrough(
+            sub_provider.api_format,
+            subagent_model,
+            sub_provider_name,
+            subagent_choice,
+        )
+
+        subagent_tool = _build_subagent_tool(
+            specs=specs,
+            description=_subagent_description(parsed_specs),
+            provider_config=subagent_provider_config,
+            provider_passthrough=subagent_passthrough,
+        )
+        co.register_tool(
+            subagent_tool.name, description=subagent_tool.description
+        )(_wrap_subagent_handler(subagent_tool.handler, parsed_specs))
 
     if on_tool_call is not None:
         co.register_hook(co.BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
@@ -797,9 +979,6 @@ def build_runtime(
     )
     if outo_passthrough:
         outo_config.provider_passthrough.update(outo_passthrough)
-
-    subagent_config = co.get_agent_preset("subagent").to_config()
-    subagent_config.provider_config.update(subagent_provider_config)
 
     return co.Agent(outo_config)
 
@@ -944,42 +1123,68 @@ def _make_thinking_logger(callback: Callable[[str], None]):
     return hook
 
 
-def _subagent_description() -> str:
-    return (
-        "Delegate self-contained task briefs to subagent(s). Each brief "
-        "runs in a fresh context with its own tool access "
-        "(Bash/Image/Video/Audio) and blocks until it terminates; the "
-        "final text is the result. Pass ONE brief for a single delegation, "
-        "or an ARRAY of briefs in `tasks` to run several subagents in "
-        "parallel — independent briefs (different targets, no shared "
-        "state) should go out together in one call; you receive one "
-        "combined result numbered per brief. Every brief is a complete "
-        "specification on its own — goal, paths, context, constraints, "
-        "expected result — the subagent sees nothing else."
+def _subagent_description(specs: list[SubagentSpec]) -> str:
+    available = ", ".join(s.name for s in specs)
+    base = (
+        "Delegate self-contained task briefs to one or more named "
+        "subagents. Each brief runs in a fresh context with its own tool "
+        "access (Bash/Image/Video/Audio) and blocks until it terminates; "
+        "the final text is the result.\n\n"
+        "Use the `name` parameter to pick which subagent runs the brief "
+        "(see `Available names` below). Omit `name` to fall back to a "
+        "subagent literally named `subagent` if one exists, else the sole "
+        "declared spec. Passing a name that does not match any declared "
+        "spec fails the call.\n\n"
+        "Pass `task` for a single brief. Pass `tasks` (an array of "
+        "briefs) to fan several briefs out in parallel under the same "
+        "resolved `name` — independent briefs (different targets, no "
+        "shared state) should go out together in one call; you receive "
+        "one combined, numbered result. Pass `briefs` (an array of "
+        "{task, name?}) for mixed-role fan-out in a single call: every "
+        "entry inherits the call-level `name` unless it sets its own, so "
+        "the same tool invocation can launch several subagent roles at "
+        "once.\n\n"
+        "Every brief is a complete specification on its own — goal, "
+        "paths, context, constraints, expected result — the subagent "
+        "sees nothing else."
     )
+    if available:
+        base += f"\n\nAvailable names: {available}"
+    return base
 
 
 def _resolve_both_styles(
     style_name: str, overrides: dict[str, str] | None
-) -> tuple[str, str]:
-    """Return (outo_prompt, subagent_prompt) from the active style document.
+) -> tuple[str, list[SubagentSpec]]:
+    """Return (outo_prompt, specs) from the active style document.
 
-    The style document is split at <subagent>...</subagent> tags. If no such
-    tags exist, the entire document is the outo prompt and subagent uses a
-    minimal built-in default. Active skills are prepended to both prompts.
+    The parser (`storage.styles.parse_style`) yields one `SubagentSpec` per
+    named tag — `<editor>...</editor>` becomes a spec named `editor`, the
+    legacy `<subagent>...</subagent>` becomes a spec named `subagent`,
+    and a style with no other tags yields zero specs (no subagents at
+    all — `build_runtime` will not register the `call_subagent` tool).
+
+    Active skills are prepended to BOTH the outo prompt and to each spec's
+    prompt (new `SubagentSpec` instances — the dataclass is frozen). An
+    empty/whitespace spec body falls back to `_fallback_style("subagent")`
+    content as that spec's prompt.
     """
 
     raw = _read_raw_style(style_name, overrides)
-    outo_part, subagent_part = style_store.split_style(raw)
-    if not subagent_part:
-        subagent_part = _fallback_style("subagent")
+    outo_part, parsed_specs = style_store.parse_style(raw)
 
     skills_content = _load_active_skills()
+    fallback_sub = _fallback_style("subagent")
+    specs: list[SubagentSpec] = []
+    for spec in parsed_specs:
+        body = spec.prompt.strip() or fallback_sub
+        prompt = (skills_content + "\n\n" + body) if skills_content else body
+        specs.append(SubagentSpec(name=spec.name, prompt=prompt))
+
     if skills_content:
         outo_part = skills_content + "\n\n" + outo_part
-        subagent_part = skills_content + "\n\n" + subagent_part
 
-    return outo_part, subagent_part
+    return outo_part, specs
 
 
 def _read_raw_style(name: str, overrides: dict[str, str] | None) -> str:
@@ -1055,10 +1260,10 @@ def _fallback_style(name: str) -> str:
             "more tool calls."
         )
     return (
-        f"You are {name}. Use the call_subagent tool for non-trivial work. "
-        "To finish, respond with text and no tool call — that text becomes "
-        "the final answer returned to the user. Use the `continue_loop` tool "
-        "if you need to share progress while still planning more tool calls."
+        f"You are {name}. To finish, respond with text and no tool call — "
+        "that text becomes the final answer returned to the user. Use the "
+        "`continue_loop` tool if you need to share progress while still "
+        "planning more tool calls."
     )
 
 
