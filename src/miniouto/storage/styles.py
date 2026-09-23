@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -11,6 +12,80 @@ import httpx
 
 from . import toml_io
 from .paths import BUNDLED_STYLE_DIR, STYLE_DIR, STYLE_REPOS_FILE, ensure_dirs
+
+
+@dataclass(frozen=True)
+class SubagentSpec:
+    """One named subagent declared by a style document.
+
+    ``name`` is the raw tag name (e.g. ``"editor"``, ``"file-picker"``) and is
+    used both as the ``name`` argument of the ``call_subagent`` tool and in
+    actor labels like ``editor-abc123``.
+    """
+
+    name: str
+    prompt: str
+
+
+_PAIR_RE = re.compile(r"<([A-Za-z][A-Za-z0-9_-]*)>(.*?)</\1>", re.DOTALL)
+
+
+def _top_level_pairs(text: str) -> list[tuple[str, str]]:
+    """Find non-overlapping ``<tag>...</tag>`` pairs in document order.
+
+    Sequential scan: each match is accepted, then scanning resumes after its
+    closing tag. A tag pair nested inside a body is *content* of that body,
+    never a separate pair. The reserved name ``outo`` is always skipped (it
+    belongs to the outo prompt, never to a subagent).
+    """
+
+    pairs: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(text):
+        m = _PAIR_RE.search(text, pos)
+        if not m:
+            break
+        if m.group(1) != "outo":
+            pairs.append((m.group(1), m.group(2)))
+        pos = m.end()
+    return pairs
+
+
+def parse_style(content: str) -> tuple[str, list[SubagentSpec]]:
+    """Parse a style document into ``(outo_prompt, subagent_specs)``.
+
+    Format:
+
+    * ``<outo>...</outo>`` is required (or the whole document is the outo
+      prompt — preserves the old ``split_style`` fallback behaviour).
+    * Every other top-level ``<tag>...</tag>`` pair outside the outo block
+      becomes one ``SubagentSpec``; the tag name IS the subagent name.
+    * Tag names match ``[A-Za-z][A-Za-z0-9_-]*`` (hyphens allowed: e.g.
+      ``file-picker``, ``code-searcher``).
+    * ``outo`` is reserved — never appears as a subagent name.
+    * Legacy compat: ``<subagent>...</subagent>`` becomes a subagent named
+      ``"subagent"`` (treated as any other tag).
+    * Duplicate subagent names raise ``ValueError``.
+    * Stray prose outside any tag is ignored.
+    """
+
+    outo_match = _PAIR_RE.search(content)
+    if outo_match is not None and outo_match.group(1) == "outo":
+        outo_prompt = outo_match.group(2).strip()
+        remainder = content[: outo_match.start()] + content[outo_match.end() :]
+    else:
+        outo_prompt = content.strip()
+        remainder = ""
+
+    specs: list[SubagentSpec] = []
+    seen: set[str] = set()
+    for tag, body in _top_level_pairs(remainder):
+        if tag in seen:
+            raise ValueError(f"Duplicate subagent name: {tag!r}")
+        seen.add(tag)
+        specs.append(SubagentSpec(name=tag, prompt=body.strip()))
+
+    return outo_prompt, specs
 
 
 def list_styles() -> list[str]:
@@ -223,20 +298,3 @@ def write_default_style(content: str) -> None:
     target = path_for("default")
     if not target.exists():
         target.write_text(content, encoding="utf-8")
-
-
-def split_style(style_content: str) -> tuple[str, str]:
-    """Split a style document into (outo_prompt, subagent_prompt).
-
-    Expects XML tags: <outo>...</outo> and optionally <subagent>...</subagent>.
-    If <subagent> is absent, subagent_prompt is empty.
-    If <outo> is absent, the entire document is the outo prompt.
-    """
-
-    outo_match = re.search(r"<outo>(.*?)</outo>", style_content, re.DOTALL)
-    subagent_match = re.search(r"<subagent>(.*?)</subagent>", style_content, re.DOTALL)
-
-    outo_part = outo_match.group(1).strip() if outo_match else style_content.strip()
-    subagent_part = subagent_match.group(1).strip() if subagent_match else ""
-
-    return outo_part, subagent_part
