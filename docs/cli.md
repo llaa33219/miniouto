@@ -77,7 +77,7 @@ The chat log is a `VerticalScroll` of row widgets (migrated from `RichLog` so ro
 | `AnswerRow` | the final answer as `Markdown` — behavior inherited from `RowStatic`; exists as a distinct class because Markdown goes through `RichVisual` (no native selection painting) |
 | `ThinkingRow` | reasoning/thinking — **collapsed by default** (`▸ thinking`), click or `Enter` to expand the full text (`▾ thinking` + content), click again to re-collapse. Same translucent border + muted styling as `EventRow` |
 | `EventRow` | any other intermediate loop output — tool calls, iteration/token progress, provider errors — rendered with a **translucent left border (`$primary 40%`) and muted gray text** (provider errors use `$error`). No `actor:` prefixes |
-| `SubagentRow` | one clickable line per subagent invocation: a **live braille spinner** + `subagent-<6hex>` + task preview while running, flipping to `✓` (success) / `✗` (error) on completion |
+| `SubagentRow` | one clickable line per subagent invocation: a **live braille spinner** + `{name}-{6hex>` (e.g. `editor-a1b2c3`, `subagent-a1b2c3` for legacy `<subagent>` styles) + task preview while running, flipping to `✓` (success) / `✗` (error) on completion |
 
 Clicking a `SubagentRow` (or focusing it and pressing `Enter`) pushes a **`SubagentDetailScreen`** — a modal rendering that invocation in the same notation as the main chat: the received task brief as a `> ` row, internal loop events as translucent-border muted rows, and the final result as a Markdown `AnswerRow` (live-refreshing while the subagent is still running). **`Esc` or `q` goes back.** Subagent-internal events never appear in the main chat log — only in the detail screen.
 
@@ -140,7 +140,7 @@ Reads:
 - `storage.skills.list_skills()` → all visible skill names (hidden skills excluded)
 - `storage.sessions.list_sessions()` → session filenames
 
-Prints 10 rich-formatted key/value lines: `Default provider`, `Default model`, `Subagent`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, `Sessions`. Always exits 0 (no error states). The `Subagent` line shows the resolved subagent `provider/model` when `settings.subagent_provider` or `settings.subagent_model` is set, or `same as outo (<provider>/<model>)` when it inherits.
+Prints 10 rich-formatted key/value lines: `Default provider`, `Default model`, `Subagent`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, `Sessions`. Always exits 0 (no error states). The `Subagent` line shows the resolved subagent `provider/model` when `settings.subagent_provider` or `settings.subagent_model` is set, or `same as outo (<provider>/<model>)` when it inherits. This is the shared subagent provider trio — every named subagent (declared via top-level tags in the active style) uses it.
 
 ---
 
@@ -202,14 +202,14 @@ Loop-event notation in verbose CLI output keeps the `name:` prefix style:
 ```
 outo: Bash ls -la                          # outo tool call
 outo:thinking: <full reasoning text>       # outo reasoning (dim, untruncated)
-subagent-a1b2c3: write the tests           # subagent invocation start (task preview)
-subagent-a1b2c3: Bash pytest -q            # a tool call inside that subagent
-subagent-a1b2c3:thinking: <full text>      # reasoning inside that subagent
-subagent-a1b2c3: done                      # subagent finished (dim; "error: …" on failure)
-provider: HTTP 429 → retry: …              # rule-matched provider error
+editor-a1b2c3: write the tests            # named-subagent invocation start (task preview)
+editor-a1b2c3: Bash pytest -q             # a tool call inside that subagent
+editor-a1b2c3:thinking: <full text>       # reasoning inside that subagent
+editor-a1b2c3: done                       # subagent finished (dim; "error: …" on failure)
+provider: HTTP 429 → retry: …             # rule-matched provider error
 ```
 
-Every subagent invocation gets a stable 6-hex id (`subagent-<6hex>`), so parallel `call_subagent` runs are distinguishable line-by-line. Reasoning/thinking is labeled `:thinking:` for both outo and subagents and printed **in full** in the CLI (the TUI shows a truncated gray row in the main chat and the full text in the subagent detail screen).
+Every subagent invocation gets a stable 6-hex id, and its actor label is `{name}-{6hex}` — `editor-a1b2c3`, `reviewer-def456`, etc. — so parallel `call_subagent` runs (across different names via `briefs`, or across the same name via `tasks`) are distinguishable line-by-line. Legacy `<subagent>`-only styles still get the `subagent-<6hex>` label. Reasoning/thinking is labeled `:thinking:` for both outo and subagents and printed **in full** in the CLI (the TUI shows a truncated gray row in the main chat and the full text in the subagent detail screen).
 
 ### Model resolution
 

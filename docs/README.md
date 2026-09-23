@@ -15,7 +15,7 @@ This directory contains a complete reference for the project. Read [`architectur
 | [`storage.md`](./storage.md) | `~/.miniouto/` filesystem layout, TOML/JSON schemas, style/skills storage. The persistence layer. |
 | [`core.md`](./core.md) | Chat loop, `RuntimeConfig` resolution, provider construction, context-window management, subagent dispatch. |
 | [`tools.md`](./tools.md) | The Bash + media tools — handlers, schemas, multimodal blocks. |
-| [`styles.md`](./styles.md) | Style document format, `<outo>` / `<subagent>` tags, the five bundled templates. |
+| [`styles.md`](./styles.md) | Style document format (tag-as-name grammar: `<outo>` + named subagent tags), the five bundled templates. |
 | [`skills.md`](./skills.md) | Skill discovery from `~/.agents/skills/`, frontmatter schema. |
 | [`lma.md`](./lma.md) | lma (llm-model-api) integration: provider/model discovery, context caps, the `provider providers/models/add` CLI commands, TUI add flows. |
 | [`development.md`](./development.md) | Install, build, lint, release, contributing notes, known issues. |
@@ -51,7 +51,7 @@ src/miniouto/
 │   ├── sessions.py          # SessionData/TurnRecord (schema v2) + JSON CRUD
 │   ├── settings.py          # Settings dataclass (provider/model/style/session/theme) + TOML CRUD
 │   ├── skills.py            # Skill dataclass + ~/.agents/skills/ discovery
-│   ├── styles.py            # style CRUD + add_from_repo + record_repo/list_repos + split_style
+│   ├── styles.py            # style CRUD + add_from_repo + record_repo/list_repos + parse_style + SubagentSpec
 │   └── toml_io.py           # tiny tomllib + tomliw wrapper
 ├── tools/                   # Bash + media + computer tools  → see tools.md
 │   ├── __init__.py

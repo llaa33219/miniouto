@@ -352,13 +352,17 @@ cat > ~/.miniouto/style/my-prompt.md <<'EOF'
 You are a code review expert. ...
 </outo>
 
-<subagent>
-You are the subagent. Perform the brief concisely and accurately.
-</subagent>
+<editor>
+You are an editor. Edit the file the brief names, then report back.
+</editor>
+
+<reviewer>
+You are a reviewer. Read the diff, flag problems, never edit.
+</reviewer>
 EOF
 ```
 
-The `<outo>...</outo>` tag is required (without it, the entire file is used as the outo prompt). `<subagent>...</subagent>` is optional — when absent, the minimal built-in prompt from `core/runtime.py:_fallback_style("subagent")` is used. Format details in [`styles.md`](./styles.md).
+The `<outo>...</outo>` tag is required (without it, the entire file is used as the outo prompt). Each **top-level** `<name>...</name>` block is one named subagent — the tag name IS the persona name. A legacy `<subagent>...</subagent>` block becomes a subagent named `"subagent"`. **Zero named subagents → `call_subagent` is NOT registered** (outo-only style, no delegation surface); there is no fallback subagent prompt anymore. Format details in [`styles.md`](./styles.md).
 
 To activate:
 
@@ -465,7 +469,7 @@ When the user says "format this" ...
 
 ### Auto-detection
 
-**Just create the directory and file — the next chat call picks it up automatically.** There is no registration command. `core/runtime.py:_load_active_skills` scans `~/.agents/skills/` on every `build_runtime()` call and injects a catalog (name + description per skill, plus the on-disk location) into both the outo and subagent system prompts; the agent reads the full SKILL.md via Bash on demand.
+**Just create the directory and file — the next chat call picks it up automatically.** There is no registration command. `core/runtime.py:_load_active_skills` scans `~/.agents/skills/` on every `build_runtime()` call and injects a catalog (name + description per skill, plus the on-disk location) into the outo system prompt and into each named subagent's prompt; the agent reads the full SKILL.md via Bash on demand.
 
 ### Auto-registration script example
 

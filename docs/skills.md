@@ -79,7 +79,7 @@ def _load_active_skills() -> str:
     return "\n".join(lines)
 ```
 
-Skills are **lazy-loaded**. Only a catalog — a `# Available Skills` heading, a short instruction telling the model where the skill directories live (`~/.agents/skills/<name>/`) and that it should read the SKILL.md via Bash when a task matches, plus one `- <name>: <description>` line per skill — is prepended to **both** the outo and subagent prompts. The full SKILL.md body is NOT injected; the agent reads it on demand.
+Skills are **lazy-loaded**. Only a catalog — a `# Available Skills` heading, a short instruction telling the model where the skill directories live (`~/.agents/skills/<name>/`) and that it should read the SKILL.md via Bash when a task matches, plus one `- <name>: <description>` line per skill — is prepended to the outo system prompt and to each named subagent's prompt. The full SKILL.md body is NOT injected; the agent reads it on demand.
 
 If no skills are installed (or all are hidden), `_load_active_skills` returns an empty string (no catalog block at all).
 

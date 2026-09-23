@@ -304,7 +304,7 @@ miniouto provider remove my-local
 
 ## `miniouto style` — style management
 
-A style is a markdown system prompt at `~/.miniouto/style/<name>.md`. The `<outo>...</outo>` and (optional) `<subagent>...</subagent>` tags split the two agents' prompts. Format details in [`styles.md`](./styles.md).
+A style is a markdown system prompt at `~/.miniouto/style/<name>.md`. It declares one `<outo>` body plus zero or more **named subagent** bodies — each `<name>...</name>` top-level tag is one subagent, and the tag name IS the persona name (e.g. `editor`, `file-picker`). An outo-only style declares no named subagents and the `call_subagent` tool is not registered. Format details in [`styles.md`](./styles.md).
 
 ```bash
 # Five bundles are pre-installed: default, coding, coding-pro, coding-work, coding-ultra
@@ -365,7 +365,7 @@ miniouto skill show git-master
 # [full SKILL.md body]
 ```
 
-Skills are automatically listed (name + description, plus their on-disk location) in both the outo and subagent system prompts on every chat call (`core/runtime.py:_load_active_skills`); the agent reads the full SKILL.md via Bash when a task matches.
+Skills are automatically listed (name + description, plus their on-disk location) in the outo system prompt and in each named subagent's prompt on every chat call (`core/runtime.py:_load_active_skills`); the agent reads the full SKILL.md via Bash when a task matches.
 
 ---
 

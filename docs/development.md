@@ -99,7 +99,7 @@ Suggested test priorities (in order):
 1. `tools/edit.py` — exact match, ambiguity, overlap, fuzzy fallback, empty edits. (Highest value: most rules, easiest to break with refactors.)
 2. `tools/write.py` — refuse overwrite, atomic write, content length cap.
 3. `core/context.py` — `make_summarize_hook`'s non-list guard. The divergence from `coreouto.contrib.hooks.auto_summarize_hook` is the most fragile bit.
-4. `storage/styles.py` — `split_style` regex edge cases (nested tags, missing tags, tag in content).
+4. `storage/styles.py` — `parse_style` edge cases (missing `<outo>`, nested tags, legacy `<subagent>`, duplicate names, zero-tag outo-only styles). `tests/test_styles.py` exists and covers the basics; extend it as new edge cases appear.
 5. `core/chat.py` — `ToolCallArgsError` path; `_dump_failure_diagnostics` output.
 6. `cli/provider.py` — `add`/`list`/`remove`/`default` happy + sad paths.
 
@@ -209,8 +209,8 @@ Then visit the printed URL.
 1. **No tests directory exists.** Don't assume one is being created behind the scenes.
 2. **`tui/` and `utils/` are empty.** They look like package directories but contain no code. Don't add modules there without first deciding whether the contents should be moved into the proper package (TUI lives in `cli/tui.py`, utilities are scattered).
 3. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
-4. **`continue_loop` tool is referenced in every bundled style** but **not** registered in `tools/registry.py`. Models currently improvise. To enable, register a no-op `continue_loop` handler and add the name to `core/runtime.ALL_TOOLS`.
-5. **`core/runtime.py:_SUBAGENT_DEPTH` is a module-level `ContextVar`** that is set inside `_wrap_subagent_handler`. If you add new async tools that themselves call subagents (recursive delegation), make sure they go through the wrapper or the depth tracking will be wrong.
+4. **`continue_loop` tool is referenced in every bundled style** but **not** registered in `tools/registry.py`. Models currently improvise. To enable, register a no-op `continue_loop` handler and add the name to `core/runtime.BASE_TOOLS`.
+5. **`core/runtime.py:_SUBAGENT_DEPTH` / `_SUBAGENT_NAME` / `_SUBAGENT_ID`** are three module-level `ContextVar`s set inside `_wrap_subagent_handler`. They carry the depth, persona name, and 6-hex id of the innermost active subagent invocation. If you add new async tools that themselves call subagents (recursive delegation), make sure they go through the wrapper or the depth/name/id tracking — and the per-invocation stall supervision (`supervised_run` at `level=depth`) — will be wrong.
 6. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code; do not rely on them affecting model behavior.
 
 ## Common modifications
@@ -227,7 +227,7 @@ See `docs/tools.md` § "Adding a new tool".
 
 ### "Add a new bundled style"
 
-1. Create `src/miniouto/default_style/<name>.md` (follow the `<outo>` / `<subagent>` structure).
+1. Create `src/miniouto/default_style/<name>.md` (follow the tag-as-name structure: one top-level `<outo>...</outo>` block plus zero or more `<name>...</name>` blocks — one per named subagent).
 2. It will be auto-seeded into `~/.miniouto/style/` on first run for new installs.
 3. Document in `docs/styles.md`.
 
