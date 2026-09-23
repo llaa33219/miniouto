@@ -125,8 +125,8 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
       "events": [
         {"actor": "outo", "kind": "thinking", "text": "the user wants a listing…"},
         {"actor": "outo", "kind": "tool", "text": "Bash ls", "tool_name": "Bash"},
-        {"actor": "subagent-a1b2c3", "kind": "subagent_start", "text": "inspect the dir", "tool_name": "call_subagent", "subagent_id": "a1b2c3"},
-        {"actor": "subagent-a1b2c3", "kind": "subagent_end", "text": "done", "subagent_id": "a1b2c3"}
+      {"actor": "editor-a1b2c3", "kind": "subagent_start", "text": "edit the auth route", "tool_name": "call_subagent", "subagent_id": "a1b2c3", "subagent_name": "editor"},
+      {"actor": "editor-a1b2c3", "kind": "subagent_end", "text": "done", "subagent_id": "a1b2c3", "subagent_name": "editor"}
       ]
     }
   ]
@@ -134,7 +134,7 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
 ```
 
 - **`history`** — restorable model context: raw coreouto `Message.model_dump(mode="json")` dicts, **system messages excluded** (coreouto prepends a fresh system prompt on every `call()`, so persisting it would duplicate it — see coreouto `examples/21_loop_history.py`). Contains the *full* loop transcript: intermediate assistant messages, tool calls, and tool results. **Rewritten in full after every turn** from `Response.messages`, so it always matches what the model actually saw — including any in-loop compaction done by the summarize hook. Reloaded via `co.Message.model_validate`.
-- **`turns`** — display-only log, appended once per turn. `events` are `LoopEvent` dicts (`actor`, `kind`, `text`, optional `tool_name` / `subagent_id`). Thinking/reasoning lives **only here** as `kind="thinking"` events: coreouto's providers never put thinking into history `Message` objects, so it is captured from the `ON_THINKING` hook and cannot be part of the restorable history. The TUI renders past sessions from `turns`.
+- **`turns`** — display-only log, appended once per turn. `events` are `LoopEvent` dicts (`actor`, `kind`, `text`, optional `tool_name` / `subagent_id` / `subagent_name`). Actor labels for subagent events are `{name}-{6hex}` (`editor-a1b2c3`, `reviewer-def456`, …) or `subagent-<6hex>` for the legacy `subagent` name. Thinking/reasoning lives **only here** as `kind="thinking"` events: coreouto's providers never put thinking into history `Message` objects, so it is captured from the `ON_THINKING` hook and cannot be part of the restorable history. The TUI renders past sessions from `turns`.
 
 Notes:
 - **v1 migration**: files without a `version` key (flat `messages` list) are migrated on load — records become `history` entries, and user/assistant pairs are synthesized into `turns`. The `(session created)` system marker is dropped.
@@ -153,7 +153,7 @@ Schema of one `history` entry (coreouto `Message`):
 
 ### `style/<name>.md`
 
-Plain Markdown. Optional XML structure:
+Plain Markdown. Top-level XML structure: one optional `<outo>` block (always the outo prompt) plus zero or more named subagent blocks (each `<tag>` is one subagent — the tag name IS the name):
 
 ```markdown
 <outo>
@@ -161,15 +161,20 @@ You are outo…
 [main agent prompt]
 </outo>
 
-<subagent>
-You are subagent…
-[delegated agent prompt]
-</subagent>
+<editor>
+You are an editor. Read the brief, edit the file, report back. …
+[editor prompt]
+</editor>
+
+<file-picker>
+You are a file picker. Locate the right files. Do not edit. …
+[file-picker prompt]
+</file-picker>
 ```
 
-The `<outo>` tag is required (or the whole document is treated as the outo prompt). The `<subagent>` tag is optional — if absent, the subagent gets `core.runtime._fallback_style("subagent")` (a hardcoded minimal prompt).
+The `<outo>` tag is required (or the whole document is treated as the outo prompt). Each top-level `<name>...</name>` pair outside `<outo>` is one named subagent. A legacy `<subagent>...</subagent>` block becomes a subagent named `"subagent"`. **Zero named subagents → zero `SubagentSpec`s → the `call_subagent` tool is NOT registered** (outo-only style = no delegation surface).
 
-`storage.styles.split_style(content) -> (outo_part, subagent_part)` does the parsing. See `docs/styles.md` for full details.
+`storage.styles.parse_style(content) -> tuple[str, list[SubagentSpec]]` does the parsing. See `docs/styles.md` for full details.
 
 ## Module API reference
 
@@ -294,7 +299,7 @@ class SessionData:
 | `list_repos()` | `list[str]` | recorded repo URLs from `style_repos.toml` (`[]` if absent/malformed) |
 | `builtin_default()` | `str` | seeds `~/.miniouto/style/default.md` from the bundled copy if absent, then returns its **text content** (or `""` if neither exists). Despite the legacy docstring, it returns content — not a path. |
 | `write_default_style(content)` | `None` | writes `default.md` only if absent |
-| `split_style(content)` | `tuple[str, str]` | `(outo, subagent)`; missing tag → whole/empty |
+| `parse_style(content)` | `tuple[str, list[SubagentSpec]]` | `(outo, [SubagentSpec...])`; missing `<outo>` → whole document; top-level `<name>...</name>` → one spec per tag |
 
 `add_from_repo` accepts GitHub URLs (`https://github.com/owner/repo`), GitLab URLs, or any URL whose directory listing exposes `<a href="*.md">` links. Internally dispatches to:
 - `_fetch_github_tree(parsed)` — GitHub Contents API for `/style-md/`.

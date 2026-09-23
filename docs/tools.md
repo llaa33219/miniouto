@@ -216,7 +216,7 @@ Wires the bash/media/computer tools into coreouto's tool registry.
 
 ### `register_all()`
 
-Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`, and — when `computer_supported()`; screenshot availability is decided at call time from the outo provider's `api_format` — `Computer` (with `parallelizable=False`). (The `call_subagent` tool is registered separately in `core.runtime.build_runtime` because it needs the subagent config to be built first.)
+Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`, and — when `computer_supported()`; screenshot availability is decided at call time from the outo provider's `api_format` — `Computer` (with `parallelizable=False`). (The `call_subagent` tool is registered conditionally in `core.runtime.build_runtime` when the active style declares at least one named subagent, because it needs the resolved subagent specs to dispatch by `name=`. An outo-only style produces no `call_subagent` tool at all.)
 
 ### `_register_if_missing(name, handler, schema, description, *, parallelizable=True)`
 
@@ -266,8 +266,8 @@ If you need the agent to operate relative to a different directory, pass an abso
 
 1. Create `src/miniouto/tools/<name>.py` with a single function `<name>(**kwargs) -> str` (or `async def`). Keep it **pure stdlib** — no `coreouto` import. If the tool needs to return media (image/video/audio bytes), return a plain data structure (like `media.py`'s `LoadedMedia`) and let `registry.py` build the `co.ContentBlock`s. See `tools/media.py` for the pattern.
 2. Add the function's description, schema, and handler to `tools/registry.py`. Add `_<name>_handler`, `_<name>_schema`, `_<name>_description` and wire them via `_register_if_missing` inside `register_all`. (Note: per "A note on schemas" above, the schema dict is currently discarded at registration — the description string is what reaches the model.) **For multimodal tools**, the handler returns `list[co.ContentBlock]` instead of `str` — see the `Image` / `Video` / `Audio` handlers for the exact shape.
-3. Add the name to `core/runtime.ALL_TOOLS` (this controls which tools are visible to both outo and subagent presets — both `register_agent_preset("outo", tools=ALL_TOOLS, …)` and `register_agent_preset("subagent", tools=ALL_TOOLS, …)` reference it).
-4. If the tool should only be visible to outo (not subagent), create separate tool lists and edit the `tools=` argument in each `register_agent_preset` call. **Do not confuse this with `_resolve_both_styles`** — that function only resolves the style *prompts*, not the tool lists.
+3. Add the name to `core/runtime.BASE_TOOLS` (this controls which tools are visible to both outo and subagent presets — every `register_agent_preset(..., tools=BASE_TOOLS + OUTO_ONLY_TOOLS [...], ...)` call references it). `call_subagent` is NOT in this list — it's registered conditionally based on the active style.
+4. If the tool should only be visible to outo (not subagent), add its name to `core/runtime.OUTO_ONLY_TOOLS` instead of `BASE_TOOLS`. **Do not confuse this with `parse_style`** — that function only resolves the style *prompts*, not the tool lists.
 5. Add the tool name to `_LOGGABLE_TOOL_NAMES` and the tool-name set in `_make_tool_call_dispatcher` (plus a branch in `_short_arg_summary`) in `core/chat.py`, so loop events and failure diagnostics render the new tool nicely. (The media tools `Image` / `Video` / `Audio` are examples of this wiring.)
 6. Update `default_style/*.md` if the tool's name or behavior should be documented to the model.
 7. Add a `Bash`-style test for the new tool's edge cases (none exist yet, so this is a chance to start the test suite).
