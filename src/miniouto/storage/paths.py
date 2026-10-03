@@ -11,6 +11,9 @@ SETTINGS_FILE = ROOT / "settings.toml"
 STYLE_DIR = ROOT / "style"
 STYLE_REPOS_FILE = ROOT / "style_repos.toml"
 SESSION_DIR = ROOT / "sessions"
+# Background-subagent result files (core/subagents.py); the job completion
+# alarm handed to the model points here.
+SUBAGENT_RESULTS_DIR = ROOT / "subagent-results"
 LOG_DIR = ROOT / "logs"
 BUNDLED_STYLE_DIR = Path(__file__).parent.parent / "default_style"
 
@@ -34,7 +37,7 @@ def ensure_dirs() -> None:
     left untouched.
     """
 
-    for p in (ROOT, STYLE_DIR, SESSION_DIR, LOG_DIR):
+    for p in (ROOT, STYLE_DIR, SESSION_DIR, SUBAGENT_RESULTS_DIR, LOG_DIR):
         p.mkdir(parents=True, exist_ok=True)
 
     if BUNDLED_STYLE_DIR.is_dir():
