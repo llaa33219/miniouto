@@ -761,6 +761,10 @@ class EventRow(RowStatic):
         color: $error;
         border-left: heavy $error 60%;
     }
+    EventRow.-alarm {
+        color: $warning;
+        border-left: heavy $warning 60%;
+    }
     """
 
 
@@ -1484,6 +1488,15 @@ class TUIEventSink:
             app._add_subagent_row(event)
         elif event.kind == "subagent_end":
             app._finish_subagent_row(event)
+        elif event.kind == "alarm":
+            # An alarm is outo's own message (invariant 16 appends it to the
+            # live history), so it belongs in the main chat — and it is the
+            # only completion signal v1 has, hence finishing the row FIRST.
+            # `mount_result=False`: the alarm names the result file, it is
+            # not the result, so the unbounded box is not mounted.
+            if event.subagent_id:
+                app._finish_subagent_row(event, mount_result=False)
+            app._add_event_row(event)
         elif event.subagent_id:
             pass  # subagent internals live in the detail screen, not main chat
         else:
@@ -2622,7 +2635,9 @@ class ChatTUI(App):
         the same collapsible `ToolRow` + result pairing as the live path;
         subagent_end replays through `_finish_subagent_row`, which both
         flips the `SubagentRow` status *and* mounts the subagent result
-        box.
+        box. Alarms take the same route as the live path (main-chat row
+        plus a row finish, no result box), so a session looks identical
+        whether it is live or reloaded.
         """
 
         if event.subagent_id:
@@ -2638,6 +2653,10 @@ class ChatTUI(App):
             self._mount_row(row)
         elif event.kind == "subagent_end":
             self._finish_subagent_row(event)
+        elif event.kind == "alarm":
+            if event.subagent_id:
+                self._finish_subagent_row(event, mount_result=False)
+            self._add_event_row(event)
         elif event.kind in ("tool", "tool_result", "thinking", "error"):
             self._add_event_row(event)
         elif event.subagent_id:
@@ -2865,6 +2884,8 @@ class ChatTUI(App):
         row = EventRow(Text(event.text))
         if event.kind == "error":
             row.add_class("-error")
+        elif event.kind == "alarm":
+            row.add_class("-alarm")
         self._mount_row(row, event.msg_ref)
 
     def _remove_event_rows(self, msg_refs: list[str]) -> None:
@@ -2908,11 +2929,15 @@ class ChatTUI(App):
         # started it, so its row must survive a repair that cuts that turn.
         self._mount_row(row)
 
-    def _finish_subagent_row(self, event: LoopEvent) -> None:
+    def _finish_subagent_row(
+        self, event: LoopEvent, *, mount_result: bool = True
+    ) -> None:
         sid = event.subagent_id or ""
         row = self._subagent_rows.get(sid)
         if row is not None:
             row.finish(ok=not event.text.startswith("error:"))
+        if not mount_result:
+            return
         # Mount a collapsible result box below the SubagentRow so users see
         # the full returned text inline (the SubagentRow itself stays
         # focused on the task summary and still opens the detail screen on
