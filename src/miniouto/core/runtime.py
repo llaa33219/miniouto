@@ -456,7 +456,10 @@ async def supervised_run(
         wakeups = 0
         restarts = 0
         while True:
-            await asyncio.sleep(WATCHDOG_CHECK_SECONDS)
+            # `asyncio.wait` returns as soon as the attempt finishes; a
+            # bare `sleep` would make every turn pay a full poll interval
+            # before its own result could be returned.
+            await asyncio.wait({task}, timeout=WATCHDOG_CHECK_SECONDS)
             if task.done():
                 return task.result()
             if cancel_event is not None and cancel_event.is_set():
@@ -465,7 +468,17 @@ async def supervised_run(
                     await task
                 raise LoopCancelledError("stopped by user")
             if restart_on_repetition is not None:
-                verdict = repetition.consume_verdict(restart_on_repetition)
+                # PEEK before consuming: `consume_verdict` pops the actor's
+                # counters even when it returns None, so an unconditional
+                # poll erases the counts every WATCHDOG_CHECK_SECONDS and a
+                # loop slower than the poll interval (5s in production) can
+                # never reach a threshold. Same discipline as
+                # `repetition.cancel_background_loop`.
+                verdict = (
+                    None
+                    if repetition.check(restart_on_repetition) is None
+                    else repetition.consume_verdict(restart_on_repetition)
+                )
                 if verdict is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
