@@ -75,11 +75,20 @@ The chat log is a `VerticalScroll` of row widgets (migrated from `RichLog` so ro
 |---|---|
 | `Static` | user prompts (`> ` in accent), blank spacers, `[system]` lines in warning color |
 | `AnswerRow` | the final answer as `Markdown` — behavior inherited from `RowStatic`; exists as a distinct class because Markdown goes through `RichVisual` (no native selection painting) |
-| `ThinkingRow` | reasoning/thinking — **collapsed by default** (`▸ thinking`), click or `Enter` to expand the full text (`▾ thinking` + content), click again to re-collapse. Same translucent border + muted styling as `EventRow` |
+| `ThinkingRow` | reasoning/thinking — **collapsed by default** (`▸ thinking`), click or `Enter` to expand the full text (`▾ thinking` + content), click again to re-collapse. While reasoning is still streaming, the header carries a `●` marker; the completed message's whole text then replaces the streamed fragments in place. Same translucent border + muted styling as `EventRow` |
+| `StreamRow` | the **live** assistant text while the model is still generating it: mounted on the first text delta of a message and updated in place for each subsequent one (one widget per message, not per token). Replaced by the canonical `AnswerRow` when the turn's final answer arrives, or kept as the record of an intermediate message whose whole text is otherwise suppressed |
 | `EventRow` | any other intermediate loop output — tool calls, iteration/token progress, provider errors — rendered with a **translucent left border (`$primary 40%`) and muted gray text** (provider errors use `$error`). No `actor:` prefixes |
 | `SubagentRow` | one clickable line per subagent invocation: a **live braille spinner** + `{name}-{6hex>` (e.g. `editor-a1b2c3`, `subagent-a1b2c3` for legacy `<subagent>` styles) + task preview while running, flipping to `✓` (success) / `✗` (error) on completion |
 
 Clicking a `SubagentRow` (or focusing it and pressing `Enter`) pushes a **`SubagentDetailScreen`** — a modal rendering that invocation in the same notation as the main chat: the received task brief as a `> ` row, internal loop events as translucent-border muted rows, and the final result as a Markdown `AnswerRow` (live-refreshing while the subagent is still running). **`Esc` or `q` goes back.** Subagent-internal events never appear in the main chat log — only in the detail screen.
+
+### Live token streaming
+
+While the provider is streaming, the TUI renders text and reasoning **as it arrives** (coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` fire once per token). Per-token hooks fire 100+/s, so `TUIEventSink` folds them through `_StreamCoalescer` into a single UI-thread update roughly every **33 ms (~30 Hz)** — fast enough to read as typing, cheap enough that a long answer repaints a few dozen times instead of hundreds. The final `< interval` window is drained when the turn's spinner stops, so no tail fragment is lost.
+
+Deltas are **display-only**: they are never written to the session file (`_RecordingSink` forwards them to the wrapped sink without recording), so a reloaded session is byte-identical to a pre-streaming one. Nor are they fed to the repetition watchdog — that stays on whole-message boundaries to avoid counting each phrase twice.
+
+Finalization avoids showing the same text twice: the live `StreamRow` is removed and the Markdown `AnswerRow` mounted in its place for the final answer, the whole-text `thinking` event finalizes the live `ThinkingRow` in place, and the stashed `response` row is suppressed whenever deltas already showed that message (a non-streaming turn renders exactly as before). Subagent streams are **not** displayed in v1: there are no per-actor rows, and a *background* subagent has no hooks at all once the turn that started it has ended.
 
 Reloading a session (`Ctrl+P` → "Pick session") re-renders from the session's `turns` section: subagent rows come back finished but stay clickable, with their recorded internal events available in the detail screen.
 

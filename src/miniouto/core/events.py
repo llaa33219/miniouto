@@ -21,7 +21,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from rich.console import Console
 from rich.status import Status
@@ -73,6 +73,15 @@ class EventSink(Protocol):
     def end_working(self) -> None: ...
     def emit_loop_event(self, event: LoopEvent) -> None: ...
     def emit_final_answer(self, content: str, session_name: str) -> None: ...
+    def emit_stream_delta(self, kind: str, text: str) -> None: ...
+
+
+# The two `emit_stream_delta` kinds. Deltas are transient display-only
+# fragments of a message the model is still generating (coreouto fires
+# ON_STREAM_TEXT / ON_STREAM_THINKING once per incremental fragment).
+StreamKind = Literal["text", "thinking"]
+STREAM_TEXT: StreamKind = "text"
+STREAM_THINKING: StreamKind = "thinking"
 
 
 class NullSink:
@@ -89,6 +98,9 @@ class NullSink:
         pass
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
+        pass
+
+    def emit_stream_delta(self, kind: str, text: str) -> None:
         pass
 
 
@@ -175,3 +187,12 @@ class ConsoleEventSink:
             if not content or not content.endswith("\n"):
                 sys.stdout.write("\n")
             sys.stdout.flush()
+
+    def emit_stream_delta(self, kind: str, text: str) -> None:
+        """No-op: live streaming is a TUI feature only.
+
+        The CLI prints intermediate model text from the discrete
+        `response` loop event and the final answer from
+        `emit_final_answer`; rendering the same tokens twice (once
+        incrementally, once whole) would corrupt that output.
+        """

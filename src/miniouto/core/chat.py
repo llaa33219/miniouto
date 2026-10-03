@@ -17,7 +17,7 @@ from ..storage import sessions as session_store
 from ..storage.sessions import STATUS_DONE, STATUS_INTERRUPTED
 from . import providers, repetition, subagents
 from .context import get_max_output_tokens
-from .events import EventSink, LoopEvent, NullSink
+from .events import STREAM_TEXT, STREAM_THINKING, EventSink, LoopEvent, NullSink, StreamKind
 from .runtime import (
     WATCHDOG_MAX_WAKEUPS,
     ChatOverrides,
@@ -125,6 +125,19 @@ class _RecordingSink:
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
         self._inner.emit_final_answer(content, session_name)
+
+    def emit_stream_delta(self, kind: str, text: str) -> None:
+        """Forward a live delta for display, never for the session file.
+
+        A delta is a fragment of a message the model is still writing; the
+        whole message is recorded once, when it completes (as a `thinking`
+        or `response` loop event, or as the turn's final answer). Recording
+        fragments too would duplicate every streamed message in the session
+        JSON and make replay render it twice — so the persister is
+        deliberately bypassed here.
+        """
+
+        self._inner.emit_stream_delta(kind, text)
 
 
 class _TurnPersister:
@@ -267,6 +280,8 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
         on_tool_call=on_tool_call,
         on_response=_make_response_dispatcher(sink, pending_responses),
         on_thinking=_make_thinking_dispatcher(sink),
+        on_stream_text=_make_stream_dispatcher(sink, STREAM_TEXT),
+        on_stream_thinking=_make_stream_dispatcher(sink, STREAM_THINKING),
         on_iteration=on_iteration,
         on_provider_error=_make_provider_error_dispatcher(sink),
         on_history_repair=on_history_repair,
@@ -679,6 +694,35 @@ def _make_thinking_dispatcher(sink: EventSink):
         )
 
     return on_thinking
+
+
+def _make_stream_dispatcher(sink: EventSink, kind: StreamKind):
+    """Build the per-delta callback for ON_STREAM_TEXT / ON_STREAM_THINKING.
+
+    coreouto fires these once per incremental fragment of the message the
+    provider is still streaming, so this is a pure display path: the delta
+    goes to `sink.emit_stream_delta` and nowhere else.
+
+    Two deliberate omissions:
+
+    - **No repetition feed.** Deltas fragment mid-segment, so a phrase
+      detector fed from them would count half-phrases; combined with the
+      whole-message `note_text` calls in the thinking/response paths, each
+      message would be counted twice and the 10x threshold would trip at 5
+      real repeats. The watchdog therefore stays on whole-message
+      boundaries, which cover the same content.
+    - **No subagent deltas.** A subagent's stream would need per-actor rows
+      and the background-job case has no hooks at all once the turn ends
+      (the job keeps streaming against a different agent's loop), so
+      v1 renders outo's own text only.
+    """
+
+    def on_stream_delta(delta: str) -> None:
+        if not delta or current_subagent_depth() > 0:
+            return
+        sink.emit_stream_delta(kind, delta)
+
+    return on_stream_delta
 
 
 def _make_response_dispatcher(

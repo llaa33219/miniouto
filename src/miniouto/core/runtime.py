@@ -693,6 +693,8 @@ def build_runtime(
     on_tool_result: Callable[[str, Any], None] | None = None,
     on_response: Callable[[str, bool], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
+    on_stream_text: Callable[[str], None] | None = None,
+    on_stream_thinking: Callable[[str], None] | None = None,
     on_iteration: Callable[..., None] | None = None,
     on_provider_error: Callable[..., None] | None = None,
     on_history_repair: Callable[[list[Any]], None] | None = None,
@@ -717,6 +719,10 @@ def build_runtime(
     `on_thinking` is called after each LLM response that carries reasoning
     text (coreouto's ON_THINKING; providers never put thinking into history
     messages, so this hook is the only way to surface it). Pass None to skip.
+    `on_stream_text` / `on_stream_thinking` are called once per incremental
+    fragment as the provider streams (coreouto's ON_STREAM_TEXT /
+    ON_STREAM_THINKING) — display-only, so the whole message is what a sink
+    should record. Pass None to skip.
     `on_iteration` is called after each agent-loop iteration with the same
     kwargs coreouto passes to ON_ITERATION (iteration, messages, response),
     letting the caller stream loop-progress signals. Pass None to skip.
@@ -933,6 +939,15 @@ def build_runtime(
     if on_thinking is not None:
         co.register_hook(co.ON_THINKING, _make_thinking_logger(on_thinking))
 
+    # Registered in addition to the watchdog activity tracker's own
+    # registrations for these two events: display deltas are the user's
+    # only view of a message while it is still being generated.
+    if on_stream_text is not None:
+        co.register_hook(co.ON_STREAM_TEXT, _make_stream_logger(on_stream_text))
+
+    if on_stream_thinking is not None:
+        co.register_hook(co.ON_STREAM_THINKING, _make_stream_logger(on_stream_thinking))
+
     if on_iteration is not None:
         co.register_hook(co.ON_ITERATION, _make_iteration_logger(on_iteration))
 
@@ -1072,6 +1087,20 @@ def _make_response_logger(
             return
         tool_calls = getattr(response, "tool_calls", None) or []
         callback(response.content, bool(tool_calls))
+
+    return hook
+
+
+def _make_stream_logger(callback: Callable[[str], None]):
+    """Build the ON_STREAM_TEXT / ON_STREAM_THINKING hook forwarding one delta.
+
+    coreouto fires these per incremental fragment (not the accumulated
+    text) with `(text, messages, model)`; only `text` reaches the caller.
+    """
+
+    def hook(*, text: str, **_kwargs: Any) -> None:
+        if text:
+            callback(text)
 
     return hook
 

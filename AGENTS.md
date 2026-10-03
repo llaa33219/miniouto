@@ -50,7 +50,8 @@ CLI flag bag → ChatOptions (core/chat.py)
             → build_runtime (core/runtime.py)
                 → coreouto provider registry + tool registry + hooks
                     (sink loggers on BEFORE/AFTER_TOOL_CALL, ON_ITERATION×2,
-                    AFTER_LLM_CALL, ON_THINKING, ON_PROVIDER_ERROR + watchdog
+                    AFTER_LLM_CALL, ON_THINKING, ON_STREAM_TEXT/THINKING,
+                    ON_PROVIDER_ERROR + watchdog
                     trackers: activity/loop-progress + BEFORE_LLM_CALL capture)
                 → co.Agent(outo_config)
             → run_chat(opts, sink) → asyncio.run(_run_with_watchdog(agent, ...))
@@ -68,6 +69,8 @@ CLI flag bag → ChatOptions (core/chat.py)
                   preset by `name=`/`task`/`tasks`/`briefs`; each
                   invocation mints a `<name>-<6hex>` id tracked via
                   ContextVars)
+                → ON_STREAM_TEXT/THINKING (per token) → sink.emit_stream_delta
+                  (TUI live row only; never recorded — invariant 8)
             → incremental persistence: begin_turn before the loop, event +
               sanitized-history snapshots during it, then finish_turn stamps
               the turn done (history rewritten from Response.messages minus
@@ -92,7 +95,7 @@ CLI flag bag → ChatOptions (core/chat.py)
 
 ---
 
-## The 13 invariants (do NOT break these)
+## The 15 invariants (do NOT break these)
 
 These rules hold throughout the codebase. Breaking any of them silently degrades or breaks the system. **If your change seems to require breaking one, stop and ask.**
 
@@ -165,19 +168,28 @@ Turn lifecycle: `begin_turn` appends a `status="running"` turn before the loop s
 
 `load()` migrates v1 files and never raises on corrupt content. If you change the schema again, bump `SCHEMA_VERSION` and extend the migration — do not break old files.
 
-### 8. File manipulation is Bash-only
+### 8. Stream deltas are display-only — never a record
+`EventSink.emit_stream_delta(kind, text)` (`kind` is the `StreamKind` literal `"text"` / `"thinking"`) carries the incremental fragments coreouto fires from `ON_STREAM_TEXT` / `ON_STREAM_THINKING` — one hook **per token**, not the accumulated message. Three rules hold it together:
+
+- **The protocol is closed.** All four implementers must define it (`NullSink`, `ConsoleEventSink`, `_RecordingSink`, `TUIEventSink`): hooks are global and there is no `__getattr__` delegation, so a missing method raises `AttributeError` on the first delta of the first turn.
+- **Nothing persists them.** `_RecordingSink.emit_stream_delta` forwards to the wrapped sink and stops there — not `self.events`, not `on_event` (the persister). The whole message is recorded once, when it completes (as a `thinking` / `response` loop event, or the turn's final answer). Recording fragments too would duplicate every streamed message in the session JSON and make replay render it twice. `ConsoleEventSink` is a no-op: the CLI prints whole messages only, and its output must stay byte-identical.
+- **Repetition is not fed from streams.** `_make_stream_dispatcher` deliberately does not call `repetition.note_text`: deltas fragment mid-segment (half-phrases), and the whole-message `note_text` calls in the thinking/response paths already cover the same content, so feeding both would count each phrase twice and trip the 10x threshold at 5 real repeats. If you ever do want delta-level repetition detection, the segmentation in `core/repetition.py` must become shared with a buffering splitter first — do not bolt it on.
+
+In the TUI, deltas land in a live `StreamRow` (one row per message, updated in place) / a `●`-marked `ThinkingRow`, coalesced to ~30 Hz by `_StreamCoalescer` and finalized by the canonical whole-message render (`_finalize_stream` + the `response`-row suppression in `_add_event_row`). Subagent deltas are dropped in v1 — there are no per-actor rows, and a *background* job loses its hooks once the turn that started it ends.
+
+### 9. File manipulation is Bash-only
 There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (error-prone; the agent reached for Bash anyway). **Do not reintroduce them without explicit discussion.** To add any other tool, follow the "Add a new tool" recipe below.
 
-### 9. Async only where needed
+### 10. Async only where needed
 `tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The Computer tool is sync too (py-Vwayland's blocking IPC; coreouto runs sync handlers via `asyncio.to_thread`). The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop. **Don't make the media loaders async** — they don't need to be, and it complicates the TUI dispatch.
 
-### 10. Skill discovery lives outside `~/.miniouto/`
+### 11. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention), NOT from `~/.miniouto/`. Skills are portable content, not per-installation config. **Do not move them into `~/.miniouto/`.**
 
-### 11. TUI model editor manages `Provider.default_model`, not `Settings.model`
+### 12. TUI model editor manages `Provider.default_model`, not `Settings.model`
 In the TUI, picking or typing a model always writes to `provider.default_model` (via `dataclasses.replace(p, default_model=...)` + `provider_store.upsert`) and clears any prior `settings.model`. The model chip displays `provider.default_model` only — `settings.model` is reserved for the `chat --model` CLI flag. Legacy `settings.model` values from older sessions keep working at the runtime layer (`resolve_runtime_from_settings` still treats them as priority 2) but are invisible in the TUI. **Do not reintroduce a `settings.model`-as-TUI-override path.**
 
-### 12. lma-backed vs custom providers
+### 13. lma-backed vs custom providers
 `storage/providers.py:Provider` carries a `source: str` field, one of `SOURCE_CUSTOM` (default) or `SOURCE_LMA`. lma-backed (catalog) providers are added via `miniouto provider add …` or the TUI `+ add from catalog…` wizard; custom providers come from `provider custom add` or the TUI `+ add custom…` wizard. The TUI model picker dispatches on `source`:
 
 - `source == "lma"` → `cli/tui.py:_catalog_model_picker_flow` (fetches `/model-list` and shows a `SelectionModal`).
@@ -187,10 +199,10 @@ The CLI command `miniouto provider providers` filters its "Addable?" column thro
 
 Note: the source string remains the literal `"lma"` (it predates the "catalog" UI rename) — `SOURCE_LMA = "lma"`. The TUI and CLI surface call these "catalog" providers, but the underlying field value is still `"lma"`.
 
-### 13. lma cache lives in `core.lma._CACHE`
+### 14. lma cache lives in `core.lma._CACHE`
 `core/lma.py` mirrors lma's 10-minute server-side TTL with a module-level dict. Cache keys are explicit (`"providers"`, `f"models:{provider.lower()}"`, `f"model:{provider.lower()}:{model.lower()}"` — both segments are lowercased); a cached `None` payload is meaningful (means "lma returned 404"). `core.lma.clear_cache()` exists for tests / manual refresh. **Do not cache anything other than `None` and successful payloads** — a transient transport error must not pollute the cache for 10 minutes.
 
-### 14. Computer tool: screen registry, outo-only, auto-detected
+### 15. Computer tool: screen registry, outo-only, auto-detected
 The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual screens from a **module-level registry** (`_SCREENS`) — one compositor == one screen == one app, so multi-app work means explicitly spawning multiple screens (`spawn`/`kill`/`list` actions, `screen=` targeting; omission resolves lazily when zero or one screen is up, errors when several are). All screens are killed at process exit by vwayland's own atexit hook. Five rules follow:
 
 - It is visible to the **outo preset only** (`core/runtime.py:OUTO_ONLY_TOOLS`) — parallel subagents acting on one shared screen would interleave clicks/keystrokes unpredictably. The outo preset filters that list down to what actually got registered, so an unregistered Computer never reaches the preset.
@@ -227,11 +239,11 @@ The `Computer` tool (`tools/computer.py`, backed by py-Vwayland) drives virtual 
 | `cli/style.py` | `style list/set/add/update/show` |
 | `cli/skill.py` | `skill list/show` (read-only) |
 | `cli/subagent.py` | `subagent show/set/clear` — manage the subagent provider/model/reasoning override persisted in settings (shared by every named subagent) |
-| `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results) with windowed mounting (`_RowWindow` + `ChatScroll`, shared by the main log and `SubagentDetailScreen`: only a trailing window of rows is mounted, older chunks mount on scroll-up, far-above-viewport rows evict; follow-mode via Textual's built-in `anchor()`), `SubagentDetailScreen`, provider wizards + model picker |
+| `cli/tui.py` | `ChatTUI` (Textual App), `run_tui()`, `tui_summary()`; row-widget chat log (`EventRow`/`ThinkingRow`/`ToolRow`/`SubagentRow` — tool calls render as collapsible boxes with attached results) with live token streaming (`StreamRow` + `_StreamCoalescer`) and windowed mounting (`_RowWindow` + `ChatScroll`, shared by the main log and `SubagentDetailScreen`: only a trailing window of rows is mounted, older chunks mount on scroll-up, far-above-viewport rows evict; follow-mode via Textual's built-in `anchor()`), `SubagentDetailScreen`, provider wizards + model picker |
 | `core/__init__.py` | Re-exports `chat`, `events`, `lma`, `providers`, `runtime` (NOT `context`) |
-| `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `_run_with_watchdog` (thin level-0 wrapper over `runtime.supervised_run`), `_TurnPersister` (incremental session persistence), `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
+| `core/chat.py` | `ChatOptions` (incl. `cancel_event`), `run_chat(opts, sink=None)`, `_RecordingSink` (forwards stream deltas without recording them), `_make_stream_dispatcher`, `_run_with_watchdog` (thin level-0 wrapper over `runtime.supervised_run`), `_TurnPersister` (incremental session persistence), `ToolCallArgsError`, failure diagnostics, sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_subagent_dispatcher`, `_make_iteration_dispatcher`) |
 | `core/context.py` | lma `/model` fetcher (via `core.lma.get_model`), `make_summarize_hook` |
-| `core/events.py` | `LoopEvent` (with `subagent_id`, `subagent_name`, `detail`), `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events) |
+| `core/events.py` | `LoopEvent` (with `subagent_id`, `subagent_name`, `detail`), `EventSink` protocol (incl. the transient `emit_stream_delta`), `StreamKind`/`STREAM_TEXT`/`STREAM_THINKING`, `NullSink`, `ConsoleEventSink` (CLI spinner + loop-event rendering; skips `tool_result` events and stream deltas) |
 | `core/error_rules.py` | Per-format `ErrorRule` lists (coreouto >= 0.10 provider-level `error_handling`) ending with coreouto's `TIMEOUT_ERRORS` preset (>= 0.11, `exc_type` match — the HTTP-level stall wakeup for `API_STALL_TIMEOUT_SECONDS`) + `default_error_handling(api_format)`. Tool-call 400/422s use `reaction="retry"` (NOT `tool_result` — that loops forever on malformed calls; coreouto examples/29) paired with the history-repair hook in `core/runtime.py` |
 | `core/lma.py` | `lma.blp.sh` REST client + `slugify` + `find_provider`; in-process 10-min cache |
 | `core/providers.py` | `SUPPORTED_FORMATS`, `sdk_to_format`, `add_provider_from_lma`, `build_coreouto_provider`, `clear_coreouto_state` |

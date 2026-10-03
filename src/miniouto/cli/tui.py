@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, ClassVar
@@ -51,7 +51,7 @@ from textual.widgets import (
 from .. import __version__, paths_runtime
 from ..core import lma as catalog_api
 from ..core.chat import ChatOptions, run_chat
-from ..core.events import LoopEvent
+from ..core.events import STREAM_THINKING, LoopEvent
 from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
 from ..core.runtime import LoopCancelledError
 from ..storage import paths
@@ -167,6 +167,12 @@ def _construct_provider_with_reasoning(**kwargs: Any) -> provider_store.Provider
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SPINNER_INTERVAL = 0.08
 _SPINNER_DEFAULT_TEXT = "Working…"
+
+# Live token streaming. coreouto fires one hook per token, so a burst of
+# deltas is folded into a single UI-thread update roughly every 33 ms
+# (~30 Hz) — fast enough to look like typing, cheap enough that a 400-token
+# burst repaints a dozen times instead of four hundred.
+_STREAM_FLUSH_INTERVAL = 0.033
 
 # Chat-log windowing. Mounting every row of a long session makes Textual
 # lay out thousands of widgets on each reflow (the reported slowdown), so
@@ -752,7 +758,9 @@ class ThinkingRow(EventRow):
     """Collapsible reasoning row: `▸ thinking` collapsed (default), click
     or Enter to expand the full reasoning text, click again to re-collapse.
 
-    Inherits EventRow's translucent left border + muted styling.
+    Inherits EventRow's translucent left border + muted styling. While the
+    model is still streaming its reasoning the collapsed header carries a
+    `●` marker, so a live row is distinguishable from a settled one.
     """
 
     can_focus = True
@@ -766,10 +774,28 @@ class ThinkingRow(EventRow):
     }
     """
 
-    def __init__(self, thinking: str) -> None:
+    def __init__(self, thinking: str = "") -> None:
         super().__init__(Text("▸ thinking"))
         self._thinking = thinking
         self._expanded = False
+        self._streaming = False
+
+    def begin_stream(self) -> None:
+        self._streaming = True
+        self._refresh()
+
+    def append(self, delta: str) -> None:
+        if not delta:
+            return
+        self._thinking += delta
+        self._refresh()
+
+    def finalize(self, thinking: str) -> None:
+        """Replace the streamed text with the message's complete reasoning."""
+
+        self._streaming = False
+        self._thinking = thinking
+        self._refresh()
 
     def on_click(self) -> None:
         self._toggle()
@@ -779,10 +805,34 @@ class ThinkingRow(EventRow):
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
+        self._refresh()
+
+    def _refresh(self) -> None:
+        marker = " ●" if self._streaming else ""
         if self._expanded:
-            self.update(Text(f"▾ thinking\n{self._thinking}"))
+            self.update(Text(f"▾ thinking{marker}\n{self._thinking}"))
         else:
-            self.update(Text("▸ thinking"))
+            self.update(Text(f"▸ thinking{marker}"))
+
+
+class StreamRow(EventRow):
+    """Live assistant text: one row, updated in place as tokens arrive.
+
+    Mounted on the first text delta of a message and appended to (never
+    replaced) for each subsequent one, so a streamed message costs one
+    widget instead of one per token. The final answer replaces this row
+    with the canonical Markdown `AnswerRow` (see `ChatTUI._finalize_stream`).
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(Text(text))
+        self._text = text
+
+    def append(self, delta: str) -> None:
+        if not delta:
+            return
+        self._text += delta
+        self.update(Text(self._text))
 
 
 class ToolRow(EventRow):
@@ -1041,6 +1091,23 @@ class _RowWindow:
         self.rows.clear()
         self.first = 0
 
+    def remove(self, widget: Static) -> None:
+        """Drop a row from the window and the DOM, keeping `first` aligned.
+
+        Used when a live stream row is replaced by the canonical answer row
+        — re-mounting the answer at the tail would otherwise leave the
+        streamed prefix above it as a duplicate.
+        """
+
+        for idx, row in enumerate(self.rows):
+            if row is widget:
+                del self.rows[idx]
+                if idx < self.first:
+                    self.first -= 1
+                break
+        if widget.is_attached:
+            widget.remove()
+
     def append(self, log: VerticalScroll, widget: Static, *, defer_mount: bool) -> None:
         self.rows.append(widget)
         if defer_mount:
@@ -1265,6 +1332,46 @@ class SubagentDetailScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class _StreamCoalescer:
+    """Fold per-token deltas into one UI update per flush window.
+
+    coreouto fires one ON_STREAM_* hook per token, often 100+/s, and every
+    sink call hops to the UI thread — hopping and repainting per token
+    would starve the Textual event loop. The sink appends into this
+    buffer (only the single worker thread calls it, so no lock is needed)
+    and drains it on a time gate; the turn's last window is drained
+    explicitly when working ends, so no tail is ever lost.
+    """
+
+    def __init__(
+        self,
+        flush_interval: float = _STREAM_FLUSH_INTERVAL,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._flush_interval = flush_interval
+        self._clock = clock
+        self._text: list[str] = []
+        self._thinking: list[str] = []
+        self._last_flush = 0.0
+
+    def push(self, kind: str, text: str) -> bool:
+        """Buffer one delta; return True when the caller should flush now."""
+
+        target = self._thinking if kind == STREAM_THINKING else self._text
+        target.append(text)
+        now = self._clock()
+        if now - self._last_flush < self._flush_interval:
+            return False
+        self._last_flush = now
+        return True
+
+    def drain(self) -> tuple[str, str]:
+        text, thinking = "".join(self._text), "".join(self._thinking)
+        self._text.clear()
+        self._thinking.clear()
+        return text, thinking
+
+
 class TUIEventSink:
     """Sink that posts chat events to a running `ChatTUI` app.
 
@@ -1280,6 +1387,7 @@ class TUIEventSink:
         self._frame_idx = 0
         self._activity = _SPINNER_DEFAULT_TEXT
         self._timer: Timer | None = None
+        self._stream = _StreamCoalescer()
 
     def begin_working(self) -> None:
         self._app.call_from_thread(self._start_spin)
@@ -1313,7 +1421,33 @@ class TUIEventSink:
         if self._timer is not None:
             self._timer.stop()
             self._timer = None
+        # Flush the last (< interval) window on the UI thread we are already
+        # on — call_from_thread would raise from this thread.
+        self._drain_stream()
         self._app._render_spinner("", "")
+
+    def emit_stream_delta(self, kind: str, text: str) -> None:
+        if not text:
+            return
+        if self._stream.push(kind, text):
+            self._flush_stream()
+
+    def _flush_stream(self) -> None:
+        text, thinking = self._stream.drain()
+        if not text and not thinking:
+            return
+        self._app.call_from_thread(self._post_stream, text, thinking)
+
+    def _drain_stream(self) -> None:
+        text, thinking = self._stream.drain()
+        if text or thinking:
+            self._post_stream(text, thinking)
+
+    def _post_stream(self, text: str, thinking: str) -> None:
+        if thinking:
+            self._app._apply_stream_thinking(thinking)
+        if text:
+            self._app._apply_stream_text(text)
 
     def emit_loop_event(self, event: LoopEvent) -> None:
         self._app.call_from_thread(self._post_loop_event, event)
@@ -1335,6 +1469,7 @@ class TUIEventSink:
         self._app.call_from_thread(self._post_final_answer, content, session_name)
 
     def _post_final_answer(self, content: str, session_name: str) -> None:
+        self._app._finalize_stream()
         if content:
             self._app._mount_row(AnswerRow(Markdown(content)))
         else:
@@ -1439,6 +1574,8 @@ class ChatTUI(App):
         self._pending_tool_rows: list[ToolRow] = []
         self._window = _RowWindow()
         self._bulk_loading = False
+        self._stream_text_row: StreamRow | None = None
+        self._stream_thinking_row: ThinkingRow | None = None
         self._cancel_event: threading.Event | None = None
         self._last_escape = 0.0
         self._esc_hint: str | None = None
@@ -2571,6 +2708,58 @@ class ChatTUI(App):
         """Drop the row list alongside `remove_children()` (logo/clear/load)."""
 
         self._window.reset()
+        self._stream_text_row = None
+        self._stream_thinking_row = None
+
+    def _apply_stream_text(self, delta: str) -> None:
+        """Extend the current message's live text row (UI thread only).
+
+        The reference is cleared on every path that invalidates the row
+        (`_reset_rows`, `_finalize_stream`, and the message-boundary events
+        in `_add_event_row`), so a row that is gone — evicted by window
+        pressure, or dropped by a session reload — is never updated again
+        and never re-mounted, which would put the message out of order.
+        Window eviction leaves the row tracked but off-DOM; appending to it
+        there is a string concat that no layout ever sees, and it keeps the
+        row correct if a later chunk-load mounts it again.
+        """
+
+        if self._log is None or not delta:
+            return
+        row = self._stream_text_row
+        if row is None:
+            row = StreamRow(delta)
+            self._stream_text_row = row
+            self._mount_row(row)
+            return
+        row.append(delta)
+
+    def _apply_stream_thinking(self, delta: str) -> None:
+        """Extend the current message's live reasoning row (UI thread only)."""
+
+        if self._log is None or not delta:
+            return
+        row = self._stream_thinking_row
+        if row is None:
+            row = ThinkingRow()
+            self._stream_thinking_row = row
+            self._mount_row(row)
+            row.begin_stream()
+        row.append(delta)
+
+    def _finalize_stream(self) -> None:
+        """Drop the live rows once the message's canonical form exists.
+
+        The streamed text is a prefix of the message the final answer (or
+        the recorded `thinking` / `response` event) already carries, so
+        keeping the live row would render the same content twice.
+        """
+
+        for row in (self._stream_text_row, self._stream_thinking_row):
+            if row is not None:
+                self._window.remove(row)
+        self._stream_text_row = None
+        self._stream_thinking_row = None
 
     def _mount_row(self, widget: Static) -> None:
         if self._log is None:
@@ -2589,6 +2778,13 @@ class ChatTUI(App):
 
     def _add_event_row(self, event: LoopEvent) -> None:
         if event.kind == "thinking":
+            live = self._stream_thinking_row
+            self._stream_thinking_row = None
+            if live is not None and live.is_attached:
+                # The streamed reasoning was this message's prefix; the
+                # whole-text event is the canonical copy.
+                live.finalize(event.text)
+                return
             self._mount_row(ThinkingRow(event.text))
             return
         if event.kind == "tool":
@@ -2623,6 +2819,16 @@ class ChatTUI(App):
                     row.add_class("-error")
                 self._mount_row(row)
             return
+        if event.kind == "response" and self._stream_text_row is not None:
+            # The deltas already rendered this message in the live row
+            # above; a second copy would duplicate the text.
+            self._stream_text_row = None
+            return
+        if event.kind in ("response", "context"):
+            # Message boundary: the next deltas belong to a new message and
+            # need their own live row.
+            self._stream_text_row = None
+            self._stream_thinking_row = None
         row = EventRow(Text(event.text))
         if event.kind == "error":
             row.add_class("-error")
@@ -2707,6 +2913,8 @@ class ChatTUI(App):
         first_message = not self._chat_started
         self._chat_started = True
         self._busy = True
+        # A previous turn that died mid-stream can leave live rows behind.
+        self._finalize_stream()
         if first_message and not self._session_assigned:
             import datetime
             import uuid

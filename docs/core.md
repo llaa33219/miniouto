@@ -28,7 +28,8 @@ resolve_runtime_from_settings(overrides) → RuntimeConfig
    ▼
 build_runtime(runtime, *, style_overrides, provider_config,
               on_tool_call, on_tool_result, on_response, on_thinking,
-              on_iteration, on_provider_error, reasoning) → co.Agent
+              on_stream_text, on_stream_thinking, on_iteration,
+              on_provider_error, reasoning) → co.Agent
    │
    │  ┌─ clear_coreouto_state()
    │  ├─ build_coreouto_provider(runtime.provider)      → co.register_provider
@@ -81,7 +82,7 @@ run_chat(ChatOptions, sink=None) → str
 The sink layer — a tiny abstraction so the chat loop can emit progress/trace events without coupling to either the CLI (`rich.Console`) or the TUI (Textual widgets). Introduced when the TUI was added so `run_chat` could drive both surfaces from the same code path.
 
 - **`LoopEvent`** — dataclass with `actor: str` (`"outo"` / `"{name}-{6hex}"` — `"subagent-<6hex>"` for the legacy `"subagent"` name — / `"provider"` / `"watchdog"`), `kind: str`, `text: str`, optional `tool_name`, optional `subagent_id` (the 6-hex invocation id, set on every event emitted inside a subagent), optional `subagent_name` (the persona name — `"editor"`, `"reviewer"`, … — set alongside `subagent_id`), optional `detail` (extra payload not shown by the CLI — currently the full untruncated Bash command on `kind="tool"` events). Kinds: `"tool"` / `"tool_result"` / `"response"` / `"thinking"` / `"context"` / `"error"` / `"wakeup"` / `"subagent_start"` / `"subagent_end"`. `to_dict()`/`from_dict()` provide the sparse JSON form stored in session turns (optional fields are only serialized when truthy, so older session files load unchanged).
-- **`EventSink`** — `Protocol`: `begin_working()`, `update_activity(text)`, `end_working()`, `emit_loop_event(event)`, `emit_final_answer(content, session_name)`.
+- **`EventSink`** — `Protocol`: `begin_working()`, `update_activity(text)`, `end_working()`, `emit_loop_event(event)`, `emit_final_answer(content, session_name)`, `emit_stream_delta(kind, text)`. `emit_stream_delta` is **transient and display-only** (`kind` is `"text"` or `"thinking"` — the `StreamKind` literal): deltas are incremental fragments of a message the model is still generating, never records. All four implementers must define it — hooks are global and there is no `__getattr__` delegation, so a missing method raises `AttributeError` on the first delta. `NullSink` and `ConsoleEventSink` are no-ops (the CLI renders whole messages only, keeping its output byte-identical), `_RecordingSink` forwards without recording, `TUIEventSink` coalesces into a live row.
 - **`NullSink`** — no-op implementation (used when `run_chat` is called without a sink).
 - **`ConsoleEventSink`** — CLI implementation. Renders loop events as `{actor}: {text}` in `orange3`; `kind="thinking"` renders the **full** reasoning text as `{actor}:thinking: {text}` (dim); `subagent_start`/`subagent_end` render as a single-line preview (whitespace-flattened, 120 chars; `subagent_end` dim); `kind="tool_result"` is **ignored** (early return — the events exist for the TUI; CLI output stays byte-identical to the pre-tool_result behavior); runs a `rich.status` spinner updated by `update_activity`; writes the final answer as plain stdout followed by a `------finish------` marker.
 
@@ -196,6 +197,13 @@ Builds the `on_thinking(thinking)` closure wired into coreouto's `ON_THINKING` h
 ### `_make_response_dispatcher(sink: EventSink, pending: dict)`
 
 Builds the `on_response(content, has_tool_calls)` closure. When `has_tool_calls` is true (intermediate LLM response that triggers a tool call), the text is **stashed in `pending`** (keyed by actor: `""` for outo, the subagent id inside a subagent) instead of being emitted immediately — coreouto fires `AFTER_LLM_CALL` *before* `ON_THINKING`, so an immediate emit would place the model's text above its own thinking row. The stash is flushed by `_make_iteration_dispatcher` (below), which `ON_ITERATION` guarantees runs after `ON_THINKING` — every sink therefore sees `thinking` → `response` in that order. The stashed tuple carries the actor/subagent id captured at stash time, so parallel subagent streams stay self-consistent.
+
+### `_make_stream_dispatcher(sink: EventSink, kind: StreamKind)`
+
+Builds the `on_stream_delta(delta)` closure wired into coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` hooks, which fire **once per incremental fragment** (not the accumulated text) whenever the provider streams. It only calls `sink.emit_stream_delta(kind, delta)` — a display-only path. Two deliberate omissions:
+
+- **No repetition feed.** Deltas fragment mid-segment, so the phrase detector would count half-phrases; combined with the whole-message `note_text` calls in the thinking/response paths, every message would be counted twice and the 10x threshold would trip at 5 real repeats. The repetition watchdog therefore stays on whole-message boundaries, which cover the same content.
+- **No subagent deltas.** A subagent stream would need per-actor rows, and a *background* job has no hooks at all once the turn that started it has ended (it keeps streaming against its own agent loop), so v1 renders outo's own text only. Deltas arriving at `current_subagent_depth() > 0` are dropped.
 
 ### `_make_iteration_dispatcher(sink: EventSink, pending: dict)`
 
@@ -409,7 +417,7 @@ class ChatOverrides:
 
 Per-call overrides from CLI flags. All optional.
 
-### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_tool_result=None, on_response=None, on_thinking=None, on_iteration=None, on_provider_error=None, reasoning=None, cancel_event=None) -> co.Agent`
+### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_tool_result=None, on_response=None, on_thinking=None, on_stream_text=None, on_stream_thinking=None, on_iteration=None, on_provider_error=None, on_history_repair=None, on_alarms=None, reasoning=None, cancel_event=None) -> co.Agent`
 
 The heart of miniouto. Steps:
 
@@ -429,6 +437,7 @@ The heart of miniouto. Steps:
    - `ON_ITERATION` → `_make_iteration_logger(on_iteration)` (only if `on_iteration` is not None — `chat.run_chat` always supplies one).
    - `AFTER_LLM_CALL` → `_make_response_logger(on_response)` (only if `on_response` is not None).
    - `ON_THINKING` → `_make_thinking_logger(on_thinking)` (only if `on_thinking` is not None — `chat.run_chat` always supplies one).
+   - `ON_STREAM_TEXT` / `ON_STREAM_THINKING` → `_make_stream_logger(on_stream_text)` / `_make_stream_logger(on_stream_thinking)` (only if not None — `chat.run_chat` always supplies both). Registered **in addition to** the watchdog's own tracker registrations for the same two events; each forwards the per-delta `text` payload to the display-only stream dispatcher.
     - `ON_PROVIDER_ERROR` → `_make_provider_error_logger(on_provider_error)` (only if `on_provider_error` is not None — `chat.run_chat` always supplies one).
     - `ON_PROVIDER_ERROR` → `_make_history_repair_hook(on_history_repair)` (**always**, unlike the sink loggers) — repairs the live message list in place before each retry attempt of the 400/422 tool-call rules in `core/error_rules.py`. Each fire first runs `_repair_pairing` (drop duplicate tool results, fill dangling tool calls on the last assistant turn with error results, inserted at the correct position right after that turn's existing results); if that changed nothing, `_cut_poisoned_turn` excises ONE suspect assistant tool-call turn plus its own results — preferring a turn with structurally malformed (non-dict) arguments, else the most recent tool-call turn, so repeated attempts walk backwards through history — and folds an explanatory note into the preceding user message (or inserts one), preserving later turns and the user's current prompt. Whenever a pass mutates the list, the `on_history_repair` callback (wired by `core.chat.run_chat`) persists the repaired history at outo depth, so the next turn doesn't reload the same poison from disk. Gated to `reaction == "retry"` with status 400/422; rate-limit/overload retries pass through untouched.
     - **Watchdog trackers** (`_register_watchdog_trackers`, always) — `activity_tracker_hook` on `AFTER_LLM_CALL`/`AFTER_TOOL_CALL`/`ON_ITERATION`/`ON_PROVIDER_ERROR`/`ON_STREAM_TEXT`/`ON_STREAM_THINKING`, all five `loop_progress_hook` entries, and a `BEFORE_LLM_CALL` live-messages capture keyed by actor (`"outo"` or the subagent sid). States are exposed via `watchdog_states()` for `supervised_run`.
