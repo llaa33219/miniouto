@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import secrets
 import threading
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -18,9 +17,11 @@ from ..storage import providers as provider_store
 from ..storage import settings as settings_store
 from ..storage import skills as skill_store
 from ..storage import styles as style_store
+from ..storage.paths import SUBAGENT_RESULTS_DIR
 from ..storage.styles import SubagentSpec
 from ..tools import bash as bash_tool
 from ..tools import registry as tool_registry
+from . import subagents
 from .providers import API_STALL_TIMEOUT_SECONDS, build_coreouto_provider, clear_coreouto_state
 
 # Tools visible to both presets. The subagent tool is appended per-preset
@@ -458,59 +459,30 @@ def _notify_subagent(phase: str, sid: str, name: str, text: str) -> None:
 
 
 def _wrap_subagent_handler(
-    dispatch: Callable[..., Any],
+    agents: dict[str, Any],
     specs: list[SubagentSpec],
 ) -> Callable[..., Any]:
-    """Wrap `call_subagent`'s handler: name-aware dispatch + multi-brief fan-out.
+    """Build `call_subagent`'s handler: resolve a name, start a background job.
 
-    `dispatch(name, brief, history=None)` is the per-name inner handler
-    produced by `_build_subagent_tool`: it picks the right per-spec Agent
-    and runs the brief. This wrapper turns the model's flat
-    `(name, task, tasks, briefs)` parameter bag into a list of
-    `(name, brief)` pairs and fans them out under `_run_one` per pair.
+    Fire-and-forget. The handler validates `(name, task)`, hands the brief and
+    the per-spec Agent to `subagents.submit` (which owns the id, the daemon
+    event loop, and the completion alarm) and returns an acknowledgement. The
+    subagent's answer is NEVER in the return value: it reaches the model later
+    as a synthetic user message carrying the completion alarm, delivered by
+    `_make_alarm_hook` at the next `BEFORE_LLM_CALL`. Several calls in one turn
+    start several concurrent jobs, so no fan-out parameters are needed.
 
-    WHY multi-brief: current models reliably emit at most ONE tool call
-    per assistant response, so "spawn N subagents as N `call_subagent`
-    tool_use blocks in one turn" never materializes — the blocks come out
-    serialized across turns no matter what the styles say. Parallel
-    delegation therefore lives INSIDE a single invocation: the handler
-    accepts `tasks` (an array of briefs, all run by the resolved call-
-    level `name`) and `briefs` (an array of {task, name?}, where the
-    optional per-brief name overrides the call-level default — mixed-
-    role fan-out in one call), alongside the single `task` string, and
-    runs every brief as its own supervised subagent concurrently,
-    returning ONE combined, numbered tool result (the model made one
-    tool call). A failed brief degrades to an `error:` section instead of
-    failing its siblings.
-
-    Per-brief mechanics are unchanged from the single-brief era: each
-    brief gets its own 6-hex id (ContextVars are copied per asyncio task,
-    so concurrent briefs attribute events to their own `<name>-<6hex>`
-    label), its own stall supervisor (`supervised_run` at level=depth —
-    a wedged subagent is cancelled and resumed from its own sanitized
-    transcript without taking the parent turn down), and its own
-    start/end observer notifications. Depth / id / name ContextVars are
-    also what tells the global BEFORE_TOOL_CALL hook whether a
-    Bash/Image/etc. call came from outo or from which named subagent.
-
-    ROLLBACK NOTE: the array-parameter fan-out is a workaround for
-    single-tool-call-per-turn models, not a design goal — it bends the
-    one-tool-call-one-subagent shape the codebase otherwise prefers. If
-    models learn to emit several tool_use blocks in one response
-    naturally, revert to one brief per call and remove the `tasks` and
-    `briefs` parameters (see docs/core.md § `call_subagent`). The
-    `briefs` parameter exists specifically for mixed-role fan-out — when
-    models DO start emitting multiple tool_use blocks, drop `briefs`
-    alongside `tasks` so each tool call stays one role / one role only.
+    `agents` maps each declared spec name to the `co.Agent` built for it by
+    `_build_subagent_tool` — the job engine only needs something with
+    `call(brief)`.
     """
 
     def _resolve(requested: str) -> str:
         """Resolve a name to one of `specs`. Empty → fallback rules.
 
         Fallback: a spec literally named `subagent` (legacy compat),
-        else the sole declared spec, else ValueError. The fallback only
-        kicks in for the call-level empty `name`; a per-brief empty
-        name inherits whatever the wrapper resolved for the call.
+        else the sole declared spec, else ValueError. An explicit name
+        that matches nothing fails fast, before any job is started.
         """
 
         if requested:
@@ -529,106 +501,24 @@ def _wrap_subagent_handler(
             f"Available names: {', '.join(s.name for s in specs)}"
         )
 
-    async def _run_one(raw_name: str, brief: str, default_name: str) -> str:
-        resolved = _resolve(raw_name) if raw_name else default_name
-        sid = secrets.token_hex(3)  # 6 hex chars
-        depth_token = _SUBAGENT_DEPTH.set(_SUBAGENT_DEPTH.get() + 1)
-        id_token = _SUBAGENT_ID.set(sid)
-        name_token = _SUBAGENT_NAME.set(resolved)
-        level = _SUBAGENT_DEPTH.get()
-        _notify_subagent("start", sid, resolved, brief)
-        try:
-            result = await supervised_run(
-                lambda prompt, history: dispatch(resolved, prompt, history),
-                brief,
-                None,
-                live_key=sid,
-                level=level,
-                on_wakeup=lambda n, silent, phase: _notify_subagent(
-                    "wakeup",
-                    sid,
-                    resolved,
-                    f"no activity for {silent:.0f}s (phase={phase!r}) "
-                    f"— restarting ({n}/{WATCHDOG_MAX_WAKEUPS})",
-                ),
-            )
-        except Exception as exc:
-            _notify_subagent(
-                "end", sid, resolved, f"error: {type(exc).__name__}: {exc}"
-            )
-            raise
-        else:
-            _notify_subagent("end", sid, resolved, result or "")
-            return result
-        finally:
-            _LIVE_MESSAGES.pop(sid, None)
-            _SUBAGENT_NAME.reset(name_token)
-            _SUBAGENT_ID.reset(id_token)
-            _SUBAGENT_DEPTH.reset(depth_token)
-
-    async def wrapped(
-        name: str = "",
-        task: str = "",
-        tasks: list[str] | None = None,
-        briefs: list[dict[str, str]] | None = None,
-    ) -> str:
-        pairs: list[tuple[str, str]] = []
-        if isinstance(task, str) and task.strip():
-            pairs.append(("", task))
-        for t in tasks or []:
-            if isinstance(t, str) and t.strip():
-                pairs.append(("", t))
-        for b in briefs or []:
-            if not isinstance(b, dict):
-                continue
-            brief_text = b.get("task")
-            if not isinstance(brief_text, str) or not brief_text.strip():
-                continue
-            pairs.append((b.get("name") or "", brief_text))
-
-        if not pairs:
+    async def wrapped(name: str = "", task: str = "") -> str:
+        if not isinstance(task, str) or not task.strip():
             raise ValueError(
-                "call_subagent requires `task` (a single brief), `tasks` "
-                "(an array of briefs, all under the resolved `name`), or "
-                "`briefs` (a list of {task, name?}); none were usable."
+                "call_subagent requires `task`: one self-contained brief. "
+                "To run several subagents at once, issue several calls."
             )
-
-        # Resolve the call-level default lazily. An explicit `name` is
-        # always validated (typos fail fast); the fallback rules run only
-        # when a brief actually needs them (raw name empty). This is what
-        # lets `briefs=[{name: ...}, ...]` mixed-role fan-out work with an
-        # omitted call-level `name` — the fallback ("subagent" spec, else
-        # the sole spec) must not be required when every brief names its
-        # own persona.
-        if name:
-            default_name = _resolve(name)
-        elif any(not raw for raw, _ in pairs):
-            default_name = _resolve("")
-        else:
-            default_name = ""
-
-        if len(pairs) == 1:
-            return await _run_one(pairs[0][0], pairs[0][1], default_name)
-
-        n = len(pairs)
-        results = await asyncio.gather(
-            *[_run_one(raw, brief, default_name) for raw, brief in pairs],
-            return_exceptions=True,
+        resolved = _resolve(name)
+        job = subagents.submit(agents[resolved], resolved, task)
+        # The result file's own name is only known once the job finishes, so
+        # the ack points at the directory the alarm will name a file in.
+        return (
+            f"Started background subagent '{resolved}-{job.sid}' (id: {job.sid}). "
+            "It runs in the background and this returns immediately — this "
+            "text is NOT the result. When it finishes you will receive a user "
+            "message starting with [SYSTEM ALARM - THIS IS NOT A USER MESSAGE] "
+            f"naming the result file at {SUBAGENT_RESULTS_DIR}. Do not wait or "
+            "poll; continue with other work."
         )
-        parts: list[str] = []
-        for i, ((raw_name, brief), res) in enumerate(zip(pairs, results, strict=True), 1):
-            if isinstance(res, BaseException):
-                res_str = f"error: {type(res).__name__}: {res}"
-            else:
-                res_str = res or "(empty result)"
-            preview = " ".join(brief.split())
-            if len(preview) > 120:
-                preview = preview[:120] + "…"
-            label = raw_name or default_name
-            parts.append(
-                f"[{i}/{n}] name={label!r} task: {preview}\n{res_str}"
-            )
-        return "\n\n".join(parts)
 
     return wrapped
 
@@ -636,27 +526,24 @@ def _wrap_subagent_handler(
 def _build_subagent_tool(
     *,
     specs: list[SubagentSpec],
-    description: str,
     provider_config: dict[str, Any],
     provider_passthrough: dict[str, Any] | None = None,
-) -> Any:
-    """Build the `call_subagent` tool with one Agent per named spec.
+) -> Callable[..., Any]:
+    """Build `call_subagent`'s handler with one Agent per named spec.
 
     Invariant 5 — DO NOT simplify to `coreouto.contrib.agent_as_tool`:
     that helper drops `provider_config` when calling `preset.to_config()`,
     so the subagent would inherit the provider's low hard default
     (Anthropic: 1024 tokens) and silently truncate long tool calls
-    (heredoc writes). We rebuild the same `Tool` shape ourselves so every
-    per-name Agent carries our `provider_config` (incl. `max_tokens`) AND
+    (heredoc writes). We build the per-name Agents ourselves so every one
+    carries our `provider_config` (incl. `max_tokens`) AND
     `provider_passthrough` (incl. reasoning).
 
     Each spec becomes one `co.Agent`, built from a deep copy of the
     shared "subagent" preset's config with that spec's `prompt` set as
-    `system_prompt`. `dispatch(name, brief, history)` is the inner
-    `(prompt, history)` shape `_wrap_subagent_handler` consumes; the
-    wrapper supplies `name` per invocation, and the agent runs the brief
-    under it. `history=None` resumes from the transcript alone (coreouto
-    >= 0.11.1) — used by `supervised_run`'s wakeup restart.
+    `system_prompt`, so no two personas share mutable config. The returned
+    handler is registered with coreouto, which derives the model-facing
+    JSON schema from its type hints.
     """
 
     preset = co.get_agent_preset("subagent")
@@ -666,66 +553,58 @@ def _build_subagent_tool(
     if provider_passthrough:
         base_config.provider_passthrough.update(provider_passthrough)
 
-    agents: dict[str, co.Agent] = {}
+    agents: dict[str, Any] = {}
     for spec in specs:
         cfg = base_config.model_copy(deep=True)
         cfg.system_prompt = spec.prompt
         agents[spec.name] = co.Agent(cfg)
 
-    async def dispatch(name: str, brief: str, history: list[Any] | None = None) -> str:
-        return (await agents[name].call(brief, history=history)).content
+    return _wrap_subagent_handler(agents, specs)
 
-    parameters: dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": (
-                    "Subagent name to dispatch to (see `Available names` "
-                    "in the tool description). Omit to fall back to a "
-                    'spec named `subagent` if one exists, else the sole '
-                    "declared spec."
-                ),
-            },
-            "task": {
-                "type": "string",
-                "description": (
-                    "A single self-contained brief (same shape as one "
-                    "entry of `tasks` or `briefs`)."
-                ),
-            },
-            "tasks": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Parallel briefs, ALL run under the resolved `name`."
-                ),
-            },
-            "briefs": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "task": {"type": "string"},
-                        "name": {"type": "string"},
-                    },
-                    "required": ["task"],
-                },
-                "description": (
-                    "Parallel briefs, each an object with `task` and an "
-                    "optional `name` (overrides the call-level `name` for "
-                    "that brief). Use for mixed-role fan-out in one call."
-                ),
-            },
-        },
-    }
 
-    return co.Tool(
-        name=SUBAGENT_TOOL_NAME,
-        description=description,
-        parameters=parameters,
-        handler=dispatch,
-    )
+def _make_alarm_hook(
+    on_alarms: Callable[[list[subagents.Alarm]], None] | None = None,
+) -> Callable[..., None]:
+    """Build the BEFORE_LLM_CALL hook that delivers background-subagent alarms.
+
+    A job that finished — mid-turn or between turns — queued a completion
+    alarm naming its result file. Every iteration this hook drains the queue
+    and, if anything came back, appends the alarms to the LIVE `messages`
+    list as ONE synthetic user message (joined with a blank line), so the very
+    next `provider.create` already carries them.
+
+    Appended directly, never through `Agent.inject_user_message`: that queue
+    is drained at the TOP of the loop iteration (coreouto agent.py:301-307),
+    i.e. BEFORE this hook runs, so an alarm queued from here would only land
+    a full LLM round-trip later.
+
+    FOLD RULE: if the last message is already a user message, the alarms are
+    folded into it instead of appended — providers reject two consecutive
+    user messages, the same hazard `_cut_poisoned_turn` works around.
+
+    Gated to outo depth: a subagent's own loop must never consume outo's
+    alarms. `on_alarms` (from `core.chat`) records one loop event per alarm so
+    the session and the TUI show the completion; a broken sink must not break
+    the provider path.
+    """
+
+    def hook(*, messages: Any = None, **_kwargs: Any) -> None:
+        if messages is None or current_subagent_depth() != 0:
+            return
+        alarms = subagents.take_pending_alarms()
+        if not alarms:
+            return
+        text = "\n\n".join(alarm.text for alarm in alarms)
+        last = messages[-1] if messages else None
+        if last is not None and last.role == "user" and isinstance(last.content, str):
+            last.content = f"{last.content}\n\n{text}" if last.content else text
+        else:
+            messages.append(co.Message(role="user", content=text))
+        if on_alarms is not None:
+            with contextlib.suppress(Exception):
+                on_alarms(alarms)
+
+    return hook
 
 
 @dataclass
@@ -760,6 +639,7 @@ def build_runtime(
     on_iteration: Callable[..., None] | None = None,
     on_provider_error: Callable[..., None] | None = None,
     on_history_repair: Callable[[list[Any]], None] | None = None,
+    on_alarms: Callable[[list[subagents.Alarm]], None] | None = None,
     reasoning: str | None = None,
     cancel_event: threading.Event | None = None,
 ) -> co.Agent:
@@ -792,6 +672,11 @@ def build_runtime(
     history-repair hook actually mutates it before a 400/422 retry —
     `core.chat` persists the repaired history through it so the fix
     survives the turn. Pass None to skip persistence.
+    `on_alarms` is called with every completion alarm the BEFORE_LLM_CALL
+    alarm hook drained, after appending them to the live message list —
+    `core.chat` turns each into an `alarm` loop event so the session and
+    the TUI show the background job completing. Pass None to skip the
+    display only; the alarms are still delivered to the model.
     `reasoning` overrides reasoning for this call (effort level / "on" /
     token budget / "none"). None = auto: the provider's stored
     `reasoning_effort` wins if set, otherwise lma's per-model default.
@@ -952,15 +837,14 @@ def build_runtime(
             max_iterations=None,
         )
 
-        subagent_tool = _build_subagent_tool(
+        subagent_handler = _build_subagent_tool(
             specs=specs,
-            description=_subagent_description(parsed_specs),
             provider_config=subagent_provider_config,
             provider_passthrough=subagent_passthrough,
         )
         co.register_tool(
-            subagent_tool.name, description=subagent_tool.description
-        )(_wrap_subagent_handler(subagent_tool.handler, parsed_specs))
+            SUBAGENT_TOOL_NAME, description=_subagent_description(parsed_specs)
+        )(subagent_handler)
 
     if on_tool_call is not None:
         co.register_hook(co.BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
@@ -974,6 +858,12 @@ def build_runtime(
     # Registered before the watchdog's capture hook below, so the captured
     # list is the post-compaction one.
     co.register_hook(co.BEFORE_LLM_CALL, summarize_before_llm)
+
+    # Unconditional (like the repair hook): a job that finished between
+    # turns has no other way to reach the model. Registered before the
+    # watchdog's capture hook below, so the live message list the
+    # supervisor holds already carries the delivered alarms.
+    co.register_hook(co.BEFORE_LLM_CALL, _make_alarm_hook(on_alarms))
 
     _register_watchdog_trackers()
 
@@ -1144,27 +1034,25 @@ def _make_thinking_logger(callback: Callable[[str], None]):
 def _subagent_description(specs: list[SubagentSpec]) -> str:
     available = ", ".join(s.name for s in specs)
     base = (
-        "Delegate self-contained task briefs to one or more named "
-        "subagents. Each brief runs in a fresh context with its own tool "
-        "access (Bash/Image/Video/Audio) and blocks until it terminates; "
-        "the final text is the result.\n\n"
-        "Use the `name` parameter to pick which subagent runs the brief "
-        "(see `Available names` below). Omit `name` to fall back to a "
-        "subagent literally named `subagent` if one exists, else the sole "
-        "declared spec. Passing a name that does not match any declared "
-        "spec fails the call.\n\n"
-        "Pass `task` for a single brief. Pass `tasks` (an array of "
-        "briefs) to fan several briefs out in parallel under the same "
-        "resolved `name` — independent briefs (different targets, no "
-        "shared state) should go out together in one call; you receive "
-        "one combined, numbered result. Pass `briefs` (an array of "
-        "{task, name?}) for mixed-role fan-out in a single call: every "
-        "entry inherits the call-level `name` unless it sets its own, so "
-        "the same tool invocation can launch several subagent roles at "
-        "once.\n\n"
-        "Every brief is a complete specification on its own — goal, "
-        "paths, context, constraints, expected result — the subagent "
-        "sees nothing else."
+        "Delegate one self-contained brief to a named background subagent "
+        "and return immediately.\n\n"
+        "This call does NOT block: the subagent runs in the background, "
+        "possibly across turns. The return value is only an acknowledgement "
+        '("started ..."), never the subagent\'s answer. When the subagent '
+        "finishes, you will receive a user message starting with "
+        "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE] naming its result file "
+        "under ~/.miniouto/subagent-results/ — read that file (e.g. with "
+        "`cat`) to see what it produced. Do not poll for or re-ask the "
+        "result.\n\n"
+        "To run several subagents at once, issue several calls (each with "
+        "one brief) — they run concurrently in the background.\n\n"
+        "Arguments:\n"
+        "- name: which persona to run. Required when several subagents are "
+        "declared; may be omitted when exactly one is declared (or when one "
+        'is literally named "subagent").\n'
+        "- task: ONE self-contained brief. The subagent sees only its own "
+        "persona prompt and this brief — include all file paths, "
+        "constraints, and success criteria it needs."
     )
     if available:
         base += f"\n\nAvailable names: {available}"

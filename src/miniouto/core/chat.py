@@ -15,7 +15,7 @@ from rich.console import Console
 
 from ..storage import sessions as session_store
 from ..storage.sessions import STATUS_DONE, STATUS_INTERRUPTED
-from . import providers
+from . import providers, subagents
 from .context import get_max_output_tokens
 from .events import EventSink, LoopEvent, NullSink
 from .runtime import (
@@ -257,6 +257,7 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
         on_iteration=on_iteration,
         on_provider_error=_make_provider_error_dispatcher(sink),
         on_history_repair=on_history_repair,
+        on_alarms=_make_alarm_dispatcher(sink),
         on_tool_result=_make_tool_result_dispatcher(sink),
         reasoning=opts.reasoning,
         cancel_event=opts.cancel_event,
@@ -597,6 +598,32 @@ def _make_subagent_dispatcher(sink: EventSink):
     return on_subagent
 
 
+def _make_alarm_dispatcher(sink: EventSink):
+    """Build the callback the BEFORE_LLM_CALL alarm hook forwards alarms to.
+
+    The hook (runtime._make_alarm_hook) already put the alarm text into the
+    model's live message list; this only records it. One `alarm` loop event
+    per drained alarm, attributed to the finished job's `name-sid` identity
+    but emitted on outo's `actor` line — it is outo's own next input, not the
+    subagent speaking. The TUI matches the `subagent_id` against its running
+    subagent rows to close them out.
+    """
+
+    def on_alarms(alarms: list[subagents.Alarm]) -> None:
+        for alarm in alarms:
+            sink.emit_loop_event(
+                LoopEvent(
+                    actor="outo",
+                    kind="alarm",
+                    text=alarm.text,
+                    subagent_id=alarm.sid,
+                    subagent_name=alarm.name,
+                )
+            )
+
+    return on_alarms
+
+
 def _make_thinking_dispatcher(sink: EventSink):
     """Build the per-thinking callback wired into the ON_THINKING hook."""
 
@@ -873,21 +900,8 @@ def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
         return " ".join(parts)
     if name == "call_subagent":
         label = args.get("name") or "subagent"
-        brief: str | None = None
         task = args.get("task")
-        if isinstance(task, str):
-            brief = task
-        if brief is None:
-            tasks = args.get("tasks")
-            if isinstance(tasks, list) and tasks and isinstance(tasks[0], str):
-                brief = tasks[0]
-        if brief is None:
-            briefs = args.get("briefs")
-            if isinstance(briefs, list) and briefs and isinstance(briefs[0], dict):
-                t = briefs[0].get("task")
-                if isinstance(t, str):
-                    brief = t
-        preview = " ".join((brief or "").split())
+        preview = " ".join(task.split()) if isinstance(task, str) else ""
         if len(preview) > 80:
             preview = preview[:80] + "…"
         return f"{label} {preview}" if preview else label

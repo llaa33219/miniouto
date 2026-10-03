@@ -1,7 +1,7 @@
 """Background-subagent job registry: a daemon thread owning its own event loop.
 
 A background job must outlive the turn that spawned it, and `core/chat.py`
-runs every turn under `asyncio.run(...)`, which tears down detached tasks at
+runs every turn under `asyncio.run(...)`, which tears down anything still detached at
 turn end. So a job cannot live on the turn's event loop: it runs on a
 lazily-started daemon thread that owns its own `asyncio.new_event_loop()`
 and never stops.
@@ -92,11 +92,26 @@ class Job:
     future: Future[str] | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class Alarm:
+    """One drained completion alarm, with the identity of its job.
+
+    `text` is the whole contract with the model — exactly what
+    `format_completion_alarm` produced, verbatim. `sid`/`name` ride along so
+    the alarm delivery hook can attribute the message to a job without
+    re-parsing the text.
+    """
+
+    text: str
+    sid: str
+    name: str
+
+
 # One lock for both registries. Re-entrant because the completion path
 # formats its alarm (which reads the running-job list) while holding it.
 _LOCK = threading.RLock()
 _JOBS: dict[str, Job] = {}
-_PENDING_ALARMS: deque[str] = deque()
+_PENDING_ALARMS: deque[Alarm] = deque()
 _LOOP: asyncio.AbstractEventLoop | None = None
 # Bumped by `reset()`: a job from an older generation may still be finishing
 # on the daemon loop, and must not re-queue an alarm into the next run.
@@ -127,7 +142,7 @@ def submit(agent: BackgroundAgent, name: str, brief: str) -> Job:
     return job
 
 
-def take_pending_alarms() -> list[str]:
+def take_pending_alarms() -> list[Alarm]:
     """Drain every queued completion alarm, oldest first."""
 
     with _LOCK:
@@ -249,7 +264,9 @@ def _finish(job: Job, status: JobStatus, body: str) -> None:
         if status == "error":
             job.error = body
         job.result_path = str(_write_result_file(job, body))
-        _PENDING_ALARMS.append(format_completion_alarm(job))
+        _PENDING_ALARMS.append(
+            Alarm(text=format_completion_alarm(job), sid=job.sid, name=job.name)
+        )
 
 
 def _write_result_file(job: Job, body: str) -> Path:

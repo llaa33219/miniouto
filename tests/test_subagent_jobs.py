@@ -70,11 +70,11 @@ def _clean_registry() -> Iterator[None]:
 
 
 def _await_alarms(count: int = 1, timeout: float = 5.0) -> list[str]:
-    """Drain the alarm queue until `count` alarms arrived, then return them."""
+    """Drain the alarm queue until `count` alarms arrived; return their texts."""
     deadline = time.monotonic() + timeout
     drained: list[str] = []
     while time.monotonic() < deadline:
-        drained.extend(subagents.take_pending_alarms())
+        drained.extend(a.text for a in subagents.take_pending_alarms())
         if len(drained) >= count:
             return drained
         time.sleep(0.005)
