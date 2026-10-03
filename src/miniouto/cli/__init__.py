@@ -5,6 +5,7 @@ from __future__ import annotations
 import typer
 from rich.console import Console
 
+from .. import paths_runtime
 from ..storage import paths
 from . import provider as provider_module
 from . import skill as skill_module
@@ -72,7 +73,13 @@ def status() -> None:
     console.print(f"[bold]Providers:[/bold]       {', '.join(provider_store.load_all()) or '-'}")
     console.print(f"[bold]Styles:[/bold]          {', '.join(style_store.list_styles()) or '-'}")
     console.print(f"[bold]Skills:[/bold]          {', '.join(s.name for s in skill_store.list_skills()) or '-'}")
-    console.print(f"[bold]Sessions:[/bold]        {', '.join(session_store.list_sessions()) or '-'}")
+    here = str(paths_runtime.INVOCATION_CWD)
+    here_names: list[str] = []
+    other_names: list[str] = []
+    for name, cwd, _mtime in session_store.list_sessions_with_meta():
+        (here_names if cwd == here else other_names).append(name)
+    console.print(f"[bold]Sessions (this directory):[/bold] {', '.join(here_names) or '-'}")
+    console.print(f"[bold]Sessions (other):[/bold]       {', '.join(other_names) or '-'}")
 
 
 if __name__ == "__main__":

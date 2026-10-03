@@ -39,6 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .. import paths_runtime
 from .paths import SESSION_DIR, ensure_dirs
 
 SCHEMA_VERSION = 2
@@ -87,6 +88,9 @@ class SessionData:
     name: str
     history: list[dict[str, Any]] = field(default_factory=list)
     turns: list[TurnRecord] = field(default_factory=list)
+    # Launch directory, stamped on the first turn only; "" for sessions
+    # written before this field existed (they group as "other" in pickers).
+    cwd: str = ""
 
 
 def path_for(name: str) -> Path:
@@ -113,23 +117,24 @@ def load(name: str) -> SessionData:
     if raw.get("version") == SCHEMA_VERSION:
         history = [d for d in raw.get("history", []) if isinstance(d, dict)]
         turns = [TurnRecord.from_dict(t) for t in raw.get("turns", []) if isinstance(t, dict)]
-        return SessionData(name=name, history=history, turns=turns)
+        return SessionData(
+            name=name, history=history, turns=turns, cwd=str(raw.get("cwd") or "")
+        )
     return _migrate_v1(name, raw)
 
 
 def save(name: str, data: SessionData) -> None:
     ensure_dirs()
-    payload = json.dumps(
-        {
-            "version": SCHEMA_VERSION,
-            "session": name,
-            "updated": _utcnow(),
-            "history": data.history,
-            "turns": [t.to_dict() for t in data.turns],
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+    payload_dict: dict[str, Any] = {
+        "version": SCHEMA_VERSION,
+        "session": name,
+        "updated": _utcnow(),
+    }
+    if data.cwd:
+        payload_dict["cwd"] = data.cwd
+    payload_dict["history"] = data.history
+    payload_dict["turns"] = [t.to_dict() for t in data.turns]
+    payload = json.dumps(payload_dict, ensure_ascii=False, indent=2)
     path = path_for(name)
     # Atomic write: incremental persistence saves on nearly every loop
     # event, so a SIGKILL mid-write must not leave a torn JSON file.
@@ -151,9 +156,15 @@ def begin_turn(name: str, prompt: str) -> None:
     Any stale running turn found on disk belongs to a dead writer (the
     process was force-killed before `finish_turn`), so it is reaped to
     `"interrupted"` first — from here on the only running turn is ours.
+
+    The launch directory is stamped here, once: a session belongs to the
+    directory it was created in, so later turns (even from another
+    directory) never overwrite it.
     """
 
     data = load(name)
+    if not data.cwd:
+        data.cwd = str(paths_runtime.INVOCATION_CWD)
     for turn in data.turns:
         if turn.status == STATUS_RUNNING:
             turn.status = STATUS_INTERRUPTED
@@ -241,6 +252,33 @@ def list_sessions_by_mtime() -> list[str]:
             return 0.0
 
     return [p.stem for p in sorted(SESSION_DIR.glob("*.json"), key=mtime, reverse=True)]
+
+
+def list_sessions_with_meta() -> list[tuple[str, str, float]]:
+    """`(name, cwd, mtime)` per session, most recently written first.
+
+    Reads the session files directly instead of going through `load()`,
+    which calls `ensure_dirs()` and therefore force-writes the bundled
+    style files — a read-only picker must never write. Missing, unreadable
+    or unparseable files yield an empty `cwd` and a `mtime` of 0.0.
+    """
+
+    def stat(p: Path) -> tuple[str, float]:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "", mtime
+        if not isinstance(raw, dict):
+            return "", mtime
+        return str(raw.get("cwd") or ""), mtime
+
+    metas = [(p.stem, *stat(p)) for p in SESSION_DIR.glob("*.json")]
+    metas.sort(key=lambda m: m[2], reverse=True)
+    return metas
 
 
 def _migrate_v1(name: str, raw: dict[str, Any]) -> SessionData:

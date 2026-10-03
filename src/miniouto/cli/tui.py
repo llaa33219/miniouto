@@ -48,7 +48,7 @@ from textual.widgets import (
     TextArea,
 )
 
-from .. import __version__
+from .. import __version__, paths_runtime
 from ..core import lma as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import LoopEvent
@@ -381,6 +381,9 @@ class SelectionModal(ModalScreen[str | None]):
     """A modal ListView picker. Returns the selected string, or None on cancel.
 
     Pass `allow_none=True` to add a "(none)" entry that returns None.
+    Pass `sections` to render non-selectable header rows above grouped
+    `(value, label)` options; the default (no sections) renders a flat
+    list, unchanged.
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -410,6 +413,11 @@ class SelectionModal(ModalScreen[str | None]):
         max-height: 20;
         background: $boost;
     }
+    #selection-list > ListItem.-header {
+        background: $boost;
+        color: $text-muted;
+        text-style: bold;
+    }
     #selection-hint {
         width: 100%;
         content-align: center middle;
@@ -427,6 +435,7 @@ class SelectionModal(ModalScreen[str | None]):
         allow_none: bool = False,
         none_label: str = "(none — clear)",
         extra_options: list[tuple[str, str]] | None = None,
+        sections: list[tuple[str, list[tuple[str, str]]]] | None = None,
     ) -> None:
         super().__init__()
         self._title = title
@@ -435,44 +444,60 @@ class SelectionModal(ModalScreen[str | None]):
         self._allow_none = allow_none
         self._none_label = none_label
         self._extra_options = list(extra_options or [])
+        self._sections = list(sections or [])
         self._row_values: dict[ListItem, str | None] = {}
+        # Option label -> its row in the ListView, which stops matching the
+        # option index as soon as header rows are inserted above it.
+        self._row_index_by_value: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical(id="selection-dialog"):
             yield Label(self._title, id="selection-title")
             items: list[ListItem] = []
+            row = 0
+
+            def add_option(label: str, value: str | None, *, mark: bool = False) -> None:
+                nonlocal row
+                marker = "● " if mark else "  "
+                item = ListItem(Label(marker + label), id=f"row-{row}")
+                self._row_values[item] = value
+                if value is not None:
+                    self._row_index_by_value[value] = row
+                items.append(item)
+                row += 1
+
             if self._allow_none:
                 none_item = ListItem(Label(self._none_label), id="row-none")
                 self._row_values[none_item] = None
                 items.append(none_item)
-            for idx, opt in enumerate(self._options):
-                marker = "● " if opt == self._current else "  "
-                row = ListItem(Label(marker + opt), id=f"row-opt-{idx}")
-                self._row_values[row] = opt
-                items.append(row)
-            for idx, (sentinel, label) in enumerate(self._extra_options):
-                row = ListItem(Label(label), id=f"row-extra-{idx}")
-                self._row_values[row] = sentinel
-                items.append(row)
+                row = 1
+            for header, opts in self._sections:
+                if not opts:
+                    continue
+                items.append(ListItem(Label(header), id=f"row-{row}", classes="-header"))
+                row += 1
+                for value, label in opts:
+                    add_option(label, value, mark=value == self._current)
+            for opt in self._options:
+                add_option(opt, opt, mark=opt == self._current)
+            for sentinel, label in self._extra_options:
+                add_option(label, sentinel)
             yield ListView(*items, id="selection-list")
             yield Label("Enter to select · Esc to cancel", id="selection-hint")
 
     def on_mount(self) -> None:
-        # Pre-select the current value so Enter picks it without further input.
-        if self._current and self._current in self._options:
-            lv = self.query_one("#selection-list", ListView)
-            for idx, opt in enumerate(self._options):
-                if opt == self._current:
-                    lv.index = idx + (1 if self._allow_none else 0)
-                    break
         lv = self.query_one("#selection-list", ListView)
+        # Pre-select the current value so Enter picks it without further input.
+        if self._current:
+            idx = self._row_index_by_value.get(self._current)
+            if idx is not None:
+                lv.index = idx
         lv.focus()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        value = self._row_values.get(event.item)
-        if value is None and event.item not in self._row_values:
+        if event.item not in self._row_values:
             return
-        self.dismiss(value)
+        self.dismiss(self._row_values[event.item])
         event.stop()
 
     def action_dismiss_cancel(self) -> None:
@@ -2329,7 +2354,15 @@ class ChatTUI(App):
         )
 
     def _open_session_picker(self) -> None:
-        sessions = session_store.list_sessions_by_mtime()
+        here = str(paths_runtime.INVOCATION_CWD)
+        this_dir: list[tuple[str, str]] = []
+        other_dir: list[tuple[str, str]] = []
+        for name, cwd, _mtime in session_store.list_sessions_with_meta():
+            if cwd == here:
+                this_dir.append((name, name))
+            else:
+                label = f"[{Path(cwd).name or cwd}] {name}" if cwd else f"[?] {name}"
+                other_dir.append((name, label))
         s = settings_store.load()
         current = s.session if self._chat_started else ""
 
@@ -2345,14 +2378,19 @@ class ChatTUI(App):
             self._load_session_history(result)
             self._refresh_chips()
 
-        options = [*sessions, "__new__"]
+        sections: list[tuple[str, list[tuple[str, str]]]] = []
+        if this_dir:
+            sections.append(("This directory", this_dir))
+        if other_dir:
+            sections.append(("Other directories", other_dir))
         self.push_screen(
             SelectionModal(
                 "Select session",
-                options,
+                [],
                 current=current,
                 allow_none=False,
                 extra_options=[("__new__", "+ new session…")],
+                sections=sections,
             ),
             _on_close,
         )
