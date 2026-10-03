@@ -39,7 +39,7 @@ Behavior:
 - Spawns `asyncio.create_subprocess_shell` with `stdin=DEVNULL, stdout=PIPE, stderr=PIPE, start_new_session=True`.
   - **stdin is `/dev/null`, never inherited** — a command that reads stdin (`cat` with no args, `sudo`, an ssh host-key prompt) would otherwise block forever on input that can never arrive (in TUI mode Textual owns the tty). Such reads now hit EOF immediately and the command fails fast instead of hanging.
   - **`start_new_session=True`** puts the shell in its own process group, so timeout/cancel can `os.killpg(SIGKILL)` the children too. Killing only the shell (the old behavior) orphaned a running child, which kept the captured pipes open and deadlocked the output readers — the kill path itself hung.
-- Captures stdout + stderr with two `_drain` reader tasks (not `communicate()`), so the shell's exit and pipe EOF are tracked separately.
+- Captures stdout + stderr with two `_drain` reader coroutines (not `communicate()`), so the shell's exit and pipe EOF are tracked separately.
 - **Pipe-grace rule**: pipe fds are inherited across fork/exec, so when the shell has exited but a surviving background child still holds stdout/stderr open (`server &` without a redirect, a sloppy daemon), the pipes never reach EOF and collection would hang. After `PIPE_GRACE_SECONDS` (5 s) the whole process group is killed and the call returns the output captured so far plus a `<NOTE>` explaining what happened. A properly redirected background job (`nohup … > /tmp/out.log 2>&1 &`) releases the pipes at spawn, returns immediately, and the child survives — this is the supported way to launch daemons.
 - **1-hour hard timeout** (`BASH_TIMEOUT_SECONDS = 3600`) — a wedged process's whole group is killed and the tool raises `BashError` (with any partial output attached), which coreouto converts into an error `ToolResult`; the loop wakes and the model decides how to proceed. (The user can also force-stop the loop from the TUI with a double-ESC, which kills the in-flight process much sooner: `build_runtime` passes the turn's `cancel_event` into `set_cancel_event`, and `bash()` polls it every 0.1 s while waiting for the process.)
 - Formats output (via `_format_output`) as:
@@ -216,7 +216,7 @@ Wires the bash/media/computer tools into coreouto's tool registry.
 
 ### `register_all()`
 
-Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`, and — when `computer_supported()`; screenshot availability is decided at call time from the outo provider's `api_format` — `Computer` (with `parallelizable=False`). (The `call_subagent` tool is registered conditionally in `core.runtime.build_runtime` when the active style declares at least one named subagent, because it needs the resolved subagent specs to dispatch by `name=`. An outo-only style produces no `call_subagent` tool at all.)
+Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`, and — when `computer_supported()`; screenshot availability is decided at call time from the outo provider's `api_format` — `Computer` (with `parallelizable=False`). (The `call_subagent` tool is registered conditionally in `core.runtime.build_runtime` when the active style declares at least one named subagent, because it needs the resolved subagent specs to pick a persona by `name=`. An outo-only style produces no `call_subagent` tool at all.)
 
 ### `_register_if_missing(name, handler, schema, description, *, parallelizable=True)`
 
@@ -251,6 +251,26 @@ Each description includes the tool's restrictions inline. Verbatim from `registr
 | `Computer` | "Operate a GUI application inside a virtual 1280x720 display (headless; one screen shared across calls, spawned lazily on first use). Core loop: `launch` an app, then repeat screenshot -> act -> screenshot. ALWAYS take a screenshot before clicking anything — click coordinates come from the latest screenshot; (0, 0) is the top-left corner, units are screen pixels, positions are clamped to the screen. After any action that changes the screen, screenshot again rather than assuming the result. …" (followed by the per-action field list, the vision-provider requirement, and the `computer`-extra install hint — see `_computer_description()` in `registry.py` for the full verbatim text) |
 
 > **Why no provider names in the descriptions**: the agent cannot introspect which provider it is running on, so telling it "OpenAI Chat Completions rejects video" is not actionable — it cannot classify itself. If a provider rejects a multimodal block, the `ValueError` surfaces at call time and that error message is the teaching signal. The full provider support matrix for human operators lives in the `tools/media.py` section below.
+
+---
+
+## `call_subagent` (registered in `core/runtime.py`, not here)
+
+The one tool that is not a `tools/` module. It is built and registered by `core/runtime.py:_build_subagent_tool` on every `build_runtime`, and **only when the active style declares at least one named subagent** — an outo-only style exposes no delegation surface at all.
+
+| Argument | Meaning |
+|---|---|
+| `name` | which persona to run. `""` resolves to a spec literally named `"subagent"` (legacy compat), else the sole declared spec, else an error. An explicit name that matches nothing fails fast, before any job starts. |
+| `task` | **ONE** self-contained brief. The subagent sees only its persona prompt and this brief. There is no fan-out parameter: several `call_subagent` calls in one response = several concurrent jobs. |
+
+Contract, in the order the model experiences it:
+
+1. **The call does not block.** The handler validates `(name, task)`, hands the brief and the per-persona `co.Agent` to `core/subagents.py:submit`, and returns an **acknowledgement** — the job id, an explicit "this text is NOT the result", the alarm header the model will receive later, the results directory, and "do not wait or poll; continue with other work".
+2. The job runs in the **background**, on a daemon thread owning its own event loop (`core/subagents.py`), so it can outlive the turn that started it — and, on purpose, it has no stall supervisor and no hooks of its own once that turn ends.
+3. On completion the job writes `~/.miniouto/subagent-results/<sid>-<ts>.md` and queues **exactly one** alarm.
+4. The alarm is delivered as a **synthetic user message** whose first line is `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`, appended to the live message list at the next `BEFORE_LLM_CALL` (see `docs/core.md` for why it is not `inject_user_message`). It names the result file, which the model is told to `cat`.
+
+Do not reintroduce a multi-brief parameter, and do not "simplify" `_build_subagent_tool` back to `coreouto.contrib.agent_as_tool`: the stock helper drops `provider_config`, so a subagent writing a file with a heredoc gets truncated at the provider's low default (1024 for Anthropic).
 
 ---
 

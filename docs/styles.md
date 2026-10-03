@@ -74,7 +74,7 @@ Every style should include a **Tools available** section that lists the tools th
 |---|---|
 | `Bash(command, *, cwd=None)` | Run a shell command — the ONLY file-manipulation tool (read via `cat`/`grep`, write via heredoc/`tee`, edit via `sed -i`/Python, delete via `rm`). 1-hour hard timeout (`BASH_TIMEOUT_SECONDS`). (`env` is accepted by the underlying `bash()` function but is **not** exposed through the model-facing schema — the registered `_bash_handler` does not accept it.) |
 | `Image(file_path)` / `Video(file_path)` / `Audio(file_path)` | View/listen to a media file (multimodal blocks). |
-| `call_subagent(name="", task="", tasks=None, briefs=None)` | Delegate one or more self-contained briefs to subagent(s). `name=""` resolves to `"subagent"` if declared, else the sole subagent if exactly one, else an error. `task` is a single brief; `tasks` is N parallel briefs to the SAME `name`; `briefs` is `list[{"name", "task"}]` for mixed-name fan-out (e.g. an editor + a reviewer spawned concurrently in one invocation). All briefs merge into one concurrent pool and return ONE numbered tool result. **Only registered when the active style declares ≥1 named subagent.** |
+| `call_subagent(name="", task="")` | Delegate **one** self-contained brief to a **background** named subagent and return immediately. `name=""` resolves to `"subagent"` if declared, else the sole subagent if exactly one, else an error. The return value is only an acknowledgement, never the answer; the answer is written to `~/.miniouto/subagent-results/<id>.md` and delivered later as a user message starting with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`. Several calls in one response = several subagents running concurrently. **Only registered when the active style declares ≥1 named subagent.** |
 
 There are deliberately **no** Write/Edit/Delete tools — file work goes through Bash (see `docs/tools.md` § "Why Bash is the only file tool"). All bundled styles describe the tools with **identical behavior summaries** (so the model doesn't see inconsistent tool docs across styles). The summaries come from `tools/registry.py`'s `_<name>_description` strings.
 
@@ -106,7 +106,7 @@ The five bundled templates live in `src/miniouto/default_style/`. They are seede
 
 `coding-pro.md`, `coding-work.md`, and `coding-ultra.md` include explicit guidance on when and how to delegate via `call_subagent`; `default.md` and `coding.md` are deliberately minimal.
 
-**Note on mechanics**: each bundled orchestrator style declares its roster as top-level named tags (one tag per role). At invocation time the model passes the role name via `call_subagent(name=...)` and the matching tag body is loaded as that subagent's system prompt — a per-role lean prompt replaces the old single shared subagent prompt. Mixed-role fan-out uses `call_subagent(briefs=[{"name": …, "task": …}, …])` (e.g. an editor and a reviewer concurrently in one invocation); same-name fan-out uses `call_subagent(tasks=[…])`. See each style file for its actual roster.
+**Note on mechanics**: each bundled orchestrator style declares its roster as top-level named tags (one tag per role). At invocation time the model passes the role name via `call_subagent(name=...)` and the matching tag body is loaded as that subagent's system prompt — a per-role lean prompt replaces the old single shared subagent prompt. A mixed-role layer is just several `call_subagent` calls in the same response (an editor, then a reviewer), each carrying exactly one brief; each job runs in the background and reports through its own completion alarm. See each style file for its actual roster.
 
 ### `default.md` — minimal fallback
 
@@ -124,8 +124,8 @@ only the load-bearing rules. Both halves are a short ruleset:
 - **Identity**: "expert coding agent. Be precise, minimal, and verified."
 - **Tools**: one line each — Bash as the ONLY file tool (with the
   read/create/edit/delete command forms), media viewers, Computer
-  (outo-only), and `call_subagent` with self-contained briefs (parallel for
-  independent tasks).
+  (outo-only), and `call_subagent` with one self-contained brief per call
+  (several calls in one response run independently).
 - **Seven rules** (outo half): follow matching skills; read before editing
   and follow project conventions; smallest change; verify with real
   commands and never fabricate; fetch web content instead of recalling it;
@@ -167,7 +167,7 @@ that is "a teammate, not a tutor." It requires the following behaviors:
   `./.miniouto/plans/<name>.md`, plus optional `CHECKPOINTS.md` and
   `DECISIONS.md` companions (mirrors Karpathy's PLAN / EXPERIMENTS / NOTES
   pattern).
-- **6-section delegation brief**: every `call_subagent(name=..., task=...)` (or each item in `briefs=[…]`) must carry TASK, EXPECTED OUTCOME, REQUIRED TOOLS, MUST DO, MUST NOT DO, CONTEXT — the subagent has no conversation history, so the brief is its entire spec.
+- **6-section delegation brief**: every `call_subagent(name=..., task=...)` must carry TASK, EXPECTED OUTCOME, REQUIRED TOOLS, MUST DO, MUST NOT DO, CONTEXT — the subagent has no conversation history, so the brief is its entire spec.
 - **Definition of done**: an explicit checklist (build/lint/typecheck/test
   exit 0, minimal diff, plan file updated, subagent claims confirmed by
   reading changed files, parallel batches actually emitted as N tool_use
@@ -193,7 +193,7 @@ styles (never stop early, never ask permission mid-loop, decide soft blocks
 yourself, three-strike rule) with **proportionate machinery** — the work is
 **distributed by its scale**: what the orchestrator can read, understand, and
 execute within a modest number of calls is done end-to-end itself (batched
-parallel reads, direct edits, no subagent ceremony on small tasks);
+parallel reads, direct edits, no subagent ceremony on small work);
 large-scale understanding (unfamiliar codebase too broad to survey directly)
 goes to parallel context subagents; large or multi-site changes go to one
 focused editor subagent per independent slice — parallel spawns for
@@ -220,14 +220,14 @@ It requires the following behaviors:
   small-task case); Flavor 2 — parallel `call_subagent` blocks in one
   response for large splittable work (parallel context searches with
   different angles on a broad codebase, or one editor per independent site
-  of a multi-site change). Ceremony on small tasks is the named
+  of a multi-site change). Ceremony on small work is the named
   anti-pattern; the self-check counts tool_use blocks after each batch.
 - **Scale-based decision framework**: "read it, understand it, do it
   directly within a modest number of calls → do it yourself" is the first
   row; large-scale understanding, non-trivial execution, multi-site
   modification, and independent checking each map to their delegation
   action. The closing rule runs both directions — subagent ceremony on
-  small tasks and hand-grinding oversized work are the same failure.
+  small work and hand-grinding oversized work are the same failure.
 - **Five-phase workflow**: EXPLORE (direct batched-read exploration — the
   onboarding sweep runs as ONE batched block of read-only commands by the
   orchestrator itself; parallel context subagents when the tree is
@@ -278,12 +278,13 @@ are decided autonomously). It requires the following behaviors:
   deep-thinker for non-obvious design decisions, a validator, and a verifier.
   Stated cost: 5–8x more tokens in exchange for meaningfully better output.
 - **PARALLEL TOOL CALLS mechanics**: an expanded version of `coding-pro.md`'s
-  section — every layer's N subagents go out as N `call_subagent` tool_use
-  blocks in ONE assistant response (use `briefs=[…]` for mixed-role layers
-  like an editor + a reviewer; use `tasks=[…]` for same-role layers like
-  three file-pickers), with a concrete worked example (a six-block spawn
-  batch for "add rate limiting to the auth endpoints") and a mandatory
-  self-check after every layer.
+  section — every layer's N subagents go out as N `call_subagent` calls, each
+  with one brief, in ONE assistant response (mixed-role layers like an editor
+  + a reviewer and same-role layers like three file-pickers are both just
+  several calls), with a concrete worked example (a six-call spawn batch for
+  "add rate limiting to the auth endpoints"), a mandatory self-check after
+  every layer, and the "Handling results" contract (never wait, never poll,
+  never re-ask; read the file the alarm names).
 - **Subagent roster (top-level tags)**: file-picker, code-searcher, glob-matcher, directory-lister, researcher-docs, researcher-web, commander, thinker, deep-thinker, generate-plan, editor, code-reviewer, validator, verifier, context-pruner, doc-reviewer, doc-bootstrapper — each a named tag in the file. Per-role tool whitelists and expected output shapes live in each tag's body.
 - **Canonical layer sequence (0–9)**: project onboarding → heavy context
   gathering → second-pass context → deep thinking + plan generation →
@@ -301,7 +302,7 @@ are decided autonomously). It requires the following behaviors:
   worktree under `./.miniouto/worktrees/<task>/`; the user decides when to
   merge. Checkpoint commits after every verified milestone; a boulder state
   JSON (`BOULDER.json`) tracks milestones for long-running, interruptible
-  tasks.
+  work.
 - **Domain probes**: when intent is ambiguous, dispatch 2–3 parallel thinker
   probes on plausible interpretations and synthesize, instead of stopping to
   ask.
@@ -363,7 +364,7 @@ Re-seeds all bundled styles from the miniouto package (same force-refresh that `
 
 ### Skills guidance in bundled styles
 
-The larger templates (`default.md`, `coding-pro.md`, `coding-work.md`, `coding-ultra.md`) include a **Skills — MANDATORY first check** section in their `<outo>` half (immediately before the tools list) and a mirror section in each named subagent's tag body as applicable. It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from `~/.agents/skills/`) before starting any task, and — when a skill matches the task's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in delegation briefs so the subagent follows it too. The minimal `coding.md` compresses this to a single rule ("if a listed skill matches the task, read its SKILL.md and follow it") in each role's prompt. Keep some form of this guidance when authoring a custom style; it is what makes installed skills actually get used.
+The larger templates (`default.md`, `coding-pro.md`, `coding-work.md`, `coding-ultra.md`) include a **Skills — MANDATORY first check** section in their `<outo>` half (immediately before the tools list) and a mirror section in each named subagent's tag body as applicable. It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from `~/.agents/skills/`) before starting any work, and — when a skill matches the work's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in the delegation brief so the subagent follows it too. The minimal `coding.md` compresses this to a single rule ("if a listed skill matches the work, read its SKILL.md and follow it") in each role's prompt. Keep some form of this guidance when authoring a custom style; it is what makes installed skills actually get used.
 
 ### Web access guidance in bundled styles
 

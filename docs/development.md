@@ -206,11 +206,11 @@ Then visit the printed URL.
 
 ## Known sharp edges (the easy-to-miss stuff)
 
-1. **No tests directory exists.** Don't assume one is being created behind the scenes.
+1. **Test coverage is uneven.** `tests/` covers `parse_style` plus a set of runtime/storage/subagent cases; `tools/bash.py` and `core/context.py:make_summarize_hook` are still untested. Run `uv run pytest` before assuming a change is safe.
 2. **`tui/` and `utils/` are empty.** They look like package directories but contain no code. Don't add modules there without first deciding whether the contents should be moved into the proper package (TUI lives in `cli/tui.py`, utilities are scattered).
 3. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
 4. **`continue_loop` tool is referenced in every bundled style** but **not** registered in `tools/registry.py`. Models currently improvise. To enable, register a no-op `continue_loop` handler and add the name to `core/runtime.BASE_TOOLS`.
-5. **`core/runtime.py:_SUBAGENT_DEPTH` / `_SUBAGENT_NAME` / `_SUBAGENT_ID`** are three module-level `ContextVar`s set inside `_wrap_subagent_handler`. They carry the depth, persona name, and 6-hex id of the innermost active subagent invocation. If you add new async tools that themselves call subagents (recursive delegation), make sure they go through the wrapper or the depth/name/id tracking — and the per-invocation stall supervision (`supervised_run` at `level=depth`) — will be wrong.
+5. **`core/runtime.py:_SUBAGENT_DEPTH` / `_SUBAGENT_NAME` / `_SUBAGENT_ID`** are three module-level `ContextVar`s set by `core/subagents.py:_enter_context` at the top of a background job's own asyncio task (reset in `_exit_context`). They carry the depth, persona name, and 6-hex id of the running job. If you add new async tools that themselves spawn subagents, route them through `core/subagents.py:submit` so the id minting, actor labels, and the completion alarm stay in one place. Note there is **no** per-job supervisor: a background job runs without `supervised_run`.
 6. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code; do not rely on them affecting model behavior.
 
 ## Common modifications

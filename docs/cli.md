@@ -104,6 +104,8 @@ Each `StatusChip` is a focusable widget. Click it (or focus it with `Tab` and pr
 
 There is **no** session chip — the session label in row 3 is a plain `Static`. To change sessions, use the command palette (`Ctrl+P`) → "Pick session" / "New session".
 
+The "Pick session" modal is the one place that uses `SelectionModal`'s opt-in `sections=` argument, and it groups by the session's creation directory: a **"This directory"** section first, then **"Other directories"** with each entry prefixed by its basename (`[myproject] old-thing`, or `[?] legacy` for files written before the `cwd` field existed), then the `+ new session…` row. Section headers are non-selectable display rows. Every other picker passes no `sections=` and renders exactly as before.
+
 The provider picker modal also accepts two sentinels (rendered as `extra_options` rows at the bottom of the list):
 
 - `+ add from catalog…` — runs `_catalog_add_flow`: fetches `https://lma.blp.sh/provider`, filters to entries whose `sdk` maps to a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="lma"` and the first model returned by lma as `default_model`. See `core/lma.py` and `core/providers.py:sdk_to_format`.
@@ -147,9 +149,16 @@ Reads:
 - `storage.providers.load_all()` → all configured provider names
 - `storage.styles.list_styles()` → installed style names
 - `storage.skills.list_skills()` → all visible skill names (hidden skills excluded)
-- `storage.sessions.list_sessions()` → session filenames
+- `storage.sessions.list_sessions_with_meta()` → `(name, cwd, mtime)` per session file, read by parsing the JSON directly (never through `load()`, which would write)
 
-Prints 10 rich-formatted key/value lines: `Default provider`, `Default model`, `Subagent`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, `Sessions`. Always exits 0 (no error states). The `Subagent` line shows the resolved subagent `provider/model` when `settings.subagent_provider` or `settings.subagent_model` is set, or `same as outo (<provider>/<model>)` when it inherits. This is the shared subagent provider trio — every named subagent (declared via top-level tags in the active style) uses it.
+Prints 10 rich-formatted key/value lines: `Default provider`, `Default model`, `Subagent`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, and the sessions split by directory. Always exits 0 (no error states). The last entry is two lines:
+
+```
+Sessions (this directory): default, tui-20260723-103412-a1b2c3
+Sessions (other):       old-thing
+```
+
+A session's `cwd` is stamped from the launch directory on its **first** turn only, so the grouping means "the directory this session was created in", not "wherever it was last used". The `Subagent` line shows the resolved subagent `provider/model` when `settings.subagent_provider` or `settings.subagent_model` is set, or `same as outo (<provider>/<model>)` when it inherits. This is the shared subagent provider trio — every named subagent (declared via top-level tags in the active style) uses it.
 
 ---
 
@@ -211,14 +220,19 @@ Loop-event notation in verbose CLI output keeps the `name:` prefix style:
 ```
 outo: Bash ls -la                          # outo tool call
 outo:thinking: <full reasoning text>       # outo reasoning (dim, untruncated)
-editor-a1b2c3: write the tests            # named-subagent invocation start (task preview)
-editor-a1b2c3: Bash pytest -q             # a tool call inside that subagent
-editor-a1b2c3:thinking: <full text>       # reasoning inside that subagent
-editor-a1b2c3: done                       # subagent finished (dim; "error: …" on failure)
+editor-a1b2c3: write the tests            # background subagent job started (brief preview)
+editor-a1b2c3: Bash pytest -q             # a tool call inside that job (while its turn is still live)
+outo: [SYSTEM ALARM - THIS IS NOT A USER MESSAGE]   # the job finished; the whole alarm is printed,
+…                                              # including the result-file path to `cat`
+watchdog: no activity for 1800s (phase='llm_call') — restarting the turn (1/3)
 provider: HTTP 429 → retry: …             # rule-matched provider error
 ```
 
-Every subagent invocation gets a stable 6-hex id, and its actor label is `{name}-{6hex}` — `editor-a1b2c3`, `reviewer-def456`, etc. — so parallel `call_subagent` runs (across different names via `briefs`, or across the same name via `tasks`) are distinguishable line-by-line. Legacy `<subagent>`-only styles still get the `subagent-<6hex>` label. Reasoning/thinking is labeled `:thinking:` for both outo and subagents and printed **in full** in the CLI (the TUI shows a truncated gray row in the main chat and the full text in the subagent detail screen).
+Every background subagent job gets a stable 6-hex id, and its actor label is `{name}-{6hex}` — `editor-a1b2c3`, `reviewer-def456`, etc. — so concurrent `call_subagent` calls are distinguishable line-by-line. Legacy `<subagent>`-only styles still get the `subagent-<6hex>` label.
+
+There is exactly **one** start line per job and exactly **one** completion line, and the two come from different places: the start is the lifecycle observer event (`subagent_start`, the actor's label), while the completion is a `kind="alarm"` loop event attributed to **outo** (the alarm is outo's own next input, not the subagent speaking). `ConsoleEventSink` has no special case for `alarm`, so the alarm text prints in full — including the exact result-file path the model was told to read. The `subagent_end` kind still exists in `LoopEvent` for old session files and is rendered dim with a 120-char preview, but a background job never emits it.
+
+A message-removal prune (a 400/422 history repair cutting a poisoned tool call, or a watchdog restart truncating a dangling tail) prints a single dim note — `[removed N corrupted messages from the record]` — because stdout cannot be un-printed. It is suppressed under `--answer-only` / `--with-session`. Reasoning/thinking is labeled `:thinking:` for both outo and subagents and printed **in full** in the CLI (the TUI shows a truncated gray row in the main chat and the full text in the subagent detail screen).
 
 ### Model resolution
 

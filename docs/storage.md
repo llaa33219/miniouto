@@ -19,6 +19,8 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 │   └── coding-ultra.md            # force-refreshed from src/miniouto/default_style/coding-ultra.md
 ├── sessions/
 │   └── <name>.json               # conversation history per session
+├── subagent-results/
+│   └── <sid>-<YYYY-MM-DD-HH-MM>.md   # one markdown file per finished background subagent job
 └── logs/                         # reserved (currently unused by code)
 ```
 
@@ -35,11 +37,12 @@ SETTINGS_FILE      = ROOT / "settings.toml"
 STYLE_DIR          = ROOT / "style"
 STYLE_REPOS_FILE   = ROOT / "style_repos.toml"
 SESSION_DIR        = ROOT / "sessions"
+SUBAGENT_RESULTS_DIR = ROOT / "subagent-results"
 LOG_DIR            = ROOT / "logs"
 ```
 
 `ensure_dirs()` (called by the CLI root callback before every command):
-1. Creates `ROOT`, `STYLE_DIR`, `SESSION_DIR`, `LOG_DIR` if missing.
+1. Creates `ROOT`, `STYLE_DIR`, `SESSION_DIR`, `SUBAGENT_RESULTS_DIR`, `LOG_DIR` if missing.
 2. For every `*.md` in the bundled `src/miniouto/default_style/` package data, overwrites the matching `STYLE_DIR/<name>.md` with the current bundled content **whenever the content differs** — bundled templates are force-refreshed, so editing a bundled style in place does not survive a reinstall/relaunch. To customize a bundled style, copy it to a new name. Files whose names do not match a bundled template are left untouched.
 
 ## File format schemas
@@ -107,6 +110,7 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
   "version": 2,
   "session": "<name>",
   "updated": "2026-07-23T10:34:12Z",
+  "cwd": "/home/luke/miniouto",   # launch directory, stamped on the first turn only
   "history": [
     {"role": "user", "content": "hello"},
     {
@@ -126,7 +130,7 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
         {"actor": "outo", "kind": "thinking", "text": "the user wants a listing…"},
         {"actor": "outo", "kind": "tool", "text": "Bash ls", "tool_name": "Bash"},
       {"actor": "editor-a1b2c3", "kind": "subagent_start", "text": "edit the auth route", "tool_name": "call_subagent", "subagent_id": "a1b2c3", "subagent_name": "editor"},
-      {"actor": "editor-a1b2c3", "kind": "subagent_end", "text": "done", "subagent_id": "a1b2c3", "subagent_name": "editor"}
+      {"actor": "outo", "kind": "alarm", "text": "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]\nBackground subagent 'editor' (id: a1b2c3) finished (status: done).\nResult file: /home/luke/.miniouto/subagent-results/a1b2c3-2026-07-23-10-34.md …", "subagent_id": "a1b2c3", "subagent_name": "editor"}
       ]
     }
   ]
@@ -134,9 +138,10 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
 ```
 
 - **`history`** — restorable model context: raw coreouto `Message.model_dump(mode="json")` dicts, **system messages excluded** (coreouto prepends a fresh system prompt on every `call()`, so persisting it would duplicate it — see coreouto `examples/21_loop_history.py`). Contains the *full* loop transcript: intermediate assistant messages, tool calls, and tool results. **Rewritten in full after every turn** from `Response.messages`, so it always matches what the model actually saw — including any in-loop compaction done by the summarize hook. Reloaded via `co.Message.model_validate`.
-- **`turns`** — display-only log, appended once per turn. `events` are `LoopEvent` dicts (`actor`, `kind`, `text`, optional `tool_name` / `subagent_id` / `subagent_name`). Actor labels for subagent events are `{name}-{6hex}` (`editor-a1b2c3`, `reviewer-def456`, …) or `subagent-<6hex>` for the legacy `subagent` name. Thinking/reasoning lives **only here** as `kind="thinking"` events: coreouto's providers never put thinking into history `Message` objects, so it is captured from the `ON_THINKING` hook and cannot be part of the restorable history. The TUI renders past sessions from `turns`.
+- **`turns`** — display-only log, appended once per turn. `events` are `LoopEvent` dicts (`actor`, `kind`, `text`, optional `tool_name` / `subagent_id` / `subagent_name` / `detail` / `msg_ref`). Actor labels for subagent events are `{name}-{6hex}` (`editor-a1b2c3`, `reviewer-def456`, …) or `subagent-<6hex>` for the legacy `subagent` name. Thinking/reasoning lives **only here** as `kind="thinking"` events: coreouto's providers never put thinking into history `Message` objects, so it is captured from the `ON_THINKING` hook and cannot be part of the restorable history. The TUI renders past sessions from `turns`.
 
 Notes:
+- **`cwd`** — the directory the session was **created** in (`paths_runtime.INVOCATION_CWD` at import), stamped by `begin_turn` on the **first turn only**, so a session belongs to one directory and later turns (even from another one) never overwrite it. It is purely presentational: the TUI session picker groups "This directory" first, then "Other directories" (`[basename] name`, or `[?] name` for legacy files with no cwd), and `miniouto status` prints `Sessions (this directory)` / `Sessions (other)`. The field is **additive** — `save()` writes it only when non-empty and `load()`'s v2 branch reads it, so `SCHEMA_VERSION` stays 2 and pre-existing files round-trip with `cwd=""` (they group as "other"). Sessions written before the field existed load unchanged.
 - **v1 migration**: files without a `version` key (flat `messages` list) are migrated on load — records become `history` entries, and user/assistant pairs are synthesized into `turns`. The `(session created)` system marker is dropped.
 - **Tolerant loading**: corrupt JSON, non-dict envelopes, and unknown record fields never raise — they yield an empty `SessionData`.
 - **Media handling**: media tool results (Image/Video/Audio) are never persisted as media. coreouto's providers build them as raw API wire dicts via `Message.model_construct` (validation bypass), which fail `Message.model_validate` on reload — so `core/chat.py:_dump_message` flattens any content list containing media blocks to plain text (`[image omitted from restored history: image/png]` placeholder) at persist time. A message whose blocks still fail JSON serialization (raw bytes) degrades to a text placeholder too, but **keeps `tool_call_id`/`name`/`tool_calls`** — dropping them would break tool_use/tool_result pairing and make the provider reject the whole restored request with HTTP 400.
@@ -150,6 +155,41 @@ Schema of one `history` entry (coreouto `Message`):
 | `tool_calls` | `list[dict] \| null` | assistant-only: `{id, name, arguments}` (flat — coreouto `ToolCall`, **not** the OpenAI nested `function` shape) |
 | `tool_call_id` | `str \| null` | tool-only: matches an assistant's `tool_calls[].id` |
 | `name` | `str \| null` | tool-only: tool name (e.g. `Bash`) |
+
+### `subagent-results/<sid>-<YYYY-MM-DD-HH-MM>.md`
+
+Written by `core/subagents.py:_write_result_file` when a background subagent job finishes (successfully, with an error, or cancelled — all three go through the same `_finish` path, which is idempotent so a job can only ever produce one file and one alarm). The filename is `<job id>-<job start, local time, minute resolution>.md`, and the directory is created on demand with `mkdir(parents=True, exist_ok=True)`.
+
+Format — a meta header, the brief verbatim, then the result:
+
+```markdown
+# Subagent result — editor-a1b2c3
+
+- id: a1b2c3
+- name: editor
+- status: done                  # running | done | error | stopped
+- started: 2026-07-23T10:34:12
+- finished: 2026-07-23T10:36:41
+
+## Brief
+
+TASK: …
+
+## Result
+
+<the subagent's final message>
+```
+
+The file is the **only** durable record of what the subagent did: the parent turn never sees the text as a tool result, and the job's hooks (and therefore any live event) are gone once the turn that started it ends. The completion alarm the model receives points here — the model is instructed to `cat` the file:
+
+```
+[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]
+Background subagent 'editor' (id: a1b2c3) finished (status: done).
+Result file: /home/luke/.miniouto/subagent-results/a1b2c3-2026-07-23-10-34.md — read this file (e.g. with `cat`) to see what it produced.
+Currently running background subagents: reviewer-def456
+```
+
+That alarm is a **synthetic user message**, appended to the live coreouto message list by the `BEFORE_LLM_CALL` alarm hook (`core/runtime.py:_make_alarm_hook`), so it lands in `Response.messages` and therefore in the session's `history` on the next `finish_turn`. Its first line is the single-source-of-truth constant `core.subagents.ALARM_HEADER`.
 
 ### `style/<name>.md`
 
@@ -188,6 +228,7 @@ The `<outo>` tag is required (or the whole document is treated as the outo promp
 | `STYLE_DIR` | `Path` | `ROOT/style` |
 | `STYLE_REPOS_FILE` | `Path` | `ROOT/style_repos.toml` (repo URLs recorded by `style add`) |
 | `SESSION_DIR` | `Path` | `ROOT/sessions` |
+| `SUBAGENT_RESULTS_DIR` | `Path` | `ROOT/subagent-results` — where `core/subagents.py` writes a finished job's result file |
 | `LOG_DIR` | `Path` | `ROOT/logs` |
 | `ensure_dirs() -> None` | function | Create dirs + force-refresh bundled styles |
 
@@ -266,6 +307,7 @@ class SessionData:
     name: str
     history: list[dict[str, Any]] = field(default_factory=list)  # coreouto Message dumps
     turns: list[TurnRecord] = field(default_factory=list)
+    cwd: str = ""                 # launch directory, stamped once by begin_turn
 ```
 
 | Function | Returns | Notes |
@@ -273,14 +315,16 @@ class SessionData:
 | `path_for(name)` | `Path` | |
 | `load(name)` | `SessionData` | empty on missing/corrupt; migrates v1 files on the fly |
 | `save(name, data)` | `None` | full envelope rewrite, **atomic** (tmp file + `os.replace`) so a force-kill mid-write never leaves torn JSON |
-| `begin_turn(name, prompt)` | `None` | append a `status="running"` turn; reaps any stale running turn (dead writer) to `"interrupted"` first |
+| `begin_turn(name, prompt)` | `None` | append a `status="running"` turn; reaps any stale running turn (dead writer) to `"interrupted"` first; stamps `SessionData.cwd` from `INVOCATION_CWD` **only if it is still empty** |
 | `update_turn_events(name, events)` | `None` | rewrite the running turn's events — called on nearly every loop event (throttled in `core/chat.py`) |
 | `update_history(name, history)` | `None` | persist a sanitized mid-loop history snapshot for crash resumption |
+| `prune_turn_events(name, msg_refs)` | `int` | drop the recorded events carrying any of those `msg_ref`s, sweeping **every** turn (a repair can cut a message from an earlier turn of a resumed session, whose events live only in the file); returns how many went, and saves only when something was removed |
 | `finish_turn(name, *, prompt, assistant, status, events, history)` | `None` | stamp the running turn `"done"`/`"interrupted"`; `history=None` keeps the on-disk (incrementally persisted) transcript |
 | `create(name)` | `None` | touch an empty session (no-op if the file exists) |
 | `clear(name)` | `None` | deletes the file |
 | `list_sessions()` | `list[str]` | sorted by name |
 | `list_sessions_by_mtime()` | `list[str]` | most recently written first (TUI picker order) |
+| `list_sessions_with_meta()` | `list[(str, str, float)]` | `(name, cwd, mtime)`, mtime-descending. Parses the session JSON **directly** instead of calling `load()`, because `load()` calls `ensure_dirs()` and would force-write the five bundled style files — a read-only picker must never write. Missing / unreadable / unparseable files yield `("", 0.0)` |
 
 **Turn lifecycle / crash safety:** `core/chat.py` calls `begin_turn` before the loop starts, rewrites the running turn's `events` as they stream in, snapshots the sanitized live history at every outo iteration (`update_history`), and calls `finish_turn` at the end. A turn still marked `"running"` on disk therefore means the process was force-killed mid-turn — the TUI renders it with an explicit "turn interrupted" marker instead of a (nonexistent) final answer, and the persisted partial history lets `--continue` resume from real progress.
 

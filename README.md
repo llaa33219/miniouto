@@ -117,6 +117,7 @@ Everything lives under `~/.miniouto/`:
 - `settings.toml` — active `provider`, `model` (legacy), `style`, `session`, `theme`, `subagent_provider`, `subagent_model`, `subagent_reasoning`
 - `style/<name>.md` — style documents
 - `sessions/<name>.json` — conversation history
+- `subagent-results/` — one markdown file per finished background subagent job (the completion alarm names the file)
 - `logs/` — reserved (currently unused)
 
 Skills live outside this tree, at `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention).

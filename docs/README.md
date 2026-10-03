@@ -43,12 +43,15 @@ src/miniouto/
 │   ├── error_rules.py       # per-format ErrorRule lists for provider error_handling (coreouto >= 0.10)
 │   ├── lma.py               # lma REST client + slugify          → see lma.md
 │   ├── providers.py         # SUPPORTED_FORMATS, sdk_to_format, build_coreouto_provider
-│   └── runtime.py           # RuntimeConfig, build_runtime, subagent tool, hooks
+│   ├── reasoning.py         # reasoning choice → provider_passthrough
+│   ├── repetition.py        # repetition watchdog (phrase / tool loops)   → see core.md
+│   ├── runtime.py           # RuntimeConfig, build_runtime, subagent tool, alarm hook, hooks
+│   └── subagents.py         # background job registry (daemon loop, handshake, result files, alarms)
 ├── storage/                 # Filesystem persistence         → see storage.md
 │   ├── __init__.py
 │   ├── paths.py             # ROOT, PROVIDERS_FILE, …, ensure_dirs()
 │   ├── providers.py         # Provider dataclass + TOML CRUD (with `source` field)
-│   ├── sessions.py          # SessionData/TurnRecord (schema v2) + JSON CRUD
+│   ├── sessions.py          # SessionData/TurnRecord (schema v2, `cwd`) + JSON CRUD
 │   ├── settings.py          # Settings dataclass (provider/model/style/session/theme) + TOML CRUD
 │   ├── skills.py            # Skill dataclass + ~/.agents/skills/ discovery
 │   ├── styles.py            # style CRUD + add_from_repo + record_repo/list_repos + parse_style + SubagentSpec
@@ -73,6 +76,6 @@ src/miniouto/
 
 - **Absolute paths** are shown as `/home/luke/miniouto/src/miniouto/...`.
 - **External runtime root** is `~/.miniouto/` (overridable via the `MINIOUTO_HOME` env var).
-- **The agent is called `outo`**. The delegable nested agent is called `subagent`.
+- **The agent is called `outo`**. Nested agents are named by their style tag (a legacy `<subagent>` block keeps the name `subagent`).
 - Code snippets come from the actual source. Module docstrings are reproduced when present.
 - When a behavior depends on a flag, the flag is named in backticks (e.g. `` `chat --continue` ``).
