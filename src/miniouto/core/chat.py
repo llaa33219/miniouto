@@ -15,13 +15,14 @@ from rich.console import Console
 
 from ..storage import sessions as session_store
 from ..storage.sessions import STATUS_DONE, STATUS_INTERRUPTED
-from . import providers, subagents
+from . import providers, repetition, subagents
 from .context import get_max_output_tokens
 from .events import EventSink, LoopEvent, NullSink
 from .runtime import (
     WATCHDOG_MAX_WAKEUPS,
     ChatOverrides,
     LoopCancelledError,
+    LoopRepeatedError,
     build_runtime,
     current_subagent_depth,
     current_subagent_id,
@@ -83,6 +84,18 @@ def _actor_label() -> tuple[str, str | None]:
     if current_subagent_depth() > 0:
         return "subagent", None
     return "outo", None
+
+
+def _note_repetition_text(actor_key: str, text: str) -> None:
+    """Feed model text to the phrase detector; a looping job is cancelled.
+
+    A background job has no supervisor, so a trip is enforced by cancelling
+    it (see `core.repetition.cancel_background_loop`); for outo the verdict
+    simply stays sticky until the supervisor polls it.
+    """
+
+    repetition.note_text(actor_key, text)
+    repetition.cancel_background_loop(actor_key)
 
 
 class _RecordingSink:
@@ -282,6 +295,20 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
             sink.end_working()
             _finish_turn(session_name, None, opts, sink, status=STATUS_INTERRUPTED)
             raise
+        except LoopRepeatedError as exc:
+            # The model kept repeating itself through every restart. Same
+            # treatment as any other failed turn, but the recorded reason is
+            # a repetition stop, not a user stop.
+            sink.end_working()
+            sink.events.append(
+                LoopEvent(
+                    actor="miniouto", kind="error",
+                    text=f"repetition-stop: {type(exc).__name__}: {exc}",
+                ).to_dict()
+            )
+            _finish_turn(session_name, None, opts, sink, status=STATUS_INTERRUPTED)
+            _dump_failure_diagnostics(exc, session_name)
+            raise
         except Exception as exc:
             sink.end_working()
             # Record-only (not emitted live — the caller renders its own
@@ -356,6 +383,9 @@ async def _run_with_watchdog(
     wedged subagent is recovered in place (its own sanitized transcript)
     instead of taking the whole turn down. Emits `watchdog:` loop events
     on each wakeup and wires the user's cancel_event into the fast path.
+    It also supervises repetition (`core.repetition`) for the "outo" actor:
+    a looping model is force-stopped and resumed with the `[SYSTEM ALARM]`
+    as its new user message, which the alarm loop event below renders.
     """
 
     def on_wakeup(wakeups: int, silent: float, phase: Any) -> None:
@@ -371,6 +401,10 @@ async def _run_with_watchdog(
         )
         sink.update_activity("watchdog wakeup")
 
+    def on_repetition(verdict: repetition.LoopVerdict, alarm: str) -> None:
+        sink.emit_loop_event(LoopEvent(actor="watchdog", kind="alarm", text=alarm))
+        sink.update_activity("watchdog repetition alarm")
+
     return await supervised_run(
         lambda p, h: agent.call(p, history=h),
         prompt,
@@ -378,6 +412,8 @@ async def _run_with_watchdog(
         live_key="outo",
         level=0,
         on_wakeup=on_wakeup,
+        on_repetition=on_repetition,
+        restart_on_repetition="outo",
         cancel_event=cancel_event,
         states=states,
     )
@@ -470,6 +506,14 @@ def _make_tool_call_dispatcher(sink: EventSink):
     def on_tool_call(name: str, arguments: dict[str, Any]) -> None:
         _validate_tool_call_args(name, arguments)
         actor, sid = _actor_label()
+
+        # Before every skip branch below: a `call_subagent` that returns
+        # early (the subagent observer owns that line) is still a tool call
+        # outo made, and a model re-spawning the same brief forever must
+        # trip. The subagent's own internal calls carry the job's sid.
+        actor_key = sid or "outo"
+        repetition.note_tool_call(actor_key, name, arguments)
+        repetition.cancel_background_loop(actor_key)
 
         with _tool_trace_lock:
             _tool_trace.append({"name": name, "arguments": dict(arguments or {})})
@@ -629,6 +673,7 @@ def _make_thinking_dispatcher(sink: EventSink):
 
     def on_thinking(thinking: str) -> None:
         actor, sid = _actor_label()
+        _note_repetition_text(sid or "outo", thinking)
         sink.emit_loop_event(
             LoopEvent(actor=actor, kind="thinking", text=thinking, subagent_id=sid)
         )
@@ -725,6 +770,7 @@ def _make_iteration_dispatcher(
         stashed = pending.pop(sid or "", None)
         if stashed is not None:
             s_actor, s_text, s_sid = stashed
+            _note_repetition_text(s_sid or "outo", s_text)
             sink.emit_loop_event(
                 LoopEvent(actor=s_actor, kind="response", text=s_text, subagent_id=s_sid)
             )

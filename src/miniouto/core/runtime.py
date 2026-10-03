@@ -21,7 +21,7 @@ from ..storage.paths import SUBAGENT_RESULTS_DIR
 from ..storage.styles import SubagentSpec
 from ..tools import bash as bash_tool
 from ..tools import registry as tool_registry
-from . import subagents
+from . import repetition, subagents
 from .providers import API_STALL_TIMEOUT_SECONDS, build_coreouto_provider, clear_coreouto_state
 
 # Tools visible to both presets. The subagent tool is appended per-preset
@@ -101,6 +101,15 @@ WATCHDOG_MAX_WAKEUPS = 3
 
 class LoopStalledError(Exception):
     """A supervisor exhausted its wakeups — the loop re-wedges every time."""
+
+
+class LoopRepeatedError(Exception):
+    """A supervisor exhausted its repetition restarts — the loop repeats.
+
+    Sibling of `LoopStalledError`, NOT of `LoopCancelledError`: a repeat is
+    the model's own failure, never a user stop, so cancellation handling
+    (which reports a clean, expected stop) must not swallow it.
+    """
 
 
 def watchdog_states() -> tuple[Any, Any, dict[str, Any]]:
@@ -327,6 +336,8 @@ async def supervised_run(
     on_wakeup: Callable[[int, float, Any], None],
     cancel_event: threading.Event | None = None,
     states: tuple[Any, Any, dict[str, Any]] | None = None,
+    restart_on_repetition: str | None = None,
+    on_repetition: Callable[[repetition.LoopVerdict, str], None] | None = None,
 ) -> Any:
     """Run `start(prompt, history)` under the stall watchdog (examples/27+28).
 
@@ -350,6 +361,26 @@ async def supervised_run(
     The `cancel_event` fast path (outo only) makes ESC ESC responsive
     during an in-flight LLM call, which the hook-boundary cancel guard
     alone cannot interrupt.
+
+    REPETITION (`restart_on_repetition` = the actor key, e.g. "outo").
+    A repeating model is active, not stalled, so this check runs BEFORE
+    the stall test and has its own budget (REPEAT_MAX_RESTARTS, unrelated
+    to WATCHDOG_MAX_WAKEUPS) and its own terminal error
+    (LoopRepeatedError). It is per-actor and only this supervisor consumes
+    its actor's verdict, so the deeper-supervisor deferral below does not
+    apply to it.
+
+    WHY THE TWO RESTART PATHS DIFFER. The stall path resumes with
+    `start(None, history)`: nothing is wrong, the transport just hung, and
+    the transcript alone tells the model to carry on. A repetition stop
+    needs the model to CHANGE ITS BEHAVIOUR, and a bare transcript cannot
+    say that — so the alarm is delivered as the resumed attempt's user
+    message (`start(alarm, history)`), which also lands in
+    `Response.messages` and therefore in the persisted session history.
+    It is deliberately NOT pushed through `subagents`' alarm deque: that
+    deque is drained into the live list by `_make_alarm_hook` and would
+    deliver the same text a second time. `on_repetition` covers the
+    display side (one `alarm` loop event on the turn's sink).
     """
 
     if states is None:
@@ -363,6 +394,7 @@ async def supervised_run(
     try:
         task = asyncio.create_task(start(prompt, history))
         wakeups = 0
+        restarts = 0
         while True:
             await asyncio.sleep(WATCHDOG_CHECK_SECONDS)
             if task.done():
@@ -372,6 +404,31 @@ async def supervised_run(
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
                 raise LoopCancelledError("stopped by user")
+            if restart_on_repetition is not None:
+                verdict = repetition.consume_verdict(restart_on_repetition)
+                if verdict is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    restarts += 1
+                    if restarts > repetition.REPEAT_MAX_RESTARTS:
+                        raise LoopRepeatedError(
+                            f"loop is repeating itself — {verdict.kind}: "
+                            f"{verdict.detail} — after {repetition.REPEAT_MAX_RESTARTS} "
+                            f"restarts, giving up"
+                        )
+                    alarm = repetition.alarm_text(verdict)
+                    history = sanitize_history(live.get(live_key)) or history
+                    if on_repetition is not None:
+                        with contextlib.suppress(Exception):
+                            on_repetition(verdict, alarm)
+                    # No recoverable transcript means the loop tripped before
+                    # its first LLM call finished — the alarm alone would lose
+                    # the task, so it rides along with the original prompt.
+                    task = asyncio.create_task(
+                        start(alarm if history else f"{prompt}\n\n{alarm}", history)
+                    )
+                    continue
             if any(lv > level for lv in _ACTIVE_SUPERVISORS.values()):
                 continue  # a deeper supervisor owns the current silence
             silent = activity.seconds_since_last_activity()
@@ -924,6 +981,9 @@ def _register_watchdog_trackers() -> None:
         co.register_hook(event, fn)
 
     _LIVE_MESSAGES.clear()
+    # Same lifecycle: a repetition counter is scoped to one turn, so a
+    # verdict from the previous turn can never stop the next one.
+    repetition.reset()
 
     def capture_messages(*, messages: Any, **_kwargs: Any) -> None:
         _LIVE_MESSAGES[_SUBAGENT_ID.get() or "outo"] = messages

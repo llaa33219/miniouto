@@ -158,6 +158,19 @@ def running_jobs() -> list[tuple[str, str]]:
         return [(job.sid, job.name) for job in _JOBS.values() if job.status == "running"]
 
 
+def is_running(sid: str) -> bool:
+    """True while `sid` names a live job — the cheap liveness query.
+
+    `repetition.cancel_background_loop` needs to tell "a looping background
+    job" from "a supervised actor" without a status or type check of its
+    own, so the registry answers that directly.
+    """
+
+    with _LOCK:
+        job = _JOBS.get(sid)
+        return job is not None and job.status == "running"
+
+
 def cancel_job(sid: str, reason: str = "cancelled") -> bool:
     """Cancel a running job; its completion path still writes file + alarm.
 
