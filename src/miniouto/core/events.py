@@ -74,6 +74,7 @@ class EventSink(Protocol):
     def emit_loop_event(self, event: LoopEvent) -> None: ...
     def emit_final_answer(self, content: str, session_name: str) -> None: ...
     def emit_stream_delta(self, kind: str, text: str) -> None: ...
+    def remove_events(self, msg_refs: list[str]) -> None: ...
 
 
 # The two `emit_stream_delta` kinds. Deltas are transient display-only
@@ -101,6 +102,9 @@ class NullSink:
         pass
 
     def emit_stream_delta(self, kind: str, text: str) -> None:
+        pass
+
+    def remove_events(self, msg_refs: list[str]) -> None:
         pass
 
 
@@ -196,3 +200,23 @@ class ConsoleEventSink:
         `emit_final_answer`; rendering the same tokens twice (once
         incrementally, once whole) would corrupt that output.
         """
+
+    def remove_events(self, msg_refs: list[str]) -> None:
+        """Note the removal — the console cannot unprint what it showed.
+
+        A repair can excise a tool call the user already watched scroll
+        past, and stdout is append-only, so the honest v1 behavior is a
+        dim note saying how many messages left the record. `quiet`
+        suppresses it: `--answer-only` / `--with-session` promise
+        byte-identical output.
+        """
+
+        if self._quiet or not msg_refs:
+            return
+        self._console.print(
+            Text(
+                f"[removed {len(msg_refs)} corrupted messages from the record]",
+                style="dim",
+            ),
+            highlight=False,
+        )

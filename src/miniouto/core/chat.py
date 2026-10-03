@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -107,6 +108,9 @@ class _RecordingSink:
         # Set by run_chat once the session name is known: called with each
         # recorded event so the persister can flush it to disk.
         self.on_event: Any = None
+        # Set by run_chat to the persister's re-persist hook, called after
+        # `remove_events` rewrote `self.events`.
+        self.on_prune: Any = None
 
     def begin_working(self) -> None:
         self._inner.begin_working()
@@ -138,6 +142,52 @@ class _RecordingSink:
         """
 
         self._inner.emit_stream_delta(kind, text)
+
+    def remove_events(self, msg_refs: list[str]) -> None:
+        """Drop the record of messages the agent loop removed.
+
+        The PRUNING ENTRY POINT for display/file/perceived consistency:
+        a 400/422 history repair that cuts a poisoned tool-call turn, or
+        a stall/restart sanitization that truncates a dangling tail, both
+        remove messages from the live conversation. Whatever those
+        messages produced (the `thinking`, `response`, `context`, `tool`
+        and `tool_result` events stamped with their `msg_ref`) must
+        disappear here, or the TUI and the session file keep showing a
+        turn the model no longer has.
+
+        THREE CONTRACT POINTS:
+
+        - `self.events` is pruned IN PLACE (slice assignment, never
+          rebinding): `_TurnPersister` holds this exact list object and
+          `finish_turn(events=sink.events)` writes it.
+        - The wrapped sink is always notified, so the TUI drops its rows
+          and the console prints its note even when the in-memory list
+          held no matching event.
+        - THE SUMMARIZER IS EXCLUDED, deliberately. It compacts history
+          wholesale (`messages.clear(); messages.extend(...)`) when the
+          context window demands it, but the display transcript is the
+          human record of what happened while history is only the
+          model-context layer — compaction must never erase rows. Only
+          the two removal sources above call this.
+
+        `msg_refs` are `str(id(message))`, i.e. process-local: pruning is
+        a live-turn repair, and a session reloaded in a later process
+        keeps the events it already recorded.
+        """
+
+        if not msg_refs:
+            return
+        refs = set(msg_refs)
+        kept = [e for e in self.events if e.get("msg_ref") not in refs]
+        if len(kept) != len(self.events):
+            self.events[:] = kept
+        # The persister is notified UNCONDITIONALLY: a repair can cut a
+        # message from an EARLIER turn of a resumed session, whose events
+        # exist only in the file — this turn may hold nothing matching
+        # while the file still does.
+        if self.on_prune is not None:
+            self.on_prune(list(refs))
+        self._inner.remove_events(msg_refs)
 
 
 class _TurnPersister:
@@ -184,6 +234,20 @@ class _TurnPersister:
 
     def track(self, events: list[dict[str, Any]]) -> None:
         self._events = events
+
+    def on_prune(self, msg_refs: list[str]) -> None:
+        """Re-persist after a removal rewrote the tracked event list.
+
+        `prune_turn_events` (not `update_turn_events`) because a repair
+        can cut a message from an EARLIER turn of a resumed session,
+        whose events are only in the file. The running turn is covered
+        too — pruning on disk can only remove MORE than the in-memory
+        list already dropped, never less, and the next incremental flush
+        rewrites it in full anyway.
+        """
+
+        with suppress(Exception):
+            session_store.prune_turn_events(self._session, msg_refs)
 
     def persist_history(self, messages: Any) -> None:
         with suppress(Exception):
@@ -248,15 +312,26 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
     persister.track(sink.events)
     persister.begin(opts.prompt)
     sink.on_event = persister.on_event
+    sink.on_prune = persister.on_prune
 
-    on_tool_call = _make_tool_call_dispatcher(sink)
-
-    # Shared per-actor buffer stashing intermediate response text from
-    # AFTER_LLM_CALL until ON_ITERATION flushes it — this is what keeps
-    # thinking rows above the model text they belong to.
+    # Shared per-actor buffers stashing intermediate response text from
+    # AFTER_LLM_CALL and reasoning text from ON_THINKING until
+    # ON_ITERATION flushes them — this is what keeps thinking rows above
+    # the model text they belong to, and the first point where the
+    # turn's assistant message exists to stamp a `msg_ref` from.
     pending_responses: dict[str, tuple[str, str, str | None]] = {}
+    pending_thinking: dict[str, tuple[str, str, str | None]] = {}
+    # Per-actor `str(id(assistant_message))` of the current iteration,
+    # published by the iteration dispatcher and read by the tool
+    # dispatchers. Keyed like the stashes: "" for outo, a subagent id
+    # inside a subagent invocation.
+    turn_refs: dict[str, str] = {}
 
-    base_on_iteration = _make_iteration_dispatcher(sink, pending_responses)
+    on_tool_call = _make_tool_call_dispatcher(sink, turn_refs)
+
+    base_on_iteration = _make_iteration_dispatcher(
+        sink, pending_responses, pending_thinking, turn_refs
+    )
 
     def on_iteration(*, iteration: int, messages: Any, response: Any) -> None:
         base_on_iteration(iteration=iteration, messages=messages, response=response)
@@ -274,19 +349,28 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
         if current_subagent_depth() == 0:
             persister.persist_history(messages)
 
+    def on_messages_removed(msg_refs: list[str]) -> None:
+        # The repair also REMOVED messages; drop their events so the
+        # record matches what the model still has. Depth-gated for the
+        # same reason as on_history_repair: a subagent's transcript is
+        # not this session's record.
+        if current_subagent_depth() == 0:
+            sink.remove_events(msg_refs)
+
     agent = build_runtime(
         runtime,
         provider_config=provider_config,
         on_tool_call=on_tool_call,
         on_response=_make_response_dispatcher(sink, pending_responses),
-        on_thinking=_make_thinking_dispatcher(sink),
+        on_thinking=_make_thinking_dispatcher(pending_thinking),
         on_stream_text=_make_stream_dispatcher(sink, STREAM_TEXT),
         on_stream_thinking=_make_stream_dispatcher(sink, STREAM_THINKING),
         on_iteration=on_iteration,
         on_provider_error=_make_provider_error_dispatcher(sink),
         on_history_repair=on_history_repair,
+        on_messages_removed=on_messages_removed,
         on_alarms=_make_alarm_dispatcher(sink),
-        on_tool_result=_make_tool_result_dispatcher(sink),
+        on_tool_result=_make_tool_result_dispatcher(sink, turn_refs),
         reasoning=opts.reasoning,
         cancel_event=opts.cancel_event,
     )
@@ -302,6 +386,7 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
                 _run_with_watchdog(
                     agent, opts.prompt, core_msgs,
                     sink=sink, cancel_event=opts.cancel_event,
+                    on_removed=sink.remove_events,
                 )
             )
         except LoopCancelledError:
@@ -390,6 +475,7 @@ async def _run_with_watchdog(
     *,
     sink: EventSink,
     cancel_event: threading.Event | None,
+    on_removed: Callable[[list[str]], None] | None = None,
     states: tuple[Any, Any, dict[str, Any]] | None = None,
 ) -> co.Response:
     """Run outo's turn under the stall watchdog — see runtime.supervised_run.
@@ -401,6 +487,10 @@ async def _run_with_watchdog(
     It also supervises repetition (`core.repetition`) for the "outo" actor:
     a looping model is force-stopped and resumed with the `[SYSTEM ALARM]`
     as its new user message, which the alarm loop event below renders.
+
+    `on_removed` prunes the display record of whatever the restart threw
+    away — the resumed attempt's transcript no longer has it, so neither
+    should the TUI or the session file.
     """
 
     def on_wakeup(wakeups: int, silent: float, phase: Any) -> None:
@@ -429,6 +519,7 @@ async def _run_with_watchdog(
         on_wakeup=on_wakeup,
         on_repetition=on_repetition,
         restart_on_repetition="outo",
+        on_removed=on_removed,
         cancel_event=cancel_event,
         states=states,
     )
@@ -515,8 +606,16 @@ def _coerce_dumped_tool_args(dumped: dict[str, Any]) -> None:
                 tc["arguments"] = {}
 
 
-def _make_tool_call_dispatcher(sink: EventSink):
-    """Build the per-tool-call callback wired into the BEFORE_TOOL_CALL hook."""
+def _make_tool_call_dispatcher(sink: EventSink, refs: dict[str, str]):
+    """Build the per-tool-call callback wired into the BEFORE_TOOL_CALL hook.
+
+    `refs` maps an actor key to the `str(id(...))` of the assistant
+    message that issued the turn's tool calls. BEFORE_TOOL_CALL carries
+    only `(name, arguments)` — no message list — so the ref is the only
+    way to tie the call to the message that made it. coreouto appends
+    that assistant message and fires ON_ITERATION before executing any
+    tool call, so the ref is always the current turn's.
+    """
 
     def on_tool_call(name: str, arguments: dict[str, Any]) -> None:
         _validate_tool_call_args(name, arguments)
@@ -553,6 +652,7 @@ def _make_tool_call_dispatcher(sink: EventSink):
                     tool_name=name,
                     subagent_id=sid,
                     detail=detail,
+                    msg_ref=refs.get(sid or ""),
                 )
             )
             sink.update_activity(actor if sid else name)
@@ -564,7 +664,7 @@ _TOOL_RESULT_NAMES = ("Bash", "Image", "Video", "Audio", "Computer")
 _TOOL_RESULT_MAX = 4000
 
 
-def _make_tool_result_dispatcher(sink: EventSink):
+def _make_tool_result_dispatcher(sink: EventSink, refs: dict[str, str]):
     """Build the per-tool-result callback wired into the AFTER_TOOL_CALL hook.
 
     coreouto fires AFTER_TOOL_CALL with the handler's ToolResult, so this
@@ -575,6 +675,12 @@ def _make_tool_result_dispatcher(sink: EventSink):
     is skipped — the subagent observer's `subagent_end` event already
     carries that result. The dispatcher must never raise: a sink failure
     here must not break the agent loop.
+
+    The result carries the SAME `msg_ref` as the `tool` event it answers
+    (the assistant message that issued the call) — that is what makes
+    pruning safe: a removed message takes its call and its result
+    together, so the TUI can never be left with a result row whose call
+    row is gone.
     """
 
     def on_tool_result(name: str, result: Any) -> None:
@@ -594,6 +700,7 @@ def _make_tool_result_dispatcher(sink: EventSink):
                     text=text,
                     tool_name=name,
                     subagent_id=sid,
+                    msg_ref=refs.get(sid or ""),
                 )
             )
         except Exception:
@@ -683,15 +790,29 @@ def _make_alarm_dispatcher(sink: EventSink):
     return on_alarms
 
 
-def _make_thinking_dispatcher(sink: EventSink):
-    """Build the per-thinking callback wired into the ON_THINKING hook."""
+def _make_thinking_dispatcher(
+    pending_thinking: dict[str, tuple[str, str, str | None]],
+):
+    """Build the per-thinking callback wired into the ON_THINKING hook.
+
+    The text is STASHED, not emitted, and flushed by the ON_ITERATION
+    dispatcher — for the same reason `_make_response_dispatcher` defers
+    (so the text lands below its thinking row), plus one more: coreouto
+    fires ON_THINKING *before* it appends the assistant message, so the
+    message does not exist yet and there is nothing to stamp a `msg_ref`
+    with. ON_ITERATION fires immediately after the append, which is the
+    first point where the turn's message identity is known. Repetition
+    detection still runs HERE, at the earliest possible moment — only
+    the display is deferred.
+
+    `pending_thinking` is keyed by actor ("" for outo, the subagent id
+    inside a subagent invocation), like the response stash.
+    """
 
     def on_thinking(thinking: str) -> None:
         actor, sid = _actor_label()
         _note_repetition_text(sid or "outo", thinking)
-        sink.emit_loop_event(
-            LoopEvent(actor=actor, kind="thinking", text=thinking, subagent_id=sid)
-        )
+        pending_thinking[sid or ""] = (actor, thinking, sid)
 
     return on_thinking
 
@@ -791,32 +912,61 @@ def _make_provider_error_dispatcher(sink: EventSink):
 def _make_iteration_dispatcher(
     sink: EventSink,
     pending: dict[str, tuple[str, str, str | None]],
+    pending_thinking: dict[str, tuple[str, str, str | None]],
+    refs: dict[str, str],
 ):
     """Build the per-iteration callback wired into the ON_ITERATION hook.
 
-    First flushes any response text stashed by the AFTER_LLM_CALL
-    dispatcher for the current actor — ON_ITERATION always fires after
-    ON_THINKING, so the flushed text lands *below* the thinking row and
-    above this context line, restoring the natural reading order
-    (thinking → text → progress).
+    ON_ITERATION is where the turn's message identity becomes available:
+    coreouto appends the assistant message (agent.py) and only then fires
+    this hook, so `messages[-1]` IS the message every event of this
+    iteration came from. Its `str(id(...))` is published into `refs`
+    (keyed by actor) and stamped onto everything flushed here — the
+    thinking and response text stashed by the AFTER_LLM_CALL /
+    ON_THINKING dispatchers, and this iteration's progress line. The
+    tool dispatchers read the same slot, which is why a `tool` event and
+    its `tool_result` always share one ref: a removed message takes both
+    rows with it.
 
-    Emits a `context` loop event with the iteration number and cumulative
-    token usage so the user sees the agent is making progress even between
-    tool calls. Without this, the loop is silent from the moment the prompt
-    is sent until the first tool call or terminal answer — there's no signal
-    that work is happening at all.
+    Flush order is thinking → response → context: ON_ITERATION always
+    fires after ON_THINKING, so the reasoning reads above the text it
+    produced, and both sit above this iteration's progress line.
     """
 
     cumulative: list[int] = [0]
 
     def on_iteration(*, iteration: int, messages: Any, response: Any, **_kwargs: Any) -> None:
         actor, sid = _actor_label()
-        stashed = pending.pop(sid or "", None)
+        key = sid or ""
+        msg_ref = None
+        if messages:
+            last = messages[-1]
+            if getattr(last, "role", None) == "assistant":
+                msg_ref = refs[key] = str(id(last))
+        stashed_thinking = pending_thinking.pop(key, None)
+        if stashed_thinking is not None:
+            t_actor, t_text, t_sid = stashed_thinking
+            sink.emit_loop_event(
+                LoopEvent(
+                    actor=t_actor,
+                    kind="thinking",
+                    text=t_text,
+                    subagent_id=t_sid,
+                    msg_ref=msg_ref,
+                )
+            )
+        stashed = pending.pop(key, None)
         if stashed is not None:
             s_actor, s_text, s_sid = stashed
             _note_repetition_text(s_sid or "outo", s_text)
             sink.emit_loop_event(
-                LoopEvent(actor=s_actor, kind="response", text=s_text, subagent_id=s_sid)
+                LoopEvent(
+                    actor=s_actor,
+                    kind="response",
+                    text=s_text,
+                    subagent_id=s_sid,
+                    msg_ref=msg_ref,
+                )
             )
         usage = getattr(response, "usage", None) if response else None
         tokens = getattr(usage, "total_tokens", None) if usage else None
@@ -827,7 +977,13 @@ def _make_iteration_dispatcher(
         if cumulative[0]:
             text += f" · {cumulative[0]} tokens"
         sink.emit_loop_event(
-            LoopEvent(actor=actor, kind="context", text=text, subagent_id=sid)
+            LoopEvent(
+                actor=actor,
+                kind="context",
+                text=text,
+                subagent_id=sid,
+                msg_ref=msg_ref,
+            )
         )
 
     return on_iteration

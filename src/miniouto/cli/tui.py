@@ -690,7 +690,17 @@ class RowStatic(Static):
     `Style(reverse=True)` — a true fg/bg inversion that looks identical
     on every row type (prompts, loop output, thinking, subagents, and
     Markdown answers).
+
+    `msg_ref` is the `str(id(message))` of the live coreouto Message this
+    row was built from (set from the LoopEvent), or None for rows that
+    have no message behind them (user prompts, system notices, answers)
+    and for events that are never prunable (alarms, wakeups, provider
+    errors). `ChatTUI._remove_event_rows` drops every row whose ref is
+    reported removed, which is how a repaired-away turn stops being
+    displayed without a separate bookkeeping list.
     """
+
+    msg_ref: str | None = None
 
     @property
     def text_selection(self) -> Selection | None:
@@ -1094,9 +1104,14 @@ class _RowWindow:
     def remove(self, widget: Static) -> None:
         """Drop a row from the window and the DOM, keeping `first` aligned.
 
-        Used when a live stream row is replaced by the canonical answer row
-        — re-mounting the answer at the tail would otherwise leave the
-        streamed prefix above it as a duplicate.
+        Two callers: a live stream row replaced by the canonical answer
+        row (re-mounting the answer at the tail would otherwise leave
+        the streamed prefix above it as a duplicate), and a row whose
+        message was removed from history by a repair (`_remove_event_rows`).
+
+        `first` is clamped, not just decremented: removing the last row of
+        a fully-evicted window would otherwise leave it pointing past the
+        end of `rows`, and the next top-edge chunk load would index off it.
         """
 
         for idx, row in enumerate(self.rows):
@@ -1105,6 +1120,7 @@ class _RowWindow:
                 if idx < self.first:
                     self.first -= 1
                 break
+        self.first = min(self.first, len(self.rows))
         if widget.is_attached:
             widget.remove()
 
@@ -1137,10 +1153,18 @@ class _RowWindow:
         start = max(0, self.first - _WINDOW_CHUNK_ROWS)
         new_rows = self.rows[start:self.first]
         self.first = start
-        first_mounted = self.rows[start + len(new_rows)]
+        # The new chunk goes in front of the first currently mounted row.
+        # A pruned window can have nothing mounted (`first == len(rows)`),
+        # and there is then no anchor to insert before.
+        anchor_idx = start + len(new_rows)
+        anchor = self.rows[anchor_idx] if anchor_idx < len(self.rows) else None
         for row in new_rows:
-            if not row.is_attached:
-                log.mount(row, before=first_mounted)
+            if row.is_attached:
+                continue
+            if anchor is None:
+                log.mount(row)
+            else:
+                log.mount(row, before=anchor)
         log.call_after_refresh(self._finish_older, log, new_rows)
 
     def _finish_older(self, log: VerticalScroll, new_rows: list[Static]) -> None:
@@ -1475,6 +1499,11 @@ class TUIEventSink:
         else:
             self._app._mount_row(Static(Text("(empty response)", style="dim")))
         self._app._mount_row(Static(""))
+
+    def remove_events(self, msg_refs: list[str]) -> None:
+        if not msg_refs:
+            return
+        self._app.call_from_thread(self._app._remove_event_rows, msg_refs)
 
 
 # ─── Chat input ──────────────────────────────────────────────────────────────
@@ -2761,7 +2790,9 @@ class ChatTUI(App):
         self._stream_text_row = None
         self._stream_thinking_row = None
 
-    def _mount_row(self, widget: Static) -> None:
+    def _mount_row(self, widget: Static, msg_ref: str | None = None) -> None:
+        if msg_ref is not None:
+            widget.msg_ref = msg_ref
         if self._log is None:
             return
         self._window.append(self._log, widget, defer_mount=self._bulk_loading)
@@ -2784,8 +2815,9 @@ class ChatTUI(App):
                 # The streamed reasoning was this message's prefix; the
                 # whole-text event is the canonical copy.
                 live.finalize(event.text)
+                live.msg_ref = event.msg_ref
                 return
-            self._mount_row(ThinkingRow(event.text))
+            self._mount_row(ThinkingRow(event.text), event.msg_ref)
             return
         if event.kind == "tool":
             row = ToolRow(
@@ -2793,6 +2825,7 @@ class ChatTUI(App):
                 detail=getattr(event, "detail", None),
                 tool_name=event.tool_name,
             )
+            row.msg_ref = event.msg_ref
             self._pending_tool_rows.append(row)
             self._mount_row(row)
             return
@@ -2817,7 +2850,7 @@ class ChatTUI(App):
                 row = EventRow(Text(text))
                 if is_error:
                     row.add_class("-error")
-                self._mount_row(row)
+                self._mount_row(row, event.msg_ref)
             return
         if event.kind == "response" and self._stream_text_row is not None:
             # The deltas already rendered this message in the live row
@@ -2832,7 +2865,31 @@ class ChatTUI(App):
         row = EventRow(Text(event.text))
         if event.kind == "error":
             row.add_class("-error")
-        self._mount_row(row)
+        self._mount_row(row, event.msg_ref)
+
+    def _remove_event_rows(self, msg_refs: list[str]) -> None:
+        """Drop the rows of messages the agent loop removed (UI thread).
+
+        A `tool` row and its `tool_result` share one `msg_ref` — the
+        assistant message that issued the call — so pruning by ref takes
+        both or neither and a result can never be left orphaned. The
+        pending-pair list is filtered for the same reason: it holds live
+        row references that a later `tool_result` would otherwise try to
+        attach to a row that is no longer displayed.
+
+        The blank `Static` spacers between turns carry no `msg_ref` at
+        all, hence the `getattr` default — they are never prunable.
+        """
+
+        refs = set(msg_refs)
+        if not refs:
+            return
+        for row in list(self._window.rows):
+            if getattr(row, "msg_ref", None) in refs:
+                self._window.remove(row)
+        self._pending_tool_rows = [
+            r for r in self._pending_tool_rows if r.msg_ref not in refs
+        ]
 
     def _record_subagent_event(self, event: LoopEvent) -> None:
         if event.subagent_id:
@@ -2846,6 +2903,9 @@ class ChatTUI(App):
         )
         self._subagent_rows[event.subagent_id] = row
         self._subagent_events.setdefault(event.subagent_id, [])
+        # Deliberately un-stamped: a subagent keeps running (and delivers
+        # its completion alarm) long after the `call_subagent` turn that
+        # started it, so its row must survive a repair that cuts that turn.
         self._mount_row(row)
 
     def _finish_subagent_row(self, event: LoopEvent) -> None:

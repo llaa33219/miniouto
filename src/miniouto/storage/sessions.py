@@ -191,6 +191,34 @@ def update_history(name: str, history: list[dict[str, Any]]) -> None:
     save(name, data)
 
 
+def prune_turn_events(name: str, msg_refs: list[str]) -> int:
+    """Drop the display events of removed messages; return how many went.
+
+    A history repair can reach back past the current turn: a resumed
+    session's poisoned message may sit in an earlier turn's assistant
+    message, and its tool rows are recorded in THAT turn's event list.
+    So the sweep is over every turn, not just the running one — otherwise
+    the file would keep showing a tool call the model no longer has.
+
+    `msg_refs` are `str(id(message))` values from the live process, so
+    only the current turn's events can actually match. Unknown refs are a
+    no-op: nothing is saved when nothing was removed.
+    """
+
+    if not msg_refs:
+        return 0
+    refs = set(msg_refs)
+    data = load(name)
+    removed = 0
+    for turn in data.turns:
+        kept = [e for e in turn.events if e.get("msg_ref") not in refs]
+        removed += len(turn.events) - len(kept)
+        turn.events = kept
+    if removed:
+        save(name, data)
+    return removed
+
+
 def finish_turn(
     name: str,
     *,

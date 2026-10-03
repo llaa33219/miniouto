@@ -118,7 +118,11 @@ def watchdog_states() -> tuple[Any, Any, dict[str, Any]]:
     return _ACTIVITY_STATE, _PROGRESS_STATE, _LIVE_MESSAGES
 
 
-def sanitize_history(messages: list[co.Message] | None) -> list[co.Message] | None:
+def sanitize_history(
+    messages: list[co.Message] | None,
+    *,
+    on_removed: Callable[[list[str]], None] | None = None,
+) -> list[co.Message] | None:
     """Prepare a cancelled loop's messages for `call(history=...)`.
 
     From coreouto examples/27+28 (`cut_to_last_answered_turn`): drops
@@ -128,6 +132,12 @@ def sanitize_history(messages: list[co.Message] | None) -> list[co.Message] | No
     results only after ALL of its tool calls finish, so a cancellation
     lands either before or after the whole batch — the tail is always a
     bare assistant message, never a partially-answered one.
+
+    `on_removed` receives the `str(id(message))` of every truncated
+    message so `core.chat` can prune the display record of a turn the
+    model is about to forget. The dropped SYSTEM messages are reported
+    as nothing: no loop event is ever produced from one, so a ref could
+    only ever add a phantom count to the removal note.
     """
 
     if not messages:
@@ -138,12 +148,18 @@ def sanitize_history(messages: list[co.Message] | None) -> list[co.Message] | No
         if msg.role == "assistant" and msg.tool_calls:
             answered = {m.tool_call_id for m in history[i + 1:] if m.role == "tool"}
             if {tc.id for tc in msg.tool_calls} - answered:
+                if on_removed is not None:
+                    on_removed([str(id(m)) for m in history[i:]])
                 del history[i:]
             break
     return history or None
 
 
-def _repair_pairing(messages: list[Any]) -> bool:
+def _repair_pairing(
+    messages: list[Any],
+    *,
+    on_removed: Callable[[list[str]], None] | None = None,
+) -> bool:
     """Gentle in-place repair of tool-call pairing; True if anything changed.
 
     Two fixes, both about making the request payload structurally valid:
@@ -151,28 +167,37 @@ def _repair_pairing(messages: list[Any]) -> bool:
     - Drop duplicate tool-result messages (same `tool_call_id` answered
       twice). Strict providers reject duplicates with a 400, and the old
       `tool_result` error reaction used to pile them up — a session
-      persisted mid-poisoning can still carry them.
+      persisted mid-poisoning can still carry them. Each dropped copy is
+      reported through `on_removed`; its own ref is harmless because no
+      loop event is ever stamped with a tool message's identity (results
+      carry their ASSISTANT message's ref instead), so the prune it
+      triggers removes nothing.
     - Fill dangling tool calls on the LAST assistant tool-call turn with
       error results (coreouto examples/29 shape A). coreouto appends a
       turn's results as one batch, so only the tail can dangle; an
       interrupted turn restored from disk is the usual source. Filling
-      beats cutting here: the turn's earlier work is kept.
+      beats cutting here: the turn's earlier work is kept. FILLING IS AN
+      ADDITION — nothing is removed, so `on_removed` is not called.
     """
 
     changed = False
     seen: set[str] = set()
     deduped: list[Any] = []
+    dropped: list[Any] = []
     for m in messages:
         if m.role == "tool":
             call_id = getattr(m, "tool_call_id", None)
             if call_id is not None:
                 if call_id in seen:
                     changed = True
+                    dropped.append(m)
                     continue
                 seen.add(call_id)
         deduped.append(m)
     if changed:
         messages[:] = deduped
+        if on_removed is not None:
+            on_removed([str(id(m)) for m in dropped])
 
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -226,7 +251,11 @@ def _malformed_tool_turn_index(messages: list[Any]) -> int | None:
     return None
 
 
-def _cut_poisoned_turn(messages: list[Any]) -> bool:
+def _cut_poisoned_turn(
+    messages: list[Any],
+    *,
+    on_removed: Callable[[list[str]], None] | None = None,
+) -> bool:
     """Excise ONE assistant tool-call turn plus its results, in place.
 
     coreouto examples/29 shape B: a malformed tool call sitting in the
@@ -246,6 +275,12 @@ def _cut_poisoned_turn(messages: list[Any]) -> bool:
 
     A note replaces the cut turn so the model knows what happened and
     continues with full context instead of repeating the call.
+
+    `on_removed` receives the cut messages' refs, captured BEFORE the
+    deletion. The note that replaces the turn is an ADDITION — folded
+    into the preceding user message when there is one (some providers
+    reject two consecutive user messages), inserted otherwise — and an
+    in-place edit of a surviving message never prunes anything.
     """
 
     i = _malformed_tool_turn_index(messages)
@@ -260,6 +295,8 @@ def _cut_poisoned_turn(messages: list[Any]) -> bool:
     j = i + 1
     while j < len(messages) and messages[j].role == "tool":
         j += 1
+    if on_removed is not None:
+        on_removed([str(id(m)) for m in messages[i:j]])
     del messages[i:j]
     explanation = (
         "A previous tool call was rejected by the provider (HTTP 400: the "
@@ -278,7 +315,9 @@ def _cut_poisoned_turn(messages: list[Any]) -> bool:
 
 
 def _make_history_repair_hook(
+    *,
     on_repair: Callable[[list[Any]], None] | None = None,
+    on_removed: Callable[[list[str]], None] | None = None,
 ):
     """Build the ON_PROVIDER_ERROR hook that repairs history before retries.
 
@@ -303,6 +342,19 @@ def _make_history_repair_hook(
     history, so the fix survives the turn instead of being reloaded from
     disk (and re-400ing) on the next prompt.
 
+    `on_removed` (optional) is called with the `str(id(message))` of
+    every message the pass REMOVED, so `core.chat` can prune the display
+    record beside the history fix. It is reported separately from
+    `on_repair` because the two answer different questions: "what does
+    the model now have" vs "what did the user just watch happen".
+
+    NOTE on a deduped tool result: the dropped copy is reported, but its
+    own ref matches no event — a `tool_result` is stamped with the
+    ASSISTANT message's ref, not its own, so the prune that ref triggers
+    removes nothing. The record keeps showing the turn's call and the one
+    result that survived, which is exactly what the model now has. No row
+    is orphaned, because a call and its result always share one ref.
+
     Gated to `reaction == "retry"` with status 400/422 so rate-limit and
     overload retries (which need no repair) pass through untouched.
     """
@@ -316,9 +368,9 @@ def _make_history_repair_hook(
     ) -> None:
         if status_code not in (400, 422) or reaction != "retry" or messages is None:
             return
-        changed = _repair_pairing(messages)
+        changed = _repair_pairing(messages, on_removed=on_removed)
         if not changed:
-            changed = _cut_poisoned_turn(messages)
+            changed = _cut_poisoned_turn(messages, on_removed=on_removed)
         if changed and on_repair is not None:
             with contextlib.suppress(Exception):
                 on_repair(messages)
@@ -338,6 +390,7 @@ async def supervised_run(
     states: tuple[Any, Any, dict[str, Any]] | None = None,
     restart_on_repetition: str | None = None,
     on_repetition: Callable[[repetition.LoopVerdict, str], None] | None = None,
+    on_removed: Callable[[list[str]], None] | None = None,
 ) -> Any:
     """Run `start(prompt, history)` under the stall watchdog (examples/27+28).
 
@@ -381,6 +434,13 @@ async def supervised_run(
     deque is drained into the live list by `_make_alarm_hook` and would
     deliver the same text a second time. `on_repetition` covers the
     display side (one `alarm` loop event on the turn's sink).
+
+    `on_removed` is the display side of BOTH restart paths: every
+    `sanitize_history` truncation it performs reports the discarded
+    messages' refs there, so the record loses the events of a turn the
+    resumed attempt no longer has. The two paths differ in what survives
+    — a stall keeps the answered prefix, a repetition restart keeps it
+    plus the alarm — but a discarded tail is a discard on both.
     """
 
     if states is None:
@@ -418,7 +478,10 @@ async def supervised_run(
                             f"restarts, giving up"
                         )
                     alarm = repetition.alarm_text(verdict)
-                    history = sanitize_history(live.get(live_key)) or history
+                    history = (
+                        sanitize_history(live.get(live_key), on_removed=on_removed)
+                        or history
+                    )
                     if on_repetition is not None:
                         with contextlib.suppress(Exception):
                             on_repetition(verdict, alarm)
@@ -444,7 +507,7 @@ async def supervised_run(
                     f"loop stalled repeatedly ({WATCHDOG_MAX_WAKEUPS} wakeups, "
                     f"last phase={progress.phase!r}) — giving up"
                 )
-            history = sanitize_history(live.get(live_key)) or history
+            history = sanitize_history(live.get(live_key), on_removed=on_removed) or history
             on_wakeup(wakeups, silent, progress.phase)
             if history:
                 task = asyncio.create_task(start(None, history))
@@ -698,6 +761,7 @@ def build_runtime(
     on_iteration: Callable[..., None] | None = None,
     on_provider_error: Callable[..., None] | None = None,
     on_history_repair: Callable[[list[Any]], None] | None = None,
+    on_messages_removed: Callable[[list[str]], None] | None = None,
     on_alarms: Callable[[list[subagents.Alarm]], None] | None = None,
     reasoning: str | None = None,
     cancel_event: threading.Event | None = None,
@@ -735,6 +799,12 @@ def build_runtime(
     history-repair hook actually mutates it before a 400/422 retry —
     `core.chat` persists the repaired history through it so the fix
     survives the turn. Pass None to skip persistence.
+    `on_messages_removed` is called with the `str(id(message))` of every
+    message a repair REMOVED, beside (and independently of)
+    `on_history_repair`: it lets `core.chat` prune the display record so
+    the turn record describes exactly the messages that survived.
+    Additions (a filled-in tool result, the explanation note folded into
+    the preceding user message) are never reported. Pass None to skip.
     `on_alarms` is called with every completion alarm the BEFORE_LLM_CALL
     alarm hook drained, after appending them to the live message list —
     `core.chat` turns each into an `alarm` loop event so the session and
@@ -931,7 +1001,12 @@ def build_runtime(
     _register_watchdog_trackers()
 
     # Unconditional (unlike the sink loggers): repair makes the retry rules recover.
-    co.register_hook(co.ON_PROVIDER_ERROR, _make_history_repair_hook(on_history_repair))
+    co.register_hook(
+        co.ON_PROVIDER_ERROR,
+        _make_history_repair_hook(
+            on_repair=on_history_repair, on_removed=on_messages_removed
+        ),
+    )
 
     if on_response is not None:
         co.register_hook(co.AFTER_LLM_CALL, _make_response_logger(on_response))
