@@ -15,6 +15,7 @@ from rich.console import Console
 
 from ..storage import sessions as session_store
 from ..storage.sessions import STATUS_DONE, STATUS_INTERRUPTED
+from . import providers
 from .context import get_max_output_tokens
 from .events import EventSink, LoopEvent, NullSink
 from .runtime import (
@@ -179,6 +180,18 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
     raw_sink = sink if sink is not None else NullSink()
     sink = _RecordingSink(raw_sink)
 
+    try:
+        return _run_chat_prepared(opts, sink)
+    except Exception:
+        # Hooks are global and close over THIS turn's sink and persister.
+        # A send that dies while resolving the runtime (provider deleted
+        # mid-session, a malformed style) would otherwise leave the
+        # previous turn's hooks registered against the new process state.
+        providers.clear_coreouto_state()
+        raise
+
+
+def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
     runtime = resolve_runtime_from_settings(
         ChatOverrides(
             provider=opts.provider,

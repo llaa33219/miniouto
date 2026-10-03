@@ -810,6 +810,88 @@ def build_runtime(
     next step.
     """
 
+    from .context import get_max_output_tokens, make_summarize_hook
+    from .reasoning import resolve_reasoning_passthrough
+
+    # ---- Slow resolution, hoisted ABOVE `clear_coreouto_state()` ----
+    # Everything below this point must be pure in-memory work: the clear
+    # wipes coreouto's global provider/preset/tool/hook registries, and a
+    # background subagent job resolves its provider and tools by NAME at
+    # `call()` entry — so a multi-second network fetch inside the
+    # clear+register window is a real race (the subagent would find an
+    # empty registry). Style file I/O and both lma lookups therefore
+    # resolve first; only dict/registry operations follow the clear.
+    provider = provider_store.get(runtime.provider_name)
+    if provider is None:
+        raise RuntimeError(
+            f"Provider {runtime.provider_name!r} is not configured. "
+            "Run `miniouto provider add` first."
+        )
+
+    outo_style, parsed_specs = _resolve_both_styles(runtime.style_name, style_overrides)
+    outo_prompt = _with_cwd("outo", outo_style)
+    # Per-spec cwd prepending happens here, not in _resolve_both_styles —
+    # cwd is a runtime-derived value (INVOCATION_CWD) regenerated every
+    # build_runtime call, so it must not be baked into the style loader.
+    specs = [
+        SubagentSpec(name=spec.name, prompt=_with_cwd("subagent", spec.prompt))
+        for spec in parsed_specs
+    ]
+
+    # Subagent runs the same model (or its override) and must share
+    # the output-token cap, otherwise long tool calls it issues
+    # (heredoc file writes) get truncated at the provider's low
+    # default (1024 for Anthropic) and we end up with a half-written
+    # file and an "I cut off mid-function" loop. Pull the cap from
+    # the same lma endpoint as outo so it tracks the subagent's
+    # model when one is configured. `setdefault` still lets a CLI
+    # `--max-tokens` override win.
+    subagent_model = runtime.subagent_model or runtime.model
+    subagent_provider_config: dict[str, Any] = dict(provider_config or {})
+    subagent_passthrough: dict[str, Any] = {}
+    sub_provider: Any = None
+    sub_provider_name: str = ""
+    if specs:
+        sub_provider_name = runtime.subagent_provider or runtime.provider_name
+        sub_provider = provider_store.get(sub_provider_name)
+        if sub_provider is None:
+            raise RuntimeError(
+                f"Subagent provider {sub_provider_name!r} is not configured."
+            )
+        subagent_provider_config.setdefault(
+            "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
+        )
+        subagent_choice = (
+            reasoning
+            if reasoning is not None
+            else (runtime.subagent_reasoning or sub_provider.reasoning_effort)
+        )
+        subagent_passthrough = resolve_reasoning_passthrough(
+            sub_provider.api_format,
+            subagent_model,
+            sub_provider_name,
+            subagent_choice,
+        )
+
+    # Thinking display (ON_THINKING → CLI/TUI) only works when the model is
+    # asked to reason — providers never emit thinking blocks unrequested.
+    # The resolver consults lma's per-model reasoning_options; an explicit
+    # `reasoning` choice wins over the provider's stored reasoning_effort.
+    outo_choice = reasoning if reasoning is not None else provider.reasoning_effort
+    outo_passthrough = resolve_reasoning_passthrough(
+        provider.api_format,
+        runtime.model,
+        runtime.provider_name,
+        outo_choice,
+    )
+
+    # make_summarize_hook also consults lma for the context window (unless
+    # a provider override supplies it) — resolved here, hooked below.
+    summarize_on_iteration, summarize_before_llm = make_summarize_hook(
+        runtime.model, runtime.session or "default", runtime.provider_name
+    )
+
+    # ---- Registry rebuild: pure in-memory from here to the return ----
     clear_coreouto_state()
     bash_tool.set_cancel_event(cancel_event)
 
@@ -821,12 +903,6 @@ def build_runtime(
         co.register_hook(co.BEFORE_LLM_CALL, guard)
         co.register_hook(co.BEFORE_TOOL_CALL, guard)
 
-    provider = provider_store.get(runtime.provider_name)
-    if provider is None:
-        raise RuntimeError(
-            f"Provider {runtime.provider_name!r} is not configured. "
-            "Run `miniouto provider add` first."
-        )
     build_coreouto_provider(provider)
 
     # api_format selects the Computer handler variant: openai Chat
@@ -834,16 +910,6 @@ def build_runtime(
     # returns an explanatory notice instead of an image (see
     # tools/registry._make_computer_handler).
     tool_registry.register_all(api_format=provider.api_format)
-
-    outo_style, parsed_specs = _resolve_both_styles(runtime.style_name, style_overrides)
-    outo_prompt = _with_cwd("outo", outo_style)
-    # Per-spec cwd prepending happens here, not in _resolve_both_styles —
-    # cwd is a runtime-derived value (INVOCATION_CWD) regenerated every
-    # build_runtime call, so it must not be baked into the style loader.
-    specs = [
-        SubagentSpec(name=spec.name, prompt=_with_cwd("subagent", spec.prompt))
-        for spec in parsed_specs
-    ]
 
     # outo preset is always registered. The subagent tool is added to its
     # tool list ONLY when the active style declared ≥1 subagent; otherwise
@@ -870,12 +936,6 @@ def build_runtime(
     # without, or vice versa) correctly add or remove the tool and the
     # preset between turns. No extra caching of specs across turns.
     if specs:
-        sub_provider_name = runtime.subagent_provider or runtime.provider_name
-        sub_provider = provider_store.get(sub_provider_name)
-        if sub_provider is None:
-            raise RuntimeError(
-                f"Subagent provider {sub_provider_name!r} is not configured."
-            )
         build_coreouto_provider(sub_provider)
 
         # The "subagent" preset is a config carrier: it provides the
@@ -890,33 +950,6 @@ def build_runtime(
             system_prompt=parsed_specs[0].prompt,
             tools=[*BASE_TOOLS, SUBAGENT_TOOL_NAME],
             max_iterations=None,
-        )
-
-        # Subagent runs the same model (or its override) and must share
-        # the output-token cap, otherwise long tool calls it issues
-        # (heredoc file writes) get truncated at the provider's low
-        # default (1024 for Anthropic) and we end up with a half-written
-        # file and an "I cut off mid-function" loop. Pull the cap from
-        # the same lma endpoint as outo so it tracks the subagent's
-        # model when one is configured.
-        from .context import get_max_output_tokens
-        from .reasoning import resolve_reasoning_passthrough
-
-        subagent_model = runtime.subagent_model or runtime.model
-        subagent_provider_config = dict(provider_config or {})
-        subagent_provider_config.setdefault(
-            "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
-        )
-        subagent_choice = (
-            reasoning
-            if reasoning is not None
-            else (runtime.subagent_reasoning or sub_provider.reasoning_effort)
-        )
-        subagent_passthrough = resolve_reasoning_passthrough(
-            sub_provider.api_format,
-            subagent_model,
-            sub_provider_name,
-            subagent_choice,
         )
 
         subagent_tool = _build_subagent_tool(
@@ -935,10 +968,6 @@ def build_runtime(
     if on_tool_result is not None:
         co.register_hook(co.AFTER_TOOL_CALL, _make_tool_result_logger(on_tool_result))
 
-    from .context import make_summarize_hook
-    summarize_on_iteration, summarize_before_llm = make_summarize_hook(
-        runtime.model, runtime.session or "default", runtime.provider_name
-    )
     co.register_hook(co.ON_ITERATION, summarize_on_iteration)
     # Compaction runs at BEFORE_LLM_CALL (all tool-call pairs complete) —
     # see make_summarize_hook's docstring for why ON_ITERATION is unsafe.
@@ -966,17 +995,6 @@ def build_runtime(
     outo_config = co.get_agent_preset("outo").to_config()
     if provider_config:
         outo_config.provider_config.update(provider_config)
-    # Thinking display (ON_THINKING → CLI/TUI) only works when the model is
-    # asked to reason — providers never emit thinking blocks unrequested.
-    # The resolver consults lma's per-model reasoning_options; an explicit
-    # `reasoning` choice wins over the provider's stored reasoning_effort.
-    outo_choice = reasoning if reasoning is not None else provider.reasoning_effort
-    outo_passthrough = resolve_reasoning_passthrough(
-        provider.api_format,
-        runtime.model,
-        runtime.provider_name,
-        outo_choice,
-    )
     if outo_passthrough:
         outo_config.provider_passthrough.update(outo_passthrough)
 

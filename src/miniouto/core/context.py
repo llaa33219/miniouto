@@ -17,9 +17,18 @@ SUMMARIZE_THRESHOLD = 0.8
 DEFAULT_MAX_OUTPUT_TOKENS = 16384
 
 # Cache: (model, provider) → {contextWindow, maxOutputTokens}. A cached
-# `{}` is meaningful — it means "lma had no info for this key" and we
-# should not re-hit it every turn.
+# `{}` is meaningful — it means "lma answered, and had no info for this
+# key" — and we should not re-hit it every turn. A *failed* fetch is NOT
+# cached: caching the `{}` a transport error produced would pin the key
+# to "no caps" for the life of the process (compaction off, 16K floor
+# applied) off a single network blip. Same rule as lma's own `_CACHE`
+# (see AGENTS.md invariant 13).
 _MODEL_CACHE: dict[tuple[str, str], dict[str, int]] = {}
+
+
+def clear_model_cache() -> None:
+    """Drop every cached model-cap lookup (mirror of `lma.clear_cache()`)."""
+    _MODEL_CACHE.clear()
 
 
 def _fetch_model_caps(model: str, provider_name: str | None = None) -> dict[str, int]:
@@ -30,15 +39,17 @@ def _fetch_model_caps(model: str, provider_name: str | None = None) -> dict[str,
     result: dict[str, int] = {}
     try:
         info = lma_api.get_model(model, provider_name)
-        if info:
-            cw = info.get("context_window")
-            mo = info.get("max_output_tokens")
-            if isinstance(cw, int) and cw > 0:
-                result["contextWindow"] = cw
-            if isinstance(mo, int) and mo > 0:
-                result["maxOutputTokens"] = mo
     except Exception:
-        pass
+        # Uncached fallback: the caller gets the 16K floor and no context
+        # window for this call, and the next call retries lma.
+        return {}
+    if info:
+        cw = info.get("context_window")
+        mo = info.get("max_output_tokens")
+        if isinstance(cw, int) and cw > 0:
+            result["contextWindow"] = cw
+        if isinstance(mo, int) and mo > 0:
+            result["maxOutputTokens"] = mo
     _MODEL_CACHE[key] = result
     return result
 
