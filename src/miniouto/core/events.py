@@ -37,6 +37,7 @@ class LoopEvent:
     subagent_id: str | None = None
     detail: str | None = None
     subagent_name: str | None = None
+    msg_ref: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"actor": self.actor, "kind": self.kind, "text": self.text}
@@ -48,6 +49,8 @@ class LoopEvent:
             d["detail"] = self.detail
         if self.subagent_name:
             d["subagent_name"] = self.subagent_name
+        if self.msg_ref:
+            d["msg_ref"] = self.msg_ref
         return d
 
     @classmethod
@@ -60,6 +63,7 @@ class LoopEvent:
             subagent_id=d.get("subagent_id") or None,
             detail=d.get("detail") or None,
             subagent_name=d.get("subagent_name") or None,
+            msg_ref=d.get("msg_ref") or None,
         )
 
 
