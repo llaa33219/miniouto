@@ -10,9 +10,11 @@ visible log disagrees with the file. Two sources emit alarms:
   thing that closes the spinning `SubagentRow`;
 - the repetition watchdog (`actor="watchdog"`, no `subagent_id`).
 
-The alarm text is a *pointer* to the result file, not the result, so the
-unbounded result box is mounted for `subagent_end` but never for an alarm.
-Live and replay must route identically, or the same session looks different
+An alarm REACHES THE MODEL AS A USER MESSAGE (invariant 16 appends it to
+the live history as `role="user"`; the idle path makes it the whole turn's
+prompt), so it renders the way a user message renders — the `> ` prompt
+prefix — plus the `-alarm` class that keeps it identifiable as a system
+notice. Live and replay must agree, or the same session looks different
 depending on when it is opened.
 """
 
@@ -48,6 +50,10 @@ def _plain_rows(app: ChatTUI) -> list[Any]:
     """EventRows that are not ToolRows (ToolRow subclasses EventRow)."""
 
     return [r for r in app._window.rows if isinstance(r, EventRow) and not isinstance(r, ToolRow)]
+
+
+def _alarm_rows(app: ChatTUI) -> list[Any]:
+    return [r for r in app._window.rows if r.has_class("-alarm")]
 
 
 def _result_boxes(app: ChatTUI) -> list[ToolRow]:
@@ -97,12 +103,13 @@ def test_live_alarm_renders_in_the_main_chat_and_stops_its_subagent_row() -> Non
             # Then: the spinner stopped and the alarm is visible in main chat
             assert not app._subagent_rows[SID].running
             assert "✓" in _rendered(app._subagent_rows[SID])
-            rows = _plain_rows(app)
+            rows = _alarm_rows(app)
             assert len(rows) == 1
             assert "SYSTEM ALARM" in _rendered(rows[0])
-            # It carries its own style so it reads as a system notice, not
-            # ordinary tool noise.
-            assert rows[0].has_class("-alarm")
+            # The model receives it as a user message, so it renders like one
+            # — the `> ` prompt prefix, not the muted EventRow treatment.
+            assert _rendered(rows[0]).lstrip().startswith("> ")
+            assert _plain_rows(app) == []
             # And the alarm is a pointer, not a result: no result box for it
             assert _result_boxes(app) == []
 
@@ -128,10 +135,11 @@ def test_watchdog_alarm_without_a_subagent_row_still_renders() -> None:
             )
             await pilot.pause()
 
-            # Then: it renders as a main-chat row instead of crashing
-            rows = _plain_rows(app)
+            # Then: it renders as a main-chat user row instead of crashing
+            rows = _alarm_rows(app)
             assert len(rows) == 1
             assert "looping" in _rendered(rows[0])
+            assert _rendered(rows[0]).lstrip().startswith("> ")
 
     asyncio.run(body())
 
@@ -173,10 +181,46 @@ def test_replayed_alarm_renders_exactly_like_the_live_one() -> None:
             subagent_rows = [r for r in app._window.rows if isinstance(r, SubagentRow)]
             assert len(subagent_rows) == 1
             assert not subagent_rows[0].running
-            rows = _plain_rows(app)
+            rows = _alarm_rows(app)
             assert len(rows) == 1
             assert "SYSTEM ALARM" in _rendered(rows[0])
+            assert _rendered(rows[0]).lstrip().startswith("> ")
             assert _result_boxes(app) == []
+
+    asyncio.run(body())
+
+
+def test_live_and_replayed_alarm_rows_are_byte_identical() -> None:
+    async def body() -> None:
+        name = "alarm-parity"
+        session_store.create(name)
+        session_store.begin_turn(name, "fix the bug")
+        session_store.update_turn_events(
+            name,
+            [
+                LoopEvent(
+                    actor="outo", kind="alarm", text=ALARM_TEXT
+                ).to_dict()
+            ],
+        )
+        session_store.finish_turn(name, assistant="done")
+
+        live = ChatTUI()
+        replay = ChatTUI()
+        async with live.run_test(size=(80, 24)) as pilot, replay.run_test(
+            size=(80, 24)
+        ) as p2:
+            live._log.remove_children()
+            live._reset_rows()
+            await pilot.pause()
+            live._post_alarm_row(ALARM_TEXT)
+            await pilot.pause()
+
+            replay._load_session_history(name)
+            await p2.pause()
+
+            # Then: the same alarm reads identically either way
+            assert _rendered(_alarm_rows(live)[0]) == _rendered(_alarm_rows(replay)[0])
 
     asyncio.run(body())
 

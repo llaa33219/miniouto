@@ -4,13 +4,85 @@ from __future__ import annotations
 
 import datetime
 import sys
+import time
 import uuid
+from dataclasses import replace
 
 import typer
 
+from ..core import subagents
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import ConsoleEventSink
 from ..storage import settings as settings_store
+from ..storage.paths import SUBAGENT_RESULTS_DIR
+
+# A one-shot `chat` must not orphan the background jobs its turn spawned:
+# they run on a daemon thread that dies with the process, and their
+# completion alarms live in an in-memory deque. So after the main turn the
+# chain waits for the jobs and replays their alarms as follow-up turns,
+# until nothing is running and nothing is pending.
+#
+# Both bounds exist because automation must not hang on a wedged job:
+# FOLLOWUP_MAX_TURNS caps the turns a single invocation may chain (a
+# turn that keeps spawning jobs can never settle), FOLLOWUP_WAIT_SECONDS
+# caps the total wall time spent waiting (mirrors API_STALL_TIMEOUT_SECONDS).
+FOLLOWUP_MAX_TURNS = 20
+FOLLOWUP_WAIT_SECONDS = 1800.0
+FOLLOWUP_POLL_SECONDS = 0.5
+
+
+def run_turn_chain(opts: ChatOptions, *, quiet: bool) -> None:
+    """Run the prompt's turn, then keep turning while subagents are alive.
+
+    A background job survives `run_chat`'s event-loop teardown but not
+    process exit, so returning after the first turn would kill it and lose
+    its alarm. The chain is the only thing that keeps a one-shot chat
+    equivalent to a TUI conversation.
+    """
+
+    run_chat(opts, sink=ConsoleEventSink(quiet=quiet))
+    _run_followups(opts, quiet=quiet)
+
+
+def _run_followups(opts: ChatOptions, *, quiet: bool) -> None:
+    """Chain follow-up turns until no job is running and no alarm is pending."""
+
+    followups = 0
+    deadline = time.monotonic() + FOLLOWUP_WAIT_SECONDS
+    while True:
+        alarms = subagents.take_pending_alarms()
+        if alarms:
+            if followups >= FOLLOWUP_MAX_TURNS:
+                _warn(
+                    f"✗ stopping after {FOLLOWUP_MAX_TURNS} follow-up turns: background "
+                    f"subagents are still reporting completions. Read {SUBAGENT_RESULTS_DIR}/ "
+                    f"for anything that arrived after this command exited."
+                )
+                return
+            prompt = "\n\n".join(alarm.text for alarm in alarms)
+            followups += 1
+            if not quiet:
+                sys.stdout.write(f"------follow-up {followups}------\n")
+                sys.stdout.flush()
+            run_chat(
+                replace(opts, prompt=prompt, continue_session=True),
+                sink=ConsoleEventSink(quiet=quiet),
+            )
+            continue
+        if not subagents.running_jobs():
+            return
+        if time.monotonic() >= deadline:
+            running = ", ".join(f"{name}-{sid}" for sid, name in subagents.running_jobs())
+            _warn(
+                f"✗ giving up after {FOLLOWUP_WAIT_SECONDS:.0f}s waiting for background "
+                f"subagents: {running}. Results land in {SUBAGENT_RESULTS_DIR}/ once they finish."
+            )
+            return
+        time.sleep(FOLLOWUP_POLL_SECONDS)
+
+
+def _warn(message: str) -> None:
+    typer.secho(message, err=True, fg="yellow")
 
 
 def chat_cmd(
@@ -88,4 +160,4 @@ def chat_cmd(
     if not answer_only:
         sys.stdout.write(f"------{session_name}------\n")
         sys.stdout.flush()
-    run_chat(opts, sink=ConsoleEventSink(quiet=quiet))
+    run_turn_chain(opts, quiet=quiet)

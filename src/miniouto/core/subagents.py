@@ -30,9 +30,11 @@ completion alarm are the only channels. Both are later milestones.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 import threading
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future
 from contextvars import Token
 from dataclasses import dataclass, field
@@ -116,6 +118,12 @@ _LOOP: asyncio.AbstractEventLoop | None = None
 # Bumped by `reset()`: a job from an older generation may still be finishing
 # on the daemon loop, and must not re-queue an alarm into the next run.
 _GENERATION = 0
+# One completion listener, replacing the alarm queue. The TUI installs it so a
+# job finishing between turns is delivered as a user message right away instead
+# of sitting invisible until the user types something. Called on the daemon
+# thread with the alarm that was just queued — the callback drains the queue
+# itself and must hop to its own thread.
+_COMPLETION_OBSERVER: Callable[[Alarm], None] | None = None
 
 _ContextTokens = tuple[Token[int], Token[str | None], Token[str | None]]
 
@@ -140,6 +148,14 @@ def submit(agent: BackgroundAgent, name: str, brief: str) -> Job:
     # The spawn handshake — see the module docstring.
     job.spawned.wait(SPAWN_HANDSHAKE_TIMEOUT_SECONDS)
     return job
+
+
+def set_completion_observer(cb: Callable[[Alarm], None] | None) -> None:
+    """Install (or clear, with None) the completion listener."""
+
+    global _COMPLETION_OBSERVER
+    with _LOCK:
+        _COMPLETION_OBSERVER = cb
 
 
 def take_pending_alarms() -> list[Alarm]:
@@ -212,12 +228,14 @@ def reset() -> None:
     """Test hook: cancel every job and drop all registry state.
 
     Bumping the generation retires the current jobs, so a completion landing
-    after this call writes no file and queues no alarm.
+    after this call writes no file and queues no alarm. The completion
+    observer goes too: a stale one would fire into the next run's UI.
     """
 
-    global _GENERATION
+    global _GENERATION, _COMPLETION_OBSERVER
     with _LOCK:
         _GENERATION += 1
+        _COMPLETION_OBSERVER = None
         jobs = list(_JOBS.values())
         _JOBS.clear()
         _PENDING_ALARMS.clear()
@@ -281,7 +299,10 @@ async def _run_job(job: Job, agent: BackgroundAgent) -> str:
 def _finish(job: Job, status: JobStatus, body: str) -> None:
     """The single completion path: result file, job record, one alarm.
 
-    Idempotent per job, so a job can only ever enqueue one alarm.
+    Idempotent per job, so a job can only ever enqueue one alarm. The
+    completion observer is notified only for an alarm this call actually
+    queued — a retired job (older generation) is not even a completion any
+    more.
     """
 
     with _LOCK:
@@ -292,9 +313,14 @@ def _finish(job: Job, status: JobStatus, body: str) -> None:
         if status == "error":
             job.error = body
         job.result_path = str(_write_result_file(job, body))
-        _PENDING_ALARMS.append(
-            Alarm(text=format_completion_alarm(job), sid=job.sid, name=job.name)
+        alarm = Alarm(
+            text=format_completion_alarm(job), sid=job.sid, name=job.name
         )
+        _PENDING_ALARMS.append(alarm)
+        observer = _COMPLETION_OBSERVER
+    if observer is not None:
+        with contextlib.suppress(Exception):
+            observer(alarm)
 
 
 def _write_result_file(job: Job, body: str) -> Path:

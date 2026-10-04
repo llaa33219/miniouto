@@ -19,6 +19,7 @@ Layout:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -777,10 +778,6 @@ class EventRow(RowStatic):
     EventRow.-error {
         color: $error;
         border-left: heavy $error 60%;
-    }
-    EventRow.-alarm {
-        color: $warning;
-        border-left: heavy $warning 60%;
     }
     """
 
@@ -1602,6 +1599,13 @@ class ChatTUI(App):
         border: none;
         border-left: thick $primary;
     }
+    RowStatic.-alarm {
+        height: auto;
+        width: 1fr;
+        border-left: heavy $warning 60%;
+        padding-left: 1;
+        color: $warning;
+    }
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -1669,6 +1673,17 @@ class ChatTUI(App):
         self._show_logo()
         if self._input is not None:
             self._input.focus()
+        subagents.set_completion_observer(self._on_job_completed)
+
+    def on_unmount(self) -> None:
+        # A stale observer would hop into a dead app (and leak across tests).
+        subagents.set_completion_observer(None)
+
+    def _on_job_completed(self, alarm: subagents.Alarm) -> None:
+        """Registry callback — runs on the daemon thread, so hop to the UI."""
+
+        with contextlib.suppress(Exception):
+            self.call_from_thread(self._deliver_pending_alarms)
 
     def _show_logo(self) -> None:
         if self._log is None:
@@ -2894,6 +2909,9 @@ class ChatTUI(App):
             # above; a second copy would duplicate the text.
             self._stream_text_row = None
             return
+        if event.kind == "alarm":
+            self._post_alarm_row(event.text)
+            return
         if event.kind in ("response", "context"):
             # Message boundary: the next deltas belong to a new message and
             # need their own live row.
@@ -2902,8 +2920,6 @@ class ChatTUI(App):
         row = EventRow(Text(event.text))
         if event.kind == "error":
             row.add_class("-error")
-        elif event.kind == "alarm":
-            row.add_class("-alarm")
         self._mount_row(row, event.msg_ref)
 
     def _remove_event_rows(self, msg_refs: list[str]) -> None:
@@ -2998,6 +3014,22 @@ class ChatTUI(App):
     def _post_user(self, text: str) -> None:
         self._mount_row(
             RowStatic(Text("> ", style=f"bold {self.current_theme.accent}") + Text(text))
+        )
+
+    def _post_alarm_row(self, text: str) -> None:
+        """Render an alarm as the user message the model actually receives.
+
+        An alarm is a synthetic `role="user"` message (invariant 16), so it
+        reads like one — the same construction as `_post_user` — plus the
+        `-alarm` class, which keeps it identifiable as a system notice.
+        """
+
+        self._mount_row(
+            RowStatic(
+                Text("> ", style=f"bold {self.current_theme.accent}")
+                + Text(text),
+                classes="-alarm",
+            )
         )
 
     def _post_system(self, text: str) -> None:
@@ -3111,6 +3143,34 @@ class ChatTUI(App):
             # a notice never had one, so blank the line explicitly.
             self._render_spinner("", "")
 
+    def _deliver_pending_alarms(self) -> None:
+        """Turn queued completion alarms into a real turn (UI thread).
+
+        The in-turn path (`runtime._make_alarm_hook`, on BEFORE_LLM_CALL) is
+        the only delivery a running turn needs — it wins while `_busy`, so it
+        owns the queue and this must not double-deliver. Between turns no
+        hook runs, and the alarm would sit invisible until the user typed
+        something; instead the alarm text becomes the prompt of a turn, so
+        `turn.user`, the chat row and the model's own view are the same
+        string by construction. Several completions coalesce into one
+        message and one turn.
+        """
+
+        if self._busy:
+            return
+        alarms = subagents.take_pending_alarms()
+        if not alarms:
+            return
+        text = "\n\n".join(alarm.text for alarm in alarms)
+        if self._logo_shown and self._log is not None:
+            self._log.remove_children()
+            self._reset_rows()
+            self._logo_shown = False
+        self._post_user(text)
+        if self._log is not None:
+            self._log.anchor()
+        self.run_worker(self._dispatch(text), exclusive=True)
+
     async def _dispatch(self, prompt: str) -> None:
         assert self._log is not None
         first_message = not self._chat_started
@@ -3148,6 +3208,9 @@ class ChatTUI(App):
         self._busy = False
         self._esc_hint = None
         self._refresh_chips()
+        # A job can finish while the final answer is already streaming, after
+        # the last BEFORE_LLM_CALL — nothing else will consume its alarm.
+        self._deliver_pending_alarms()
 
 
 def run_tui() -> None:

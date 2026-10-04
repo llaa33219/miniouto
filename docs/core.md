@@ -452,7 +452,7 @@ There is **one brief per call** and no fan-out parameter. Several calls in one t
 
 ### `_make_alarm_hook(on_alarms=None)`
 
-The `BEFORE_LLM_CALL` hook that delivers background-subagent completion alarms. Registered **unconditionally** (a job that finished between turns has no other way to reach the model) and **before** the watchdog's `capture_messages` hook, so the supervisor's live message list already carries the delivered alarms.
+The `BEFORE_LLM_CALL` hook that delivers background-subagent completion alarms **mid-turn**. When no turn is active the delivery path is different and lives outside this hook: the TUI drains the queue and starts a turn whose prompt IS the alarm text (`ChatTUI._deliver_pending_alarms`), and `miniouto chat` chains follow-up turns (`cli/chat.py:run_turn_chain`) — see AGENTS.md invariant 16. Registered **before** the watchdog's `capture_messages` hook, so the supervisor's live message list already carries the delivered alarms.
 
 - Gated to outo depth (`current_subagent_depth() == 0`) — a subagent's own loop must never consume outo's alarms.
 - Drains `subagents.take_pending_alarms()`, joins the texts with a blank line, and appends **one** `co.Message(role="user")` to the live `messages` list, so the very next `provider.create` already carries it.
