@@ -443,7 +443,7 @@ The brief is your entire specification. It follows the 6-section shape (TASK / E
 **Blocker:** [anything you could not find or verify, or "none"]
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 ## Hard rules
 
@@ -490,7 +490,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Not verified:** [any input you relied on but could not confirm, or "none"]
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 ## Hard rules
 
@@ -537,7 +537,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Notes / risks:** [anything the parent should know, or "none"]
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 ## Hard rules
 
@@ -585,7 +585,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Out-of-scope drift:** [drive-by changes spotted in the diff, or "none"]
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 ## Hard rules
 
@@ -632,7 +632,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Flaky / worth re-running:** [any command whose result you do not trust, or "none"]
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 ## Hard rules
 

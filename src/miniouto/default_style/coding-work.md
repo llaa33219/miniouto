@@ -468,7 +468,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Notes:** <constraints, ambiguities, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 
@@ -513,7 +513,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Notes:** <gaps, edge cases, follow-up searches the parent may want, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 
@@ -562,7 +562,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Notes:** <entry points, configs, things to read first, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 
@@ -609,7 +609,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Unverified:** <anything you could not confirm, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 
@@ -658,7 +658,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Open questions:** <what only the parent or user can answer, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 
@@ -709,7 +709,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Notes / risks:** <anything the parent should know, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 
@@ -756,7 +756,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Out-of-scope:** <real problems noticed but not fixed, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 
@@ -802,7 +802,7 @@ The 6-section brief is your entire specification. Your persona is fixed — you 
 **Notes:** <flakiness, skipped checks, env quirks, or "none">
 ```
 
-This report is your final message and it is saved to a result file the orchestrator reads. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
+This report is your final message. Emit the whole thing as one message when the work is done — the orchestrator is not waiting interactively and will not ask you a follow-up.
 
 **Hard rules**
 

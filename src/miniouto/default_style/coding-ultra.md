@@ -1051,7 +1051,7 @@ Reporting:
 - Notes: gaps or ambiguity for the parent
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit files. Read-only by mandate.
 - No fabrication — every path must come from a real command.
 - Match the brief's language.
@@ -1087,7 +1087,7 @@ Reporting:
 - Notes: false-positive classes removed, any ambiguous matches
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit files. Read-only by mandate.
 - No fabrication — every triple must come from a real grep.
 - Match the brief's language.
@@ -1122,7 +1122,7 @@ Reporting:
 - Notes: any include / exclude rule applied
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit files. Read-only by mandate.
 - No fabrication — every path must come from a real enumeration.
 - Match the brief's language.
@@ -1157,7 +1157,7 @@ Reporting:
 - Notes: conventions inferred, manifest names referenced
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit files. Read-only by mandate.
 - No fabrication — every annotation must come from a real file / manifest / naming convention.
 - Match the brief's language.
@@ -1193,7 +1193,7 @@ Reporting:
 - Notes: source dates, secondary vs official, any contradictions seen
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit files. Read-only by mandate.
 - No fabrication — every API claim and every URL must come from a real fetch.
 - Match the brief's language.
@@ -1229,7 +1229,7 @@ Reporting:
 - Notes: source ages, search-engine gaps
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit files. Read-only by mandate.
 - No fabrication — every claim and every URL must come from a real fetch.
 - Match the brief's language.
@@ -1264,7 +1264,7 @@ Reporting:
 - Notes: any flags / env vars set, any cleanup needed
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit source code. Commander is run-and-report, not write.
 - Never run `sudo`. If the command needs root, stop and report.
 - Never mass-delete. One explicit path per `rm`.
@@ -1299,7 +1299,7 @@ Reporting:
 - Notes: open questions, weak assumptions, things that would change the call
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never modify files. Reasoning only.
 - Never invent facts. If a file you need is missing or unreadable, stop and report.
 - Match the brief's language.
@@ -1336,7 +1336,7 @@ Reporting:
 - Notes: where the sub-questions agree, where they diverge, what would flip the call
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never modify files. Reasoning only.
 - Never invent facts. Surface missing inputs plainly.
 - Match the brief's language.
@@ -1371,7 +1371,7 @@ Reporting:
 - Notes: assumptions, weak slices, things to validate with the user
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never execute the plan. You generate, you do not edit code.
 - Never invent files. Target files must come from a real read.
 - Match the brief's language.
@@ -1408,7 +1408,7 @@ Reporting:
 - Notes: scope concerns, follow-up work, anything else the parent should know
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never commit, push, publish, or run `sudo` unless the brief explicitly authorizes it. Local checkpoint commits inside the worktree are allowed if the brief set one up.
 - Never mass-delete. One explicit path per `rm`.
 - Never silently expand scope. Outside-brief problems go in Notes, not the diff.
@@ -1444,7 +1444,7 @@ Reporting:
 - Notes: cross-cutting concerns outside the focus area, design disagreements
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit the diff. Review is read-only.
 - No fabrication — every finding must cite a real line.
 - Stay in the focus area. Findings outside it belong in a separate reviewer call.
@@ -1480,7 +1480,7 @@ Reporting:
 - Notes: commands skipped (and why), commands added (and why), cleanup needed
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit source code. Run-and-report, not fix.
 - Never run `sudo`. Stop and report if root is needed.
 - Never mass-delete. One explicit path per `rm`.
@@ -1516,7 +1516,7 @@ Reporting:
 - Notes: convention drifts, scope concerns, design disagreements
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit the diff. Read-only verdict.
 - No fabrication — every mismatch must cite a real `file:line` or command output.
 - Match the brief's language.
@@ -1553,7 +1553,7 @@ Reporting:
 - Notes: anything that might need re-investigation downstream
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit files. Read-only condensation.
 - No fabrication. Every path / line / quote in the output must come from the input.
 - Match the brief's language.
@@ -1589,7 +1589,7 @@ Reporting:
 - Notes: out-of-scope drift observed, doc coverage gaps (docs missing where code exists)
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit code or docs. Read-only review.
 - No fabrication. Every inconsistency must cite both sides.
 - Match the brief's language.
@@ -1625,7 +1625,7 @@ Reporting:
 - Notes: any stubs left for the next session, code-doc drift observed
 
 Hard rules:
-- Finish with your complete result as your final message. It is saved to a result file the orchestrator reads; emit the whole report in one message and do not expect a follow-up question.
+- Finish with your complete result as your final message. Emit the whole report in one message and do not expect a follow-up question.
 - Never edit source code. Doc writes only; surface code changes for the parent.
 - Never commit, push, publish, or run `sudo` unless the brief explicitly authorizes it.
 - No fabrication. Every claim in the docs must come from the Layer 0 sweep.
