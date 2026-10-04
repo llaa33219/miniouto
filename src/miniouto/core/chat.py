@@ -326,11 +326,15 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
     # dispatchers. Keyed like the stashes: "" for outo, a subagent id
     # inside a subagent invocation.
     turn_refs: dict[str, str] = {}
+    # Verbatim text of the message each actor is streaming right now. The
+    # completed message's own event owns that text; these partials exist
+    # only so a force-stop can record a message the cut never let finish.
+    stream_partials = _PartialStreams()
 
     on_tool_call = _make_tool_call_dispatcher(sink, turn_refs)
 
     base_on_iteration = _make_iteration_dispatcher(
-        sink, pending_responses, pending_thinking, turn_refs
+        sink, pending_responses, pending_thinking, turn_refs, stream_partials
     )
 
     def on_iteration(*, iteration: int, messages: Any, response: Any) -> None:
@@ -363,8 +367,8 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
         on_tool_call=on_tool_call,
         on_response=_make_response_dispatcher(sink, pending_responses),
         on_thinking=_make_thinking_dispatcher(pending_thinking),
-        on_stream_text=_make_stream_dispatcher(sink, STREAM_TEXT),
-        on_stream_thinking=_make_stream_dispatcher(sink, STREAM_THINKING),
+        on_stream_text=_make_stream_dispatcher(sink, STREAM_TEXT, stream_partials),
+        on_stream_thinking=_make_stream_dispatcher(sink, STREAM_THINKING, stream_partials),
         on_iteration=on_iteration,
         on_provider_error=_make_provider_error_dispatcher(sink),
         on_history_repair=on_history_repair,
@@ -387,6 +391,7 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
                     agent, opts.prompt, core_msgs,
                     sink=sink, cancel_event=opts.cancel_event,
                     on_removed=sink.remove_events,
+                    partials=stream_partials,
                 )
             )
         except LoopCancelledError:
@@ -477,6 +482,7 @@ async def _run_with_watchdog(
     cancel_event: threading.Event | None,
     on_removed: Callable[[list[str]], None] | None = None,
     states: tuple[Any, Any, dict[str, Any]] | None = None,
+    partials: _PartialStreams | None = None,
 ) -> co.Response:
     """Run outo's turn under the stall watchdog — see runtime.supervised_run.
 
@@ -507,6 +513,25 @@ async def _run_with_watchdog(
         sink.update_activity("watchdog wakeup")
 
     def on_repetition(verdict: repetition.LoopVerdict, alarm: str) -> None:
+        # The force-stop may have cut a message MID-STREAM, in which case it
+        # never completed and its whole-message event never fired. Record
+        # the truncated answer verbatim first — as an ordinary message
+        # boundary event, with `msg_ref=None` because the assistant message
+        # never existed (which is also what keeps it out of every removal
+        # path: this turn is not retracted, only stopped) — then the alarm.
+        # Nothing is buffered here when the repetition WAS the completed
+        # answer: that message closed its own partial, so the completion
+        # path stays silent.
+        repetition.flush_stream("outo")
+        if partials is not None:
+            for kind, actor_key, text in partials.drain():
+                sink.emit_loop_event(
+                    LoopEvent(
+                        actor=actor_key,
+                        kind="thinking" if kind == STREAM_THINKING else "response",
+                        text=text,
+                    )
+                )
         sink.emit_loop_event(LoopEvent(actor="watchdog", kind="alarm", text=alarm))
         sink.update_activity("watchdog repetition alarm")
 
@@ -817,30 +842,84 @@ def _make_thinking_dispatcher(
     return on_thinking
 
 
-def _make_stream_dispatcher(sink: EventSink, kind: StreamKind):
+class _PartialStreams:
+    """The verbatim text of the message each actor is streaming right now.
+
+    A message is recorded ONCE, when it completes (as a `thinking` /
+    `response` loop event, or as the turn's final answer) — never per
+    delta. But a force-stop cuts a stream mid-flight, so that message
+    never completes and its whole-message event never fires: the text the
+    user watched would simply vanish from the turn. This is the raw
+    counterpart of the live stream row, kept per `(actor, kind)` so the
+    force-stop can record the truncated answer AS-IS, exactly once.
+
+    `close_message` hands ownership back to the completed message (whose
+    own event now carries the text); `drain` is the force-stop path.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: dict[tuple[str, str], list[str]] = {}
+
+    def note(self, actor_key: str, kind: StreamKind, delta: str) -> None:
+        self._chunks.setdefault((actor_key, kind), []).append(delta)
+
+    def close_message(self, actor_key: str) -> None:
+        """The actor's message completed: the whole-message event owns it."""
+
+        for kind in (STREAM_THINKING, STREAM_TEXT):
+            self._chunks.pop((actor_key, kind), None)
+
+    def drain(self) -> list[tuple[str, str, str]]:
+        """Every still-open partial as `(kind, actor_key, text)`, then clear.
+
+        Thinking first: the reasoning reads above the text it produced.
+        """
+
+        drained = [
+            (kind, actor_key, "".join(chunks))
+            for kind in (STREAM_THINKING, STREAM_TEXT)
+            for (actor_key, buffered_kind), chunks in self._chunks.items()
+            if buffered_kind == kind and chunks
+        ]
+        self._chunks.clear()
+        return drained
+
+
+def _make_stream_dispatcher(
+    sink: EventSink, kind: StreamKind, partials: _PartialStreams | None = None
+):
     """Build the per-delta callback for ON_STREAM_TEXT / ON_STREAM_THINKING.
 
     coreouto fires these once per incremental fragment of the message the
-    provider is still streaming, so this is a pure display path: the delta
-    goes to `sink.emit_stream_delta` and nowhere else.
+    provider is still streaming, so this is a DISPLAY path: the delta goes
+    to `sink.emit_stream_delta` and to nothing else that records it.
 
-    Two deliberate omissions:
+    Two things hang off it anyway, neither of which records a delta:
 
-    - **No repetition feed.** Deltas fragment mid-segment, so a phrase
-      detector fed from them would count half-phrases; combined with the
-      whole-message `note_text` calls in the thinking/response paths, each
-      message would be counted twice and the 10x threshold would trip at 5
-      real repeats. The watchdog therefore stays on whole-message
-      boundaries, which cover the same content.
-    - **No subagent deltas.** A subagent's stream would need per-actor rows
-      and the background-job case has no hooks at all once the turn ends
-      (the job keeps streaming against a different agent's loop), so
-      v1 renders outo's own text only.
+    - **The phrase detector** (`repetition.note_stream_delta`). A model
+      that repeats itself inside ONE answer never reaches a message
+      boundary — that boundary is the call returning, i.e. max_tokens,
+      minutes later. The detector buffers the unfinished tail and counts
+      each COMPLETED segment as it arrives (`repetition` shares one
+      splitter with the whole-message path, and skips a message the stream
+      already counted, so nothing is double-counted).
+    - **`partials`**, the verbatim text of the message in flight, which
+      the force-stop records as a truncated answer (see `_PartialStreams`).
+
+    One deliberate omission remains: **no subagent deltas.** A subagent's
+    stream would need per-actor rows and the background-job case has no
+    hooks at all once the turn ends (the job keeps streaming against a
+    different agent's loop), so v1 records and renders outo's own text.
     """
 
     def on_stream_delta(delta: str) -> None:
         if not delta or current_subagent_depth() > 0:
             return
+        _, sid = _actor_label()
+        actor_key = sid or "outo"
+        repetition.note_stream_delta(actor_key, delta)
+        if partials is not None:
+            partials.note(actor_key, kind, delta)
         sink.emit_stream_delta(kind, delta)
 
     return on_stream_delta
@@ -917,6 +996,7 @@ def _make_iteration_dispatcher(
     pending: dict[str, tuple[str, str, str | None]],
     pending_thinking: dict[str, tuple[str, str, str | None]],
     refs: dict[str, str],
+    partials: _PartialStreams | None = None,
 ):
     """Build the per-iteration callback wired into the ON_ITERATION hook.
 
@@ -930,6 +1010,13 @@ def _make_iteration_dispatcher(
     tool dispatchers read the same slot, which is why a `tool` event and
     its `tool_result` always share one ref: a removed message takes both
     rows with it.
+
+    It is also the MESSAGE BOUNDARY of the stream, and fires for the
+    terminal message too: the actor's raw stream partial is dropped (its
+    whole-message event — or the final answer — owns the text now, so a
+    later force-stop cannot record it twice) and the repetition detector's
+    buffered tail is flushed, so a phrase that ended mid-sentence still
+    counts.
 
     Flush order is thinking → response → context: ON_ITERATION always
     fires after ON_THINKING, so the reasoning reads above the text it
@@ -974,6 +1061,10 @@ def _make_iteration_dispatcher(
         tokens = getattr(usage, "total_tokens", None) if usage else None
         if isinstance(tokens, int) and tokens > 0:
             cumulative[0] = tokens
+        actor_key = sid or "outo"
+        if partials is not None:
+            partials.close_message(actor_key)
+        repetition.flush_stream(actor_key)
         actor, sid = _actor_label()
         text = f"iter {iteration}"
         if cumulative[0]:

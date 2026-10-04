@@ -17,6 +17,17 @@ Counting is exact and offline — identical normalized segments only, no
 edit distance and no model call — so a verdict is deterministic, cheap,
 and reproducible in a test.
 
+TWO PATHS, ONE SPLITTER. Phrases are counted from the live stream
+(`note_stream_delta`, once per delta) and from the completed message
+(`note_text`, whole thinking/content). Both cut at the same
+`_SEGMENT_BREAKS` through `_split_completed`, so a segment compares equal
+whichever path saw it. The stream path buffers the unfinished tail —
+deltas fragment mid-phrase — and counts a segment the moment it
+completes, which is what makes a runaway SINGLE answer detectable: that
+message never ends, so its boundary is minutes away. The whole-message
+path skips a message the stream already counted, so no repeat is ever
+counted twice (invariant 8's double-count hazard).
+
 ACTORS. Counters are keyed by an actor key its caller supplies
 (`current_subagent_id() or "outo"`), so one subagent looping can never
 trip another subagent or outo. Enforcement is deliberately asymmetric,
@@ -92,10 +103,28 @@ class _ActorCounters:
     verdict: LoopVerdict | None = None
 
 
+@dataclass(slots=True)
+class _StreamState:
+    """One actor's live stream: the tail not yet counted, and whether a
+    message is currently streaming for that actor.
+
+    `buffer` holds the verbatim tail since the last segment break —
+    deltas fragment mid-phrase, so a segment is only comparable once it is
+    COMPLETE. `active` is what separates "this message arrived as deltas"
+    from "this actor never streams": without it, a message whose last
+    character happened to be a break would leave an empty buffer and the
+    whole-message `note_text` would count every repeat a second time.
+    """
+
+    buffer: str = ""
+    active: bool = False
+
+
 # One lock for every actor: hooks fire on the turn's event loop AND on the
 # background jobs' daemon loop, so counting is genuinely concurrent.
 _LOCK = threading.RLock()
 _ACTORS: dict[str, _ActorCounters] = {}
+_STREAMS: dict[str, _StreamState] = {}
 
 # One trip notifier, so a supervisor can wake on the trip itself instead of
 # discovering it on its next poll. Read under `_LOCK` by the note functions.
@@ -131,24 +160,67 @@ def _notify_trip(notifier: Callable[[str], None] | None, actor_key: str) -> None
 def note_text(actor_key: str, text: str) -> None:
     """Count `text` toward the phrase detector for one actor.
 
-    Fed from the model's thinking and its content. Whole responses today;
-    a streaming milestone can feed deltas through the same call, since the
-    segments are counted, not the surrounding text.
+    Fed from the model's thinking and its content, once per completed
+    message. A message that arrived as STREAM deltas is a special case:
+    every one of its segments was already counted the instant it completed
+    (see `note_stream_delta`), so counting the whole text again would
+    double every repeat and trip the threshold at 5 real ones. The
+    whole-message call therefore degenerates to a flush of the tail the
+    deltas left over. With no stream active — a non-streaming provider —
+    the whole text is counted exactly as it always was.
     """
 
     if not text:
         return
-    notify: Callable[[str], None] | None = None
     with _LOCK:
-        counters = _counters_for(actor_key)
-        for segment in _segments(text):
-            count = counters.phrases[segment] + 1
-            counters.phrases[segment] = count
-            if count >= REPEAT_PHRASE_THRESHOLD and counters.verdict is None:
-                counters.verdict = LoopVerdict(
-                    kind="phrase", detail=f"{count}x: {segment}"
-                )
-                notify = _TRIP_NOTIFIER
+        stream = _STREAMS.get(actor_key)
+        notify = (
+            _flush_locked(actor_key) if stream is not None and stream.active
+            else _count_segments_locked(actor_key, text)
+        )
+    _notify_trip(notify, actor_key)
+
+
+def note_stream_delta(actor_key: str, delta: str) -> None:
+    """Count ONE live fragment of the message `actor_key` is streaming.
+
+    The real-time half of the phrase detector, and the only one that can
+    see a model repeating the same sentence inside ONE answer that never
+    ends — a message boundary is minutes and tens of thousands of tokens
+    away in that case, because the message only returns at max_tokens.
+
+    Deltas fragment mid-segment, so the fragment is appended to this
+    actor's buffer and only the COMPLETED segments (up to the last
+    `_SEGMENT_BREAKS` boundary, split by the same `_split_completed` the
+    whole-message path uses) are counted. The unfinished tail stays in the
+    buffer and counts at the next fragment, at `flush_stream`, or never.
+    A threshold-th occurrence trips the verdict on the spot, and the trip
+    notifier wakes the supervisor mid-stream instead of at message end.
+
+    Same thread-safety posture as `note_text`: one lock for all counting,
+    because the turn's event loop and the jobs' daemon loop both feed it.
+    """
+
+    if not delta:
+        return
+    with _LOCK:
+        stream = _STREAMS.setdefault(actor_key, _StreamState())
+        stream.active = True
+        head, stream.buffer = _split_completed(stream.buffer + delta)
+        notify = _count_segments_locked(actor_key, head)
+    _notify_trip(notify, actor_key)
+
+
+def flush_stream(actor_key: str) -> None:
+    """Count an actor's buffered tail as a final segment and clear it.
+
+    Called at a message boundary and at a force-stop, so a phrase that was
+    still mid-sentence when the message ended (or was cut) is never lost.
+    Idempotent: a second call has an empty buffer to count.
+    """
+
+    with _LOCK:
+        notify = _flush_locked(actor_key)
     _notify_trip(notify, actor_key)
 
 
@@ -193,17 +265,19 @@ def consume_verdict(actor_key: str) -> LoopVerdict | None:
 
 
 def reset_actor(actor_key: str) -> None:
-    """Drop one actor's counters and verdict."""
+    """Drop one actor's counters, verdict and stream buffer."""
 
     with _LOCK:
         _ACTORS.pop(actor_key, None)
+        _STREAMS.pop(actor_key, None)
 
 
 def reset() -> None:
-    """Drop every actor's counters. Called once per turn from build_runtime."""
+    """Drop every actor's counters and stream buffers. Once per turn."""
 
     with _LOCK:
         _ACTORS.clear()
+        _STREAMS.clear()
 
 
 def cancel_background_loop(actor_key: str) -> LoopVerdict | None:
@@ -253,12 +327,59 @@ def alarm_text(verdict: LoopVerdict) -> str:
     )
 
 
+def _count_segments_locked(
+    actor_key: str, text: str
+) -> Callable[[str], None] | None:
+    """Count every segment of `text`; return the notifier iff a verdict TRIPS.
+
+    One transition, `None → verdict`, for both counting paths, so the
+    announcement stays exactly-once-per-trip: the verdict is sticky, so
+    every increment after it returns None and stays silent.
+    """
+
+    if not text:
+        return None
+    counters = _counters_for(actor_key)
+    notify: Callable[[str], None] | None = None
+    for segment in _segments(text):
+        count = counters.phrases[segment] + 1
+        counters.phrases[segment] = count
+        if count >= REPEAT_PHRASE_THRESHOLD and counters.verdict is None:
+            counters.verdict = LoopVerdict(kind="phrase", detail=f"{count}x: {segment}")
+            notify = _TRIP_NOTIFIER
+    return notify
+
+
+def _flush_locked(actor_key: str) -> Callable[[str], None] | None:
+    """Count the buffered tail as a final segment. Caller holds `_LOCK`."""
+
+    stream = _STREAMS.get(actor_key)
+    if stream is None:
+        return None
+    tail, stream.buffer = stream.buffer, ""
+    stream.active = False
+    return _count_segments_locked(actor_key, tail)
+
+
 def _counters_for(actor_key: str) -> _ActorCounters:
     counters = _ACTORS.get(actor_key)
     if counters is None:
         counters = _ActorCounters()
         _ACTORS[actor_key] = counters
     return counters
+
+
+def _split_completed(text: str) -> tuple[str, str]:
+    """Split at the LAST segment break: `(head, tail)`.
+
+    THE shared splitter of both counting paths — whole text and live deltas
+    cut at the same `_SEGMENT_BREAKS`, so a segment means the same thing
+    whichever path counted it. The tail carries no break by construction,
+    so it is exactly the one segment still in flight.
+    """
+
+    end = max((m.end() for m in _SEGMENT_BREAKS.finditer(text)), default=0)
+    return text[:end], text[end:]
 
 
 def _segments(text: str) -> Iterator[str]:

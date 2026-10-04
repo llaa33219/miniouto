@@ -9,7 +9,9 @@ Two jobs, both of which must happen *before* any test runs:
    before any test module, so nothing under ``miniouto`` can have resolved
    ``ROOT`` yet.
 2. Reset the module-level caches between tests, so one test's lma/model lookups
-   or coreouto provider registrations never leak into the next.
+   or coreouto provider registrations never leak into the next. The repetition
+   watchdog's counters and stream buffers are module state too, so they reset
+   here as well.
 
 ``miniouto`` symbols are imported inside the fixture body on purpose: a
 top-level import here would bind ``paths.ROOT`` at import time, which is
@@ -50,8 +52,11 @@ def _clear_model_cache(context: Any) -> None:
 def _isolate_module_state() -> None:
     """Reset every module-level cache before each test."""
 
-    from miniouto.core import context, lma, providers
+    from miniouto.core import context, lma, providers, repetition
 
     _clear_model_cache(context)
     lma.clear_cache()
     providers.clear_coreouto_state()
+    # The watchdog's counters AND its per-actor stream buffers: a test that
+    # fed deltas must not leave a half-counted phrase behind for the next.
+    repetition.reset()
