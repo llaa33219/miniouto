@@ -867,9 +867,12 @@ def _make_response_dispatcher(
     """
 
     def on_response(content: str, has_tool_calls: bool) -> None:
-        if not content or not has_tool_calls:
+        if not content:
             return
         actor, sid = _actor_label()
+        _note_repetition_text(sid or "outo", content)
+        if not has_tool_calls:
+            return
         pending[sid or ""] = (actor, content, sid)
 
     return on_response
@@ -958,7 +961,6 @@ def _make_iteration_dispatcher(
         stashed = pending.pop(key, None)
         if stashed is not None:
             s_actor, s_text, s_sid = stashed
-            _note_repetition_text(s_sid or "outo", s_text)
             sink.emit_loop_event(
                 LoopEvent(
                     actor=s_actor,

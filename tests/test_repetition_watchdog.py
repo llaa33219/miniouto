@@ -15,6 +15,7 @@ are pinned by exact equality rather than by "contains".
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -302,6 +303,130 @@ def test_a_looping_background_job_is_cancelled_and_never_restarted(
     assert repetition.cancel_background_loop("outo") is None
     assert cancels == [cancels[0]]
     assert repetition.check("outo") is not None
+
+
+class _BoomError(RuntimeError):
+    """A provider-shaped failure of one attempt."""
+
+
+def test_a_phrase_loop_force_stops_a_parked_attempt_and_resumes_with_the_alarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: an attempt that says the same sentence the documented number of
+    # times — the PHRASE detector, not the tool one — and then parks forever,
+    # so only a force-stop can end it
+    monkeypatch.setattr(rt, "WATCHDOG_CHECK_SECONDS", 0.01)
+    prompts: list[str | None] = []
+    repeats: list[tuple[repetition.LoopVerdict, str]] = []
+    live = [
+        co.Message(role="user", content="do the work"),
+        co.Message(role="assistant", content="looking"),
+    ]
+
+    async def start(p: str | None, h: list[co.Message] | None) -> co.Response:
+        prompts.append(p)
+        if len(prompts) == 1:
+            for _ in range(repetition.REPEAT_PHRASE_THRESHOLD):
+                repetition.note_text("outo", f"{PHRASE}.")
+            await asyncio.sleep(3600)  # never resolves on its own
+        return co.Response(content="answered differently", messages=[], iterations=1)
+
+    # When: the turn runs under the supervisor
+    response = _drive(
+        rt.supervised_run(
+            start,
+            "do the work",
+            None,
+            live_key="outo",
+            level=0,
+            on_wakeup=lambda *_args: None,
+            restart_on_repetition="outo",
+            on_repetition=lambda verdict, alarm: repeats.append((verdict, alarm)),
+            states=_states(live=live),
+        )
+    )
+
+    # Then: the phrase verdict — not the tool one — force-stopped the attempt
+    # and the PHRASE alarm is the resumed attempt's user message
+    assert response.content == "answered differently"
+    assert prompts == ["do the work", repeats[0][1]]
+    assert repeats[0][0].kind == "phrase"
+    assert repeats[0][1] == repetition.alarm_text(repeats[0][0])
+    assert repeats[0][1].startswith(subagents.ALARM_HEADER)
+    assert rt._ACTIVE_SUPERVISORS == {}
+
+
+def test_a_trip_wakes_the_supervisor_without_waiting_for_the_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a poll interval far longer than this test may take, so a restart
+    # can ONLY come from the trip notification — the poll would never fire
+    monkeypatch.setattr(rt, "WATCHDOG_CHECK_SECONDS", 60.0)
+    attempts = 0
+
+    async def start(p: str | None, h: list[co.Message] | None) -> co.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            for _ in range(repetition.REPEAT_TOOL_THRESHOLD):
+                repetition.note_tool_call("outo", "Bash", dict(TOOL_ARGS))
+            await asyncio.sleep(3600)  # only a force-stop can end this
+        return co.Response(content="stopped the loop", messages=[], iterations=1)
+
+    # When: the turn runs under the supervisor
+    started = time.monotonic()
+    response = _drive(
+        rt.supervised_run(
+            start,
+            "do the work",
+            None,
+            live_key="outo",
+            level=0,
+            on_wakeup=lambda *_args: None,
+            restart_on_repetition="outo",
+            states=_states(),
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    # Then: enforcement was immediate, not one 60s poll later
+    assert response.content == "stopped the loop"
+    assert attempts == 2
+    assert elapsed < 10.0
+
+
+def test_a_crashed_attempt_propagates_even_with_a_pending_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: an attempt that trips the verdict and then fails — a repetition
+    # restart must never mask a real provider error
+    monkeypatch.setattr(rt, "WATCHDOG_CHECK_SECONDS", 0.01)
+    attempts = 0
+
+    async def start(p: str | None, h: list[co.Message] | None) -> co.Response:
+        nonlocal attempts
+        attempts += 1
+        for _ in range(repetition.REPEAT_TOOL_THRESHOLD):
+            repetition.note_tool_call("outo", "Bash", dict(TOOL_ARGS))
+        raise _BoomError("provider exploded")
+
+    # When/Then: the failure surfaces, un-restarted and un-consumed
+    with pytest.raises(_BoomError):
+        _drive(
+            rt.supervised_run(
+                start,
+                "do the work",
+                None,
+                live_key="outo",
+                level=0,
+                on_wakeup=lambda *_args: None,
+                restart_on_repetition="outo",
+                states=_states(),
+            )
+        )
+    assert attempts == 1
+    assert repetition.check("outo") is not None
+    assert rt._ACTIVE_SUPERVISORS == {}
 
 
 def test_alarm_texts_are_exact_in_english() -> None:

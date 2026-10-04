@@ -423,6 +423,25 @@ async def supervised_run(
     its actor's verdict, so the deeper-supervisor deferral below does not
     apply to it.
 
+    ENFORCEMENT IS EVENT-DRIVEN AND COVERS THE COMPLETION PATH. A verdict
+    trips at note time, so this supervisor subscribes to it with
+    `repetition.set_trip_notifier` (for the duration of the run) and waits on
+    a `trip.wait()` task alongside the attempt: the force-stop is immediate
+    instead of arriving with the next WATCHDOG_CHECK_SECONDS poll, which
+    stays the stall check's cadence. `call_soon_threadsafe` is required —
+    a background job notes from the daemon thread.
+
+    The verdict is also consulted when the attempt task is ALREADY DONE.
+    The bug that forces this: coreouto fires ON_ITERATION (where the reply
+    text is noted) and then terminates on a content-only response, so a
+    final answer that is ITSELF the repetition trips the detector
+    microseconds before the task completes — checking `task.done()` first
+    would return that garbage answer and let the next turn's `reset()` wipe
+    the verdict. So a completed-but-repeating attempt is DISCARDED and
+    resumed like a force-stopped one; the garbage answer never reaches
+    `run_chat`. A crashed attempt is exempt (its verdict is left unconsumed):
+    a repetition stop must never mask a real provider error.
+
     WHY THE TWO RESTART PATHS DIFFER. The stall path resumes with
     `start(None, history)`: nothing is wrong, the transport just hung, and
     the transcript alone tells the model to carry on. A repetition stop
@@ -451,59 +470,90 @@ async def supervised_run(
 
     token = object()
     _ACTIVE_SUPERVISORS[token] = level
+    loop = asyncio.get_running_loop()
+    trip = asyncio.Event()
+    previous_notifier = repetition._TRIP_NOTIFIER
+    waiter: asyncio.Task[bool] | None = None
+
+    def on_trip(actor_key: str) -> None:
+        if actor_key == restart_on_repetition:
+            loop.call_soon_threadsafe(trip.set)
+
+    def take_verdict() -> repetition.LoopVerdict | None:
+        # PEEK before consuming: `consume_verdict` pops the actor's counters
+        # even when it returns None, so an unconditional poll erases the
+        # counts every WATCHDOG_CHECK_SECONDS and a loop slower than the poll
+        # interval (5s in production) can never reach a threshold. Same
+        # discipline as `repetition.cancel_background_loop`.
+        if repetition.check(restart_on_repetition) is None:
+            return None
+        return repetition.consume_verdict(restart_on_repetition)
+
+    repetition.set_trip_notifier(on_trip)
     try:
         task = asyncio.create_task(start(prompt, history))
         wakeups = 0
         restarts = 0
+        waiter = asyncio.create_task(trip.wait())
+
+        def resume_with_alarm(verdict: repetition.LoopVerdict) -> asyncio.Task[Any]:
+            """The one repetition restart sequence, shared by both branches."""
+            nonlocal history, restarts
+            restarts += 1
+            if restarts > repetition.REPEAT_MAX_RESTARTS:
+                raise LoopRepeatedError(
+                    f"loop is repeating itself — {verdict.kind}: "
+                    f"{verdict.detail} — after {repetition.REPEAT_MAX_RESTARTS} "
+                    f"restarts, giving up"
+                )
+            alarm = repetition.alarm_text(verdict)
+            history = (
+                sanitize_history(live.get(live_key), on_removed=on_removed) or history
+            )
+            if on_repetition is not None:
+                with contextlib.suppress(Exception):
+                    on_repetition(verdict, alarm)
+            # No recoverable transcript means the loop tripped before its
+            # first LLM call finished — the alarm alone would lose the task,
+            # so it rides along with the original prompt.
+            return asyncio.create_task(
+                start(alarm if history else f"{prompt}\n\n{alarm}", history)
+            )
+
         while True:
-            # `asyncio.wait` returns as soon as the attempt finishes; a
-            # bare `sleep` would make every turn pay a full poll interval
+            # `asyncio.wait` returns as soon as EITHER the attempt finishes or
+            # a verdict trips; the timeout is the stall check's cadence only.
+            # A bare `sleep` would make every turn pay a full poll interval
             # before its own result could be returned.
-            await asyncio.wait({task}, timeout=WATCHDOG_CHECK_SECONDS)
+            await asyncio.wait(
+                {task, waiter}, timeout=WATCHDOG_CHECK_SECONDS, return_when=asyncio.FIRST_COMPLETED
+            )
             if task.done():
-                return task.result()
+                crashed = task.cancelled() or task.exception() is not None
+                verdict = None
+                if restart_on_repetition is not None and not crashed:
+                    verdict = take_verdict()
+                if verdict is None:
+                    return task.result()
+                # A repeating final answer: discard it and resume.
+                task = resume_with_alarm(verdict)
+                trip.clear()
+                waiter = asyncio.create_task(trip.wait())
+                continue
+            trip.clear()
+            waiter = asyncio.create_task(trip.wait())
             if cancel_event is not None and cancel_event.is_set():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
                 raise LoopCancelledError("stopped by user")
             if restart_on_repetition is not None:
-                # PEEK before consuming: `consume_verdict` pops the actor's
-                # counters even when it returns None, so an unconditional
-                # poll erases the counts every WATCHDOG_CHECK_SECONDS and a
-                # loop slower than the poll interval (5s in production) can
-                # never reach a threshold. Same discipline as
-                # `repetition.cancel_background_loop`.
-                verdict = (
-                    None
-                    if repetition.check(restart_on_repetition) is None
-                    else repetition.consume_verdict(restart_on_repetition)
-                )
+                verdict = take_verdict()
                 if verdict is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
-                    restarts += 1
-                    if restarts > repetition.REPEAT_MAX_RESTARTS:
-                        raise LoopRepeatedError(
-                            f"loop is repeating itself — {verdict.kind}: "
-                            f"{verdict.detail} — after {repetition.REPEAT_MAX_RESTARTS} "
-                            f"restarts, giving up"
-                        )
-                    alarm = repetition.alarm_text(verdict)
-                    history = (
-                        sanitize_history(live.get(live_key), on_removed=on_removed)
-                        or history
-                    )
-                    if on_repetition is not None:
-                        with contextlib.suppress(Exception):
-                            on_repetition(verdict, alarm)
-                    # No recoverable transcript means the loop tripped before
-                    # its first LLM call finished — the alarm alone would lose
-                    # the task, so it rides along with the original prompt.
-                    task = asyncio.create_task(
-                        start(alarm if history else f"{prompt}\n\n{alarm}", history)
-                    )
+                    task = resume_with_alarm(verdict)
                     continue
             if any(lv > level for lv in _ACTIVE_SUPERVISORS.values()):
                 continue  # a deeper supervisor owns the current silence
@@ -529,6 +579,9 @@ async def supervised_run(
                 # start over with the original prompt.
                 task = asyncio.create_task(start(prompt, history))
     finally:
+        repetition.set_trip_notifier(previous_notifier)
+        if waiter is not None:
+            waiter.cancel()
         _ACTIVE_SUPERVISORS.pop(token, None)
 
 

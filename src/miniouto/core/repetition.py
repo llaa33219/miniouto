@@ -32,15 +32,22 @@ because the actors are not supervised the same way:
 Counters live for one turn: `reset()` is called from
 `runtime._register_watchdog_trackers`, where the live message lists are
 cleared, so a verdict can never leak into the next turn.
+
+IMMEDIACY. A verdict trips at note time, so it is also ANNOUNCED at note
+time through `set_trip_notifier`: a supervisor subscribes to its own actor
+key and wakes on the event, instead of discovering the trip on its next
+poll (WATCHDOG_CHECK_SECONDS). The announcement fires once per trip — the
+verdict is sticky, so the increments after it stay silent.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -90,6 +97,36 @@ class _ActorCounters:
 _LOCK = threading.RLock()
 _ACTORS: dict[str, _ActorCounters] = {}
 
+# One trip notifier, so a supervisor can wake on the trip itself instead of
+# discovering it on its next poll. Read under `_LOCK` by the note functions.
+_TRIP_NOTIFIER: Callable[[str], None] | None = None
+
+
+def set_trip_notifier(cb: Callable[[str], None] | None) -> None:
+    """Install the callback fired with the actor key when a verdict TRIPS.
+
+    Fired exactly once per trip — the verdict is sticky, so the increments
+    after it must stay silent — and under `contextlib.suppress(Exception)`,
+    so a broken notifier can never break the counting it observes. Pass None
+    to uninstall. The slot is global, so save the previous value yourself and
+    put it back when you are done (see `runtime.supervised_run`).
+
+    THREADS. `note_text` / `note_tool_call` are called from the turn's event
+    loop AND from the daemon thread that owns the background jobs, so the
+    callback may run on either. It must thread-hop itself (e.g.
+    `loop.call_soon_threadsafe`) before touching anything loop-affine.
+    """
+
+    global _TRIP_NOTIFIER
+    with _LOCK:
+        _TRIP_NOTIFIER = cb
+
+
+def _notify_trip(notifier: Callable[[str], None] | None, actor_key: str) -> None:
+    if notifier is not None:
+        with contextlib.suppress(Exception):
+            notifier(actor_key)
+
 
 def note_text(actor_key: str, text: str) -> None:
     """Count `text` toward the phrase detector for one actor.
@@ -101,6 +138,7 @@ def note_text(actor_key: str, text: str) -> None:
 
     if not text:
         return
+    notify: Callable[[str], None] | None = None
     with _LOCK:
         counters = _counters_for(actor_key)
         for segment in _segments(text):
@@ -110,6 +148,8 @@ def note_text(actor_key: str, text: str) -> None:
                 counters.verdict = LoopVerdict(
                     kind="phrase", detail=f"{count}x: {segment}"
                 )
+                notify = _TRIP_NOTIFIER
+    _notify_trip(notify, actor_key)
 
 
 def note_tool_call(actor_key: str, name: str, arguments: Any) -> None:
@@ -118,6 +158,7 @@ def note_tool_call(actor_key: str, name: str, arguments: Any) -> None:
     if not name:
         return
     key = f"{name}\0{_canonical_json(arguments)}"
+    notify: Callable[[str], None] | None = None
     with _LOCK:
         counters = _counters_for(actor_key)
         count = counters.tools[key] + 1
@@ -126,6 +167,8 @@ def note_tool_call(actor_key: str, name: str, arguments: Any) -> None:
             counters.verdict = LoopVerdict(
                 kind="tool", detail=f"{count}x: {name} {_canonical_json(arguments)}"
             )
+            notify = _TRIP_NOTIFIER
+    _notify_trip(notify, actor_key)
 
 
 def check(actor_key: str) -> LoopVerdict | None:

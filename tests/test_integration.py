@@ -15,7 +15,8 @@ The promises locked here, one seam per test:
    the turn record and in the restorable history.
 2. A repetition stop and a job completion share one alarm header, and the
    repetition restart delivers its alarm as the resumed attempt's user
-   message.
+   message — including when the repetition IS the final answer, which is
+   discarded rather than returned.
 3. A history repair that removes a message leaves the model's transcript,
    the record and the session file describing the same conversation.
 4. A background job survives the end of its turn and is answered in the
@@ -258,6 +259,86 @@ def test_a_repeating_model_is_resumed_with_the_shared_alarm_text(
     # And the alarm landed in the restorable history as a user message, so a
     # later resume still shows why the turn restarted
     assert expected in harness.user_history(session)
+
+
+def test_a_repeating_final_answer_is_discarded_and_the_turn_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a model whose FIRST attempt ends naturally on a garbage answer —
+    # the same sentence ten times across the closing reply, no tool call, so
+    # the turn completes instead of looping. coreouto fires ON_THINKING /
+    # ON_ITERATION (where the text is noted) microseconds before the attempt
+    # task finishes, so the verdict exists with nobody left to enforce it.
+    session = "e2e-repetition-final-answer"
+    sentence = "I checked the parser again"
+    garbage = " ".join(f"{sentence}." for _ in range(repetition.REPEAT_PHRASE_THRESHOLD))
+    calls = 0
+
+    async def handler(req: harness.Request) -> co.LLMResponse:
+        nonlocal calls
+        if req.actor != "outo":
+            return _answer("unused")
+        if any(t.startswith(subagents.ALARM_HEADER) for t in req.user_texts()):
+            return _answer("read the AST instead of grepping")
+        calls += 1
+        return co.LLMResponse(content=garbage, thinking=garbage)
+
+    provider = harness.install(monkeypatch, handler, session=session)
+    sink = harness.CaptureSink()
+
+    # When: the turn runs
+    answer = chat_mod.run_chat(chat_mod.ChatOptions(prompt="find the bug", session=session), sink)
+
+    # Then: the garbage answer was DISCARDED and the resumed attempt's answer
+    # is what the user got — the loop never reached run_chat
+    assert calls == 1
+    assert answer == "read the AST instead of grepping"
+    assert garbage not in answer
+    assert provider.for_actor("outo")[-1].messages[-1].content.startswith(
+        subagents.ALARM_HEADER
+    )
+
+    # And the model was told why, exactly once, with the shared header
+    delivered = [
+        t
+        for t in provider.for_actor("outo")[-1].user_texts()
+        if t.startswith(subagents.ALARM_HEADER)
+    ]
+    assert len(delivered) == 1
+    assert delivered[0] == repetition.alarm_text(repetition.LoopVerdict(
+        kind="phrase", detail=f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {sentence.lower()}"
+    ))
+
+    # And the display side carries that one alarm, attributed to the watchdog
+    assert [e.actor for e in sink.of_kind("alarm")] == ["watchdog"]
+    assert len(sink.of_kind("alarm")) == 1
+
+
+def test_a_repeated_final_answer_without_thinking_is_also_discarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a model that never emits thinking at all — the repetition is
+    # in the CONTENT only, which must reach the phrase detector on its own
+    session = "e2e-repetition-content-only"
+    sentence = "I checked the parser again"
+    garbage = " ".join(f"{sentence}." for _ in range(repetition.REPEAT_PHRASE_THRESHOLD))
+
+    async def handler(req: harness.Request) -> co.LLMResponse:
+        if req.actor != "outo":
+            return _answer("unused")
+        if any(t.startswith(subagents.ALARM_HEADER) for t in req.user_texts()):
+            return _answer("read the AST instead of grepping")
+        return co.LLMResponse(content=garbage)
+
+    harness.install(monkeypatch, handler, session=session)
+    sink = harness.CaptureSink()
+
+    # When: the turn runs
+    answer = chat_mod.run_chat(chat_mod.ChatOptions(prompt="find the bug", session=session), sink)
+
+    # Then: the content-only repeat trips the detector and the turn resumes
+    assert answer == "read the AST instead of grepping"
+    assert len(sink.of_kind("alarm")) == 1
 
 
 # ── 3. repair: model, record and file agree ─────────────────────────────────
