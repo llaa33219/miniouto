@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from rich.markdown import Markdown
 from rich.style import Style
@@ -50,6 +50,7 @@ from textual.widgets import (
 
 from .. import __version__, paths_runtime
 from ..core import lma as catalog_api
+from ..core import subagents
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import STREAM_THINKING, LoopEvent
 from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
@@ -167,6 +168,13 @@ def _construct_provider_with_reasoning(**kwargs: Any) -> provider_store.Provider
 _SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SPINNER_INTERVAL = 0.08
 _SPINNER_DEFAULT_TEXT = "Working…"
+
+# How often the ticker asks `core.subagents` how the displayed rows are doing.
+# 12.5fps polling a dict is free, but the poll is throttled anyway so a long
+# session with many rows does not grow a hot path.
+_JOB_RECONCILE_INTERVAL = 0.5
+
+_RowState = Literal["running", "ok", "failed"]
 
 # Live token streaming. coreouto fires one hook per token, so a burst of
 # deltas is folded into a single UI-thread update roughly every 33 ms
@@ -660,20 +668,29 @@ class BottomPanel(Static):
         return self._chips.get(kind)
 
     def render_spinner(self, frame: str, text: str) -> None:
+        """Paint the bottom status line.
+
+        `frame` empty with `text` set is a NOTICE — plain text, no glyph
+        (a frozen spinner next to a finished action reads as "still
+        working"). Both empty blanks the row: when nothing needs showing
+        the line shows nothing.
+        """
+
         if self._spinner_row is None:
             try:
                 self._spinner_row = self.query_one("#spinner-row", Static)
             except Exception:
                 return
-        if not frame:
+        if not frame and not text:
             self._spinner_row.update("")
             return
-        self._spinner_row.update(
-            Text.assemble(
-                (frame, f"bold {self.app.current_theme.accent}"),
-                (f" {text}", self.app.current_theme.foreground),
-            )
-        )
+        theme = self.app.current_theme
+        parts: list[tuple[str, str]] = []
+        if frame:
+            parts.append((frame, f"bold {theme.accent}"))
+        if text:
+            parts.append((f" {text}" if frame else text, theme.foreground))
+        self._spinner_row.update(Text.assemble(*parts))
 
 
 # ─── Chat log rows ───────────────────────────────────────────────────────────
@@ -1017,8 +1034,16 @@ class SubagentRow(RowStatic):
         # MessagePump owns `_task` (the pump's asyncio Task) and `_running`
         # (flipped True on mount), so widget state must avoid both names.
         self._task_preview = task_preview
-        self._active = running
-        self._failed = False
+        # Tri-state, not a bool: a row constructed `running=False` (a
+        # session REPLAY) renders ✓ but is still finishable, and
+        # `_verdict_given` — not "running" — is what makes `finish()`
+        # idempotent, so a late alarm cannot flip a glyph the poll already
+        # set. NEVER name this `_closed`/`_closing`: `MessagePump` owns those
+        # as its lifecycle flags, and writing `_closed = True` here would
+        # strand the pump's message loop (which only re-reads the flag
+        # between messages) — the app then hangs on shutdown.
+        self._state: _RowState = "running" if running else "ok"
+        self._verdict_given = False
         self._frame = _SPINNER_FRAMES[0]
 
     @property
@@ -1027,26 +1052,30 @@ class SubagentRow(RowStatic):
 
     @property
     def running(self) -> bool:
-        return self._active
+        return self._state == "running"
 
     def on_mount(self) -> None:
         self._refresh_text()
 
     def set_frame(self, frame: str) -> None:
-        if self._active:
+        if self.running:
             self._frame = frame
             self._refresh_text()
 
     def finish(self, *, ok: bool) -> None:
-        self._active = False
-        self._failed = not ok
+        """Close the row. Idempotent: the first verdict wins."""
+
+        if self._verdict_given:
+            return
+        self._verdict_given = True
+        self._state = "ok" if ok else "failed"
         self._refresh_text()
 
     def _refresh_text(self) -> None:
         theme = self.app.current_theme
-        if self._active:
+        if self.running:
             glyph, glyph_style = self._frame, f"bold {theme.accent}"
-        elif self._failed:
+        elif self._state == "failed":
             glyph, glyph_style = "✗", f"bold {theme.error}"
         else:
             glyph, glyph_style = "✓", f"bold {theme.success}"
@@ -1405,54 +1434,34 @@ class TUIEventSink:
 
     The agent loop runs on a worker thread (via `asyncio.to_thread`), so
     every callback must hop to the main thread with `call_from_thread`
-    before touching widgets. The spinner is driven by a Textual `Timer`
-    that ticks on the main thread — `start_spin` / `stop_spin` only need
-    to enable/disable it; `tick_spin` runs in the main loop already.
+    before touching widgets. The sink owns NO animation state: the spinner
+    ticker lives on the app (`ChatTUI._sync_ticker`), because a sink is
+    created per dispatch and dies at `end_working` while background
+    subagent rows keep running across turns. `begin_working` /
+    `end_working` / `update_activity` are therefore thin drivers of app
+    state.
     """
 
     def __init__(self, app: ChatTUI) -> None:
         self._app = app
-        self._frame_idx = 0
-        self._activity = _SPINNER_DEFAULT_TEXT
-        self._timer: Timer | None = None
         self._stream = _StreamCoalescer()
 
     def begin_working(self) -> None:
-        self._app.call_from_thread(self._start_spin)
-
-    def _start_spin(self) -> None:
-        if self._timer is not None:
-            return
-        self._frame_idx = 0
-        self._timer = self._app.set_interval(_SPINNER_INTERVAL, self._tick_spin)
-
-    def _tick_spin(self) -> None:
-        frame = _SPINNER_FRAMES[self._frame_idx % len(_SPINNER_FRAMES)]
-        self._frame_idx += 1
-        text = self._activity
-        hint = self._app._esc_hint
-        if hint is not None:
-            if time.monotonic() < self._app._esc_hint_until:
-                text = hint
-            else:
-                self._app._esc_hint = None
-        self._app._render_spinner(frame, text)
-        self._app._tick_subagent_rows(frame)
+        self._app.call_from_thread(self._app._set_chat_working, True)
 
     def update_activity(self, text: str) -> None:
-        self._activity = text or _SPINNER_DEFAULT_TEXT
+        # Plain attribute on the app: the ticker repaints it on the next
+        # frame, so there is nothing to hop to the UI thread for.
+        self._app._set_activity(text)
 
     def end_working(self) -> None:
-        self._app.call_from_thread(self._stop_spin)
+        self._app.call_from_thread(self._end_working_on_ui)
 
-    def _stop_spin(self) -> None:
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
+    def _end_working_on_ui(self) -> None:
+        self._app._set_chat_working(False)
         # Flush the last (< interval) window on the UI thread we are already
         # on — call_from_thread would raise from this thread.
         self._drain_stream()
-        self._app._render_spinner("", "")
 
     def emit_stream_delta(self, kind: str, text: str) -> None:
         if not text:
@@ -1622,6 +1631,14 @@ class ChatTUI(App):
         self._last_escape = 0.0
         self._esc_hint: str | None = None
         self._esc_hint_until = 0.0
+        self._spin_timer: Timer | None = None
+        self._spin_frame_idx = 0
+        self._chat_working = False
+        self._activity = _SPINNER_DEFAULT_TEXT
+        self._wizard_status: str | None = None
+        self._wizard_working = False
+        self._last_job_reconcile = 0.0
+        self._job_reconcile_interval = _JOB_RECONCILE_INTERVAL
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -1771,7 +1788,7 @@ class ChatTUI(App):
         self._spinner_status(f"provider → {name}")
 
     async def _catalog_add_flow(self) -> None:
-        self._spinner_status("fetching catalog…")
+        self._spinner_status("fetching catalog…", working=True)
         try:
             all_providers = await asyncio.to_thread(catalog_api.list_providers)
         except Exception as exc:
@@ -1821,7 +1838,7 @@ class ChatTUI(App):
         if api_key is None:
             return
 
-        self._spinner_status("fetching model list…")
+        self._spinner_status("fetching model list…", working=True)
         default_model = ""
         try:
             models = await asyncio.to_thread(catalog_api.list_models, picked_name)
@@ -2184,7 +2201,7 @@ class ChatTUI(App):
         ask_model_id()
 
     async def _catalog_model_picker_flow(self, provider) -> None:
-        self._spinner_status("fetching model list…")
+        self._spinner_status("fetching model list…", working=True)
         try:
             models = await asyncio.to_thread(catalog_api.list_models, provider.name)
         except Exception as exc:
@@ -2366,7 +2383,7 @@ class ChatTUI(App):
         )
 
     async def _subagent_catalog_flow(self, provider) -> None:
-        self._spinner_status("fetching model list…")
+        self._spinner_status("fetching model list…", working=True)
         try:
             models = await asyncio.to_thread(catalog_api.list_models, provider.name)
         except Exception as exc:
@@ -2596,6 +2613,7 @@ class ChatTUI(App):
         self._logo_shown = False
         self._subagent_events.clear()
         self._subagent_rows.clear()
+        self._sync_ticker()
         self._pending_tool_rows.clear()
         data = session_store.load(session_name)
         # Bulk: rows are only collected here; `_mount_tail_window` mounts
@@ -2928,6 +2946,9 @@ class ChatTUI(App):
         # its completion alarm) long after the `call_subagent` turn that
         # started it, so its row must survive a repair that cuts that turn.
         self._mount_row(row)
+        # A row can be added between turns, when no ticker is running: the
+        # new row's spinner is what keeps the ticker alive.
+        self._sync_ticker()
 
     def _finish_subagent_row(
         self, event: LoopEvent, *, mount_result: bool = True
@@ -2961,7 +2982,8 @@ class ChatTUI(App):
     def _tick_subagent_rows(self, frame: str) -> None:
         for row in self._subagent_rows.values():
             # Evicted rows keep their state off-DOM; painting them would be
-            # wasted work at 12.5fps per subagent.
+            # wasted work at 12.5fps per subagent. `set_frame` ignores rows
+            # that already closed, so a ✓/✗ is never painted over.
             if row.is_attached:
                 row.set_frame(frame)
 
@@ -2985,13 +3007,109 @@ class ChatTUI(App):
         if self._panel is not None:
             self._panel.render_spinner(frame, text)
 
-    def _spinner_status(self, text: str) -> None:
-        if self._panel is not None:
-            self._panel.render_spinner("⠋", text)
+    # ── animation ticker ────────────────────────────────────────────────────
+    #
+    # ONE ticker drives every animated indicator: the chat status line, the
+    # wizard's "fetching…" line, and the per-row spinners of live background
+    # jobs. It runs while any of them has something to show, and stops (with
+    # the bottom row blanked) the moment none does — a spinner that froze
+    # mid-frame, or a stale line left over after the work was done, is worse
+    # than no indicator at all.
+
+    def _set_chat_working(self, working: bool) -> None:
+        self._chat_working = working
+        self._sync_ticker()
+
+    def _set_activity(self, text: str) -> None:
+        self._activity = text or _SPINNER_DEFAULT_TEXT
+
+    def _running_subagent_rows(self) -> bool:
+        return any(row.running for row in self._subagent_rows.values())
+
+    def _sync_ticker(self) -> None:
+        needed = (
+            self._chat_working or self._wizard_working or self._running_subagent_rows()
+        )
+        if needed:
+            if self._spin_timer is None:
+                self._spin_frame_idx = 0
+                self._spin_timer = self.set_interval(_SPINNER_INTERVAL, self._tick_spin)
+                self._paint_spinner(_SPINNER_FRAMES[0])
+        elif self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+            self._render_spinner("", "")
+
+    def _tick_spin(self) -> None:
+        self._reconcile_subagent_rows()
+        frame = _SPINNER_FRAMES[self._spin_frame_idx % len(_SPINNER_FRAMES)]
+        self._spin_frame_idx += 1
+        self._paint_spinner(frame)
+        if self._running_subagent_rows():
+            self._tick_subagent_rows(frame)
+        # A row that just closed (or a turn that just ended) can leave nothing
+        # to animate, so re-check instead of leaving a timer running on nothing.
+        self._sync_ticker()
+
+    def _paint_spinner(self, frame: str) -> None:
+        if self._chat_working:
+            self._render_spinner(frame, self._spin_text())
+        elif self._wizard_working and self._wizard_status:
+            self._render_spinner(frame, self._wizard_status)
+        else:
+            # Only background jobs are running (or nothing is): the row they
+            # carry says it all, so this line shows nothing.
+            self._render_spinner("", "")
+
+    def _spin_text(self) -> str:
+        text = self._activity
+        if self._esc_hint is not None:
+            if time.monotonic() < self._esc_hint_until:
+                return self._esc_hint
+            self._esc_hint = None
+        return text
+
+    def _reconcile_subagent_rows(self) -> None:
+        """Close rows whose background job finished since the last tick.
+
+        A job finishing between turns queues its alarm for the NEXT user
+        message, which can be minutes away — the row would spin the whole
+        time. The registry is the truth, so ask it. An sid the registry has
+        never seen (a replayed row from an older session) is left alone, and
+        the later alarm's `finish()` is idempotent, so the two paths can both
+        fire for one job.
+        """
+
+        now = time.monotonic()
+        if now - self._last_job_reconcile < self._job_reconcile_interval:
+            return
+        self._last_job_reconcile = now
+        for sid, row in self._subagent_rows.items():
+            if not row.running:
+                continue
+            status = subagents.job_status(sid)
+            if status is None or status == "running":
+                continue
+            row.finish(ok=status == "done")
+
+    def _spinner_status(self, text: str, *, working: bool = False) -> None:
+        """Put a line in the bottom row: `working=True` animates it, else it
+        is a plain notice (no glyph — see `BottomPanel.render_spinner`)."""
+
+        self._wizard_status = text
+        self._wizard_working = working
+        self._sync_ticker()
+        if not working:
+            self._render_spinner("", text)
 
     def _clear_spinner_status(self) -> None:
-        if self._panel is not None:
-            self._panel.render_spinner("", "")
+        self._wizard_status = None
+        self._wizard_working = False
+        self._sync_ticker()
+        if not self._chat_working:
+            # `_sync_ticker` only blanks as part of stopping a timer it owns;
+            # a notice never had one, so blank the line explicitly.
+            self._render_spinner("", "")
 
     async def _dispatch(self, prompt: str) -> None:
         assert self._log is not None

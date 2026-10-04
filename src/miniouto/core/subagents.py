@@ -171,6 +171,21 @@ def is_running(sid: str) -> bool:
         return job is not None and job.status == "running"
 
 
+def job_status(sid: str) -> JobStatus | None:
+    """Current status of `sid`, or None when the registry never saw it.
+
+    The display layer needs to tell three cases apart for a row it is
+    displaying: a job still running, a job that finished while nobody was
+    looking (so the row can close itself), and an sid from a *replayed*
+    session that this process never registered. None is the third case —
+    the caller must leave such a row alone.
+    """
+
+    with _LOCK:
+        job = _JOBS.get(sid)
+        return None if job is None else job.status
+
+
 def cancel_job(sid: str, reason: str = "cancelled") -> bool:
     """Cancel a running job; its completion path still writes file + alarm.
 
