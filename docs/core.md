@@ -402,12 +402,12 @@ A job must outlive the turn that spawned it, and `run_chat` runs every turn unde
 
 ## `core/repetition.py` — repetition watchdog
 
-A model that has stopped making progress rarely goes quiet, so the stall watchdog never fires for it. This module catches exactly two shapes, counting **cumulatively** (not consecutively) and **exactly** (identical normalized segments only — no edit distance, no model call), so a verdict is deterministic and cheap.
+A model that has stopped making progress rarely goes quiet, so the stall watchdog never fires for it. This module catches exactly two shapes, counting **exactly** (identical normalized segments only — no edit distance, no model call), so a verdict is deterministic and cheap. Phrase counting is **cumulative** (a model alternating two phrases forever loops just as hard); tool counting is **consecutive** (a legitimately repeated utility call scattered over a long turn must never warn — only a back-to-back streak of a byte-identical call means a stuck loop).
 
 | Symbol | Purpose |
 |---|---|
 | `REPEAT_PHRASE_THRESHOLD = 10` | The same normalized segment seen this many times in thinking or content |
-| `REPEAT_TOOL_THRESHOLD = 30` | The same tool call (name + `json.dumps(args, sort_keys=True)`) this many times |
+| `REPEAT_TOOL_THRESHOLD = 30` | The same tool call (name + `json.dumps(args, sort_keys=True)`) this many times back to back |
 | `REPEAT_MAX_RESTARTS = 3` | A supervised turn's own restart budget, independent of `WATCHDOG_MAX_WAKEUPS` |
 | `MIN_SEGMENT_CHARS = 4` | Shorter segments ("ok.", "yes!") are junk and not counted |
 | `note_text(actor_key, text)` / `note_tool_call(actor_key, name, arguments)` | Count one message / one tool call toward that actor's detectors |

@@ -7,11 +7,21 @@ failure, and detects exactly two shapes:
 
 - PHRASE — the same normalized sentence or line in the model's thinking or
   its content, seen `REPEAT_PHRASE_THRESHOLD` times.
-- TOOL — the same tool call (name + arguments), issued
-  `REPEAT_TOOL_THRESHOLD` times.
+- TOOL — the same tool call (name + every argument detail), issued
+  `REPEAT_TOOL_THRESHOLD` times IN A ROW.
 
-Both counts are CUMULATIVE, not consecutive: a model that alternates two
-phrases forever is looping just as hard as one that repeats one.
+The two detectors count on different terms, and both are right:
+
+PHRASE is CUMULATIVE: a model that alternates two phrases forever is
+looping just as hard as one that repeats a single phrase, so every
+occurrence counts toward the threshold.
+
+TOOL is CONSECUTIVE. A long turn legitimately re-issues the same utility
+call — `git status`, a screenshot — scattered among other work, and 30 of
+those scattered over the turn is normal, not a loop; warning there would
+teach the user to distrust the detector. Only a back-to-back streak of a
+byte-identical call means a model is stuck, so ANY different call in
+between resets the streak to one.
 
 Counting is exact and offline — identical normalized segments only, no
 edit distance and no model call — so a verdict is deterministic, cheap,
@@ -99,7 +109,8 @@ class LoopVerdict:
 @dataclass(slots=True)
 class _ActorCounters:
     phrases: Counter[str] = field(default_factory=Counter)
-    tools: Counter[str] = field(default_factory=Counter)
+    last_tool_key: str | None = None
+    tool_streak: int = 0
     verdict: LoopVerdict | None = None
 
 
@@ -225,7 +236,14 @@ def flush_stream(actor_key: str) -> None:
 
 
 def note_tool_call(actor_key: str, name: str, arguments: Any) -> None:
-    """Count one tool call toward the tool detector for one actor."""
+    """Count one tool call toward the tool detector for one actor.
+
+    CONSECUTIVE, not cumulative: only a back-to-back streak of the very same
+    call (name + every argument detail, via `_canonical_json`) reaches the
+    threshold. Any different call in between resets the streak to one, so a
+    legitimately repeated utility call scattered across a long turn never
+    warns — only a model stuck re-issuing the identical call does.
+    """
 
     if not name:
         return
@@ -233,11 +251,15 @@ def note_tool_call(actor_key: str, name: str, arguments: Any) -> None:
     notify: Callable[[str], None] | None = None
     with _LOCK:
         counters = _counters_for(actor_key)
-        count = counters.tools[key] + 1
-        counters.tools[key] = count
-        if count >= REPEAT_TOOL_THRESHOLD and counters.verdict is None:
+        if key == counters.last_tool_key:
+            counters.tool_streak += 1
+        else:
+            counters.last_tool_key = key
+            counters.tool_streak = 1
+        streak = counters.tool_streak
+        if streak >= REPEAT_TOOL_THRESHOLD and counters.verdict is None:
             counters.verdict = LoopVerdict(
-                kind="tool", detail=f"{count}x: {name} {_canonical_json(arguments)}"
+                kind="tool", detail=f"{streak}x: {name} {_canonical_json(arguments)}"
             )
             notify = _TRIP_NOTIFIER
     _notify_trip(notify, actor_key)

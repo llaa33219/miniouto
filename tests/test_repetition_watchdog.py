@@ -95,6 +95,57 @@ def test_twenty_nine_identical_tool_calls_do_not_trip_but_the_thirtieth_does() -
     assert repetition.REPEAT_TOOL_THRESHOLD == 30
 
 
+def test_identical_tool_calls_scattered_by_other_calls_do_not_trip() -> None:
+    # Given: two long batches of one identical call, split by a DIFFERENT
+    # call in between — 58 identical calls in a turn that is not looping
+    batch = {"command": "git status"}
+    for i in range(2 * (repetition.REPEAT_TOOL_THRESHOLD - 1)):
+        repetition.note_tool_call("outo", "Bash", dict(batch))
+        if i % 2 == 0:
+            repetition.note_tool_call("outo", "Bash", {"command": f"ls {i}"})
+
+    # When/Then: nothing accumulates across the interruption — a legitimately
+    # repeated utility call scattered over a long turn must never warn
+    assert repetition.check("outo") is None
+
+    # And a genuine back-to-back streak still trips on the documented boundary
+    repetition.note_tool_call("outo", "Bash", {"command": "ls -la"})
+    for _ in range(repetition.REPEAT_TOOL_THRESHOLD - 1):
+        repetition.note_tool_call("outo", "Bash", dict(batch))
+    assert repetition.check("outo") is None
+    repetition.note_tool_call("outo", "Bash", dict(batch))
+    verdict = repetition.check("outo")
+    assert verdict is not None
+    assert verdict.kind == "tool"
+
+
+def test_all_different_tool_calls_never_trip() -> None:
+    # Given: far more calls than the threshold, none of them alike
+    for i in range(3 * repetition.REPEAT_TOOL_THRESHOLD):
+        repetition.note_tool_call("outo", "Bash", {"command": f"echo {i}"})
+
+    # When/Then: the verdict stays None — locked through the public API so a
+    # future key regression (argument details dropped from the key) is caught
+    assert repetition.check("outo") is None
+
+
+def test_a_different_tool_name_resets_the_streak_too() -> None:
+    # Given: one tool's streak interrupted by a single call to another tool
+    batch = {"command": "git status"}
+    for _ in range(repetition.REPEAT_TOOL_THRESHOLD - 1):
+        repetition.note_tool_call("outo", "Bash", dict(batch))
+    repetition.note_tool_call("outo", "Computer", {"action": "screenshot"})
+
+    # When: the same call resumes, it starts a fresh streak of one
+    for i in range(repetition.REPEAT_TOOL_THRESHOLD - 2):
+        repetition.note_tool_call("outo", "Bash", dict(batch))
+        if i % 5 == 0:
+            repetition.note_tool_call("outo", "Computer", {"action": "screenshot"})
+
+    # Then: 57 identical Bash calls, no streak of them long enough to trip
+    assert repetition.check("outo") is None
+
+
 def test_the_same_phrase_with_other_case_and_whitespace_counts_once() -> None:
     # Given: the same sentence written with varying case and inner spacing
     variants = [
