@@ -7,9 +7,10 @@ phrases and identical tool calls per actor, force-stops the loop on the
 spot, and resumes the turn with an English `[SYSTEM ALARM]` that tells the
 model to change pattern.
 
-The counts are the user-facing contract (>=10 phrases, >=30 identical tool
-calls, at most 3 restarts), so the boundary cases and the two alarm texts
-are pinned by exact equality rather than by "contains".
+The counts are the user-facing contract (a phrase UNIT repeated >=50 times in
+a row, >=30 identical tool calls in a row, at most 3 restarts), so the
+boundary cases and the two alarm texts are pinned by exact equality rather
+than by "contains".
 """
 
 from __future__ import annotations
@@ -66,20 +67,22 @@ def _drive(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-def test_nine_repeats_of_a_phrase_do_not_trip_but_the_tenth_does() -> None:
-    # Given: one phrase seen REPEAT_PHRASE_THRESHOLD - 1 times
+def test_forty_nine_repeats_of_a_phrase_do_not_trip_but_the_fiftieth_does() -> None:
+    # Given: one phrase seen REPEAT_PHRASE_THRESHOLD - 1 times IN A ROW
     for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
         repetition.note_text("outo", f"{PHRASE}.")
+    assert repetition.check("outo") is None
 
     # When: the threshold-th occurrence arrives
     repetition.note_text("outo", f"{PHRASE}.")
 
-    # Then: the verdict trips exactly on the documented boundary
+    # Then: the verdict trips exactly on the documented boundary, and the
+    # detail keeps its shape (a p=1 unit renders as the segment itself)
     verdict = repetition.check("outo")
     assert verdict is not None
     assert verdict.kind == "phrase"
-    assert f"{repetition.REPEAT_PHRASE_THRESHOLD}x" in verdict.detail
-    assert repetition.REPEAT_PHRASE_THRESHOLD == 10
+    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {PHRASE.lower()}"
+    assert repetition.REPEAT_PHRASE_THRESHOLD == 50
 
 
 def test_twenty_nine_identical_tool_calls_do_not_trip_but_the_thirtieth_does() -> None:
@@ -159,11 +162,11 @@ def test_the_same_phrase_with_other_case_and_whitespace_counts_once() -> None:
         "Let\tMe Check The File",
     ]
 
-    # When: the variants are fed until the threshold
+    # When: they are fed back to back until the threshold
     for i in range(repetition.REPEAT_PHRASE_THRESHOLD):
         repetition.note_text("outo", variants[i % len(variants)])
 
-    # Then: they normalized to one segment, so the boundary still trips
+    # Then: they normalized to ONE segment, so the boundary still trips
     verdict = repetition.check("outo")
     assert verdict is not None
     assert verdict.kind == "phrase"
@@ -483,56 +486,130 @@ def test_a_crashed_attempt_propagates_even_with_a_pending_verdict(
     assert rt._ACTIVE_SUPERVISORS == {}
 
 
-# ── the phrase window is ONE message, not the whole turn ────────────────────
+# ── the phrase detector is CONSECUTIVE unit-run detection ──────────────────
 
 
-def test_boilerplate_repeated_once_per_message_never_trips_the_phrase_detector() -> None:
-    # Given: ten Bash executions with DIFFERENT commands, each announced by
+def test_boilerplate_repeated_once_per_iteration_never_trips() -> None:
+    # Given: many Bash executions with DIFFERENT commands, each announced by
     # the same one-sentence lead-in — the false positive that fired a
     # repetition alarm on completely normal multi-step work
     for i in range(3 * repetition.REPEAT_PHRASE_THRESHOLD):
         repetition.note_text("outo", f"{BOILERPLATE}. Now checking item {i}.")
         repetition.note_tool_call("outo", "Bash", {"command": f"echo {i}"})
-        repetition.close_message("outo")
 
-        # Then: a message boundary means different work happened, so the
-        # window restarts and nothing accumulates into the threshold
-        assert repetition.check("outo") is None
+    # Then: the interleaved segment breaks every run, so nothing accumulates
+    assert repetition.check("outo") is None
 
 
-def test_two_phrases_alternating_inside_one_message_still_trip() -> None:
-    # Given: a runaway answer that alternates two phrases — inside ONE
-    # message, so the window never closes
+def test_normal_speech_reusing_the_same_phrases_never_trips() -> None:
+    # Given: the user's own counter-example, verbatim in shape — words
+    # revisited in a different order while the model speaks normally. A run
+    # only ever grows from a block that repeats ITSELF back to back
+    speech = ["alpha", "bravo", "charlie", "delta", "alpha", "echo", "charlie",
+              "alpha", "bravo", "bravo", "alpha"]
+    for segment in speech:
+        repetition.note_text("outo", f"{segment} and more words.")
+
+    # Then: no verdict — that is just speaking normally
+    assert repetition.check("outo") is None
+
+
+def test_scattered_repeats_never_trip_however_many_there_are() -> None:
+    # Given: the same segment 200 times, a different one between each pair
+    for i in range(200):
+        repetition.note_text("outo", f"{PHRASE}.")
+        repetition.note_text("outo", f"I am checking item {i}.")
+
+    # Then: 200 occurrences is 200 runs of one — the threshold is on the run,
+    # never on the total, so this must stay silent forever
+    assert repetition.check("outo") is None
+
+
+def test_two_phrases_alternating_consecutively_trip_as_a_pair_unit() -> None:
+    # Given: the user's own example — "A B A B A B ... A B". A single
+    # segment never repeats back to back, but the PAIR does
     a, b = "first pattern of the loop", "second pattern of the loop"
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD):
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
         repetition.note_text("outo", f"{a}. {b}.")
+    assert repetition.check("outo") is None
 
-    # Then: the cumulative count inside one message still catches it
+    # When: the 50th pair completes the run
+    repetition.note_text("outo", f"{a}. {b}.")
+
+    # Then: it trips as a 2-segment unit, and the smallest unit wins the
+    # verdict, so the detail names the whole repeated pair
     verdict = repetition.check("outo")
     assert verdict is not None
     assert verdict.kind == "phrase"
-    assert f"{repetition.REPEAT_PHRASE_THRESHOLD}x" in verdict.detail
+    assert verdict.detail == (
+        f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {a.lower()} {b.lower()}"
+    )
 
 
-def test_close_message_keeps_the_verdict_sticky() -> None:
-    # Given: a tripped phrase verdict
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD):
-        repetition.note_text("outo", f"{PHRASE}.")
+def test_a_three_segment_unit_trips_at_fifty_and_not_at_forty_nine() -> None:
+    # Given: a longer cycle, one segment short of the threshold
+    unit = ("first clause of the loop", "second clause of the loop",
+            "third clause of the loop")
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+        repetition.note_text("outo", ". ".join(unit) + ".")
+
+    # Then: 49 units is not the threshold
+    assert repetition.check("outo") is None
+
+    # When: the 50th unit lands
+    repetition.note_text("outo", ". ".join(unit) + ".")
+
+    # Then: it trips, and the detail renders the whole 3-segment unit
     verdict = repetition.check("outo")
-
-    # When: the message that tripped it ends
-    repetition.close_message("outo")
-
-    # Then: the verdict survives — only the counts are forgotten
-    assert repetition.check("outo") is verdict
+    assert verdict is not None
+    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {' '.join(unit)}"
 
 
-def test_close_message_keeps_the_tool_streak_across_messages() -> None:
+def test_an_interrupted_run_never_joins_into_one_long_run() -> None:
+    # Given: 30 pairs, ONE different segment, then 30 pairs again — twice the
+    # threshold in pairs overall, but never a chain of them end to end. This
+    # is what separates exact block-chain counting from anything looser
+    a, b = "first pattern of the loop", "second pattern of the loop"
+    for _ in range(30):
+        repetition.note_text("outo", f"{a}. {b}.")
+    repetition.note_text("outo", "Something else entirely happened here.")
+    for _ in range(30):
+        repetition.note_text("outo", f"{a}. {b}.")
+    assert repetition.check("outo") is None
+
+    # And the run restarts after the interruption, so the boundary is exact:
+    # 19 more pairs reach 49, and only the 50th trips
+    for _ in range(19):
+        repetition.note_text("outo", f"{a}. {b}.")
+    assert repetition.check("outo") is None
+    repetition.note_text("outo", f"{a}. {b}.")
+    assert repetition.check("outo") is not None
+
+
+def test_a_message_boundary_does_not_break_a_run() -> None:
+    # Given: 25 identical segments, then the message boundary flush, then 25
+    # more — a model alternating two phrases across messages must still trip
+    for _ in range(25):
+        repetition.note_text("outo", f"{PHRASE}.")
+    repetition.flush_stream("outo")
+    assert repetition.check("outo") is None
+
+    # When: the next message carries it to the threshold
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 25):
+        repetition.note_text("outo", f"{PHRASE}.")
+
+    # Then: the run spans the boundary and trips on its 50th segment
+    verdict = repetition.check("outo")
+    assert verdict is not None
+    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {PHRASE.lower()}"
+
+
+def test_a_message_boundary_does_not_reset_the_tool_streak() -> None:
     # Given: one identical tool call per message — 29 messages, a streak
     # that spans them by design
     for _ in range(repetition.REPEAT_TOOL_THRESHOLD - 1):
         repetition.note_tool_call("outo", "Bash", dict(TOOL_ARGS))
-        repetition.close_message("outo")
+        repetition.flush_stream("outo")
     assert repetition.check("outo") is None
 
     # When/Then: the 30th, one message later, still trips the streak
@@ -542,29 +619,11 @@ def test_close_message_keeps_the_tool_streak_across_messages() -> None:
     assert verdict.kind == "tool"
 
 
-def test_a_closed_message_starts_a_fresh_phrase_window() -> None:
-    # Given: threshold-minus-one occurrences, then the message closes
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
-        repetition.note_text("outo", f"{PHRASE}.")
-    repetition.close_message("outo")
-
-    # When: the next message says it again, threshold-minus-one times
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
-        repetition.note_text("outo", f"{PHRASE}.")
-    assert repetition.check("outo") is None
-
-    # Then: only the NEXT window's own tenth trips, at the documented bound
-    repetition.note_text("outo", f"{PHRASE}.")
-    verdict = repetition.check("outo")
-    assert verdict is not None
-    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {PHRASE.lower()}"
-
-
-def test_a_stall_restart_opens_a_fresh_phrase_window(
+def test_a_stall_restart_opens_a_fresh_phrase_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Given: a wedged attempt that left threshold-minus-one occurrences in
-    # the phrase window, resumed with a history sanitized of that tail
+    # Given: a wedged attempt that left threshold-minus-one segments in the
+    # run, resumed with a history sanitized of that tail
     monkeypatch.setattr(rt, "WATCHDOG_CHECK_SECONDS", 0.01)
     for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
         repetition.note_text("outo", f"{PHRASE}.")
@@ -596,8 +655,8 @@ def test_a_stall_restart_opens_a_fresh_phrase_window(
         )
     )
 
-    # Then: the discarded tail's phrases did not leak into the new window,
-    # so the resumed attempt is not immediately force-stopped for repetition
+    # Then: the discarded tail's phrases did not leak into the new run, so
+    # the resumed attempt is not immediately force-stopped for repetition
     assert response.content == "recovered"
     assert attempts == 2
     assert prompts == ["do the work", "do the work"]
@@ -612,7 +671,7 @@ def test_alarm_texts_are_exact_in_english() -> None:
     # Then: the delivered text is the shared contract, verbatim
     assert repetition.alarm_text(phrase) == (
         f"{subagents.ALARM_HEADER}\n"
-        "Repetition detected: the same phrase has been repeated >= 10 times. "
+        "Repetition detected: the same phrase has been repeated >= 50 times. "
         "The loop was force-stopped and is being resumed. Continue the work, "
         "but proceed with a DIFFERENT pattern or approach instead of repeating "
         "the same wording."

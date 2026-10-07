@@ -10,8 +10,8 @@ So the deltas feed the detector too (`repetition.note_stream_delta`), and
 because deltas fragment mid-segment they go through a buffering splitter
 that counts each COMPLETED segment the moment it completes. The whole-message
 `note_text` that still fires for the same message must then count only what
-is left over, or every repeat is counted twice and the 10x threshold trips
-at 5.
+is left over, or every repeat is counted twice and the threshold trips at
+half of it.
 
 The second half of the contract is the record. When the force-stop cuts the
 stream mid-flight the message never completes, so its whole-message event
@@ -115,12 +115,12 @@ def test_a_whole_message_note_counts_only_what_the_deltas_left_over() -> None:
     repetition.note_text("outo", whole)
 
     # Then: it did NOT trip — the already-counted repeats were not counted
-    # a second time, so the 10x threshold is still 5 occurrences away
+    # a second time, so the threshold is still half the occurrences away
     assert repetition.check("outo") is None
 
     # And the count is honest: exactly REPEAT_PHRASE_THRESHOLD occurrences
-    # in total (5 from the stream + 5 from the tail the whole-message note
-    # legitimately added), not 15.
+    # in total (half from the stream + half from the tail the whole-message
+    # note legitimately added), not one and a half times that.
     for _ in range(repetition.REPEAT_PHRASE_THRESHOLD // 2):
         for fragment in FRAGMENTS:
             repetition.note_stream_delta("outo", fragment)
@@ -181,44 +181,20 @@ def test_a_flushed_actor_starts_over_with_the_next_message() -> None:
     assert repetition.check("outo") is not None
 
 
-def test_close_message_counts_the_unfinished_tail_before_the_window_closes() -> None:
-    # Given: REPEAT_PHRASE_THRESHOLD-1 complete segments plus a tail with no
-    # segment break — the shape of a message that ended mid-phrase
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+def test_a_streamed_run_spans_the_message_boundary() -> None:
+    # Given: half a run streamed, then the boundary flushed, then the rest
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD // 2):
         for fragment in FRAGMENTS:
             repetition.note_stream_delta("outo", fragment)
-    repetition.note_stream_delta("outo", SEGMENT)
+    repetition.flush_stream("outo")
     assert repetition.check("outo") is None
 
-    # When: the message closes (flush the tail, THEN clear the counts)
-    repetition.close_message("outo")
-
-    # Then: the tail counted as the threshold-th occurrence before the
-    # window opened, so a phrase cut at the boundary is never lost
-    verdict = repetition.check("outo")
-    assert verdict is not None
-    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {SEGMENT}"
-
-
-def test_a_closed_streaming_message_starts_a_fresh_window() -> None:
-    # Given: one message that streamed the phrase threshold-minus-one times
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
-        for fragment in FRAGMENTS:
-            repetition.note_stream_delta("outo", fragment)
-    repetition.close_message("outo")
-
-    # When: the NEXT message streams it again, threshold-minus-one times
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+    # When: the next message streams the same phrase up to the threshold
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD // 2):
         for fragment in FRAGMENTS:
             repetition.note_stream_delta("outo", fragment)
 
-    # Then: only this window's own count is live — the previous message's
-    # repeats were forgotten, so nothing has tripped
-    assert repetition.check("outo") is None
-
-    # And the tenth in THIS message still trips, at the documented bound
-    for fragment in FRAGMENTS:
-        repetition.note_stream_delta("outo", fragment)
+    # Then: the run spans the boundary, so the 50th segment trips
     verdict = repetition.check("outo")
     assert verdict is not None
     assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {SEGMENT}"

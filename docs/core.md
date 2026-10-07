@@ -402,21 +402,24 @@ A job must outlive the turn that spawned it, and `run_chat` runs every turn unde
 
 ## `core/repetition.py` — repetition watchdog
 
-A model that has stopped making progress rarely goes quiet, so the stall watchdog never fires for it. This module catches exactly two shapes, counting **exactly** (identical normalized segments only — no edit distance, no model call), so a verdict is deterministic and cheap. Phrase counting is **cumulative within one message** (a model alternating two phrases forever inside one answer loops just as hard; the window closes at every message boundary, so boilerplate narration repeated once per tool iteration does NOT accumulate — see `close_message`); tool counting is **consecutive** (a legitimately repeated utility call scattered over a long turn must never warn — only a back-to-back streak of a byte-identical call means a stuck loop).
+A model that has stopped making progress rarely goes quiet, so the stall watchdog never fires for it. This module catches exactly two shapes, counting **exactly** (identical normalized segments only — no edit distance, no model call), so a verdict is deterministic and cheap. Both counters measure a **consecutive RUN, never a total** (a legitimately repeated lead-in scattered over a long turn must never warn — only back-to-back repetition means a stuck loop). Tool counting is the byte-identical streak (`REPEAT_TOOL_THRESHOLD` in a row). Phrase counting generalises that to a **unit** of 1..`MAX_UNIT_SEGMENTS` segments: a single phrase repeated 50x in a row, a pair "A B" repeated 50x in a row, a three-clause cycle repeated 50x — all the same threshold, because a unit is what actually repeats. Sizes are tried ascending so the smallest unit that trips is the one reported, and the chain is compared from the END of the segment stream, so a stream that merely contains repeated blocks (a shifted alignment, one interleaved segment) never counts. "A B A B ..." trips because "A B" is one consecutively repeated unit; "A B C D A F C A B B A" is normal speech — the words recur but no run does. Runs **span messages** (a loop alternating two phrases across ten messages is the same loop); `reset_phrases` is the sole exception, for a discarded tail.
 
 | Symbol | Purpose |
 |---|---|
-| `REPEAT_PHRASE_THRESHOLD = 10` | The same normalized segment seen this many times in thinking or content |
+| `REPEAT_PHRASE_THRESHOLD = 50` | The same phrase UNIT repeated this many times back to back (a unit is 1..`MAX_UNIT_SEGMENTS` segments, so a pair repeated 50x trips at the same number as a single phrase) |
 | `REPEAT_TOOL_THRESHOLD = 30` | The same tool call (name + `json.dumps(args, sort_keys=True)`) this many times back to back |
 | `REPEAT_MAX_RESTARTS = 3` | A supervised turn's own restart budget, independent of `WATCHDOG_MAX_WAKEUPS` |
-| `MIN_SEGMENT_CHARS = 4` | Shorter segments ("ok.", "yes!") are junk and not counted |
+| `MIN_SEGMENT_CHARS = 4` | Shorter segments ("ok.", "yes!") are junk and not counted — they never enter the stream, so they neither grow nor break a run |
+| `MAX_UNIT_SEGMENTS = 8` | Longest phrase unit, in segments, that run detection recognises; bounds the check to at most 8 block comparisons per segment |
 | `note_text(actor_key, text)` / `note_tool_call(actor_key, name, arguments)` | Count one message / one tool call toward that actor's detectors |
 | `check` / `consume_verdict(actor_key)` | Peek at a sticky verdict / take it and clear the counters, so a resumed attempt must earn a new one |
 | `reset()` / `reset_actor(actor_key)` | Drop every / one actor's counters; `reset()` runs once per turn from `runtime._register_watchdog_trackers` |
+| `flush_stream(actor_key)` | Count the buffered, still-unfinished tail as a final segment (message boundary + force-stop path), so a phrase cut mid-sentence is never lost |
+| `reset_phrases(actor_key)` | Discard a dropped tail's run state and buffer WITHOUT flushing — the stall-restart path, so a sanitized-away tail cannot leak into the resumed attempt |
 | `cancel_background_loop(actor_key)` | Enforcement for unsupervised jobs: cancel the job instead of restarting it; a supervised actor is deliberately left alone so its sticky verdict survives |
 | `alarm_text(verdict)` | The exact resumed user message: the phrase shape tells the model to proceed with a *different pattern*; the tool shape adds *try a different method* if repeating is not producing progress |
 
-Segments come from splitting on newlines, sentence enders (`.?!。？！`), then collapsing whitespace and casefolding. The actor key is `current_subagent_id() or "outo"`, and one lock covers every actor because hooks fire on both the turn's loop and the daemon loop. Counters are fed from the whole-message paths only — the thinking dispatcher, the iteration dispatcher's response flush, and every tool call (`call_subagent` included, counted before the skip branches). Stream deltas are deliberately **not** fed (see invariant 8).
+Segments come from splitting on newlines, sentence enders (`.?!。？！`), then collapsing whitespace and casefolding. The actor key is `current_subagent_id() or "outo"`, and one lock covers every actor because hooks fire on both the turn's loop and the daemon loop. Counters are fed from the whole-message paths — the thinking dispatcher, the iteration dispatcher's response flush, and every tool call (`call_subagent` included, counted before the skip branches) — plus the stream deltas (see invariant 8). A tool call is not a phrase segment, so it neither grows nor breaks a run, symmetric with the tool streak, which narration does not break.
 
 ---
 

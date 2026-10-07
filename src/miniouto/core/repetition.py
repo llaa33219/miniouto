@@ -5,34 +5,47 @@ talking and keeps calling tools, burning tokens, so the STALL watchdog in
 `core.runtime` never fires for it. This module is the other half of that
 failure, and detects exactly two shapes:
 
-- PHRASE — the same normalized sentence or line in the model's thinking or
-  its content, seen `REPEAT_PHRASE_THRESHOLD` times WITHIN ONE MESSAGE.
+- PHRASE — the same phrase UNIT (one segment, up to `MAX_UNIT_SEGMENTS`
+  of them) repeated `REPEAT_PHRASE_THRESHOLD` times BACK TO BACK.
 - TOOL — the same tool call (name + every argument detail), issued
   `REPEAT_TOOL_THRESHOLD` times IN A ROW.
 
-The two detectors count on different terms, and both are right:
+The two detectors both count on CONSECUTIVE runs, and both are right:
 
-PHRASE is CUMULATIVE WITHIN ONE MESSAGE (`close_message` is the boundary):
-a runaway answer is ONE message that never ends, and a model alternating two
-phrases forever inside it is looping just as hard as one repeating a single
-phrase, so every occurrence counts toward the threshold. Across messages it
-is deliberately NOT a loop: a message boundary means the model said something
-and then DID something else, and a similar lead-in before each of ten tool
-calls is normal narration, not a loop. Warning there teaches the user to
-distrust the detector — the same reasoning that makes TOOL consecutive.
+PHRASE counts a RUN, not a total. A model stuck in a loop does not sprinkle
+one phrase among ten others — it emits the same wording again and again, so
+only a chain of identical units END TO END is a loop. Scattered repeats are
+how humans and healthy models speak: the same lead-in before each of ten
+tool calls, or the same word reused in a different order throughout a
+sentence. Warning there teaches the user to distrust the detector, so a
+run is required and a total never is.
 
-TOOL is CONSECUTIVE. A long turn legitimately re-issues the same utility
-call — `git status`, a screenshot — scattered among other work, and 30 of
-those scattered over the turn is normal, not a loop; warning there would
-teach the user to distrust the detector. Only a back-to-back streak of a
-byte-identical call means a model is stuck, so ANY different call in
-between resets the streak to one. Unlike the phrase window, the streak
-SPANS message boundaries: one identical call per message is 30 real
+The UNIT is what makes an alternating loop visible. "A B A B A B ... A B"
+never repeats a single segment back to back, but "A B" itself is one unit
+repeated consecutively, so it trips at the same threshold as a single
+phrase — and "A B C D A F C A B B A", which merely reuses words in a
+changing order, is not a run of anything and stays silent. Unit sizes
+`p = 1..MAX_UNIT_SEGMENTS` are tried ascending, so the smallest (most
+specific) unit that reaches the threshold is the one reported.
+
+The run SPANS messages. A model alternating two phrases across ten
+messages is the same loop as one doing it inside a single answer, and a
+message boundary means nothing about wording. `reset_phrases` is the one
+exception, for a tail that is being DISCARDED rather than closed.
+
+TOOL is CONSECUTIVE for the same reason. A long turn legitimately re-issues
+the same utility call — `git status`, a screenshot — scattered among other
+work, and 30 of those scattered over the turn is normal, not a loop. Only
+a back-to-back streak of a byte-identical call means a model is stuck, so
+ANY different call in between resets the streak to one, while the streak
+itself spans messages: one identical call per message is 30 real
 repetitions.
 
 Counting is exact and offline — identical normalized segments only, no
 edit distance and no model call — so a verdict is deterministic, cheap,
-and reproducible in a test.
+and reproducible in a test. Blocks are compared as a chain FROM THE END of
+the segment stream, so a misaligned stream can never fake a run: the
+alignment must hold for every block of the chain.
 
 TWO PATHS, ONE SPLITTER. Phrases are counted from the live stream
 (`note_stream_delta`, once per delta) and from the completed message
@@ -74,7 +87,7 @@ import contextlib
 import json
 import re
 import threading
-from collections import Counter
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -82,8 +95,10 @@ from typing import Any, Literal
 from . import subagents
 from .subagents import ALARM_HEADER
 
-# User-facing contract: how much repetition counts as a loop.
-REPEAT_PHRASE_THRESHOLD = 10
+# User-facing contract: how much repetition counts as a loop. The phrase
+# number counts UNIT REPETITIONS, not segments — one phrase 50x in a row is
+# 50 units of one segment, and a pair repeated 50x is 50 units of two.
+REPEAT_PHRASE_THRESHOLD = 50
 REPEAT_TOOL_THRESHOLD = 30
 # How many times a supervised turn may be force-stopped for repetition
 # before the turn is abandoned. Deliberately independent of (and unrelated
@@ -94,6 +109,18 @@ REPEAT_MAX_RESTARTS = 3
 # Segments shorter than this are junk ("ok.", "yes!") and are not counted —
 # a model legitimately says "sure" many times in a long turn.
 MIN_SEGMENT_CHARS = 4
+
+# Longest phrase UNIT the detector recognises, in segments. p=1 is a single
+# segment; p=8 catches an eight-segment cycle. The bound is what keeps the
+# check cheap (at most 8 block comparisons per new segment) and keeps a unit
+# specific enough that the verdict names the actual repeated wording.
+MAX_UNIT_SEGMENTS = 8
+
+# Bounded tail of recent segments per actor — the only state a run needs. It
+# must hold the longest chain that can still trip the threshold, plus room
+# for the mismatching block that ends the next one, so
+# `REPEAT_PHRASE_THRESHOLD * (MAX_UNIT_SEGMENTS + 1)`; 512 leaves slack.
+MAX_TAIL_SEGMENTS = 512
 
 # Sentence and line ends, ASCII and CJK. Splitting on these is what makes
 # "the same phrase" a phrase instead of an entire response; the fullwidth
@@ -115,7 +142,9 @@ class LoopVerdict:
 
 @dataclass(slots=True)
 class _ActorCounters:
-    phrases: Counter[str] = field(default_factory=Counter)
+    segments: deque[str] = field(
+        default_factory=lambda: deque(maxlen=MAX_TAIL_SEGMENTS)
+    )
     last_tool_key: str | None = None
     tool_streak: int = 0
     verdict: LoopVerdict | None = None
@@ -242,36 +271,19 @@ def flush_stream(actor_key: str) -> None:
     _notify_trip(notify, actor_key)
 
 
-def close_message(actor_key: str) -> None:
-    """End this actor's message: flush its tail, then open a fresh window.
-
-    The phrase window is ONE MESSAGE, and this is the boundary. Flush first
-    so a phrase still mid-sentence at the message end still counts (and
-    still trips, with its notification), clear second so the next message
-    starts from zero. Order matters: a clear-then-flush would drop the tail.
-
-    Nothing else is touched. The verdict is STICKY and survives — a tripped
-    loop must stay tripped across the boundary the supervisor notices it at
-    — and the tool streak survives too, because a back-to-back streak of one
-    identical call legitimately spans messages (one call per message is 30
-    real repetitions, and that is the whole point of the tool detector).
-    """
-
-    with _LOCK:
-        counters = _ACTORS.get(actor_key)
-        notify = _flush_locked(actor_key)
-        if counters is not None:
-            counters.phrases.clear()
-    _notify_trip(notify, actor_key)
-
-
 def reset_phrases(actor_key: str) -> None:
-    """Open a fresh phrase window for one actor, dropping its stream buffer.
+    """Drop one actor's run state and stream buffer, WITHOUT flushing them.
 
     For a message that is being DISCARDED rather than closed — the stall
     restart sanitizes the wedged tail out of the history, and nothing of it
-    is ever recorded, so counting its tail could only leak into the resumed
-    attempt's window. No flush, unlike `close_message`.
+    is ever recorded, so a run left half-built by that tail could only leak
+    into the resumed attempt. No flush, unlike `flush_stream`: what is
+    discarded must not count anywhere.
+
+    The verdict and the tool streak deliberately survive. A tripped loop
+    must stay tripped across the boundary the supervisor notices it at, and
+    a back-to-back streak of one identical call legitimately spans a restart
+    (one call per message is 30 real repetitions).
 
     A no-op for an actor with no counters, so a supervisor that never
     restarted anything pays nothing.
@@ -280,7 +292,7 @@ def reset_phrases(actor_key: str) -> None:
     with _LOCK:
         counters = _ACTORS.get(actor_key)
         if counters is not None:
-            counters.phrases.clear()
+            counters.segments.clear()
         stream = _STREAMS.get(actor_key)
         if stream is not None:
             stream.buffer = ""
@@ -404,7 +416,7 @@ def alarm_text(verdict: LoopVerdict) -> str:
 def _count_segments_locked(
     actor_key: str, text: str
 ) -> Callable[[str], None] | None:
-    """Count every segment of `text`; return the notifier iff a verdict TRIPS.
+    """Append every segment of `text` to the actor's stream; notify on a TRIP.
 
     One transition, `None → verdict`, for both counting paths, so the
     announcement stays exactly-once-per-trip: the verdict is sticky, so
@@ -416,12 +428,48 @@ def _count_segments_locked(
     counters = _counters_for(actor_key)
     notify: Callable[[str], None] | None = None
     for segment in _segments(text):
-        count = counters.phrases[segment] + 1
-        counters.phrases[segment] = count
-        if count >= REPEAT_PHRASE_THRESHOLD and counters.verdict is None:
-            counters.verdict = LoopVerdict(kind="phrase", detail=f"{count}x: {segment}")
+        counters.segments.append(segment)
+        if counters.verdict is not None:
+            continue
+        run = _unit_run(counters.segments)
+        if run is not None:
+            repeats, unit = run
+            counters.verdict = LoopVerdict(
+                kind="phrase", detail=f"{repeats}x: {' '.join(unit)}"
+            )
             notify = _TRIP_NOTIFIER
     return notify
+
+
+def _unit_run(tail: deque[str]) -> tuple[int, list[str]] | None:
+    """The tightest unit repeated `REPEAT_PHRASE_THRESHOLD` times at the END
+    of `tail`, as `(repeats, unit)`; None when no unit reaches it.
+
+    Sizes `p = 1..MAX_UNIT_SEGMENTS` are tried ASCENDING, so the smallest
+    unit that trips is reported: a pair run is not explained as a single
+    segment repeated. Each size is measured by walking the chain of `p`-blocks
+    backwards from the end and stopping at the first mismatch, so a run must
+    be exactly aligned end to end — a stream that merely CONTAINS repeated
+    blocks (a shifted alignment, an interleaved segment) never counts.
+    """
+
+    n = len(tail)
+    for p in range(1, MAX_UNIT_SEGMENTS + 1):
+        if 2 * p > n:
+            break  # no room for two blocks, and every larger p has less
+        unit = _block(tail, n - p, p)
+        repeats = 1
+        while (repeats + 1) * p <= n and _block(tail, n - (repeats + 1) * p, p) == unit:
+            repeats += 1
+        if repeats >= REPEAT_PHRASE_THRESHOLD:
+            return repeats, list(unit)
+    return None
+
+
+def _block(tail: deque[str], start: int, p: int) -> tuple[str, ...]:
+    """The `p` segments of `tail` starting at `start`. A deque is not sliceable."""
+
+    return tuple(tail[start + i] for i in range(p))
 
 
 def _flush_locked(actor_key: str) -> Callable[[str], None] | None:

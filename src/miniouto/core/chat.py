@@ -1066,7 +1066,7 @@ def _make_iteration_dispatcher(
         actor_key = sid or "outo"
         if partials is not None:
             partials.close_message(actor_key)
-        repetition.close_message(actor_key)
+        repetition.flush_stream(actor_key)
         actor, sid = _actor_label()
         text = f"iter {iteration}"
         if cumulative[0]:
