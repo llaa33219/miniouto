@@ -6,22 +6,29 @@ talking and keeps calling tools, burning tokens, so the STALL watchdog in
 failure, and detects exactly two shapes:
 
 - PHRASE — the same normalized sentence or line in the model's thinking or
-  its content, seen `REPEAT_PHRASE_THRESHOLD` times.
+  its content, seen `REPEAT_PHRASE_THRESHOLD` times WITHIN ONE MESSAGE.
 - TOOL — the same tool call (name + every argument detail), issued
   `REPEAT_TOOL_THRESHOLD` times IN A ROW.
 
 The two detectors count on different terms, and both are right:
 
-PHRASE is CUMULATIVE: a model that alternates two phrases forever is
-looping just as hard as one that repeats a single phrase, so every
-occurrence counts toward the threshold.
+PHRASE is CUMULATIVE WITHIN ONE MESSAGE (`close_message` is the boundary):
+a runaway answer is ONE message that never ends, and a model alternating two
+phrases forever inside it is looping just as hard as one repeating a single
+phrase, so every occurrence counts toward the threshold. Across messages it
+is deliberately NOT a loop: a message boundary means the model said something
+and then DID something else, and a similar lead-in before each of ten tool
+calls is normal narration, not a loop. Warning there teaches the user to
+distrust the detector — the same reasoning that makes TOOL consecutive.
 
 TOOL is CONSECUTIVE. A long turn legitimately re-issues the same utility
 call — `git status`, a screenshot — scattered among other work, and 30 of
 those scattered over the turn is normal, not a loop; warning there would
 teach the user to distrust the detector. Only a back-to-back streak of a
 byte-identical call means a model is stuck, so ANY different call in
-between resets the streak to one.
+between resets the streak to one. Unlike the phrase window, the streak
+SPANS message boundaries: one identical call per message is 30 real
+repetitions.
 
 Counting is exact and offline — identical normalized segments only, no
 edit distance and no model call — so a verdict is deterministic, cheap,
@@ -233,6 +240,51 @@ def flush_stream(actor_key: str) -> None:
     with _LOCK:
         notify = _flush_locked(actor_key)
     _notify_trip(notify, actor_key)
+
+
+def close_message(actor_key: str) -> None:
+    """End this actor's message: flush its tail, then open a fresh window.
+
+    The phrase window is ONE MESSAGE, and this is the boundary. Flush first
+    so a phrase still mid-sentence at the message end still counts (and
+    still trips, with its notification), clear second so the next message
+    starts from zero. Order matters: a clear-then-flush would drop the tail.
+
+    Nothing else is touched. The verdict is STICKY and survives — a tripped
+    loop must stay tripped across the boundary the supervisor notices it at
+    — and the tool streak survives too, because a back-to-back streak of one
+    identical call legitimately spans messages (one call per message is 30
+    real repetitions, and that is the whole point of the tool detector).
+    """
+
+    with _LOCK:
+        counters = _ACTORS.get(actor_key)
+        notify = _flush_locked(actor_key)
+        if counters is not None:
+            counters.phrases.clear()
+    _notify_trip(notify, actor_key)
+
+
+def reset_phrases(actor_key: str) -> None:
+    """Open a fresh phrase window for one actor, dropping its stream buffer.
+
+    For a message that is being DISCARDED rather than closed — the stall
+    restart sanitizes the wedged tail out of the history, and nothing of it
+    is ever recorded, so counting its tail could only leak into the resumed
+    attempt's window. No flush, unlike `close_message`.
+
+    A no-op for an actor with no counters, so a supervisor that never
+    restarted anything pays nothing.
+    """
+
+    with _LOCK:
+        counters = _ACTORS.get(actor_key)
+        if counters is not None:
+            counters.phrases.clear()
+        stream = _STREAMS.get(actor_key)
+        if stream is not None:
+            stream.buffer = ""
+            stream.active = False
 
 
 def note_tool_call(actor_key: str, name: str, arguments: Any) -> None:

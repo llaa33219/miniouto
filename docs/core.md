@@ -402,7 +402,7 @@ A job must outlive the turn that spawned it, and `run_chat` runs every turn unde
 
 ## `core/repetition.py` — repetition watchdog
 
-A model that has stopped making progress rarely goes quiet, so the stall watchdog never fires for it. This module catches exactly two shapes, counting **exactly** (identical normalized segments only — no edit distance, no model call), so a verdict is deterministic and cheap. Phrase counting is **cumulative** (a model alternating two phrases forever loops just as hard); tool counting is **consecutive** (a legitimately repeated utility call scattered over a long turn must never warn — only a back-to-back streak of a byte-identical call means a stuck loop).
+A model that has stopped making progress rarely goes quiet, so the stall watchdog never fires for it. This module catches exactly two shapes, counting **exactly** (identical normalized segments only — no edit distance, no model call), so a verdict is deterministic and cheap. Phrase counting is **cumulative within one message** (a model alternating two phrases forever inside one answer loops just as hard; the window closes at every message boundary, so boilerplate narration repeated once per tool iteration does NOT accumulate — see `close_message`); tool counting is **consecutive** (a legitimately repeated utility call scattered over a long turn must never warn — only a back-to-back streak of a byte-identical call means a stuck loop).
 
 | Symbol | Purpose |
 |---|---|

@@ -1014,9 +1014,11 @@ def _make_iteration_dispatcher(
     It is also the MESSAGE BOUNDARY of the stream, and fires for the
     terminal message too: the actor's raw stream partial is dropped (its
     whole-message event — or the final answer — owns the text now, so a
-    later force-stop cannot record it twice) and the repetition detector's
-    buffered tail is flushed, so a phrase that ended mid-sentence still
-    counts.
+    later force-stop cannot record it twice), and the repetition detector
+    closes its phrase window here — the buffered tail flushed so a phrase
+    that ended mid-sentence still counts, then the counts cleared, because
+    the same lead-in in the NEXT message is narration about different work,
+    not repetition.
 
     Flush order is thinking → response → context: ON_ITERATION always
     fires after ON_THINKING, so the reasoning reads above the text it
@@ -1064,7 +1066,7 @@ def _make_iteration_dispatcher(
         actor_key = sid or "outo"
         if partials is not None:
             partials.close_message(actor_key)
-        repetition.flush_stream(actor_key)
+        repetition.close_message(actor_key)
         actor, sid = _actor_label()
         text = f"iter {iteration}"
         if cumulative[0]:

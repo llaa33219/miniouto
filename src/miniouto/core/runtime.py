@@ -571,6 +571,11 @@ async def supervised_run(
                     f"last phase={progress.phase!r}) — giving up"
                 )
             history = sanitize_history(live.get(live_key), on_removed=on_removed) or history
+            # The wedged tail is discarded, not recorded, so its phrases must
+            # not count against the resumed attempt. The repetition restart
+            # gets this for free (`consume_verdict` pops the whole actor).
+            if restart_on_repetition is not None:
+                repetition.reset_phrases(restart_on_repetition)
             on_wakeup(wakeups, silent, progress.phase)
             if history:
                 task = asyncio.create_task(start(None, history))

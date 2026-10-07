@@ -27,6 +27,9 @@ from miniouto.core import runtime as rt
 from miniouto.core.providers import API_STALL_TIMEOUT_SECONDS
 
 PHRASE = "I will inspect the failing module again"
+# The lead-in a model says once per tool iteration: the same segment in every
+# message, while the messages themselves are about DIFFERENT work.
+BOILERPLATE = "let me run the next command and read the output"
 TOOL_ARGS = {"command": "ls -la"}
 
 
@@ -478,6 +481,127 @@ def test_a_crashed_attempt_propagates_even_with_a_pending_verdict(
     assert attempts == 1
     assert repetition.check("outo") is not None
     assert rt._ACTIVE_SUPERVISORS == {}
+
+
+# ── the phrase window is ONE message, not the whole turn ────────────────────
+
+
+def test_boilerplate_repeated_once_per_message_never_trips_the_phrase_detector() -> None:
+    # Given: ten Bash executions with DIFFERENT commands, each announced by
+    # the same one-sentence lead-in — the false positive that fired a
+    # repetition alarm on completely normal multi-step work
+    for i in range(3 * repetition.REPEAT_PHRASE_THRESHOLD):
+        repetition.note_text("outo", f"{BOILERPLATE}. Now checking item {i}.")
+        repetition.note_tool_call("outo", "Bash", {"command": f"echo {i}"})
+        repetition.close_message("outo")
+
+        # Then: a message boundary means different work happened, so the
+        # window restarts and nothing accumulates into the threshold
+        assert repetition.check("outo") is None
+
+
+def test_two_phrases_alternating_inside_one_message_still_trip() -> None:
+    # Given: a runaway answer that alternates two phrases — inside ONE
+    # message, so the window never closes
+    a, b = "first pattern of the loop", "second pattern of the loop"
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD):
+        repetition.note_text("outo", f"{a}. {b}.")
+
+    # Then: the cumulative count inside one message still catches it
+    verdict = repetition.check("outo")
+    assert verdict is not None
+    assert verdict.kind == "phrase"
+    assert f"{repetition.REPEAT_PHRASE_THRESHOLD}x" in verdict.detail
+
+
+def test_close_message_keeps_the_verdict_sticky() -> None:
+    # Given: a tripped phrase verdict
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD):
+        repetition.note_text("outo", f"{PHRASE}.")
+    verdict = repetition.check("outo")
+
+    # When: the message that tripped it ends
+    repetition.close_message("outo")
+
+    # Then: the verdict survives — only the counts are forgotten
+    assert repetition.check("outo") is verdict
+
+
+def test_close_message_keeps_the_tool_streak_across_messages() -> None:
+    # Given: one identical tool call per message — 29 messages, a streak
+    # that spans them by design
+    for _ in range(repetition.REPEAT_TOOL_THRESHOLD - 1):
+        repetition.note_tool_call("outo", "Bash", dict(TOOL_ARGS))
+        repetition.close_message("outo")
+    assert repetition.check("outo") is None
+
+    # When/Then: the 30th, one message later, still trips the streak
+    repetition.note_tool_call("outo", "Bash", dict(TOOL_ARGS))
+    verdict = repetition.check("outo")
+    assert verdict is not None
+    assert verdict.kind == "tool"
+
+
+def test_a_closed_message_starts_a_fresh_phrase_window() -> None:
+    # Given: threshold-minus-one occurrences, then the message closes
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+        repetition.note_text("outo", f"{PHRASE}.")
+    repetition.close_message("outo")
+
+    # When: the next message says it again, threshold-minus-one times
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+        repetition.note_text("outo", f"{PHRASE}.")
+    assert repetition.check("outo") is None
+
+    # Then: only the NEXT window's own tenth trips, at the documented bound
+    repetition.note_text("outo", f"{PHRASE}.")
+    verdict = repetition.check("outo")
+    assert verdict is not None
+    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {PHRASE.lower()}"
+
+
+def test_a_stall_restart_opens_a_fresh_phrase_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given: a wedged attempt that left threshold-minus-one occurrences in
+    # the phrase window, resumed with a history sanitized of that tail
+    monkeypatch.setattr(rt, "WATCHDOG_CHECK_SECONDS", 0.01)
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+        repetition.note_text("outo", f"{PHRASE}.")
+    prompts: list[str | None] = []
+    attempts = 0
+
+    async def start(p: str | None, h: list[co.Message] | None) -> co.Response:
+        nonlocal attempts
+        attempts += 1
+        prompts.append(p)
+        if attempts == 1:
+            await asyncio.sleep(3600)  # wedged; only the stall check ends it
+        # The resumed attempt says the phrase once — the discarded tail's
+        # occurrences must not count against it
+        repetition.note_text("outo", f"{PHRASE}.")
+        return co.Response(content="recovered", messages=[], iterations=1)
+
+    # When: the supervisor restarts the turn from the sanitized transcript
+    response = _drive(
+        rt.supervised_run(
+            start,
+            "do the work",
+            None,
+            live_key="outo",
+            level=0,
+            on_wakeup=lambda *_args: None,
+            restart_on_repetition="outo",
+            states=_states(silent=API_STALL_TIMEOUT_SECONDS * 10),
+        )
+    )
+
+    # Then: the discarded tail's phrases did not leak into the new window,
+    # so the resumed attempt is not immediately force-stopped for repetition
+    assert response.content == "recovered"
+    assert attempts == 2
+    assert prompts == ["do the work", "do the work"]
+    assert repetition.check("outo") is None
 
 
 def test_alarm_texts_are_exact_in_english() -> None:

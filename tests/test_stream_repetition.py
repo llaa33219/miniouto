@@ -181,6 +181,49 @@ def test_a_flushed_actor_starts_over_with_the_next_message() -> None:
     assert repetition.check("outo") is not None
 
 
+def test_close_message_counts_the_unfinished_tail_before_the_window_closes() -> None:
+    # Given: REPEAT_PHRASE_THRESHOLD-1 complete segments plus a tail with no
+    # segment break — the shape of a message that ended mid-phrase
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+        for fragment in FRAGMENTS:
+            repetition.note_stream_delta("outo", fragment)
+    repetition.note_stream_delta("outo", SEGMENT)
+    assert repetition.check("outo") is None
+
+    # When: the message closes (flush the tail, THEN clear the counts)
+    repetition.close_message("outo")
+
+    # Then: the tail counted as the threshold-th occurrence before the
+    # window opened, so a phrase cut at the boundary is never lost
+    verdict = repetition.check("outo")
+    assert verdict is not None
+    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {SEGMENT}"
+
+
+def test_a_closed_streaming_message_starts_a_fresh_window() -> None:
+    # Given: one message that streamed the phrase threshold-minus-one times
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+        for fragment in FRAGMENTS:
+            repetition.note_stream_delta("outo", fragment)
+    repetition.close_message("outo")
+
+    # When: the NEXT message streams it again, threshold-minus-one times
+    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD - 1):
+        for fragment in FRAGMENTS:
+            repetition.note_stream_delta("outo", fragment)
+
+    # Then: only this window's own count is live — the previous message's
+    # repeats were forgotten, so nothing has tripped
+    assert repetition.check("outo") is None
+
+    # And the tenth in THIS message still trips, at the documented bound
+    for fragment in FRAGMENTS:
+        repetition.note_stream_delta("outo", fragment)
+    verdict = repetition.check("outo")
+    assert verdict is not None
+    assert verdict.detail == f"{repetition.REPEAT_PHRASE_THRESHOLD}x: {SEGMENT}"
+
+
 # ── 4. E2E: a parked, never-ending stream is cut and recorded ──────────────
 
 
