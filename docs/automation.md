@@ -4,13 +4,15 @@ A reference for setting up and driving miniouto in non-interactive environments 
 
 - [1. Post-install auto-setup](#1-post-install-auto-setup)
 - [2. Relocating storage with `MINIOUTO_HOME`](#2-relocating-storage-with-miniouto_home)
-- [3. Parsing chat output by mode](#3-parsing-chat-output-by-mode)
-- [4. Auto-registering providers](#4-auto-registering-providers)
-- [5. Auto-registering styles](#5-auto-registering-styles)
-- [6. Auto-registering skills](#6-auto-registering-skills)
-- [7. Session automation](#7-session-automation)
-- [8. Non-interactive automation patterns (CI / Docker / cron)](#8-non-interactive-automation-patterns-ci--docker--cron)
-- [9. lma cache control](#9-lma-cache-control)
+- [3. Alarm monitoring & wakeup](#3-alarm-monitoring--wakeup)
+- [4. Extracting history from session files](#4-extracting-history-from-session-files)
+- [5. Parsing chat output by mode](#5-parsing-chat-output-by-mode)
+- [6. Auto-registering providers](#6-auto-registering-providers)
+- [7. Auto-registering styles](#7-auto-registering-styles)
+- [8. Auto-registering skills](#8-auto-registering-skills)
+- [9. Session automation](#9-session-automation)
+- [10. Non-interactive automation patterns (CI / Docker / cron)](#10-non-interactive-automation-patterns-ci--docker--cron)
+- [11. lma cache control](#11-lma-cache-control)
 
 ---
 
@@ -37,7 +39,8 @@ In other words, a single `miniouto status` creates the entire `~/.miniouto/` str
 ```
 ~/.miniouto/
 ├── providers.toml         ← created on first provider registration
-├── settings.toml          ← created on first settings change
+├── settings.toml          ← created on first settings change (the GLOBAL DEFAULT provider)
+├── session-config/        ← per-session pinned provider trio (one <session>.toml each)
 ├── style/                 ← ensure_dirs() auto-copies the five bundles
 │   ├── default.md
 │   ├── coding.md
@@ -104,12 +107,310 @@ docker run -e MINIOUTO_HOME=/data/miniouto -v miniouto-data:/data ...
 ### Caveats
 
 - `MINIOUTO_HOME` is evaluated **once, at process start (import time)**. Changing it mid-process does not affect `paths.ROOT`.
-- Skills are **not** affected by `MINIOUTO_HOME`. Skills are always read from `~/.agents/skills/` (an independent Anthropic-compatible path). There is no official option to relocate skills.
+- Skills are **not** affected by `MINIOUTO_HOME`. Skills are always read from the two default roots — the invocation directory's `./skills/` and `~/.agents/skills/` (an independent Anthropic-compatible path). There is no official option to relocate them; a style can point `{skills:…}` at other directories.
 - Pointing at an already-populated directory reuses the existing files. Pointing at an empty directory causes `ensure_dirs()` to build the skeleton fresh.
 
 ---
 
-## 3. Parsing chat output by mode
+## 3. Alarm monitoring & wakeup
+
+**The model: alarms are wakeups, not waits.** A message in a session's inbox is a wakeup for whoever is awake. `miniouto chat "prompt"` runs its turn, prints its answer behind exactly one `------finish------`, and exits immediately. It does **not** wait for background runs it started, and it does **not** wait for further messages to arrive. Anything that lands afterwards stays in `~/.miniouto/inbox/<session>/` until the next wakeup.
+
+> Waiting could only ever have been satisfied by the markers this one run happened to start. Any producer anywhere can `miniouto message insert` into any inbox, so a closed wait is the wrong shape. The old follow-up chain (its turn/wall/poll bounds and its banner) is gone.
+
+There are exactly three primitives, and nothing is locked in. Any tool that can run a shell can take part.
+
+### INSERT — from anywhere
+
+```bash
+miniouto message insert --session <session> "text"
+```
+
+- `--session` is **required** (`miniouto message insert/list/clear`).
+- Words are joined with single spaces, so no shell quoting gymnastics. `--stdin` reads the body from standard input instead.
+- `--kind user` (default) or `--kind alarm`; `--source <label>` is a free-form origin tag stored with the message (`cli`, `tui`, `chat`, `summary`, `context`, …).
+- The command prints the message id (the filename stem) and exits 0.
+
+```bash
+# a script, a cron job, another agent, a webhook handler — all identical
+miniouto message insert --session mysession "the deploy finished: $(cat /tmp/status)"
+git log --oneline -1 | miniouto message insert --session mysession --source ci
+curl -s https://hooks.example/notify | miniouto message insert --session mysession --stdin
+```
+
+### OBSERVE — non-destructive
+
+```bash
+miniouto message list --session <session>          # peek; consumes nothing
+ls ~/.miniouto/inbox/<session>/                    # the same queue as plain files
+[ -n "$(miniouto message list --session <session>)" ] && echo busy   # a poll loop's condition
+```
+
+`message list` prints one line per queued message, oldest first: `<ts>  <kind>  <source>  <first 60 chars>`, and it **never unlinks anything** (`drain` is the delivery primitive, and only a running turn calls it). So it is safe to poll in a tight loop. `--session` defaults to `settings.session`; an empty session is an error, never a guess.
+
+> An empty inbox prints **nothing at all** and exits 0, so `message list` doubles as a loop's emptiness test — no placeholder line, no text matching.
+
+> A file that will not parse (truncated write, a stray editor save) is renamed `<stem>.bad` by the next drain and skipped, never raised on. `*.json` is the right glob for a loop: a leftover `.bad` file is not a message, and counting it would keep your loop awake forever.
+
+Under the hood a message is one JSON file — `kind`, `text`, `ts`, `source`, `meta` — renamed into place with `os.replace`, so a reader sees a message either not at all or complete.
+
+**Background-run liveness** is a separate on-disk fact: one marker per detached `--bg` run at `~/.miniouto/spawn-logs/<id>.json`.
+
+```bash
+cat ~/.miniouto/spawn-logs/<id>.json
+jq -r '"\(.id)  \(.status)  alarm=\(.alarm_session)  session=\(.session)"' \
+  ~/.miniouto/spawn-logs/*.json
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | `running` → `done` / `error` / `stopped` |
+| `alarm_session` | the session that **receives** the completion message |
+| `session` | the run's **own** session, where its transcript lives (never the same name for `--bg`) |
+| `pid` | the detached process; `null` means "not known yet", and unknown reads as alive |
+| `return_path`, `role`, `style`, `log` | what the run promised, and where its stdio went |
+
+The read API is `core/spawn_state.py:pending_spawns(session)` — a pure filter that returns markers still claiming `running` **and** still backed by a live pid, so a crashed run drops out immediately instead of lingering forever:
+
+```python
+from miniouto.core import spawn_state
+for marker in spawn_state.pending_spawns("mysession"):
+    print(marker.id, marker.role, marker.return_path, marker.log)
+```
+
+A pid is not a handle: if the OS recycles it, that marker stays pending for as long as the unrelated process lives. Liveness is a promise, not a proof — a SIGKILLed run never stamps its marker.
+
+### WAKE — process the queue
+
+```bash
+miniouto chat --alarms -c --name <session>
+```
+
+- `--alarms` takes **no prompt**: the queued messages *are* the prompt.
+- `-c` / `--continue` is **mandatory**. History is never loaded implicitly; asking for it is the operator's decision.
+- The named session must **exist**, or there is nothing to wake.
+- All three checks run **before** any model call and before any session file is written, so a malformed wakeup costs nothing and leaves the queue intact.
+- The drained texts, joined with a blank line, become the turn's user message.
+- An **empty inbox is a no-op, not a turn**: one line on stdout, exit 0, no session marker, no finish marker, no model call.
+
+Exact output of an empty wakeup (verified):
+
+```
+$ miniouto chat --alarms -c --name wake-demo
+no pending messages in session 'wake-demo'.
+$ echo $?
+0
+```
+
+The exact rejections (all exit 1, all pre-flight):
+
+```
+✗ --alarms takes no prompt argument — the queued messages are the prompt.
+✗ a wakeup continues an existing session — pass --continue
+✗ nothing to wake: session 'nope-not-here' does not exist
+✗ nothing to wake: no session to continue — pass --name <session>
+```
+
+A successful wakeup reads like any other run — marker, loop events, one finish marker, the answer:
+
+```
+------wake-demo------
+outo: iter 1
+------finish------
+woken answer
+```
+
+`--pm`, `--role`, `--style`, `--use-subagent-provider`, `--answer-only` are all orthogonal to `--alarms`: a wakeup can run on a different provider, as a role, or print only its answer.
+
+### Tying the three together
+
+Because an empty wakeup is free, the loop can be a plain `until` over the inbox directory. **One consumer per session** is the design rule: two live processes bound to one session steal each other's messages, so give each its own session name or its own `MINIOUTO_HOME`.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION="${1:?usage: supervise.sh <session>}"
+export MINIOUTO_HOME="${MINIOUTO_HOME:-$HOME/.miniouto}"
+INBOX="$MINIOUTO_HOME/inbox/$SESSION"
+
+# Wake the session whenever its queue stops being empty, forever.
+while :; do
+  until [ -n "$(ls -A "$INBOX"/*.json 2>/dev/null)" ]; do
+    sleep 30
+  done
+  # `message list` for a peek, or `miniouto chat --alarms -c` to consume it.
+  miniouto message list --session "$SESSION"
+  miniouto chat --alarms -c --name "$SESSION" >> "$INBOX.log" 2>&1
+done
+```
+
+An equivalent that wakes on a fixed tick instead of watching the directory, so it also picks up a queue that another process created from a different `$MINIOUTO_HOME` prefix view (this is the cron shape below, written as a loop):
+
+```bash
+while :; do
+  n=$(ls -A "$INBOX"/*.json 2>/dev/null | wc -l)
+  if [ "$n" -gt 0 ]; then
+    miniouto chat --alarms -c --name "$SESSION"
+  fi
+  sleep 30
+done
+```
+
+`miniouto message list --session "$SESSION"` is a fine thing to log or eyeball at the top of that loop, and since it is silent on an empty inbox it is also a legitimate emptiness test: `[ -n "$(miniouto message list --session "$SESSION")" ]`. The `ls` condition above stays worth preferring when another process may hold a different `$MINIOUTO_HOME` prefix view of the same directory.
+
+As a cron entry, one wakeup per tick — the "nothing to do" case is a no-op, so an over-frequent schedule is harmless:
+
+```cron
+*/2 * * * * MINIOUTO_HOME=/srv/miniouto /usr/local/bin/miniouto chat --alarms -c --name oncall >> /var/log/oncall-wake.log 2>&1
+```
+
+Two lanes worth keeping separate: a **wakeup lane** (this section — consume the queue) and a **liveness lane** (poll `spawn-logs/*.json` so you know which detached runs are still going). Neither blocks the other, and neither blocks a chat run.
+
+---
+
+## 4. Extracting history from session files
+
+Everything a session ever did is on disk at `~/.miniouto/sessions/<name>.json`, as plain JSON. Nothing needs a running harness to read it.
+
+### The schema
+
+Schema v2 (`storage/sessions.py`) has two sections, and which one you want depends on the question.
+
+| Section | What it is | Use it for |
+|---|---|---|
+| `history` | coreouto `Message` dicts — **system messages excluded**, media flattened to text placeholders, `tool_calls` / `tool_call_id` / `name` preserved. Rewritten in full at the end of every turn, and snapshotted mid-turn at every loop iteration. | The transcript the model actually saw. Feed it back, diff it, count it. |
+| `turns` | display records: `ts`, `user`, `assistant`, optional `status`, optional `events` | What the human watched: the prompt, the final answer, and every loop event. |
+
+Envelope:
+
+```json
+{
+  "version": 2,
+  "session": "my-session",
+  "updated": "2026-10-15T11:27:51Z",
+  "cwd": "/home/luke/miniouto",
+  "history": [ { "role": "...", "content": "..." } ],
+  "turns": [ { "ts": "...", "user": "...", "assistant": "...", "events": [ ... ] } ]
+}
+```
+
+`cwd` is stamped on the **first** turn only: a session belongs to the directory it was created in. `turns[].status` is `running` / `done` / `interrupted`; a turn still `running` on disk means its writer died mid-turn (a `status` key is only written when it is *not* `done`, so its absence means done).
+
+Loop events (`turns[].events[]`) are `LoopEvent` dicts: `actor`, `kind`, `text`, plus optional `tool_name`, `subagent_id`, `subagent_name`, `detail`, `msg_ref`. The `kind` values you'll actually filter on:
+
+| `kind` | Source | In `history`? |
+|---|---|---|
+| `thinking` | the model's reasoning | **no** — providers never put thinking in a `Message`, so it lives only here |
+| `response` | an assistant message body | yes |
+| `tool` | a tool call (`tool_name` + `text` summary) | yes, as `tool_calls` |
+| `tool_result` | its result (`tool_name` + `text`) | yes, as a `role: "tool"` message |
+| `context` | the context monitor's occupancy note | no |
+| `alarm` / `user` | a delivered inbox message (`detail: "inbox:<id>"`) | yes, folded into the user message |
+| `handoff` | a summarization hand-off marker | no |
+
+Every recipe below was executed against a real session file (`jq` 1.7). `$S` is the file:
+
+```bash
+S=~/.miniouto/sessions/my-session.json
+```
+
+**Full transcript, in order** (user and assistant text from the restorable history):
+
+```bash
+jq -r '.history[]
+         | select(.role == "user" or .role == "assistant")
+         | select((.content // "") != "")
+         | "\(.role): \(.content)"' "$S"
+```
+
+```
+user: how many doc files are there?
+assistant: There are 9 doc files.
+user: and now the logs
+assistant: There are 9 doc files.
+```
+
+The `select` on a non-empty `content` is what drops tool-call-only assistant messages (they carry the call in `tool_calls`, not in `content`).
+
+**Thinking only** (from `turns`, because thinking never enters `history`):
+
+```bash
+jq -r '.turns[].events[] | select(.kind == "thinking") | .text' "$S"
+```
+
+```
+I should list the files first.
+```
+
+**The final answer of a run** (the last turn that produced one; a bare `--alarms` no-op never appends a turn, so it can't be mistaken for one):
+
+```bash
+jq -r '[.turns[] | select((.assistant // "") != "")] | last | .assistant' "$S"
+```
+
+```
+There are 9 doc files.
+```
+
+**Tool calls with their results**, in emission order (`tool` then its `tool_result`, pairing them further with the shared `msg_ref`):
+
+```bash
+jq -r '.turns[].events[]
+         | select(.kind == "tool" or .kind == "tool_result")
+         | "\(.kind)  \(.tool_name // "-")  \((.text // "") | split("\n")[0])"' "$S"
+```
+
+```
+tool  Bash  Bash ls docs
+tool_result  Bash  README.md
+```
+
+Full results, not truncated:
+
+```bash
+jq -r '.turns[].events[] | select(.kind == "tool_result") | "[\(.tool_name)] \(.text)"' "$S"
+```
+
+**Handoff marker turns** — a summarization transition, as a TUI session records it (`cli/tui.py:_persist_handoff_marker` appends a trailing turn holding one `handoff` event):
+
+```bash
+jq -r '.turns[] | .events[]? | select(.kind == "handoff") | .text' "$S"
+```
+
+```
+------summary → cont-ab12cd------
+summary: /tmp/sum
+```
+
+**Turn-level summary** (when did what, and did it finish):
+
+```bash
+jq -r '.turns[] | "\(.ts)  \(.status // "done")  user=\((.user // "")[0:40])  answer=\((.assistant // "")[0:40])"' "$S"
+```
+
+**Everything as JSON lines**, for a program that wants to consume rather than read:
+
+```bash
+jq -c '.turns[] | {ts, user, assistant, events}' "$S"
+jq -c '.history[]' "$S"
+```
+
+**Session inventory** — name, directory, and recency, without going through `load()` (which would write):
+
+```bash
+for f in ~/.miniouto/sessions/*.json; do
+  jq -r --arg f "$f" '"\(.session)\t\(.cwd // "")\t\(.updated)"' "$f"
+done | sort -k3 -r
+```
+
+### Writing history back
+
+The `history` list is plain JSON, so injecting a few-shot prefix is a two-line edit — see [§ Session automation](#9-session-automation). Each entry must validate as a coreouto `Message` (`role`, `content`, optional `tool_calls` / `tool_call_id` / `name`); invalid entries degrade to plain text instead of failing. Never add a `role: "system"` entry: coreouto prepends a fresh system prompt on every call. Editing `turns` is display-only.
+
+---
+
+## 5. Parsing chat output by mode
 
 `miniouto chat` offers three output modes. Automation should use **`--answer-only`** or **`--with-session`** to keep parsing simple. (Usage details in [`usage.md`](./usage.md#output-modes-verbose---answer-only----with-session).)
 
@@ -120,6 +421,23 @@ docker run -e MINIOUTO_HOME=/data/miniouto -v miniouto-data:/data ...
 | verbose (default) | `------{session}------\n` + spinner/loop events (rich console) + `------finish------\n` + answer |
 | `--with-session` | `------{session}------\n` + answer |
 | `--answer-only` / `-a` | **answer body only** |
+
+`------finish------` is a property of the **run**, not of a turn: it is printed **exactly once**, at the true end, and nothing follows it but the final answer. The process exits immediately after that answer, however much is still queued in the inbox. A run that summarized mid-work prints its hand-off markers *before* it, and a delegated run prints its completion line before it too:
+
+```
+------my-session------
+------summary → cont-4f2a90------
+summary: /proj/.miniouto/summary/my-session
+------cont-4f2a90------
+outo: iter 1
+----- chat<9ab31c> complete ----- result: /home/luke/.miniouto/subagent-results/9ab31c-2026-10-15-11-27.md
+------finish------
+The refactor is done.
+```
+
+(There is no `------follow-up N------` banner: a chat never chains on its own. To process queued messages, wake the session — see [§ Alarm monitoring & wakeup](#3-alarm-monitoring--wakeup).)
+
+An empty `--alarms` wakeup is the one case with **no** finish marker: it prints `no pending messages in session '<s>'.` and exits 0 without running a turn.
 
 > The spinner and loop events go to stdout via rich console, but in non-verbose modes `ConsoleEventSink(quiet=True)` suppresses all of them. So `--answer-only` / `--with-session` leave only the answer and (optionally) the session marker on stdout.
 
@@ -188,8 +506,8 @@ from miniouto.core.events import NullSink  # suppresses all output
 opts = ChatOptions(
     prompt="respond as JSON",
     session="my-batch",
-    provider="anthropic",         # override (falls back to settings.provider)
-    model="claude-sonnet-4",      # override
+    provider="anthropic",         # override; else this session's pin, else the global default
+    model="claude-sonnet-4",      # override; else the pin's model, else the provider's default_model
     max_tokens=2048,
     temperature=0.0,
     continue_session=False,
@@ -198,11 +516,13 @@ answer: str = run_chat(opts, sink=NullSink())   # return value = final answer st
 data = json.loads(answer)
 ```
 
+> Resolution order for every provider/model/reasoning field is `override > this session's pin > the global default` (`session-config/<session>.toml`, frozen at the session's first resolution). Pin a long batch session so a later global default change can't move it mid-batch; `ChatOptions` fields are the CLI `--pm`'s library equivalent.
+>
 > `run_chat` always returns the final answer string. Pass `NullSink` to suppress loop events, spinner, and markers. The user message and assistant reply are automatically appended to `~/.miniouto/sessions/<session>.json`.
 
 ---
 
-## 4. Auto-registering providers
+## 6. Auto-registering providers
 
 Three ways to set up a provider non-interactively. Pick based on context.
 
@@ -247,6 +567,8 @@ session = "default"
 ```
 
 > Writing the files directly means the configuration is complete without ever running miniouto. The next `miniouto chat` reads it as-is. Note that `ensure_dirs()` must run at least once so the directory exists — a single `miniouto status` is enough.
+>
+> `settings.toml` is the **global default**; a session that already froze its own `session-config/<session>.toml` pin ignores later edits here. For a specific run (or a specific session you intend to keep), pass `chat --pm 'PROVIDER/MODEL[:REASONING]'` instead — it wins over both.
 
 ### Method B — CLI commands (`provider add` / `provider custom add`)
 
@@ -339,7 +661,7 @@ steps:
 
 ---
 
-## 5. Auto-registering styles
+## 7. Auto-registering styles
 
 A style is a file at `~/.miniouto/style/<name>.md`. Three registration methods.
 
@@ -362,7 +684,7 @@ You are a reviewer. Read the diff, flag problems, never edit.
 EOF
 ```
 
-The `<outo>...</outo>` tag is required (without it, the entire file is used as the outo prompt). Each **top-level** `<name>...</name>` block is one named subagent — the tag name IS the persona name. A legacy `<subagent>...</subagent>` block becomes a subagent named `"subagent"`. **Zero named subagents → `call_subagent` is NOT registered** (outo-only style, no delegation surface); there is no fallback subagent prompt anymore. Format details in [`styles.md`](./styles.md).
+The `<outo>...</outo>` tag is required (without it, the entire file is used as the outo prompt). Each **top-level** `<name>...</name>` block is one **role** for `miniouto chat "<brief>" --style <style> --role <tag>` — the tag name IS the role name. A legacy `<subagent>...</subagent>` block becomes a role named `"subagent"`. **Zero named tags is legal**: `chat` without `--role` runs the outo prompt, and `--role <tag>` with no match errors before the turn. Delegation itself (`Bash` → `miniouto chat --role`) is always available regardless of the style's tags. Format details in [`styles.md`](./styles.md).
 
 To activate:
 
@@ -424,16 +746,20 @@ miniouto style set my-prompt
 
 ---
 
-## 6. Auto-registering skills
+## 8. Auto-registering skills
 
-Skills live at `~/.agents/skills/<name>/SKILL.md` (NOT under `~/.miniouto/` — the **Anthropic-compatible path**). Changing `MINIOUTO_HOME` does not move skills.
+Skills live outside `~/.miniouto/`, in one of two default roots, listed **project-local first**: `./skills/<name>/SKILL.md` relative to the directory you invoked miniouto from, then `~/.agents/skills/<name>/SKILL.md` (the **Anthropic-compatible path**). Changing `MINIOUTO_HOME` does not move skills. Check a shared skill into a repo's `skills/` and anyone who clones it gets it automatically.
 
 ### Directory layout
 
 ```
-~/.agents/skills/
+./skills/                # project-local, listed FIRST
 └── my-skill/
-    └── SKILL.md       ← YAML frontmatter + markdown body
+    └── SKILL.md         ← YAML frontmatter + markdown body
+
+~/.agents/skills/        # global, listed SECOND
+└── my-skill/
+    └── SKILL.md
 ```
 
 Minimal `SKILL.md` example:
@@ -469,12 +795,12 @@ When the user says "format this" ...
 
 ### Auto-detection
 
-**Just create the directory and file — the next chat call picks it up automatically.** There is no registration command. `core/runtime.py:_load_active_skills` scans `~/.agents/skills/` on every `build_runtime()` call and injects a catalog (name + description per skill, plus the on-disk location) into the outo system prompt and into each named subagent's prompt; the agent reads the full SKILL.md via Bash on demand.
+**Just create the directory and file — the next chat call picks it up automatically.** There is no registration command. On every `build_runtime()` call each style body is expanded, and the `{skills}` token (defaulting to `./skills/` then `~/.agents/skills/`; `{skills:<dir>…}` names other roots) renders a catalog (name + description per skill, plus the on-disk location) wherever the style placed it — in the outo body and in each role body alike; the agent reads the full SKILL.md via Bash on demand. A style that names no skills token tells the model about none.
 
 ### Auto-registration script example
 
 ```bash
-# Ensure the skills directory exists
+# Ensure the skills directory exists (global root; use ./skills for project-local)
 mkdir -p ~/.agents/skills
 
 # Distribute a skill (git clone, tar, cp, ...)
@@ -497,17 +823,17 @@ miniouto skill list
 miniouto skill show project-conventions
 ```
 
-> Because there's no registration command, **removal is just deleting the directory**: `rm -rf ~/.agents/skills/my-skill`. Once the directory is gone, the skill automatically drops out of the prompt on the next chat call.
+> Because there's no registration command, **removal is just deleting the directory**: `rm -rf ~/.agents/skills/my-skill` (or `rm -rf ./skills/my-skill`). Once the directory is gone, the skill automatically drops out of the prompt on the next chat call.
 
 ---
 
-## 7. Session automation
+## 9. Session automation
 
-A session is a file at `~/.miniouto/sessions/<name>.json` — a schema-v2 envelope with two sections: `history` (restorable model context: raw coreouto `Message` dicts, system messages excluded, full loop transcript including tool calls/results) and `turns` (display log: user/assistant text + `LoopEvent` dicts including thinking). See `docs/storage.md` § `sessions/<name>.json` for the full schema.
+A session is a file at `~/.miniouto/sessions/<name>.json` — a schema-v2 envelope with two sections: `history` (restorable model context: raw coreouto `Message` dicts, system messages excluded, full loop transcript including tool calls/results) and `turns` (display log: user/assistant text + `LoopEvent` dicts including thinking). The full schema, and a set of copy-paste `jq` recipes for pulling a transcript, the thinking stream, the final answer and tool activity out of it, are in [§ Extracting history from session files](#4-extracting-history-from-session-files).
 
 ### Continuing a session programmatically
 
-`--continue` (`-c`) prepends a session's existing `history` to the next prompt. This is the backbone of multi-step workflow automation:
+`--continue` (`-c`) prepends a session's existing `history` to the next prompt, and it is **never implied** — a plain `chat` starts fresh every call, and a wakeup must spell it out. This is the backbone of multi-step workflow automation:
 
 ```bash
 SESSION="refactor-$(date +%Y%m%d)"
@@ -520,6 +846,36 @@ miniouto chat "based on the analysis, plan the refactor" --name "$SESSION" -c -a
 
 # Step 3
 miniouto chat "execute the plan" --name "$SESSION" -c
+```
+
+### Waking a session instead of chaining turns
+
+`chat` never waits: it answers its prompt, prints one `------finish------`, and exits. So a multi-step workflow is driven by the *caller*, not by the run:
+
+```bash
+SESSION="oncall-$(date +%Y%m%d)"
+
+# Kick off the session
+miniouto chat "watch the deploy log" --name "$SESSION" --bg \
+  --alarm-session "$SESSION" --return /tmp/deploy-report.md
+
+# Something happens; the agent is told without anybody polling it
+miniouto message insert --session "$SESSION" "deploy 4f2a90 finished"
+
+# A separate process (or cron tick) wakes the session up. It exits when done.
+miniouto chat --alarms -c --name "$SESSION"
+
+# And again, for whatever arrived while that turn ran
+miniouto chat --alarms -c --name "$SESSION"
+```
+
+An empty queue makes the second call a free no-op, so "wake until quiet" needs no bookkeeping:
+
+```bash
+INBOX="${MINIOUTO_HOME:-$HOME/.miniouto}/inbox/$SESSION"
+while [ -n "$(ls -A "$INBOX"/*.json 2>/dev/null)" ]; do
+  miniouto chat --alarms -c --name "$SESSION"
+done
 ```
 
 ### Manipulating session files directly
@@ -546,7 +902,7 @@ session_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 ---
 
-## 8. Non-interactive automation patterns (CI / Docker / cron)
+## 10. Non-interactive automation patterns (CI / Docker / cron)
 
 ### Docker
 
@@ -645,7 +1001,7 @@ def batch_process(items: list[str]) -> list[str]:
 
 ---
 
-## 9. lma cache control
+## 11. lma cache control
 
 The catalog commands (`provider providers`, `provider models`, `provider add`) and context-window calculation (`get_max_output_tokens`) call `https://lma.blp.sh` via `core/lma.py`. Responses are cached in `core/lma.py:_CACHE` for 10 minutes (matching lma's server-side TTL).
 

@@ -111,7 +111,7 @@ class NullSink:
 class ConsoleEventSink:
     SPINNER_TEXT_DEFAULT = "Working…"
 
-    def __init__(self, *, quiet: bool = False) -> None:
+    def __init__(self, *, quiet: bool = False, emit_final: bool = True) -> None:
         # Spinner and loop events share stdout so Rich's `Live` keeps them
         # vertically separated. Earlier stderr/stdout splits interleaved
         # on a shared tty, putting the spinner glyph on the same row as
@@ -120,11 +120,17 @@ class ConsoleEventSink:
         # The session marker stays the CLI's job (see `cli/chat.py`), not
         # the sink's — `quiet` only governs progress noise + the finish
         # marker, never the session marker.
+        #
+        # `emit_final=False` hands the answer block back to the caller: only
+        # `cli/chat.py` knows whether this turn was the RUN's last one, and
+        # `------finish------` marks the run, never a single turn.
+        # Default True keeps a direct caller byte-compatible.
         self._console = Console(soft_wrap=False, highlight=False)
         self._activity: str = self.SPINNER_TEXT_DEFAULT
         self._status: Status | None = None
         self._stdout_lock = Lock()
         self._quiet = quiet
+        self._emit_final = emit_final
 
     def begin_working(self) -> None:
         if self._quiet or self._status is not None:
@@ -184,6 +190,8 @@ class ConsoleEventSink:
         self._console.print(line, highlight=False)
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
+        if not self._emit_final:
+            return
         with self._stdout_lock:
             if not self._quiet:
                 sys.stdout.write("------finish------\n")

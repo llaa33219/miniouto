@@ -31,20 +31,49 @@ lock: coreouto runs sync handlers via asyncio.to_thread, so this lock is
 what serializes concurrent tool calls (vwayland opens a fresh IPC socket
 per call — without the lock even different screens could race the shared
 `_spawned` bookkeeping upstream).
+
+The `screen` action renders a capture as Unicode sub-cell art (2x4 source
+pixels per terminal cell, block octants for crisp regions and braille dots for
+blended ones) and writes it to a `.art` file under
+`~/.miniouto/computer-screens/`; it returns the path plus a short preview as a
+plain `str`, never an image, so it stays usable on providers whose format cannot
+carry image tool results. The `screenshot` action writes that same `.art`
+sibling for the same capture — best effort, and signalled to the caller through
+`Screenshot.art_path` — so a TUI can render the screen from a screenshot's
+details too; the line is appended by `tools/registry.py` when it wraps the
+capture into blocks. The capture still comes from the same blocking
+`comp.screenshot()` call and is still serialized by `_LOCK`. Decoding and
+rendering live in `tools/ascii_art.py` (pure stdlib).
 """
 
 from __future__ import annotations
 
 import os
 import platform
+import re
 import shlex
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Literal
+
+from ..storage.paths import COMPUTER_SCREENS_DIR
+from .ascii_art import (
+    GLYPH_MIX,
+    MODE_COLOR,
+    MODE_COLOR_SUBCELL,
+    MODE_PLAIN,
+    build_art,
+    decode_png_rgba,
+    render_subcell,
+    subcell_rows,
+)
 
 ComputerAction = Literal[
     "screenshot",
+    "screen",
     "launch",
     "close_app",
     "mouse_move",
@@ -65,12 +94,27 @@ ComputerAction = Literal[
 ]
 
 ScrollDirection = Literal["up", "down", "left", "right"]
+GlyphStyle = Literal["mix", "octant", "braille"]
 
 DEFAULT_SCREEN_WIDTH = 1280
 DEFAULT_SCREEN_HEIGHT = 720
 
 _MAX_WAIT_SECONDS = 30.0
 _DOUBLE_CLICK_GAP_SECONDS = 0.08
+
+# The `screen` action's art-width target is clamped: below 16 cells a 1280px
+# source loses every glyph of GUI text, above 200 the art stops fitting any
+# terminal (and the `.art` file stops being human-readable).
+ART_MIN_CHARS = 16
+ART_MAX_CHARS = 200
+ART_DEFAULT_CHARS = 100
+
+# The tool-result cap is 4000 chars; the `screen` result reserves the rest for
+# the path, the header lines and the closing line.
+_ART_RESULT_LIMIT = 3800
+_ART_PREVIEW_ROWS = 24
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 # xdotool-style aliases models commonly emit -> vwayland key names.
 _KEY_ALIASES = {
@@ -101,12 +145,20 @@ _SCROLL_VECTORS = {
 
 @dataclass
 class Screenshot:
-    """A PNG frame of a virtual screen; the registry wraps this into blocks."""
+    """A PNG frame of a virtual screen; the registry wraps this into blocks.
+
+    `art_path` is the sibling `.art` dump of the SAME capture, written
+    best-effort by the `screenshot` action (None when the art could not be
+    produced). The registry appends a `Saved to: <path>` line for it, which is
+    the hook the TUI keys on to render the screen inline — the exact same line
+    shape the `screen` action emits.
+    """
 
     data: bytes
     width: int
     height: int
     mime_type: str = field(default="image/png")
+    art_path: Path | None = None
 
 
 class ComputerUseError(Exception):
@@ -172,8 +224,21 @@ def computer(
     scroll_amount: int = 3,
     duration: float = 1.0,
     screen: str | None = None,
+    chars: int = ART_DEFAULT_CHARS,
+    color: bool = True,
+    glyph: GlyphStyle = GLYPH_MIX,
 ) -> str | Screenshot:
-    """Run one computer-use action against the target virtual screen."""
+    """Run one computer-use action against the target virtual screen.
+
+    `chars`, `color` and `glyph` are the art inputs: the width target in
+    terminal cells (clamped to 16..200), whether the art is truecolour sub-cells
+    or a plain luminance ramp, and which glyph family truecolour art picks per
+    cell (`mix` = crisp block octants where a cell is a clean two-tone, braille
+    dots where colours should blend; `braille` forces dots for fonts with no
+    Unicode-16 octant coverage, `octant` forces blocks). They shape the `.art`
+    dump written by `screen` and by `screenshot` (best effort); every other
+    action ignores all three.
+    """
     sid = None
     with _LOCK:
         try:
@@ -196,6 +261,9 @@ def computer(
                 scroll_direction,
                 scroll_amount,
                 duration,
+                chars,
+                color,
+                glyph,
             )
         except vwayland.CompositorNotFoundError as exc:
             if sid is not None:
@@ -304,10 +372,22 @@ def _dispatch(
     scroll_direction: ScrollDirection | None,
     scroll_amount: int,
     duration: float,
+    chars: int = ART_DEFAULT_CHARS,
+    color: bool = True,
+    glyph: GlyphStyle = GLYPH_MIX,
 ) -> str | Screenshot:
     if action == "screenshot":
         img = comp.screenshot()
-        return Screenshot(data=img.png_bytes, width=img.width, height=img.height)
+        return Screenshot(
+            data=img.png_bytes,
+            width=img.width,
+            height=img.height,
+            art_path=_write_art_best_effort(img.png_bytes, sid, chars, color, glyph),
+        )
+
+    if action == "screen":
+        result, _path = _write_art(comp.screenshot().png_bytes, sid, chars, color, glyph)
+        return result
 
     if action == "launch":
         argv = shlex.split(text or "")
@@ -455,3 +535,109 @@ def _coerce_coordinate(value, name: str) -> tuple[int, int]:
             "Coordinates are logical screen pixels; (0, 0) is top-left."
         )
     return x, y
+
+
+# ── the `screen` action: screenshot -> Unicode sub-cell art -> .art file ─────
+
+_ART_MODE_LABELS = {
+    MODE_COLOR: "halfblock truecolor",
+    MODE_COLOR_SUBCELL: "subcell truecolor",
+    MODE_PLAIN: "ramp plain",
+}
+
+
+def _render_screen_art(
+    png_bytes: bytes, sid: str, chars: int, color: bool, glyph: GlyphStyle = GLYPH_MIX
+) -> tuple[str, str, Path]:
+    """Build the tool-result string, the `.art` file text and its path.
+
+    Pure with respect to the compositor and the filesystem: everything the
+    caller needs to persist the capture is returned, so this is testable
+    without a screen.
+    """
+    cols = max(ART_MIN_CHARS, min(ART_MAX_CHARS, int(chars)))
+    try:
+        width, height, rgba = decode_png_rgba(png_bytes)
+    except ValueError as exc:
+        raise ComputerUseError(f"Could not decode the screen capture: {exc}") from exc
+
+    body = render_subcell(rgba, width, height, cols=cols, color=color, glyph=glyph)
+    rows = subcell_rows(width, height, cols)
+    now = datetime.now()
+    path = COMPUTER_SCREENS_DIR / f"{_safe_file_part(sid)}-{now:%Y-%m-%d-%H-%M-%S}.art"
+
+    meta = {
+        "screen": sid,
+        "captured": now.replace(microsecond=0).isoformat(),
+        "source": f"{width}x{height}",
+        "grid": f"{cols}x{rows}",
+        "cell": f"{round(width / (2 * cols))}x{round(height / (4 * rows))}",
+        "mode": MODE_COLOR_SUBCELL if color else MODE_PLAIN,
+    }
+    return _art_result(meta, body, path), build_art(meta, body), path
+
+
+def _safe_file_part(sid: str) -> str:
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("_", sid).strip("_")
+    return cleaned or "screen"
+
+
+def _write_art(
+    png_bytes: bytes, sid: str, chars: int, color: bool, glyph: GlyphStyle = GLYPH_MIX
+) -> tuple[str, Path]:
+    result, art_text, path = _render_screen_art(png_bytes, sid, chars, color, glyph)
+    COMPUTER_SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(art_text, encoding="utf-8")
+    return result, path
+
+
+def _write_art_best_effort(
+    png_bytes: bytes, sid: str, chars: int, color: bool, glyph: GlyphStyle = GLYPH_MIX
+) -> Path | None:
+    """The `.art` sibling for a `screenshot`, or None when it could not be made.
+
+    Best effort on purpose: the screenshot's pixels are the deliverable, so any
+    decode / render / write problem (an undecodable PNG, a full disk, a
+    read-only home) costs the art file and nothing else — never the capture.
+    """
+    try:
+        _result, path = _write_art(png_bytes, sid, chars, color, glyph)
+    except Exception:
+        return None
+    return path
+
+
+def _art_result(meta: dict[str, str], body: str, path: Path) -> str:
+    header = (
+        f"Screen art captured ({meta['source']} -> {meta['grid']} chars, "
+        f"{_ART_MODE_LABELS[meta['mode']]}).\n"
+        f"Saved to: {path}\n"
+        "Click coordinates still come from the screenshot action.\n"
+    )
+    lines = body.split("\n")
+    preview, shown = _fit_preview(lines, len(header) + _RESULT_OVERHEAD)
+    result = (
+        header
+        + f"Full art: read that file with `cat`. Preview (first {shown} rows):\n"
+        + "\n".join(preview)
+    )
+    if len(lines) > shown:
+        result += f"\n… {len(lines) - shown} more rows are in the file above."
+    return result
+
+
+#: Worst case for the closing "… N more rows" line and the preview caption.
+_RESULT_OVERHEAD = 120
+
+
+def _fit_preview(lines: list[str], used: int) -> tuple[list[str], int]:
+    budget = _ART_RESULT_LIMIT - used
+    chosen: list[str] = []
+    total = 0
+    for line in lines[:_ART_PREVIEW_ROWS]:
+        cost = len(line) + 1
+        if total + cost > budget:
+            break
+        chosen.append(line)
+        total += cost
+    return chosen, len(chosen)

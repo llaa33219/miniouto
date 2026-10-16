@@ -16,7 +16,7 @@ from rich.console import Console
 
 from ..storage import sessions as session_store
 from ..storage.sessions import STATUS_DONE, STATUS_INTERRUPTED
-from . import providers, repetition, subagents
+from . import inbox, providers, repetition, summary
 from .context import get_max_output_tokens
 from .events import STREAM_TEXT, STREAM_THINKING, EventSink, LoopEvent, NullSink, StreamKind
 from .runtime import (
@@ -25,12 +25,8 @@ from .runtime import (
     LoopCancelledError,
     LoopRepeatedError,
     build_runtime,
-    current_subagent_depth,
-    current_subagent_id,
-    current_subagent_name,
     resolve_runtime_from_settings,
     sanitize_history,
-    set_subagent_observer,
     supervised_run,
 )
 
@@ -56,6 +52,8 @@ class ChatOptions:
     provider: str | None = None
     model: str | None = None
     style: str | None = None
+    # Role mode: run AS one of the style's named subagent specs (spawn only).
+    role: str | None = None
     subagent_provider: str | None = None
     subagent_model: str | None = None
     max_tokens: int | None = None
@@ -67,36 +65,59 @@ class ChatOptions:
     cancel_event: threading.Event | None = None
 
 
-def _actor_label() -> tuple[str, str | None]:
-    """Return (actor_label, subagent_id) for the current hook context.
+# The one actor a process supervises. Delegation is cross-process now, so
+# there is no per-invocation identity to attribute hooks to; a spawned run's
+# own process owns its own "outo".
+_OUTO = ("outo", None)
 
-    Inside a subagent invocation the id ContextVar is always set, so the
-    label is `<name>-<6hex>` (name comes from the named subagent persona
-    in the style; legacy single `<subagent>` blocks resolve to the name
-    `"subagent"`, which preserves the old `subagent-<sid>` display).
-    The depth-only fallback exists solely for defensive robustness (the
-    vars are set together in the wrapper).
+
+def _actor_label() -> tuple[str, str | None]:
+    """Return (actor_label, subagent_id) — always `("outo", None)` now."""
+
+    return _OUTO
+
+
+class _StopOnHandoff(threading.Event):
+    """The turn's cancel event, also set when the turn hands off to a new session.
+
+    `runtime.build_runtime` registers its cancel guard only when it is handed
+    an event at all, so one is always passed: `is_set()` ORs the caller's
+    event (the TUI's ESC ESC) with this class's own hand-off flag. An unset
+    flag is a no-op for the guard, for `supervised_run`'s poll and for the
+    Bash cancel poll, so a turn that never hands off behaves exactly as
+    before.
+
+    The hand-off must end the loop rather than let the model burn the rest
+    of its context on work the new session is about to redo — but a
+    hand-off is not a failure or a user stop, so it travels the ordinary
+    cancel path (`LoopCancelledError`) and is re-classified at the call
+    site into a clean, "done" turn.
     """
 
-    sid = current_subagent_id()
-    if sid:
-        name = current_subagent_name() or "subagent"
-        return f"{name}-{sid}", sid
-    if current_subagent_depth() > 0:
-        return "subagent", None
-    return "outo", None
+    def __init__(self, caller: threading.Event | None) -> None:
+        super().__init__()
+        self._caller = caller
+        self._handoff = False
+
+    def handoff(self) -> None:
+        self._handoff = True
+
+    def is_set(self) -> bool:
+        return (
+            self._handoff
+            or super().is_set()
+            or (self._caller is not None and self._caller.is_set())
+        )
 
 
 def _note_repetition_text(actor_key: str, text: str) -> None:
-    """Feed model text to the phrase detector; a looping job is cancelled.
+    """Feed model text to the phrase detector; the verdict stays sticky.
 
-    A background job has no supervisor, so a trip is enforced by cancelling
-    it (see `core.repetition.cancel_background_loop`); for outo the verdict
-    simply stays sticky until the supervisor polls it.
+    Enforcement belongs to `runtime.supervised_run`, which polls the verdict
+    and resumes the attempt with the alarm.
     """
 
     repetition.note_text(actor_key, text)
-    repetition.cancel_background_loop(actor_key)
 
 
 class _RecordingSink:
@@ -287,6 +308,7 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
             provider=opts.provider,
             model=opts.model,
             style=opts.style,
+            role=opts.role,
             subagent_provider=opts.subagent_provider,
             subagent_model=opts.subagent_model,
         )
@@ -333,33 +355,27 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
 
     on_tool_call = _make_tool_call_dispatcher(sink, turn_refs)
 
+    stop = _StopOnHandoff(opts.cancel_event)
+    on_tool_result = _make_tool_result_dispatcher(sink, turn_refs, on_handoff=stop.handoff)
+
     base_on_iteration = _make_iteration_dispatcher(
         sink, pending_responses, pending_thinking, turn_refs, stream_partials
     )
 
     def on_iteration(*, iteration: int, messages: Any, response: Any) -> None:
         base_on_iteration(iteration=iteration, messages=messages, response=response)
-        # Hooks are global — a subagent's iterations fire this too, but
-        # their transcript is not the session's restorable history.
-        if current_subagent_depth() == 0:
-            persister.persist_history(messages)
+        persister.persist_history(messages)
 
     def on_history_repair(messages: Any) -> None:
         # The 400/422 repair hook mutates the live list in place; without
         # this bridge the fix would be in-memory only and the NEXT turn
-        # would reload the same poisoned history from disk (and 400
-        # again). Depth-gated like on_iteration: a subagent's repaired
-        # transcript is not the session's history.
-        if current_subagent_depth() == 0:
-            persister.persist_history(messages)
+        # would reload the same poisoned history from disk (and 400 again).
+        persister.persist_history(messages)
 
     def on_messages_removed(msg_refs: list[str]) -> None:
         # The repair also REMOVED messages; drop their events so the
-        # record matches what the model still has. Depth-gated for the
-        # same reason as on_history_repair: a subagent's transcript is
-        # not this session's record.
-        if current_subagent_depth() == 0:
-            sink.remove_events(msg_refs)
+        # record matches what the model still has.
+        sink.remove_events(msg_refs)
 
     agent = build_runtime(
         runtime,
@@ -373,28 +389,43 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
         on_provider_error=_make_provider_error_dispatcher(sink),
         on_history_repair=on_history_repair,
         on_messages_removed=on_messages_removed,
-        on_alarms=_make_alarm_dispatcher(sink),
-        on_tool_result=_make_tool_result_dispatcher(sink, turn_refs),
+        on_inbox_messages=_make_alarm_dispatcher(sink),
+        on_tool_result=on_tool_result,
         reasoning=opts.reasoning,
-        cancel_event=opts.cancel_event,
+        cancel_event=stop,
     )
 
     with _tool_trace_lock:
         _tool_trace.clear()
 
-    set_subagent_observer(_make_subagent_dispatcher(sink))
     sink.begin_working()
     try:
         try:
             response = asyncio.run(
                 _run_with_watchdog(
                     agent, opts.prompt, core_msgs,
-                    sink=sink, cancel_event=opts.cancel_event,
+                    sink=sink, cancel_event=stop,
                     on_removed=sink.remove_events,
                     partials=stream_partials,
                 )
             )
         except LoopCancelledError:
+            handed_off = summary.pending_handoff()
+            if handed_off is not None:
+                # The `continue_session` tool stopped the loop on purpose.
+                # That is a completed turn, not a cancelled one: the hand-off
+                # stays PENDING for the entry layer (which performs the session
+                # transition) and the incrementally persisted history is kept.
+                final = (
+                    f"Summary documents left in {handed_off.summary_dir}; "
+                    f"work handed off to new session '{handed_off.new_session}'."
+                )
+                _finish_turn(
+                    session_name, None, opts, sink,
+                    status=STATUS_DONE, assistant=final,
+                )
+                sink.emit_final_answer(final, session_name)
+                return final
             # User force-stopped the loop — a clean cancel, not a failure:
             # persist the turn but skip the failure diagnostics dump.
             sink.end_working()
@@ -429,7 +460,6 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
             raise
     finally:
         sink.end_working()
-        set_subagent_observer(None)
 
     final = response.content
     _finish_turn(session_name, response, opts, sink, status=STATUS_DONE, assistant=final)
@@ -486,10 +516,8 @@ async def _run_with_watchdog(
 ) -> co.Response:
     """Run outo's turn under the stall watchdog — see runtime.supervised_run.
 
-    Level 0 supervisor: it defers to any active subagent supervisor, so a
-    wedged subagent is recovered in place (its own sanitized transcript)
-    instead of taking the whole turn down. Emits `watchdog:` loop events
-    on each wakeup and wires the user's cancel_event into the fast path.
+    The process's only supervisor: it emits `watchdog:` loop events on each
+    wakeup and wires the user's cancel_event into the fast path.
     It also supervises repetition (`core.repetition`) for the "outo" actor:
     a looping model is force-stopped and resumed with the `[SYSTEM ALARM]`
     as its new user message, which the alarm loop event below renders.
@@ -540,7 +568,6 @@ async def _run_with_watchdog(
         prompt,
         history,
         live_key="outo",
-        level=0,
         on_wakeup=on_wakeup,
         on_repetition=on_repetition,
         restart_on_repetition="outo",
@@ -631,6 +658,9 @@ def _coerce_dumped_tool_args(dumped: dict[str, Any]) -> None:
                 tc["arguments"] = {}
 
 
+_LOGGABLE_TOOL_NAMES = ("Bash", "Image", "Video", "Audio", "Computer", "continue_session")
+
+
 def _make_tool_call_dispatcher(sink: EventSink, refs: dict[str, str]):
     """Build the per-tool-call callback wired into the BEFORE_TOOL_CALL hook.
 
@@ -646,23 +676,13 @@ def _make_tool_call_dispatcher(sink: EventSink, refs: dict[str, str]):
         _validate_tool_call_args(name, arguments)
         actor, sid = _actor_label()
 
-        # Before every skip branch below: a `call_subagent` that returns
-        # early (the subagent observer owns that line) is still a tool call
-        # outo made, and a model re-spawning the same brief forever must
-        # trip. The subagent's own internal calls carry the job's sid.
         actor_key = sid or "outo"
         repetition.note_tool_call(actor_key, name, arguments)
-        repetition.cancel_background_loop(actor_key)
 
         with _tool_trace_lock:
             _tool_trace.append({"name": name, "arguments": dict(arguments or {})})
 
-        if name == "call_subagent":
-            # No event here: the subagent observer emits `subagent_start`
-            # with the minted id right after, which is the canonical line
-            # (`subagent-<6hex>: <task preview>`) in both CLI and TUI.
-            return
-        if name in ("Bash", "Image", "Video", "Audio", "Computer"):
+        if name in _LOGGABLE_TOOL_NAMES:
             preview = _short_arg_summary(name, arguments)
             # detail carries the FULL untruncated command for Bash (the
             # preview flattens newlines; the TUI detail view wants the
@@ -685,32 +705,39 @@ def _make_tool_call_dispatcher(sink: EventSink, refs: dict[str, str]):
     return on_tool_call
 
 
-_TOOL_RESULT_NAMES = ("Bash", "Image", "Video", "Audio", "Computer")
+_TOOL_RESULT_NAMES = ("Bash", "Image", "Video", "Audio", "Computer", "continue_session")
 _TOOL_RESULT_MAX = 4000
 
 
-def _make_tool_result_dispatcher(sink: EventSink, refs: dict[str, str]):
+def _make_tool_result_dispatcher(
+    sink: EventSink, refs: dict[str, str], on_handoff: Callable[[], None] | None = None
+):
     """Build the per-tool-result callback wired into the AFTER_TOOL_CALL hook.
 
     coreouto fires AFTER_TOOL_CALL with the handler's ToolResult, so this
     is the only place a sink can see tool return values. Emits a
     `LoopEvent(kind="tool_result")` whose text is the flattened result
-    (prefixed with "error: " on failure, mirroring the subagent_end
-    convention the TUI keys on), truncated to 4000 chars. `call_subagent`
-    is skipped — the subagent observer's `subagent_end` event already
-    carries that result. The dispatcher must never raise: a sink failure
-    here must not break the agent loop.
+    (prefixed with "error: " on failure), truncated to 4000 chars. The
+    dispatcher must never raise: a sink failure here must not break the
+    agent loop.
 
     The result carries the SAME `msg_ref` as the `tool` event it answers
     (the assistant message that issued the call) — that is what makes
     pruning safe: a removed message takes its call and its result
     together, so the TUI can never be left with a result row whose call
     row is gone.
+
+    `on_handoff` is called when a tool call left a pending session
+    hand-off behind. AFTER_TOOL_CALL is the first hook that fires AFTER
+    the handler ran, which is what the stop needs: the loop must not
+    schedule another LLM call once the work has moved to a new session.
     """
 
     def on_tool_result(name: str, result: Any) -> None:
         try:
-            if name == "call_subagent" or name not in _TOOL_RESULT_NAMES:
+            if on_handoff is not None and summary.pending_handoff() is not None:
+                on_handoff()
+            if name not in _TOOL_RESULT_NAMES:
                 return
             text = result.flatten_text()
             if result.is_error:
@@ -734,85 +761,32 @@ def _make_tool_result_dispatcher(sink: EventSink, refs: dict[str, str]):
     return on_tool_result
 
 
-def _make_subagent_dispatcher(sink: EventSink):
-    """Build the subagent lifecycle callback for `set_subagent_observer`.
-
-    Receives (phase, sid, name, text) from the wrapped `call_subagent`
-    handler — "start" carries the task brief, "wakeup" a supervisor
-    restart notice, "end" the final result or error. `name` is the named
-    subagent persona from the active style (legacy `<subagent>` blocks
-    resolve to the name `"subagent"`, which preserves the old
-    `subagent-<sid>` display). This is the only place the minted subagent
-    id exists at event level; the BEFORE_TOOL_CALL hook for `call_subagent`
-    itself still runs in the parent context and never sees the id.
-    """
-
-    def on_subagent(phase: str, sid: str, name: str, text: str) -> None:
-        actor = f"{name}-{sid}"
-        # The full text goes into the event (and thus the session turn and
-        # the TUI detail screen); sinks truncate for their own display.
-        if phase == "start":
-            sink.emit_loop_event(
-                LoopEvent(
-                    actor=actor,
-                    kind="subagent_start",
-                    text=text,
-                    tool_name="call_subagent",
-                    subagent_id=sid,
-                    subagent_name=name,
-                )
-            )
-            sink.update_activity(actor)
-        elif phase == "wakeup":
-            # The subagent's own supervisor restarted it after a stall —
-            # surfaced as a watchdog event attributed to the invocation.
-            sink.emit_loop_event(
-                LoopEvent(
-                    actor=actor,
-                    kind="wakeup",
-                    text=text,
-                    subagent_id=sid,
-                    subagent_name=name,
-                )
-            )
-        else:
-            sink.emit_loop_event(
-                LoopEvent(
-                    actor=actor,
-                    kind="subagent_end",
-                    text=text or "done",
-                    subagent_id=sid,
-                    subagent_name=name,
-                )
-            )
-
-    return on_subagent
-
-
 def _make_alarm_dispatcher(sink: EventSink):
-    """Build the callback the BEFORE_LLM_CALL alarm hook forwards alarms to.
+    """Build the callback the BEFORE_LLM_CALL inbox hook forwards messages to.
 
-    The hook (runtime._make_alarm_hook) already put the alarm text into the
-    model's live message list; this only records it. One `alarm` loop event
-    per drained alarm, attributed to the finished job's `name-sid` identity
-    but emitted on outo's `actor` line — it is outo's own next input, not the
-    subagent speaking. The TUI matches the `subagent_id` against its running
-    subagent rows to close them out.
+    The hook (`runtime._make_alarm_hook`) already put each drained text into
+    the model's live message list; this only records it. One loop event per
+    drained `inbox.InboxMessage`, on outo's `actor` line — it is outo's own
+    next input, not a spawned process speaking. `kind` mirrors the inbox
+    kind (`alarm` / `user`), and `detail="inbox:<id>"` is the de-duplication
+    handle a display layer uses to skip a message it already showed
+    optimistically when the spawn was requested.
     """
 
-    def on_alarms(alarms: list[subagents.Alarm]) -> None:
-        for alarm in alarms:
+    def on_inbox_messages(messages: list[inbox.InboxMessage]) -> None:
+        for message in messages:
             sink.emit_loop_event(
                 LoopEvent(
                     actor="outo",
-                    kind="alarm",
-                    text=alarm.text,
-                    subagent_id=alarm.sid,
-                    subagent_name=alarm.name,
+                    kind=message.kind,
+                    text=message.text,
+                    subagent_id=message.meta.get("id"),
+                    subagent_name=message.meta.get("role"),
+                    detail=f"inbox:{message.id}",
                 )
             )
 
-    return on_alarms
+    return on_inbox_messages
 
 
 def _make_thinking_dispatcher(
@@ -913,7 +887,7 @@ def _make_stream_dispatcher(
     """
 
     def on_stream_delta(delta: str) -> None:
-        if not delta or current_subagent_depth() > 0:
+        if not delta:
             return
         _, sid = _actor_label()
         actor_key = sid or "outo"
@@ -1107,8 +1081,12 @@ def _dump_failure_diagnostics(exc: BaseException, session_name: str) -> None:
         for entry in recent[-5:]:
             name = entry.get("name")
             args = entry.get("arguments") or {}
-            summary = _short_arg_summary(name, args) if name in _LOGGABLE_TOOL_NAMES else repr(args)[:160]
-            _fail_console.print(f"  - {name}: {summary}")
+            arg_summary = (
+                _short_arg_summary(name, args)
+                if name in _LOGGABLE_TOOL_NAMES
+                else repr(args)[:160]
+            )
+            _fail_console.print(f"  - {name}: {arg_summary}")
     else:
         _fail_console.print(
             "[red]No tool call was observed before the failure — the error "
@@ -1179,11 +1157,6 @@ def _load_coreouto_history(session: str, continue_session: bool) -> list[co.Mess
     return out or None
 
 
-_LOGGABLE_TOOL_NAMES = (
-    "Bash", "Image", "Video", "Audio", "Computer", "call_subagent"
-)
-
-
 def _validate_tool_call_args(name: str, arguments: Any) -> None:
     """Reject malformed tool calls early with a clear, attributable error.
 
@@ -1227,6 +1200,8 @@ def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
         return cmd
     if name in ("Image", "Video", "Audio"):
         return args.get("file_path", "?")
+    if name == "continue_session":
+        return args.get("summary_dir", "?")
     if name == "Computer":
         parts = [str(args.get("action") or "?")]
         scr = args.get("screen")
@@ -1239,11 +1214,4 @@ def _short_arg_summary(name: str, args: dict[str, Any]) -> str:
         if text:
             parts.append(str(text).replace("\n", " ")[:80])
         return " ".join(parts)
-    if name == "call_subagent":
-        label = args.get("name") or "subagent"
-        task = args.get("task")
-        preview = " ".join(task.split()) if isinstance(task, str) else ""
-        if len(preview) > 80:
-            preview = preview[:80] + "…"
-        return f"{label} {preview}" if preview else label
     return str(args)[:120]

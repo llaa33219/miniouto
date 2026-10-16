@@ -2,6 +2,39 @@
 
 Notes for working on miniouto itself.
 
+## Development environment
+
+Two rules, both non-negotiable:
+
+**1. Always work inside the uv-managed venv.** `uv sync` creates/updates `.venv/`, and every command goes through it:
+
+```bash
+uv sync
+uv run pytest
+uv run miniouto status
+# or call the venv's binaries directly:
+.venv/bin/python -m pytest
+.venv/bin/miniouto chat "hello"
+```
+
+Never run a system `python`, `pip install -e .`, or a bare `pytest` against this checkout. The dependency resolution (including `coreouto[all]` and `py-Vwayland`) is defined by `uv.lock` and only exists inside `.venv/`; a system interpreter silently runs against a different, unpinned set of packages.
+
+**2. Keep `uv.lock` fresh and commit it.** Whenever `pyproject.toml` dependencies change:
+
+```bash
+uv lock                          # re-resolve everything
+uv lock --upgrade-package typer  # refresh a single package
+uv sync                          # apply the new lock to .venv/
+```
+
+Commit `uv.lock` **in the same change** as the `pyproject.toml` edit — a stale lockfile silently reinstalls the old resolution on the next `uv sync`. Never hand-edit `uv.lock`.
+
+To lint, use `uvx` (ruff is intentionally *not* in the project's dependency groups, so `uv run ruff` will not resolve):
+
+```bash
+uvx ruff check src/ tests/
+```
+
 ## Install
 
 ```bash
@@ -18,7 +51,7 @@ uv tool install --editable . --force
 uv tool install .
 ```
 
-`uv` is the recommended package manager (matches `uv.lock`). Standard `pip install -e .` works too but won't pick up the lockfile.
+`uv` is the required package manager (it owns `uv.lock`). A plain `pip install -e .` works for a one-off smoke test but ignores the lockfile and the venv — don't develop that way.
 
 ## Project structure
 
@@ -30,10 +63,10 @@ miniouto/
 ├── logo.svg
 ├── docs/                   # ← this directory
 └── src/miniouto/           # src-layout package
-    ├── cli/                # Typer commands + Textual TUI
-    ├── core/               # chat loop + runtime
+    ├── cli/                # Typer commands + Textual TUI (incl. chat.py, message.py, computer.py)
+    ├── core/               # chat loop + runtime (incl. inbox.py, spawn_state.py)
     ├── storage/            # filesystem persistence
-    ├── tools/              # Bash + media loaders
+    ├── tools/              # Bash + media loaders + Computer
     ├── default_style/      # bundled .md prompt templates
     ├── __init__.py         # __version__ only
     ├── paths_runtime.py    # INVOCATION_CWD
@@ -49,13 +82,14 @@ miniouto/
 
 | Package | Min version | Role |
 |---|---|---|
-| `coreouto[all]` | 0.9.0 | Agent loop, providers, tools, hooks |
+| `coreouto[all]` | 0.11.3 | Agent loop, providers, tools, hooks |
 | `typer` | 0.12.0 | CLI framework |
 | `rich` | 13.7.0 | Terminal output, tables, markdown |
 | `textual` | 0.80.0 | TUI framework |
 | `pydantic` | 2.0 | Data models |
 | `httpx` | 0.27.0 | HTTP client (lma REST client + style repo fetcher) |
 | `tomli-w` | 1.0.0 | TOML serializer |
+| `py-Vwayland` | 0.1.0 | Bundled virtual-display compositor behind the Computer tool |
 
 The `[all]` extra on `coreouto` pulls in all four provider SDKs (openai, openai-response, anthropic, google).
 
@@ -77,41 +111,40 @@ ignore = ["E501"]
 Run:
 
 ```bash
-ruff check src/
-ruff format src/        # not configured in pyproject, but works
+uvx ruff check src/ tests/
 ```
+
+Use `uvx`, not `uv run ruff` — ruff is not in the `[dependency-groups]` in `pyproject.toml`, so `uv run ruff` fails to resolve. `ruff format` is not configured in `pyproject` but works (`uvx ruff format src/`).
 
 `E501` (line too long) is ignored because `coreouto`'s dataclasses and several JSON schemas produce long lines.
 
 ## Tests
 
-**There are currently no tests.** The `src/` layout reserves space for `tests/` (referenced in `pyproject.toml`'s `tool.ruff.src`) but no test files exist.
-
-Suggested testing setup:
+The suite is ~301 tests and must stay green:
 
 ```bash
-uv add --dev pytest pytest-asyncio respx
-mkdir -p tests
+uv run pytest
+uv run pytest tests/test_chat_delegation.py -v
 ```
 
-Suggested test priorities (in order):
+Where to start reading, in rough order of usefulness as orientation:
 
-1. `tools/edit.py` — exact match, ambiguity, overlap, fuzzy fallback, empty edits. (Highest value: most rules, easiest to break with refactors.)
-2. `tools/write.py` — refuse overwrite, atomic write, content length cap.
-3. `core/context.py` — `make_summarize_hook`'s non-list guard. The divergence from `coreouto.contrib.hooks.auto_summarize_hook` is the most fragile bit.
-4. `storage/styles.py` — `parse_style` edge cases (missing `<outo>`, nested tags, legacy `<subagent>`, duplicate names, zero-tag outo-only styles). `tests/test_styles.py` exists and covers the basics; extend it as new edge cases appear.
-5. `core/chat.py` — `ToolCallArgsError` path; `_dump_failure_diagnostics` output.
-6. `cli/provider.py` — `add`/`list`/`remove`/`default` happy + sad paths.
+1. `tests/test_inbox.py` — the cross-process message store every alarm and `miniouto message insert` goes through.
+2. `tests/test_chat_delegation.py` — the delegation flag surface, answer files, alarm text, `--bg` argv reconstruction.
+3. `tests/test_tui_navigation.py` — TUI paging, jump-to-bottom, and the width-capped chat column.
+4. `tests/test_message_cli.py`, `tests/test_computer_art.py`, `tests/test_ascii_art.py` — the CLI surfaces.
+5. `tests/test_styles.py` — `parse_style` edge cases (missing `<outo>`, nested tags, legacy `<subagent>`, duplicate names, zero-role styles).
+6. `tests/test_no_call_subagent.py` — guards the deleted in-process delegation tool; keep it passing.
 
-`respx` is recommended for mocking `httpx` calls to `lma.blp.sh` and the style repo fetchers.
+`respx` is useful for mocking `httpx` calls to `lma.blp.sh` and the style repo fetchers if you extend the suite.
 
 ## Build
 
 ```bash
-uv build          # produces dist/miniouto-0.1.1-py3-none-any.whl
+uv build          # produces dist/miniouto-<version>-py3-none-any.whl (+ sdist)
 ```
 
-Build backend: `hatchling`. Wheel packages: `["src/miniouto"]`.
+Build backend: `hatchling`. Wheel packages: `["src/miniouto"]`. The console script is `miniouto = "miniouto.cli:app"`, so the built wheel installs a `miniouto` command.
 
 ## Release
 
@@ -174,7 +207,7 @@ miniouto chat "list the files" 2>debug.log
 
 ### I want to inspect the resolved runtime
 
-Add a `print` at the end of `core/runtime.py:build_runtime` to dump `outo_config` and `subagent_config` dicts.
+Add a `print` at the end of `core/runtime.py:build_runtime` to dump the resolved `outo_config` (there is no second `subagent_config` anymore — a spawned run resolves its own runtime in its own process).
 
 ### I want to test a config without polluting `~/.miniouto/`
 
@@ -206,11 +239,11 @@ Then visit the printed URL.
 
 ## Known sharp edges (the easy-to-miss stuff)
 
-1. **Test coverage is uneven.** `tests/` covers `parse_style` plus a set of runtime/storage/subagent cases; `tools/bash.py` and `core/context.py:make_summarize_hook` are still untested. Run `uv run pytest` before assuming a change is safe.
+1. **Test coverage is uneven.** `tests/` (~476 tests) covers inbox, delegation, message CLI, computer art, TUI navigation, styles, the summary hand-off (`test_handoff.py`), and a set of runtime/storage cases; `tools/bash.py` is still untested. Run `uv run pytest` before assuming a change is safe.
 2. **`tui/` and `utils/` are empty.** They look like package directories but contain no code. Don't add modules there without first deciding whether the contents should be moved into the proper package (TUI lives in `cli/tui.py`, utilities are scattered).
 3. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
 4. **`continue_loop` tool is referenced in every bundled style** but **not** registered in `tools/registry.py`. Models currently improvise. To enable, register a no-op `continue_loop` handler and add the name to `core/runtime.BASE_TOOLS`.
-5. **`core/runtime.py:_SUBAGENT_DEPTH` / `_SUBAGENT_NAME` / `_SUBAGENT_ID`** are three module-level `ContextVar`s set by `core/subagents.py:_enter_context` at the top of a background job's own asyncio task (reset in `_exit_context`). They carry the depth, persona name, and 6-hex id of the running job. If you add new async tools that themselves spawn subagents, route them through `core/subagents.py:submit` so the id minting, actor labels, and the completion alarm stay in one place. Note there is **no** per-job supervisor: a background job runs without `supervised_run`.
+5. **There is no in-process subagent engine.** The old `core/subagents.py` job registry, its `ContextVar`s, and the `call_subagent` tool are gone — `tests/test_no_call_subagent.py` guards against the tool returning. Delegation is `miniouto chat "<brief>" --style <style> --role <tag>` (see `cli/chat.py`) plus the cross-process inbox (`core/inbox.py`) — there is no second command and no second runtime path. A delegated run's bookkeeping rides on the inbox message's `meta` (`id`, `role`), not on ContextVars, so there is nothing in-process to attribute; the run gets the full `supervised_run` treatment inside its own process.
 6. **`tools/registry.py:_register_if_missing` accepts but silently discards the `schema` parameter** — the `_xxx_schema()` dicts are computed at registration time but never passed to `coreouto.register_tool`. Only the handler's Python type hints and the `description` string reach the model. The schema dicts are effectively dead code; do not rely on them affecting model behavior.
 
 ## Common modifications
@@ -248,4 +281,4 @@ Only one place: `src/miniouto/storage/paths.py`. Update the `ROOT` constant to r
 - Don't add new top-level dependencies without discussion. `coreouto`, `typer`, `rich`, `textual`, `pydantic`, `httpx`, `tomli-w` is the entire runtime footprint.
 - Don't refactor while fixing — open separate PRs.
 - If you change a tool's behavior, update the corresponding `_<name>_description` in `tools/registry.py` (the description is what the LLM sees).
-- If you change a style's structure, re-test all three bundled templates for consistency.
+- If you change a style's structure, re-test all five bundled templates for consistency.

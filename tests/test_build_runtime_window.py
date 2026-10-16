@@ -3,10 +3,9 @@
 `clear_coreouto_state()` wipes coreouto's global provider/preset/tool/hook
 registries. Anything slow that runs *inside* that window (style file I/O, lma
 lookups for the output cap, lma lookups for reasoning options) leaves the
-registries empty for as long as it takes — and a background subagent job
-resolves its provider and tools by NAME at `call()` entry. So every slow
-resolution must be hoisted above the clear, and the window itself must be pure
-in-memory dict operations.
+registries empty for as long as it takes. So every slow resolution must be
+hoisted above the clear, and the window itself must be pure in-memory dict
+operations.
 
 Also covered: a `run_chat` that dies during resolve/build must not leave the
 previous turn's global hooks (which close over the previous sink/persister)
@@ -36,7 +35,7 @@ def _install_provider() -> str:
             base_url="http://127.0.0.1:9/v1",
             api_key="k",
             default_model="m",
-            # Set so make_summarize_hook resolves the window from the
+            # Set so the context monitor resolves the window from the
             # override instead of hitting lma.
             max_context_window=200_000,
         )
@@ -73,11 +72,12 @@ def test_slow_resolution_completes_before_the_clear(monkeypatch: pytest.MonkeyPa
         rt.RuntimeConfig(provider_name=name, model="m", style_name="probe", session="probe")
     )
 
-    # Then: the style I/O and both lma lookups landed before the clear
-    assert "clear" in timeline
+    # Then: the last remaining lma lookup landed before the clear, and the
+    # clear itself happens exactly once
+    assert timeline.count("clear") == 1
     clear_at = timeline.index("clear")
-    assert "max_tokens" in timeline[:clear_at]
-    assert timeline.count("reasoning:m:probe") == 2
+    assert timeline.count("reasoning:m:probe") == 1
+    assert "reasoning:m:probe" in timeline[:clear_at]
 
 
 def test_registration_effects_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,11 +97,13 @@ def test_registration_effects_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> 
         rt.RuntimeConfig(provider_name=name, model="m", style_name="probe", session="probe")
     )
 
-    # Then: provider, tools, both presets and the subagent tool all registered
+    # Then: provider, tools and the single preset registered — and NO
+    # delegation tool survives anywhere in the registry
     assert co.get_agent_preset("outo") is not None
-    assert co.get_agent_preset("subagent") is not None
     assert co.get_tool("Bash") is not None
-    assert co.get_tool(rt.SUBAGENT_TOOL_NAME) is not None
+    assert co.get_tool("call_subagent") is None
+    with pytest.raises(KeyError):
+        co.get_agent_preset("subagent")
 
 
 def test_failed_resolve_leaves_no_stale_hooks(monkeypatch: pytest.MonkeyPatch) -> None:

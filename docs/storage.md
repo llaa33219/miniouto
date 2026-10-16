@@ -9,7 +9,9 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 ```
 ~/.miniouto/                      (or $MINIOUTO_HOME)
 ├── providers.toml                # provider configurations (one top-level TOML table per provider)
-├── settings.toml                 # active provider / model / style / session / theme
+├── settings.toml                 # GLOBAL DEFAULT provider / style / session / theme (+ subagent_*)
+├── session-config/
+│   └── <session>.toml            # that session's PINNED provider trio (outo + subagent)
 ├── style_repos.toml              # recorded repo URLs added via `style add` (re-fetched by `style update`)
 ├── style/
 │   ├── default.md                # seeded + force-refreshed from src/miniouto/default_style/default.md
@@ -20,11 +22,32 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 ├── sessions/
 │   └── <name>.json               # conversation history per session
 ├── subagent-results/
-│   └── <sid>-<YYYY-MM-DD-HH-MM>.md   # one markdown file per finished background subagent job
+│   └── <id>-<YYYY-MM-DD-HH-MM>.md   # one markdown file per finished delegated `chat` run
+├── inbox/
+│   └── <session>/                # cross-process messages (core/inbox.py)
+│       └── <YYYYMMDD-HHMMSSffffff>-<6hex>.json
+├── spawn-logs/
+│   ├── <id>.json                 # liveness marker for a detached `chat --bg` run (core/spawn_state.py)
+│   └── <id>.log                  # that run's stdout+stderr (only for --bg)
+├── computer-screens/
+│   └── <screen>-<YYYY-MM-DD-HH-MM-SS>.art   # screen captures from the Computer tool
+│                                         # (action="screen"; action="screenshot" writes the
+│                                         # same art best-effort as a sibling of its capture)
 └── logs/                         # reserved (currently unused by code)
 ```
 
-Skills live **outside** `~/.miniouto/` at `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention). See `docs/skills.md`.
+Skills live **outside** `~/.miniouto/`, in two default roots: the invocation directory's `./skills/<name>/SKILL.md` (project-local, first) and `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention). `storage.skills.list_skills(None)` reads both in that order; `list_skills(directory)` reads a named root — that is how a style's `{skills:<dir>…}` token lists project-local or Claude-style skill directories; only the default root is the harness-wide convention. See `docs/skills.md`.
+
+One more tree lives **outside** `~/.miniouto/` as well, and **project-local by design** — summary documents, under the directory miniouto was invoked from:
+
+```
+<cwd>/.miniouto/summary/          ← NOT under ~/.miniouto/, and not under MINIOUTO_HOME
+└── <session>/
+    ├── 00-overview.md            # required
+    └── NN-<topic>.md             # optional, any number
+```
+
+The harness itself never writes here: the **model** writes these files with `Bash` when the summary request arrives (`core/summary.py:summary_dir_for` → `<INVOCATION_CWD>/.miniouto/summary/<session>/`), and `continue_session` only validates the folder. It is project-local on purpose so a summary can be read, reviewed and committed with the work it describes. Nothing else may write there.
 
 ## Path constants
 
@@ -39,10 +62,14 @@ STYLE_REPOS_FILE   = ROOT / "style_repos.toml"
 SESSION_DIR        = ROOT / "sessions"
 SUBAGENT_RESULTS_DIR = ROOT / "subagent-results"
 LOG_DIR            = ROOT / "logs"
+INBOX_DIR          = ROOT / "inbox"
+SPAWN_LOG_DIR      = ROOT / "spawn-logs"
+COMPUTER_SCREENS_DIR = ROOT / "computer-screens"
+SESSION_CONFIG_DIR  = ROOT / "session-config"
 ```
 
 `ensure_dirs()` (called by the CLI root callback before every command):
-1. Creates `ROOT`, `STYLE_DIR`, `SESSION_DIR`, `SUBAGENT_RESULTS_DIR`, `LOG_DIR` if missing.
+1. Creates `ROOT`, `STYLE_DIR`, `SESSION_DIR`, `SUBAGENT_RESULTS_DIR`, `LOG_DIR`, `INBOX_DIR`, `SPAWN_LOG_DIR`, `COMPUTER_SCREENS_DIR`, `SESSION_CONFIG_DIR` if missing.
 2. For every `*.md` in the bundled `src/miniouto/default_style/` package data, overwrites the matching `STYLE_DIR/<name>.md` with the current bundled content **whenever the content differs** — bundled templates are force-refreshed, so editing a bundled style in place does not survive a reinstall/relaunch. To customize a bundled style, copy it to a new name. Files whose names do not match a bundled template are left untouched.
 
 ## File format schemas
@@ -60,7 +87,7 @@ api_format = "openai"          # one of: openai, openai-response, anthropic, goo
 source = "custom"              # "custom" (manual) or "lma" (added from the catalog)
 base_url = "https://api.openai.com/v1"   # empty values are omitted on write; defaulted on read
 api_key = "sk-..."
-default_model = "gpt-5.5"      # used when chat --model is not given
+default_model = "gpt-5.5"      # used when neither chat --pm nor the session pin names a model
 
 [anthropic]
 name = "anthropic"
@@ -68,8 +95,9 @@ api_format = "anthropic"
 source = "lma"                 # added via `provider add Anthropic …`
 default_model = "claude-opus-4.5"
 
-# Optional per-provider model-cap overrides (set via the TUI custom-model
-# editor). When present they win over anything lma reports for the
+# Optional per-provider model-cap overrides (set when the provider is added,
+# via the TUI `+ add custom…` wizard, or by hand here). When present they win
+# over anything lma reports for the
 # default_model — useful for custom providers lma has never heard of.
 # Both are omitted on write when unset.
 max_context_window = 128000
@@ -87,19 +115,43 @@ Notes on the on-disk format:
 ### `settings.toml`
 
 ```toml
-provider = "openai"     # default provider name (must match a top-level table in providers.toml)
-model    = ""           # optional; legacy per-session model override (cleared by TUI model picker)
+provider = "openai"     # global DEFAULT provider name (must match a top-level table in providers.toml)
+model    = ""           # optional; legacy, read-only (the TUI never writes it; reads at the bottom of the default chain)
 style    = "default"    # default style (must exist in ~/.miniouto/style/)
-session  = "default"    # default session name (auto-set to the most recent chat session)
-theme    = ""           # optional; TUI theme name (persisted by the TUI theme picker)
+session  = "default"    # active session name; written by PLAIN `miniouto chat` (`_is_plain_run`: no --role/--alarm-session/--return/--bg) and by TUI user actions (first dispatch, session picker, "new session"). Delegated runs never write it — they borrow it scoped to their chain (`_runtime_session_scope`) and restore it, so they don't repoint the caller's active session.
+theme    = "miniouto"   # TUI theme name. `miniouto` is the harness's own dark theme (registered in cli/tui.py); any other REGISTERED name — a stock Textual theme, e.g. `gruvbox` — replaces it, and the TUI writes back whatever is picked at runtime (Ctrl+P → Theme). An unregistered name falls back to `miniouto` rather than failing the launch.
 subagent_provider = ""  # optional; subagent provider override (empty = inherit outo's provider)
 subagent_model    = ""  # optional; subagent model override (empty = subagent provider's default_model, else inherit outo's model)
 subagent_reasoning = "" # optional; subagent reasoning-effort override (empty = subagent provider's reasoning_effort, else auto)
 ```
 
-All eight keys are optional. Missing keys fall back to: empty string for `provider`/`model`/`theme`/`subagent_provider`/`subagent_model`/`subagent_reasoning`, `"default"` for `style`/`session`.
+All eight keys are optional. Missing keys fall back to: empty string for `provider`/`model`/`subagent_provider`/`subagent_model`/`subagent_reasoning`, `"default"` for `style`/`session`, and `"miniouto"` for `theme`.
 
-The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> Settings` — non-empty/non-None override values win. `to_dict()` drops empty values (same rule as `Provider`). Because `merge()`/`update()` skip empty strings, the subagent keys cannot be *cleared* through `update()` — `cli/subagent.py`'s `clear` command uses `save(replace(load(), subagent_provider="", subagent_model="", subagent_reasoning=""))` instead (and `set --reasoning ""` does the same for the reasoning key alone).
+This file is the **global default** half of the resolution chain — what a session with no pin, and the next fresh session, resolve. The per-session half is `session-config/<session>.toml` below; `core/runtime.py:default_provider_config` computes this half, which storage never imports.
+
+### `session-config/<session>.toml`
+
+One file per session: the provider config that session is pinned to.
+
+```toml
+provider = "openai"
+model = "gpt-5.5"
+reasoning = "high"
+subagent_provider = ""     # empty = follow the global default at read time
+subagent_model = ""
+subagent_reasoning = ""
+```
+
+Semantics (`storage/session_config.py`):
+
+- **Resolution order, per key:** the explicit per-call override (`chat --pm`) > **this session's pin** > the global default (`settings.toml` + the resolved provider record's `default_model` / `reasoning_effort`). See `docs/core.md` § `resolve_runtime_from_settings`.
+- **A stored value is CONCRETE; `""` means "follow the global default at read time."** The pin is a set of overrides *on* the default, not a replacement for it: `set_fields(session, model="")` hands that one key back without touching the others. `as_dict()` drops empty keys on write, so an unset key is simply absent from the file.
+- **Freeze at first use.** `effective(session, default=…)` materializes the pin: a session with no file gets the current global default written as its pin and that value returned. A model switch made by the TUI in another process can never redirect a session that is already running.
+- **Seeding is copy-if-absent.** `seed_from(new, source)` copies a source session's pin into a freshly minted one — a delegated run's `chat-`/`spawn-` name, a summary hand-off's `cont-*` name, the TUI's "new session". A session that already carries a pin keeps it, and a source with no pin seeds nothing (the new session freezes the default itself).
+- Writes are atomic (tmp + `os.replace`), and a **corrupt pin is treated as absent**, not raised over — the session simply follows the default again (the same tolerance `sessions.load` applies).
+- Nothing else writes here. A TUI edit writes the pin **and** the global default at once (`cli/tui.py:_persist_trio`), so the edit survives a later default change while the newest choice still reaches other processes and the next session.
+
+The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> Settings` — non-empty/non-None override values win. `to_dict()` drops empty values (same rule as `Provider`). Because `merge()`/`update()` skip empty strings, the `subagent_*` keys cannot be *cleared* through `update()` — `cli/subagent.py`'s `clear` command uses `save(replace(load(), subagent_provider="", subagent_model="", subagent_reasoning=""))` instead (and `set --reasoning ""` does the same for the reasoning key alone).
 
 ### `sessions/<name>.json`
 
@@ -129,16 +181,16 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
       "events": [
         {"actor": "outo", "kind": "thinking", "text": "the user wants a listing…"},
         {"actor": "outo", "kind": "tool", "text": "Bash ls", "tool_name": "Bash"},
-      {"actor": "editor-a1b2c3", "kind": "subagent_start", "text": "edit the auth route", "tool_name": "call_subagent", "subagent_id": "a1b2c3", "subagent_name": "editor"},
-      {"actor": "outo", "kind": "alarm", "text": "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]\nBackground subagent 'editor' (id: a1b2c3) finished (status: done).\nResult file: /home/luke/.miniouto/subagent-results/a1b2c3-2026-07-23-10-34.md …", "subagent_id": "a1b2c3", "subagent_name": "editor"}
+      {"actor": "outo", "kind": "tool", "text": "Bash miniouto chat …", "tool_name": "Bash", "detail": "miniouto chat \"edit the auth route\" --style coding-pro --role editor --bg --alarm-session default"},
+      {"actor": "outo", "kind": "alarm", "text": "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]\nDelegated run 'editor' (id: a1b2c3) finished (status: done).\nResult file: /home/luke/.miniouto/subagent-results/a1b2c3-2026-07-23-10-34.md …", "subagent_id": "a1b2c3", "subagent_name": "editor", "detail": "inbox:20260723-103641123456-9f2c0a"}
       ]
     }
   ]
 }
 ```
 
-- **`history`** — restorable model context: raw coreouto `Message.model_dump(mode="json")` dicts, **system messages excluded** (coreouto prepends a fresh system prompt on every `call()`, so persisting it would duplicate it — see coreouto `examples/21_loop_history.py`). Contains the *full* loop transcript: intermediate assistant messages, tool calls, and tool results. **Rewritten in full after every turn** from `Response.messages`, so it always matches what the model actually saw — including any in-loop compaction done by the summarize hook. Reloaded via `co.Message.model_validate`.
-- **`turns`** — display-only log, appended once per turn. `events` are `LoopEvent` dicts (`actor`, `kind`, `text`, optional `tool_name` / `subagent_id` / `subagent_name` / `detail` / `msg_ref`). Actor labels for subagent events are `{name}-{6hex}` (`editor-a1b2c3`, `reviewer-def456`, …) or `subagent-<6hex>` for the legacy `subagent` name. Thinking/reasoning lives **only here** as `kind="thinking"` events: coreouto's providers never put thinking into history `Message` objects, so it is captured from the `ON_THINKING` hook and cannot be part of the restorable history. The TUI renders past sessions from `turns`.
+- **`history`** — restorable model context: raw coreouto `Message.model_dump(mode="json")` dicts, **system messages excluded** (coreouto prepends a fresh system prompt on every `call()`, so persisting it would duplicate it — see coreouto `examples/21_loop_history.py`). Contains the *full* loop transcript: intermediate assistant messages, tool calls, and tool results. **Rewritten in full after every turn** from `Response.messages`, so it always matches what the model actually saw — there is **no** in-loop compaction, ever (summarization is explicit; see `core/summary.py`). Reloaded via `co.Message.model_validate`.
+- **`turns`** — display-only log, appended once per turn. `events` are `LoopEvent` dicts (`actor`, `kind`, `text`, optional `tool_name` / `subagent_id` / `subagent_name` / `detail` / `msg_ref`). Every actor is `outo` — a delegated run is a separate process with its own transcript — while `subagent_id` / `subagent_name` still ride on the drained inbox event, so a completed run stays attributable in the record. Thinking/reasoning lives **only here** as `kind="thinking"` events: coreouto's providers never put thinking into history `Message` objects, so it is captured from the `ON_THINKING` hook and cannot be part of the restorable history. The TUI renders past sessions from `turns`.
 
 Notes:
 - **`cwd`** — the directory the session was **created** in (`paths_runtime.INVOCATION_CWD` at import), stamped by `begin_turn` on the **first turn only**, so a session belongs to one directory and later turns (even from another one) never overwrite it. It is purely presentational: the TUI session picker groups "This directory" first, then "Other directories" (`[basename] name`, or `[?] name` for legacy files with no cwd), and `miniouto status` prints `Sessions (this directory)` / `Sessions (other)`. The field is **additive** — `save()` writes it only when non-empty and `load()`'s v2 branch reads it, so `SCHEMA_VERSION` stays 2 and pre-existing files round-trip with `cwd=""` (they group as "other"). Sessions written before the field existed load unchanged.
@@ -156,44 +208,148 @@ Schema of one `history` entry (coreouto `Message`):
 | `tool_call_id` | `str \| null` | tool-only: matches an assistant's `tool_calls[].id` |
 | `name` | `str \| null` | tool-only: tool name (e.g. `Bash`) |
 
-### `subagent-results/<sid>-<YYYY-MM-DD-HH-MM>.md`
+### `subagent-results/<id>-<YYYY-MM-DD-HH-MM>.md`
 
-Written by `core/subagents.py:_write_result_file` when a background subagent job finishes (successfully, with an error, or cancelled — all three go through the same `_finish` path, which is idempotent so a job can only ever produce one file and one alarm). The filename is `<job id>-<job start, local time, minute resolution>.md`, and the directory is created on demand with `mkdir(parents=True, exist_ok=True)`.
+Written by `cli/chat.py:_write_answer_file` when a delegated run finishes (successfully, with an error, or Ctrl-C — all three go through the same `_complete` path, so a run can only ever produce one file and one alarm). The filename is `<job id>-<job start, local time, minute resolution>.md`; the directory is created on demand and the file is written atomically (`.tmp` + `os.replace`).
 
-Format — a meta header, the brief verbatim, then the result:
+Format — **the final answer alone**. No meta header, no brief, nothing but what the run produced:
 
 ```markdown
-# Subagent result — editor-a1b2c3
-
-- id: a1b2c3
-- name: editor
-- status: done                  # running | done | error | stopped
-- started: 2026-07-23T10:34:12
-- finished: 2026-07-23T10:36:41
-
-## Brief
-
-TASK: …
-
-## Result
-
-<the subagent's final message>
+<the delegated run's final answer>
 ```
 
-The file is the **only** durable record of what the subagent did: the parent turn never sees the text as a tool result, and the job's hooks (and therefore any live event) are gone once the turn that started it ends. The completion alarm the model receives points here — the model is instructed to `cat` the file:
+On a failure the "answer" is the error line instead — `error: RuntimeError: kaboom` (or `stopped: cancelled` for a Ctrl-C), so the file is always readable without knowing the outcome.
+
+The parent turn never sees that text as a tool result, so the file is the durable record of what the run did — and it is what the completion alarm names:
 
 ```
 [SYSTEM ALARM - THIS IS NOT A USER MESSAGE]
-Background subagent 'editor' (id: a1b2c3) finished (status: done).
+Delegated run 'editor' (id: a1b2c3) finished (status: done).
 Result file: /home/luke/.miniouto/subagent-results/a1b2c3-2026-07-23-10-34.md — read this file (e.g. with `cat`) to see what it produced.
-Currently running background subagents: reviewer-def456
 ```
 
-That alarm is a **synthetic user message**, appended to the live coreouto message list by the `BEFORE_LLM_CALL` alarm hook (`core/runtime.py:_make_alarm_hook`), so it lands in `Response.messages` and therefore in the session's `history` on the next `finish_turn`. Its first line is the single-source-of-truth constant `core.subagents.ALARM_HEADER`.
+With no `--return` there is no file and the alarm carries the answer inline instead, capped at `MAX_ALARM_ANSWER_CHARS = 4000`. The alarm is a **synthetic user message**: it lands in `inbox/<session>/`, and the `BEFORE_LLM_CALL` hook (`core/runtime.py:_make_alarm_hook`) appends the drained text to the live coreouto message list, so it reaches `Response.messages` and therefore the session's `history`. Its first line is the single-source-of-truth constant `core.inbox.ALARM_HEADER`.
+
+### `inbox/<session>/<YYYYMMDD-HHMMSSffffff>-<6hex>.json`
+
+The cross-process message inbox (`core/inbox.py`) — the durable hand-off from a detached `chat --bg` run (or a `miniouto message insert`, or a mid-turn TUI message) back to the session that launched it.
+
+```json
+{
+  "kind": "alarm",                 // "alarm" | "user" — both are user messages to the model
+  "text": "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]\nDelegated run 'editor' …",
+  "ts": "2026-07-23T10:36:41",
+  "source": "chat",                // "chat" | "tui" | "cli" | …
+  "meta": {"id": "a1b2c3", "role": "editor", "style": "coding-pro", "return_path": "/…/a1b2c3-2026-07-23-10-34.md"}
+}
+```
+
+- The **filename stem is the message id** — the microsecond stamp sorts in insertion order, so `drain`'s ordering is independent of `listdir` order, and `LoopEvent.detail` carries `inbox:<id>` as the display de-duplication key.
+- `insert` writes `<stem>.tmp` then `os.replace`s it into place: a drainer sees a message either not at all or complete, never half-written. `MAX_INBOX_MESSAGES = 200` are kept per session (`prune` deletes the oldest); text over `MAX_TEXT_CHARS = 100_000` is rejected.
+- `drain` is `listdir → read → unlink`, and it unlinks only **after** a successful parse, so a crash re-delivers rather than drops. An unparseable file is renamed `<stem>.bad` and skipped — it never raises, same as session files.
+- **One consumer per session, deliberately.** Nothing serializes two drainers: whichever process lists the directory first unlinks the files and the other never sees them. Two live processes bound to one session would steal each other's messages — isolate them with a distinct `MINIOUTO_HOME` or session name instead of adding a locking protocol here.
+
+### `spawn-logs/<id>.json` and `spawn-logs/<id>.log`
+
+Liveness markers (`core/spawn_state.py`) for runs started with `miniouto chat --bg`, written next to the run's stdio log. The marker exists because an in-memory registry inside the *launching* process cannot tell another process whether that run is still going to alarm it.
+
+```json
+{
+  "id": "a1b2c3",
+  "role": "editor",
+  "style": "coding-pro",
+  "alarm_session": "default",       // the caller's session — receives the completion alarm
+  "session": "spawn-20260723-103412-a1b2c3",  // the run's OWN session, where its transcript lives
+                                    // (with --bg the two never coincide: a detached run generates its own)
+  "return_path": "/home/luke/.miniouto/subagent-results/a1b2c3-2026-07-23-10-34.md",
+  "status": "running",            // running | done | error | stopped
+  "started": "2026-07-23T10:34:12",
+  "finished": null,                // stamped by finish_marker() in the run's finally
+  "log": "/home/luke/.miniouto/spawn-logs/a1b2c3.log"
+}
+```
+
+Writes are atomic (tmp + `os.replace`) and `read_marker` never raises — a missing or corrupt marker yields `None`. `pending_spawns(session)` filters on `alarm_session`, returning every marker of that session still claiming `running` AND still backed by a live pid — that is the read API for "something may yet write an alarm here", and it is what a **monitor** reads (nothing in `miniouto chat` waits on it; a run returns and dies). The marker's separate `session` field is the run's own session, which is how a receiver of a completion alarm finds the transcript the run wrote (`cli/chat.py:_alarm_text` also names it on a `Session:` line). **Liveness is a promise, not a proof**: a SIGKILLed run never calls `finish_marker`, so its marker would say `running` forever — the pid check is what stops that, since `is_pid_alive` drops a marker whose process is gone (an unknown pid counts as alive, so an unanswerable question never silently releases a watcher). A pid is not a handle: a recycled pid keeps that marker pending as long as the unrelated process lives.
+
+`<id>.log` is the detached process's combined stdout+stderr. `_detach` opens it as `stdout=` and passes `stderr=subprocess.STDOUT`, which is what frees the child from any pipe and lets it outlive the `Bash` call that started it.
+
+### `computer-screens/<screen>-<YYYY-MM-DD-HH-MM-SS>.art`
+
+One file per `Computer(action="screen")` capture. The format is owned by `tools/ascii_art.py` and is deliberately plain text so a capture stays readable (and re-renderable) after the screen is gone — a delegated role-mode run reads it, or you render it later with `miniouto computer show`.
+
+```
+#miniouto-screen-art v1
+screen: browser
+captured: 2026-07-23T10:34:12
+source: 1280x720
+grid: 100x28
+cell: 6x6
+mode: subcell-truecolor
+--- art ---
+█▛▀▊⡇█…           ← truecolour mode: ESC[38;2;r;g;b m / ESC[48;2;r;g;b m run-length SGR
+                    pairs, one glyph per cell out of {█, BLOCK OCTANT,
+                    BRAILLE} — see "The sub-cell glyph set" below
+--- end ---
+```
+
+- The first line is the version marker; the meta lines are written in the canonical order `screen, captured, source, grid, cell, mode` (missing keys skipped, any extras appended alphabetically), so the same meta always produces a byte-identical file.
+- `grid` is `<cols>x<rows>` and `cell` is the source-pixel size of ONE sub-pixel (box average, never point sampling). In `subcell-truecolor` a cell is a **2x4** pixel grid, so the sub-pixel grid is `2*cols` x `4*rows` and each sub-pixel covers `round(width / (2*cols))` x `round(height / (4*rows))` source pixels — `6x6` in the example above. The row count is **shared with half-block**: `rows = max(1, round(cols * height / width / 2.0))` (`ascii_art.subcell_rows`, identical to `render_halfblock`), so a 1280x720 capture at 100 cols is `grid: 100x28` in *both* modes. The `/ 2.0` is only the terminal cell's 1:2 aspect correction: the 2x4 sub-pixels inside a sub-cell are square, so one cell covers the same source rect either way and sub-cell art buys resolution *inside* the cell, never fewer rows.
+- `mode` is `subcell-truecolor`, `halfblock-truecolor` (legacy, still parsed and rendered byte-identically by `render_halfblock`), or `ramp-plain`. In `ramp-plain` the body carries **no escape sequences at all**: each cell is one character of `RAMP = " .:-=+*#%@"`, indexed by Rec. 601 luma.
+- `glyph` is **not** recorded in the meta. The chosen glyph family is visible only in the body bytes, and `miniouto computer show` needs nothing extra because the glyph families are self-describing from their codepoints.
+
+#### The sub-cell glyph set (`subcell-truecolor`)
+
+One terminal cell carries **eight** source pixels (2 wide x 4 tall — square sub-pixels, which is why the row count above is half-block's), so the renderer reduces each cell to two palette entries plus an 8-bit mask and lets the mask pick the glyph. The palette is a 2-means pass over the cell's box-averaged sub-cells, seeded on the **farthest pair** and refined by 3 Lloyd iterations; `fg` is the brighter entry (so dots read as highlights) and `bg` the darker one. Selection, per cell (`ascii_art._quantise_cell`):
+
+| Condition | Glyph | Why |
+|---|---|---|
+| every sub-cell within `UNIFORM_SPREAD = 12.0` of the cell mean | `█` (U+2588), `fg = bg =` that mean | one colour, one glyph, valid in every font |
+| mask is all-zero / all-one | ` ` / `█` | degenerate quantisation collapses to a blank or a solid cell |
+| the two entries are at least `OCTANT_MIN_SEPARATION = 60.0` apart **and** every sub-cell is within `OCTANT_MAX_INTRA_ERROR = 24.0` of the entry it was assigned to | **BLOCK OCTANT** (U+1CD00…U+1CDE5, Unicode 16.0) | crisp solid sub-rectangles — flat panels, hard edges, borders |
+| anything else (close tones, or intermediate tones inside the clusters) | **BRAILLE** (`U+2800 + mask`) | 8 halftone dots that optically blend the two colours — antialiased edges, gradients, text |
+
+**The two families index their sub-cells differently, and that asymmetry is the sharp edge.** Unicode numbers a BLOCK OCTANT's digits **row-major** (`BLOCK OCTANT-<digits>`: `1,2` = top row left to right, `3,4` = second row, … `7,8` = bottom row), while the renderer's internal mask — which is *exactly* the braille mask — numbers sub-cells **column-major** (`bit i` = sub-cell `i`, left column rows 0-3 then right column rows 0-3, the braille dot order). `ascii_art._name_mask_to_internal` is the single permutation between them (`digit - 1 == row * 2 + col` maps to `bit == col * 4 + row`), and `_OCTANT_NAME_MASKS` was generated from Unicode 16.0 `UnicodeData.txt` and verified against the official chart. Both families read the **same** internal mask, so they are interchangeable and one mask drives both.
+
+**Then contrast is enforced on the pair, after the glyph class is chosen** (`ascii_art._boost_pair`). 2-means minimises error, so a subtle cell lands on two nearly identical entries and its octant/braille mask becomes invisible — the dump reads as assorted coloured blocks. So every **patterned** cell's fg/bg pair is widened, **symmetrically about the cell mean**, until it spans at least
+
+- `MIN_LUMA_DELTA = 40.0` on Rec. 601 luminance — the primary criterion, because brightness is what the eye separates glyph sub-shapes by, and
+- `MIN_PAIR_DISTANCE = 50.0` of colour — a secondary guard so a pair that only moves in hue still reads as two colours.
+
+The half vector `h = (fg - bg) / 2` is first scaled along **its own direction**, so the pair's hue is preserved, by at most `MAX_CONTRAST_BOOST = 2.0` (the chroma cap, so a noisy cell cannot explode); whatever luminance shortfall is left is bought along the **neutral axis** `(1,1,1)`, which is gamut bounded and therefore cannot be capped the same way. Both steps are clamped to the `[0, 255]` room around the mean. A pair that cannot reach the floor inside that clamp — pinned at black or white, or so noisy that any boost is an explosion — **collapses the cell to the mean and draws `█`**, because a smooth block beats visible noise. Uniform cells never change, and a cell whose mask is empty or full carries no pattern, so neither is boosted; an already-readable pair is returned untouched.
+
+Unicode encodes only **230 of the 256 masks** as BLOCK OCTANT (blank, full, and shapes an older block glyph already draws are left out). Those 26 unencoded masks have no character in `OCTANT_GLYPHS`, so the cell **falls back to a braille pattern** — which is why the table above is a rule and not a table of 256 glyphs.
+
+Font caveat: BLOCK OCTANT is Unicode 16.0, so a font or terminal predating it renders nothing (tofu) wherever an octant was chosen. The `Computer` tool's `glyph` parameter is the escape hatch — `glyph="braille"` forces dots everywhere (never worse than the old half-block), `glyph="octant"` forces blocks wherever a mask applies, and the default `glyph="mix"` runs the rule above. See `docs/tools.md`.
+
+`art_to_plain` (what `miniouto computer show --plain` prints) handles both new families: each glyph's **coverage** is a popcount of its own mask over eight, and the cell's grey is the fg/bg pair blended by that fraction, so a braille or octant cell reads as the mid-tone it looks like on screen.
+- The body is written **verbatim** between the sentinels `--- art ---` / `--- end ---`, SGR bytes and all, so `parse_art(build_art(meta, body))` round-trips. `parse_art` raises `ValueError` when the version marker or either sentinel is missing — a silently half-parsed art file would render as an empty screen, indistinguishable from a real blank one.
+- Only the **preview** travels as a tool result (a `str` capped at ~3800 chars, at most 24 rows); the file holds the whole thing. That is what keeps `screen` usable where `screenshot` cannot be — see `docs/tools.md`.
+
+### `<cwd>/.miniouto/summary/<session>/*.md`
+
+Not harness state — the model's own words, but the layout is a pinned contract (`core/summary.py:SUMMARY_FORMAT_SPEC`, embedded verbatim in the summary request):
+
+```
+00-overview.md      (필수)
+NN-<주제>.md        (선택, 여러 개 가능)
+```
+
+`00-overview.md` carries seven sections: `1. 배경과 목표 (Why)` / `2. 현재 상태 (What)` (changed file paths + core changes; where it stopped; blockers) / `3. 핵심 결정과 근거 (Decisions)` (the decision, the reason, and why not to reverse it) / `4. 다음 작업 (Next)` (executable steps, first action named) / `5. 주의사항과 검증 방법 (Gotchas & Verify)` / `6. 주요 파일 지도 (File map)` / `7. 원래 요청과 계약 (Brief & contract)` (the original request or delegation brief, plus the alarm-session / result-return contract).
+
+The bar the request states: reading only this folder must be enough for the next session to continue. The history itself is **not** carried over — the documents are the whole hand-off.
+
+### The two summary-lane inbox messages
+
+Both are ordinary inbox messages (`kind="alarm"`), so they reach the model as user messages through the normal `BEFORE_LLM_CALL` drain and are recorded and replayed like any other alarm.
+
+| Message | `source` | Header (verbatim) | Goes to |
+|---|---|---|---|
+| Summary request | `"context"` | `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` + `Context budget: {pct}% of this session's window is consumed ({used}/{window} tokens). Explicit summarization is required now.` | the session running out of context |
+| Continuation | `"summary"` | `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` + `New session opened from a summary — continue the previous work here.` | the NEW `cont-*` session, `meta={"from": <old session>}` |
 
 ### `style/<name>.md`
 
-Plain Markdown. Top-level XML structure: one optional `<outo>` block (always the outo prompt) plus zero or more named subagent blocks (each `<tag>` is one subagent — the tag name IS the name):
+Plain Markdown. Top-level XML structure: one optional `<outo>` block (always the outo prompt) plus zero or more named role blocks (each `<tag>` is one role, selected by `miniouto chat "…" --style <style> --role <tag>` — the tag name IS the role name):
 
 ```markdown
 <outo>
@@ -212,7 +368,7 @@ You are a file picker. Locate the right files. Do not edit. …
 </file-picker>
 ```
 
-The `<outo>` tag is required (or the whole document is treated as the outo prompt). Each top-level `<name>...</name>` pair outside `<outo>` is one named subagent. A legacy `<subagent>...</subagent>` block becomes a subagent named `"subagent"`. **Zero named subagents → zero `SubagentSpec`s → the `call_subagent` tool is NOT registered** (outo-only style = no delegation surface).
+The `<outo>` tag is required (or the whole document is treated as the outo prompt). Each top-level `<name>...</name>` pair outside `<outo>` is one role body, used as that role's system prompt. A legacy `<subagent>...</subagent>` block becomes a role named `"subagent"`. **Zero named tags is legal** — it just means `--role` has nothing to select, and `--role` on a style with no match errors before the turn. The delegation surface itself does not depend on this: `Bash` is always registered, so delegated `chat` runs are reachable from the model in every style.
 
 `storage.styles.parse_style(content) -> tuple[str, list[SubagentSpec]]` does the parsing. See `docs/styles.md` for full details.
 
@@ -228,8 +384,11 @@ The `<outo>` tag is required (or the whole document is treated as the outo promp
 | `STYLE_DIR` | `Path` | `ROOT/style` |
 | `STYLE_REPOS_FILE` | `Path` | `ROOT/style_repos.toml` (repo URLs recorded by `style add`) |
 | `SESSION_DIR` | `Path` | `ROOT/sessions` |
-| `SUBAGENT_RESULTS_DIR` | `Path` | `ROOT/subagent-results` — where `core/subagents.py` writes a finished job's result file |
-| `LOG_DIR` | `Path` | `ROOT/logs` |
+| `SUBAGENT_RESULTS_DIR` | `Path` | `ROOT/subagent-results` — where a finished delegated `chat` run writes its answer file |
+| `LOG_DIR` | `Path` | `ROOT/logs` (reserved) |
+| `INBOX_DIR` | `Path` | `ROOT/inbox` — per-session cross-process message directories |
+| `SPAWN_LOG_DIR` | `Path` | `ROOT/spawn-logs` — one `<id>.json` marker + `<id>.log` per detached `chat --bg` run |
+| `COMPUTER_SCREENS_DIR` | `Path` | `ROOT/computer-screens` — `.art` captures written by the Computer tool's `screen` action |
 | `ensure_dirs() -> None` | function | Create dirs + force-refresh bundled styles |
 
 ### `storage.providers`
@@ -275,10 +434,13 @@ class Provider:
 @dataclass
 class Settings:
     provider: str = ""
-    model: str = ""           # legacy per-session model override; cleared by TUI model picker
+    model: str = ""           # legacy; read at the bottom of the default chain, never written by the TUI
     style: str = "default"
     session: str = "default"
-    theme: str = ""           # TUI theme name
+    theme: str = "miniouto"    # TUI theme name (cli/tui.py:MINIOUTO_THEME)
+    subagent_provider: str = ""
+    subagent_model: str = ""
+    subagent_reasoning: str = ""
 ```
 
 | Function | Returns | Notes |
@@ -288,6 +450,36 @@ class Settings:
 | `update(**kwargs)` | `Settings` | load → merge → save → return merged |
 | `Settings.to_dict()` | `dict` | drops `None`/`""` |
 | `Settings.merge(overrides)` | `Settings` | non-empty/non-None override values win |
+
+These keys are the **global default** tier of the resolution chain — see `session-config/<session>.toml` above for the pin tier and `docs/core.md` § `resolve_runtime_from_settings` for the whole order.
+
+### `storage.session_config`
+
+The per-session provider pin (`session-config/<session>.toml`). Imported directly as `session_config` — it is not in `storage/__init__.py`'s `__all__`.
+
+```python
+FIELDS = ("provider", "model", "reasoning",
+          "subagent_provider", "subagent_model", "subagent_reasoning")
+
+@dataclass(frozen=True)
+class ProviderConfig:            # six keys; "" = follow the global default at read time
+    provider: str = ""
+    model: str = ""
+    reasoning: str = ""
+    subagent_provider: str = ""
+    subagent_model: str = ""
+    subagent_reasoning: str = ""
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `path_for(session)` | `Path` | `SESSION_CONFIG_DIR / f"{session}.toml"` |
+| `read(session)` | `ProviderConfig \| None` | `None` when there is no pin — or when the file is corrupt (treated as absent, never raised over) |
+| `effective(session, *, default=callable)` | `ProviderConfig` | the stored pin as-is; with no pin, **writes** `default()` as the pin and returns it (freeze at first use) |
+| `set_fields(session, **fields)` | `ProviderConfig` | merge; `""` clears that one key; keys outside `FIELDS` are ignored |
+| `seed_from(new, source)` | `None` | copy-if-absent; a no-op when the names match or either side has no pin |
+| `clear(session)` | `None` | unlink; the session follows the global default again |
+| `ProviderConfig.as_dict()` | `dict` | drops empty keys (the on-disk shape) |
 
 ### `storage.sessions`
 
@@ -343,7 +535,7 @@ class SessionData:
 | `list_repos()` | `list[str]` | recorded repo URLs from `style_repos.toml` (`[]` if absent/malformed) |
 | `builtin_default()` | `str` | seeds `~/.miniouto/style/default.md` from the bundled copy if absent, then returns its **text content** (or `""` if neither exists). Despite the legacy docstring, it returns content — not a path. |
 | `write_default_style(content)` | `None` | writes `default.md` only if absent |
-| `parse_style(content)` | `tuple[str, list[SubagentSpec]]` | `(outo, [SubagentSpec...])`; missing `<outo>` → whole document; top-level `<name>...</name>` → one spec per tag |
+| `parse_style(content)` | `tuple[str, list[SubagentSpec]]` | `(outo, [SubagentSpec...])`; missing `<outo>` → whole document; top-level `<name>...</name>` → one role spec per tag |
 
 `add_from_repo` accepts GitHub URLs (`https://github.com/owner/repo`), GitLab URLs, or any URL whose directory listing exposes `<a href="*.md">` links. Internally dispatches to:
 - `_fetch_github_tree(parsed)` — GitHub Contents API for `/style-md/`.
@@ -354,7 +546,7 @@ The fetcher tries three candidate URL suffixes (`/style-md/`, `/tree/main/style-
 
 ### `storage.skills`
 
-See `docs/skills.md` for the full schema. Lives outside `~/.miniouto/` at `~/.agents/skills/<name>/SKILL.md`.
+See `docs/skills.md` for the full schema. Lives outside `~/.miniouto/`, in `./skills/<name>/SKILL.md` (project-local, default-listed first) or `~/.agents/skills/<name>/SKILL.md`; `list_skills(directory)` accepts any other root a style names.
 
 ### `storage.toml_io`
 

@@ -3,9 +3,10 @@
 The bug this file guards: `_fetch_model_caps` swallowed every lma exception and
 then wrote the resulting `{}` into `_MODEL_CACHE`, so one transport blip
 permanently pinned the (model, provider) key to "no caps" for the life of the
-process — compaction disabled and the 16K output floor applied forever. Only a
-fetch that completed without raising may be cached; a successful-but-empty
-result still is (that means "lma has no info for this key").
+process — the window unknown (no summary trigger) and the 16K output floor
+applied forever. Only a fetch that completed without raising may be cached; a
+successful-but-empty result still is (that means "lma has no info for this
+key").
 """
 
 from __future__ import annotations

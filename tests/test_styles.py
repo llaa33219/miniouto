@@ -19,7 +19,7 @@ def test_parse_style_legacy_subagent_tag_becomes_named_subagent_subagent() -> No
     assert specs == [SubagentSpec(name="subagent", prompt="B")]
 
 
-def test_parse_style_multiple_named_subagents_in_document_order() -> None:
+def test_parse_style_multiple_named_tags_in_document_order() -> None:
     # Given: outo plus two named subagent blocks
     content = "<outo>A</outo>\n<editor>B</editor>\n<file-picker>C</file-picker>"
 

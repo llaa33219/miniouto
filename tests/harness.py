@@ -33,9 +33,9 @@ import coreouto as co
 import pytest
 
 from miniouto.core import chat as chat_mod
+from miniouto.core import inbox
 from miniouto.core import lma as lma_module
 from miniouto.core import runtime as rt
-from miniouto.core import subagents
 from miniouto.core.error_rules import default_error_handling
 from miniouto.core.events import LoopEvent
 from miniouto.storage import providers as provider_store
@@ -239,40 +239,39 @@ def set_default_model(model: str) -> None:
     provider_store.upsert(_provider(model))
 
 
-# ── the alarm queue ─────────────────────────────────────────────────────────
+# ── the session inbox ───────────────────────────────────────────────────────
 
 
-def queued_alarms() -> int:
-    """How many completion alarms are waiting, WITHOUT draining them.
+def queued_alarms(session: str) -> int:
+    """How many completion messages are waiting, WITHOUT draining them.
 
-    A test that needs "the job has finished but nobody has read the alarm
-    yet" cannot use `take_pending_alarms()`: that is the delivery. This
-    peeks the queue under the registry's own lock, which is the only
-    non-destructive way to wait for a background job to land.
+    A test that needs "the run has finished but nobody has read the message
+    yet" cannot use `inbox.drain()`: that is the delivery, and it unlinks.
+    `inbox.pending_count` is the non-destructive peek at the session's inbox
+    directory — the same thing a caller would look at on disk.
     """
 
-    with subagents._LOCK:
-        return len(subagents._PENDING_ALARMS)
+    return inbox.pending_count(session)
 
 
-def wait_for_alarm(timeout: float = 10.0) -> None:
+def wait_for_alarm(session: str, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if queued_alarms():
+        if queued_alarms(session):
             return
         time.sleep(0.005)
-    raise AssertionError("no completion alarm was queued")
+    raise AssertionError("no completion message landed in the inbox")
 
 
-async def wait_for_alarm_async(timeout: float = 10.0) -> None:
+async def wait_for_alarm_async(session: str, timeout: float = 10.0) -> None:
     """The awaitable twin of `wait_for_alarm`, for use inside a hook."""
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if queued_alarms():
+        if queued_alarms(session):
             return
         await asyncio.sleep(0.005)
-    raise AssertionError("no completion alarm was queued")
+    raise AssertionError("no completion message landed in the inbox")
 
 
 # ── the caller's sink ───────────────────────────────────────────────────────

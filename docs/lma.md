@@ -5,13 +5,13 @@
 miniouto uses lma for four things:
 
 1. **Provider discovery** — `miniouto provider providers` lists every known provider and whether miniouto can host it.
-2. **Model discovery** — `miniouto provider models <provider>` lists every model lma knows for a provider; the TUI provider-add and model-edit flows fetch the same data.
+2. **Model discovery** — `miniouto provider models <provider>` lists every model lma knows for a provider; the TUI provider-add wizard and the popup's `Model` row fetch the same data.
 3. **Per-model context / max-output caps** — `core/context.py` calls lma's `/model` endpoint to look up `context_window` and `max_output_tokens` instead of the older `lcw-api.blp.sh/context-window` endpoint.
 4. **Per-model reasoning metadata** — `core/reasoning.py` reads `reasoning_options` from the same `/model` endpoint to resolve reasoning request kwargs (see below).
 
 ### Per-provider overrides (custom providers)
 
-For providers that lma has never heard of (anything added via `miniouto provider custom add` or the TUI `+ add custom…` wizard), the `/model` lookup misses and `core/context.py` falls back to the 16K floor. To let these providers declare their real caps, the TUI custom-model editor (`_open_custom_model_editor`) and the custom-add wizard (`_open_custom_add_wizard`) collect two extra fields after the model id:
+For providers that lma has never heard of (anything added via `miniouto provider custom add` or the TUI `+ add custom…` wizard), the `/model` lookup misses and `core/context.py` falls back to the 16K floor. To let these providers declare their real caps, the TUI custom-add wizard (`_open_custom_add_wizard`) collects two extra fields after the model id (and they can be written by hand into `providers.toml`):
 
 - `max_context_window` — written to `providers.toml`, read by `get_context_window`.
 - `max_output_tokens` — written to `providers.toml`, read by `get_max_output_tokens`.
@@ -19,7 +19,7 @@ For providers that lma has never heard of (anything added via `miniouto provider
 Precedence for `max_output_tokens` (highest wins):
 
 1. `chat --max-tokens <n>` (per-call CLI flag)
-2. Provider's `max_output_tokens` override (set via the TUI)
+2. Provider's `max_output_tokens` override (set when the provider is added, or by hand)
 3. lma's `max_output_tokens` for the (model, provider) pair
 4. lma's `context_window` (most APIs cap output at the context window)
 5. `DEFAULT_MAX_OUTPUT_TOKENS = 16384` (the floor — defends against Anthropic's silent 1024 default that truncates long tool calls, e.g. file writes)
@@ -72,9 +72,9 @@ The list can carry **multiple** descriptors for one model — e.g. kimi-k3 retur
 
 miniouto consumes this in three places:
 
-1. **`core/reasoning.py:resolve_reasoning_passthrough`** — maps the resolved reasoning choice (CLI `--reasoning` > `Provider.reasoning_effort` > lma default) into provider-native request kwargs merged into `provider_passthrough` by `build_runtime`. Only effort values and anthropic's `thinking: {"type": "adaptive"}` are emitted — `budget_tokens` models are driven as a plain toggle because many providers reject budget parameters. The mapping table and the google-format limitation are documented in `docs/core.md` (step 11).
+1. **`core/reasoning.py:resolve_reasoning_passthrough`** — maps the resolved reasoning choice (`chat --pm '…:REASONING'` > the session pin's `reasoning` > `Provider.reasoning_effort` > lma default) into provider-native request kwargs merged into `provider_passthrough` by `build_runtime`. Only effort values and anthropic's `thinking: {"type": "adaptive"}` are emitted — `budget_tokens` models are driven as a plain toggle because many providers reject budget parameters. The mapping table and the google-format limitation are documented in `docs/core.md` (step 11).
 2. **`miniouto provider add`** — auto-fills the new provider's `reasoning_effort` field from `default_reasoning_choice(default_model, provider_name)` when `--reasoning` is not given (best-effort, silent on failure).
-3. **TUI pickers** — `reasoning_choices(model, provider_name)` supplies the picker list (`["off", ...]`); `default_reasoning_choice(...)` supplies the pre-selected default. Both return `None` when the model has no reasoning options or lma is unreachable.
+3. **TUI pickers** — `reasoning_choices(model, provider_name)` supplies the provider settings popup's `Reasoning` row list (`["off", ...]`); `default_reasoning_choice(...)` supplies the pre-selected default, which is also what picking a Provider or a Model resets to (an effort level belongs to a model). Both return `None` when the model has no reasoning options or lma is unreachable.
 
 Always scope the lookup with `provider-name` (`lma.get_model(model, provider_name)`) — an unscoped lookup can return the same model id from a different provider with different reasoning options.
 
@@ -99,13 +99,13 @@ When `sdk_to_format` returns `(None, None)`, the provider is **not addable** —
 
 `cli/tui.py` uses lma in three places (the codebase calls these "catalog" providers; the underlying `source` field value is still the literal `"lma"`):
 
-1. **Provider picker modal** has two sentinels at the bottom of the list (`cli/tui.py`):
+1. **The provider settings popup's `Provider` row** (`ProviderSettingsPopup`, reached from either the `outo` or `subagent` chip) has two sentinels at the bottom of its list (`cli/tui.py`):
    - `+ add from catalog…` → `ChatTUI._catalog_add_flow()` fetches `/provider`, filters to addable entries, shows a `SelectionModal`, then a `TextInputModal` for the API key, then saves with `source="lma"` and the first model from `/model-list` as `default_model`.
    - `+ add custom…` → `ChatTUI._open_custom_add_wizard()` runs a 5-step wizard saving with `source="custom"`.
-2. **Model picker** (`_open_model_editor`) dispatches on `provider.source`:
-   - `source == "lma"` → `ChatTUI._catalog_model_picker_flow()` fetches `/model-list` and shows a `SelectionModal` with `id — name` rows.
-   - `source == "custom"` → `ChatTUI._open_custom_model_editor()` shows a free-text `TextInputModal`.
-3. **Saving a model** always writes to `provider.default_model` (via `dataclasses.replace(p, default_model=new_value)` + `provider_store.upsert`) and clears any prior `settings.model` override, so the chip reflects the new provider default immediately.
+2. **The popup's `Model` row** (`ProviderSettingsPopup._model_flow`) dispatches on `provider.source`:
+   - `source == "lma"` → fetches `/model-list` and shows a `SelectionModal` with `id — name` rows.
+   - `source == "custom"` → the same flow's "no models" fallback shows a free-text `TextInputModal` (a hand-added endpoint need not exist in the catalog).
+3. **Saving any of the three rows** goes through `_persist_trio`, which writes **both** halves of the resolution: the session pin (`session-config/<session>.toml`) and the global default — `settings.provider` plus the provider record's `default_model` / `reasoning_effort` (`dataclasses.replace` + `provider_store.upsert`) for the outo trio, the three `settings.subagent_*` keys for the subagent one. `settings.model` is never written. Picking a Provider or a Model also resets Reasoning to that model's default. See `docs/cli.md` § Clickable chips.
 
 ## Provider.source field
 

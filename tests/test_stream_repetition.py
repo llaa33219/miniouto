@@ -34,7 +34,7 @@ import pytest
 import harness
 from miniouto.cli.tui import ChatTUI, StreamRow
 from miniouto.core import chat as chat_mod
-from miniouto.core import repetition, subagents
+from miniouto.core import inbox, repetition
 from miniouto.core import runtime as rt
 from miniouto.core.events import LoopEvent
 
@@ -218,7 +218,7 @@ def test_a_never_ending_stream_is_cut_mid_flight_and_the_truncated_answer_is_kep
         nonlocal calls
         if req.actor != "outo":
             return co.LLMResponse(content="unused")
-        if any(t.startswith(subagents.ALARM_HEADER) for t in req.user_texts()):
+        if any(t.startswith(inbox.ALARM_HEADER) for t in req.user_texts()):
             return co.LLMResponse(content=final)
         calls += 1
         for _ in range(repetition.REPEAT_PHRASE_THRESHOLD):
@@ -245,7 +245,7 @@ def test_a_never_ending_stream_is_cut_mid_flight_and_the_truncated_answer_is_kep
     delivered = [
         t
         for t in provider.for_actor("outo")[-1].user_texts()
-        if t.startswith(subagents.ALARM_HEADER)
+        if t.startswith(inbox.ALARM_HEADER)
     ]
     assert len(delivered) == 1
     assert [e.actor for e in sink.of_kind("alarm")] == ["watchdog"]

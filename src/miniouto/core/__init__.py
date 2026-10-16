@@ -1,6 +1,6 @@
-from . import chat, lma, providers, runtime
+from . import chat, inbox, lma, providers, runtime
 
-__all__ = ["chat", "lma", "providers", "runtime"]
+__all__ = ["chat", "inbox", "lma", "providers", "runtime"]
 
 
 def __getattr__(name):

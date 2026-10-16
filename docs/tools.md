@@ -1,17 +1,20 @@
 # Tools
 
-The `tools/` subpackage implements the tools the agent can invoke: one shell tool (`Bash`) and three media viewers (`Image` / `Video` / `Audio`). Each tool is a plain Python function (or async function for `Bash`) registered with coreouto via `tools/registry.py`.
+The `tools/` subpackage implements the tools the agent can invoke: one shell tool (`Bash`), three media viewers (`Image` / `Video` / `Audio`), the GUI tool (`Computer`), and one session tool (`continue_session`). Each tool is a plain Python function (or async function for `Bash`) registered with coreouto via `tools/registry.py`.
 
 ```
 src/miniouto/tools/
 ├── __init__.py
+├── ascii_art.py      # .art codec: PNG decode + Unicode sub-cell render (pure stdlib)
 ├── bash.py           # async bash(command, *, cwd, env)
+├── computer.py       # computer(action, …) — virtual-display GUI control
+├── continue_session.py  # continue_session(summary_dir) — the only way a session changes
 ├── media.py          # load_image/load_video/load_audio — read media bytes (pure stdlib)
 └── registry.py       # register_all() — wires tools into coreouto
 ```
 
 **Layer rules:**
-- `bash.py` and `media.py` are **pure stdlib** (no coreouto dependency). They are the only tools layer code that touches the filesystem outside `storage/`.
+- `bash.py`, `media.py`, `computer.py`, `continue_session.py` and `ascii_art.py` are **pure stdlib** (no coreouto dependency). They are the only tools layer code that touches the filesystem outside `storage/`. `ascii_art.py` also imports nothing from `miniouto` — it is a pure codec over bytes and strings, so `computer.py` (its caller) stays below it in the dependency graph.
 - `registry.py` is the **only** tools file that imports coreouto. It defines the JSON schemas, descriptions, the registration glue, **and** the construction of multimodal `ContentBlock`s for the media tools (`media.py` returns raw `LoadedMedia` records; `registry.py` wraps them into `co.ImageBlock` / `co.VideoBlock` / `co.AudioBlock`).
 
 ## Why Bash is the only file tool
@@ -155,6 +158,8 @@ These tools only produce useful results on **multimodal-capable** providers. Per
 | OpenAI Responses API | yes | **no** (`ValueError`) | **no** (`ValueError`) |
 | OpenAI Chat Completions | **no** (`ValueError`) | **no** (`ValueError`) | **no** (`ValueError`) |
 
+`Computer(action="screen")` is the one multimodal-looking channel that **escapes this matrix**: it returns a plain `str` (path + a short preview), so it works on every provider, including OpenAI Chat Completions, where `Computer(action="screenshot")` degrades to a notice.
+
 On a non-multimodal provider, the tool call succeeds (the loader runs, the blocks are built) but the **next** LLM call raises `ValueError` from the provider's serialization layer. The tool descriptions warn the model about this inline. If your workflow needs media on OpenAI, switch the preset's provider to `openai-response` (enables image + document) or use Anthropic / Google.
 
 ---
@@ -180,13 +185,14 @@ One compositor == one virtual screen == **one app**. `computer.py` keeps a modul
 
 ### Concurrency
 
-Every action runs under one module lock (vwayland opens a fresh IPC socket per call and its upstream `_spawned` bookkeeping is not thread-safe, so without the lock concurrent calls could race — even across different screens), and the tool is registered with `parallelizable=False`. The tool is also **outo-preset-only** (`core/runtime.py:OUTO_ONLY_TOOLS`) — parallel subagents driving the screens would click/type over each other.
+Every action runs under one module lock (vwayland opens a fresh IPC socket per call and its upstream `_spawned` bookkeeping is not thread-safe, so without the lock concurrent calls could race — even across different screens), and the tool is registered with `parallelizable=False`. The tool is **platform-gated** (`core/runtime.py:PLATFORM_GATED_TOOLS` — appended only when the platform actually registered it) and available to every run, outo and delegated role alike.
 
-### `computer(action, coordinate=None, end_coordinate=None, text=None, scroll_direction=None, scroll_amount=3, duration=1.0, screen=None) -> str | Screenshot`
+### `computer(action, coordinate=None, end_coordinate=None, text=None, scroll_direction=None, scroll_amount=3, duration=1.0, screen=None, chars=100, color=True, glyph="mix") -> str | Screenshot`
 
 | `action` | Extra fields | Effect |
 |---|---|---|
-| `screenshot` | — | Fresh frame → `Screenshot` (PNG) → model sees the image |
+| `screenshot` | — | Fresh frame → `Screenshot` (PNG) → model sees the image; the same frame also gets a best-effort `.art` sibling (`Screenshot.art_path`), and the result text ends with `Saved to: <path>` |
+| `screen` | `chars`, `color`, `glyph` | Render the **current** screen as Unicode sub-cell art, write it to `~/.miniouto/computer-screens/<screen>-<ts>.art`, and return a short `str` (see below) |
 | `launch` | `text` = command line | Starts a GUI app, returns pid; app stdout/stderr → `<runtime_dir>/app.log` |
 | `close_app` | — | SIGTERM the app (returns a note if it survives the timeout) |
 | `mouse_move` | `coordinate` | Move pointer to `[x, y]` |
@@ -204,9 +210,43 @@ Every action runs under one module lock (vwayland opens a fresh IPC socket per c
 
 All actions except `spawn`/`list` accept `screen` (target screen id); the omission rules are in "Screens" above. Coordinates are **logical screen pixels**, `(0, 0)` top-left, clamped to the screen bounds. All argument errors (missing `coordinate`, unknown key name, unknown screen id, bad size) raise `ComputerUseError` with an actionable message; vwayland's own exceptions are wrapped into `ComputerUseError` as well.
 
+### The `screen` action — text capture for providers that cannot see
+
+`screenshot` hands the model **pixels**, which not every provider format can carry. `screen` hands it **text** instead: the same blocking `comp.screenshot()` frame is decoded and re-rendered as sub-cell art, written to disk, and returned as an ordinary `str`. That makes it usable exactly where the image path is not — **it deliberately bypasses the openai-format image gate**, because a `str` result carries no multimodal block for the provider to reject.
+
+| Parameter | Meaning |
+|---|---|
+| `chars` | Art width target in terminal cells, clamped to `ART_MIN_CHARS = 16` … `ART_MAX_CHARS = 200`, default `ART_DEFAULT_CHARS = 100`. Below 16 a 1280px source loses every glyph of GUI text; above 200 the art stops fitting any terminal (and the `.art` file stops being human-readable) |
+| `color` | `True` → `subcell-truecolor` (run-length SGR + `█`/octants/braille); `False` → `ramp-plain` (no escapes at all, one char per cell from `" .:-=+*#%@"`) |
+| `glyph` | `"mix"` (default) / `"octant"` / `"braille"` — which sub-cell glyph family the truecolour renderer picks per cell. Only `screen` and the `screenshot` sibling art read it; every other action ignores `chars`, `color` and `glyph` alike |
+
+#### The precision model: 8 sub-pixels per cell
+
+`render_halfblock` puts **two** vertical source pixels in one cell (`▀` + fg/bg). The default renderer, `render_subcell`, puts **eight** — a 2x4 grid — because a truecolour terminal cell can address all eight sub-cells at once. Each sub-cell is box-averaged over its own source rect, never point sampled. Consequences worth knowing:
+
+- **Same rows as half-block.** `rows = max(1, round(cols * height / width / 2.0))` (`ascii_art.subcell_rows`, the `render_halfblock` formula verbatim), so a 1280x720 capture at 100 cols is `grid: 100x28` in **both** modes. The `/ 2.0` is only the terminal cell's 1:2 aspect correction — a cell is 2x4 source pixels, but those sub-pixels are square, so one cell covers the same source rect either way. Sub-cell art buys resolution *inside* the cell, never fewer rows; halving them would squash every screen to half height. The `.art` meta's `cell` field is the sub-pixel's source size, `round(width / (2*cols))` x `round(height / (4*rows))` — `6x6` for the 1280x720 @ 100 cols example.
+- **Two colours per cell, not one.** Every cell is reduced to an (fg, bg) pair plus an 8-bit sub-cell mask by a 2-means pass seeded on the farthest pair of the eight samples (3 Lloyd iterations, brighter entry as fg). The mask then picks the glyph, so **colour is preserved rather than merely encoded**:
+
+| Cell looks like | Glyph | Chosen when |
+|---|---|---|
+| one flat colour | `█` (U+2588) | every sub-cell within `UNIFORM_SPREAD = 12.0` of the cell mean |
+| two crisp solid regions | **BLOCK OCTANT** (U+1CD00…U+1CDE5, Unicode 16.0) | entry separation ≥ `OCTANT_MIN_SEPARATION = 60.0` **and** worst intra-cluster error ≤ `OCTANT_MAX_INTRA_ERROR = 24.0` |
+| a blend, a gradient, antialiased text | **BRAILLE** (`U+2800 + mask`) | otherwise — 8 halftone dots that optically blend fg and bg |
+
+  BLOCK OCTANT digits are **row-major** (`1,2` = top row left to right, `7,8` = bottom row); braille dots and the renderer's internal mask are **column-major** (`bit i` = sub-cell `i`, left column rows 0-3 then right column rows 0-3). `ascii_art._name_mask_to_internal` is the one permutation between the two, and both glyph families read the same internal mask, so they are interchangeable. Unicode encodes only 230 of the 256 masks as BLOCK OCTANT; the **26 unencoded masks fall back to a braille pattern**. The full rule, thresholds and format spec are in `docs/storage.md` § "The sub-cell glyph set".
+- **Every patterned cell is readable.** The glyph class is picked first, then the fg/bg pair is contrast-boosted (`ascii_art._boost_pair`) — 2-means minimises error, so a subtle cell would otherwise get two nearly identical entries and an invisible mask. The pair is widened **symmetrically about the cell mean** until it spans `MIN_LUMA_DELTA = 40.0` of Rec. 601 luminance (primary) and `MIN_PAIR_DISTANCE = 50.0` of colour: along its own direction so hue is preserved (capped at `MAX_CONTRAST_BOOST = 2.0`, so a noisy cell cannot explode), then along the neutral axis for the luminance shortfall, both clamped to the `[0, 255]` room around the mean. A pair that cannot reach the floor in gamut — pinned at black/white, or structureless noise — collapses the cell to the mean `█`, because a smooth block beats visible noise. Uniform and degenerate (empty/full mask) cells are never boosted.
+- **The font caveat is real.** BLOCK OCTANT only exists from Unicode 16.0 (2024). On an older font or terminal every chosen octant renders as tofu. `glyph="braille"` is the escape hatch: it forces dots everywhere, which is never worse than the old half-block. `glyph="octant"` does the opposite (blocks wherever a mask applies), and `glyph="mix"` is the default rule above.
+- **`halfblock-truecolor` is still there.** `render_halfblock` and `MODE_COLOR = "halfblock-truecolor"` are unchanged, so existing `.art` files parse and render byte-identically, and `miniouto computer show` needs no mode switch.
+
+The result string is a header (`Screen art captured (1280x720 -> 100x28 chars, subcell truecolor).` + `Saved to: <path>` + the "coordinates still come from screenshot" note), then **at most `_ART_PREVIEW_ROWS = 24` rows** of preview — sized so the whole result stays under the `_ART_RESULT_LIMIT = 3800` char tool-result cap, with a `… N more rows are in the file above.` tail. **The full art lives in the file**, not in the transcript: render it with `miniouto computer show [PATH] [--plain] [--cols N] [--head N]` (newest capture by default), which is also how a delegated `miniouto chat --role <tag>` run reads what the orchestrator captured, since a `.art` file is plain text. Art carries **no clickable coordinates** — those still come from `screenshot`.
+
+**`screenshot` writes the same art as a best-effort sibling.** `_write_art_best_effort` renders the capture's `.art` next to it and hands the path back on `Screenshot.art_path`; `registry.py` appends the same `Saved to: <path>` line to the screenshot's caption text. Best effort on purpose: the screenshot's pixels are the deliverable, so an undecodable PNG, a full disk or a read-only home costs the art file and nothing else — never the capture. Because that line is the exact hook the TUI's `art_path_in_result` matches, an expanded tool row renders the truecolour art for **any** Computer result that names a `.art` file, not only `screen`. The TUI hands the body to Textual's `Text.from_ansi`, so the `█` / octant / braille glyphs and their SGR colours need no TUI-specific handling — the same file renders identically in `miniouto computer show`.
+
+Decoding is pure stdlib in `tools/ascii_art.py`: `decode_png_rgba` is miniouto's own 8-bit non-interlaced PNG decoder (colour types 0/2/3/4/6, all five scanline filters), because py-Vwayland exposes a screenshot **only** as `Image.png_bytes` and **Pillow is deliberately not a dependency** (the project pins eight packages; anything more needs discussion). Every input it cannot faithfully reproduce raises a `ValueError` naming the offending property — a screenshot that decodes to garbage is worse than one that refuses to decode — and the tool surfaces that as `ComputerUseError`. The decode runs on a worker thread in the caller (`asyncio.to_thread`); a straightforward pure-Python defilter is the right trade against correctness and an actionable error. The `.art` file format is documented in `docs/storage.md`.
+
 ### Provider support
 
-`screenshot` returns an `ImageBlock`, so computer use needs a **vision-capable** provider — the same matrix as the Image tool above (Anthropic/Google yes; OpenAI Responses yes; OpenAI Chat Completions rejects all multimodal blocks). On a non-vision provider the screenshot call succeeds but the *next* LLM call raises `ValueError`.
+`screenshot` returns an `ImageBlock`, so seeing the screen needs a **vision-capable** provider — the same matrix as the Image tool above (Anthropic/Google yes; OpenAI Responses yes; OpenAI Chat Completions rejects all multimodal blocks, where `screenshot` instead returns an explanatory notice and `screen` remains the working channel). On a non-vision provider the screenshot call succeeds but the *next* LLM call raises `ValueError`.
 
 ---
 
@@ -214,9 +254,9 @@ All actions except `spawn`/`list` accept `screen` (target screen id); the omissi
 
 Wires the bash/media/computer tools into coreouto's tool registry.
 
-### `register_all()`
+### `register_all(api_format=None)`
 
-Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`, and — when `computer_supported()`; screenshot availability is decided at call time from the outo provider's `api_format` — `Computer` (with `parallelizable=False`). (The `call_subagent` tool is registered conditionally in `core.runtime.build_runtime` when the active style declares at least one named subagent, because it needs the resolved subagent specs to pick a persona by `name=`. An outo-only style produces no `call_subagent` tool at all.)
+Idempotent: calls `_register_if_missing(name, handler, schema, description)` for `Bash`, `Image`, `Video`, `Audio`, `continue_session`, and — when `computer_supported()` — `Computer` (with `parallelizable=False`). `api_format` refreshes a module flag the one registered Computer handler reads **at call time** to decide whether `screenshot` may return an image or must return a notice; a mid-session provider switch therefore takes effect on the very next call. Delegation is **not** a tool at all: it rides on `Bash` as `miniouto chat "<brief>" --style <style> --role <tag>`.
 
 ### `_register_if_missing(name, handler, schema, description, *, parallelizable=True)`
 
@@ -234,9 +274,10 @@ The `_xxx_schema()` functions are invoked at registration time (`_register_if_mi
 | `Image` | `_image_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, ImageBlock]` |
 | `Video` | `_video_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, VideoBlock]` |
 | `Audio` | `_audio_handler(file_path) -> list[co.ContentBlock]` | sync, **multimodal** — returns `[TextBlock, AudioBlock]` |
-| `Computer` | `_computer_handler(action, coordinate=None, end_coordinate=None, text=None, scroll_direction=None, scroll_amount=3, duration=1.0) -> str \| list` | sync; returns `str` for ordinary actions, **multimodal** `[TextBlock, ImageBlock]` for `screenshot` |
+| `Computer` | `_computer_handler(action, coordinate=None, end_coordinate=None, text=None, scroll_direction=None, scroll_amount=3, duration=1.0, screen=None, chars=100, color=True) -> str \| list` | sync; returns `str` for ordinary actions **and** for `screen` (a text result), **multimodal** `[TextBlock, ImageBlock]` only for `screenshot` |
+| `continue_session` | `continue_session(summary_dir)` (imported straight from `tools/continue_session.py` — no wrapper handler) | sync, plain **text** result, **no provider gate** — it never returns a multimodal block, so it works identically on every `api_format` |
 
-The media handlers are the **only** handlers in this file that return something other than `str`. They delegate the file read to `tools.media.load_*` (which returns a `LoadedMedia`), then build a two-element block list: a `TextBlock` caption (path + byte count + MIME) and the binary block. coreouto forwards the list to the provider as a multimodal tool result. Do **not** refactor these to return `str` — that would discard the media payload and silently degrade the tools to "the file exists" no-ops. Contract: [coreouto `tools.md` — Multimodal tool results](https://github.com/llaa33219/coreouto/blob/main/docs/tools.md#multimodal-tool-results).
+The media handlers (and `Computer`'s `screenshot` branch) are the **only** handlers in this file that return something other than `str`. They delegate the file read to `tools.media.load_*` (which returns a `LoadedMedia`), then build a two-element block list: a `TextBlock` caption (path + byte count + MIME) and the binary block. coreouto forwards the list to the provider as a multimodal tool result. Do **not** refactor these to return `str` — that would discard the media payload and silently degrade the tools to "the file exists" no-ops. Contract: [coreouto `tools.md` — Multimodal tool results](https://github.com/llaa33219/coreouto/blob/main/docs/tools.md#multimodal-tool-results).
 
 ### Descriptions (what the LLM actually sees)
 
@@ -254,25 +295,42 @@ Each description includes the tool's restrictions inline. Verbatim from `registr
 
 ---
 
-## `call_subagent` (registered in `core/runtime.py`, not here)
+## `tools/continue_session.py`
 
-The one tool that is not a `tools/` module. It is built and registered by `core/runtime.py:_build_subagent_tool` on every `build_runtime`, and **only when the active style declares at least one named subagent** — an outo-only style exposes no delegation surface at all.
+```python
+continue_session(summary_dir: str) -> str
+```
 
-| Argument | Meaning |
-|---|---|
-| `name` | which persona to run. `""` resolves to a spec literally named `"subagent"` (legacy compat), else the sole declared spec, else an error. An explicit name that matches nothing fails fast, before any job starts. |
-| `task` | **ONE** self-contained brief. The subagent sees only its persona prompt and this brief. There is no fan-out parameter: several `call_subagent` calls in one response = several concurrent jobs. |
+Sync, registered unconditionally, in `BASE_TOOLS` — so outo and every delegated `--role` run have it. It is the **only** way a session changes.
 
-Contract, in the order the model experiences it:
+**What it does, in order:**
 
-1. **The call does not block.** The handler validates `(name, task)`, hands the brief and the per-persona `co.Agent` to `core/subagents.py:submit`, and returns an **acknowledgement** — the job id, an explicit "this text is NOT the result", the alarm header the model will receive later, the results directory, and "do not wait or poll; continue with other work".
-2. The job runs in the **background**, on a daemon thread owning its own event loop (`core/subagents.py`), so it can outlive the turn that started it — and, on purpose, it has no stall supervisor and no hooks of its own once that turn ends.
-3. On completion the job writes `~/.miniouto/subagent-results/<sid>-<ts>.md` and queues **exactly one** alarm.
-4. The alarm is delivered as a **synthetic user message** whose first line is `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`, appended to the live message list at the next `BEFORE_LLM_CALL` (see `docs/core.md` for why it is not `inject_user_message`). It names the result file, which the model is told to `cat`.
+1. **Validate.** `_resolve` expands `~`, resolves a relative path against `INVOCATION_CWD`, and requires an existing directory holding at least one `*.md`. Anything else (empty, missing, not a directory, no markdown) returns the reason as the tool result — never an exception — so the model can write the documents and retry. It deliberately does *not* judge whether the summary is *good*: only the session that reads it can.
+2. **Mint** `cont-<YYYYMMDD-HHMMSS>-<6hex>`.
+3. **Insert the continuation message** into the new session's inbox — `kind=inbox.ALARM_KIND`, `source="summary"`, `meta={"from": <old session>}` — built by `core/summary.py:build_continuation_message` (header `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` + `New session opened from a summary — continue the previous work here.`).
+4. **Record the hand-off** via `summary.request_handoff(new_session, from_session=..., summary_dir=str(directory))`. The loop layer never consumes it; the entry layer (`cli/chat.py:_run_handoffs`) performs the session transition.
+5. **Ack.** The returned text names the old and new sessions and the folder, repeats that a delegation contract (role / style / alarm session / result file) travelled along, and ends with "do no more work here, end your turn".
 
-Do not reintroduce a multi-brief parameter, and do not "simplify" `_build_subagent_tool` back to `coreouto.contrib.agent_as_tool`: the stock helper drops `provider_config`, so a subagent writing a file with a heredoc gets truncated at the provider's low default (1024 for Anthropic).
+**Why the loop ends there.** `core/chat.py` builds the turn's cancel event as a `_StopOnHandoff` — a `threading.Event` whose `is_set()` ORs the caller's cancel event with its own hand-off flag — and the `AFTER_TOOL_CALL` dispatcher fires that flag when it sees a pending hand-off. The loop stops cooperatively at its next step rather than letting the model burn the rest of a nearly-full context on work the new session is about to redo. The resulting `LoopCancelledError` is re-classified at the call site into a clean `status="done"` turn; the hand-off stays pending for the entry layer.
 
----
+**Invocation points.** Exactly two, at the end of a turn: `cli/chat.py:_run_handoffs` (`_apply_handoff` moves `opts.session`, re-registers the run contract under the new session, updates `settings.session`, and prints `------summary → <new>------` + `summary: <dir>`) and `cli/tui.py:ChatTUI._apply_handoff` (mounts the same marker in the old conversation, persists it for replay, re-pins the new session, and lets the 1 s inbox poll auto-deliver the continuation).
+
+## Delegation is a Bash command, not a tool
+
+There is **no** `call_subagent` — it was deleted along with the in-process job registry. Delegation happens because the model runs the harness through the shell:
+
+```
+Bash: miniouto chat "<brief>" --style <style> --role <tag> [--bg] --alarm-session <session>
+```
+
+That is the same `chat` command the user runs — same `ChatOptions` assembly, same `run_turn_chain`, same watchdog — in **its own OS process**. Consequences worth knowing when you write or debug a tool:
+
+- **One brief per invocation; no fan-out parameter.** Parallelism = several `miniouto chat --role` commands in one Bash call, or several Bash calls. Do not reintroduce a multi-brief flag.
+- The run **starts with no history**, so the brief is the whole input. An under-specified brief produces garbage; that is a prompting problem, not a runtime one.
+- `--role <tag>` selects a top-level `<tag>` body from the active style as the system prompt, and an unknown tag **fails before the turn** (`cli/chat.py:_validate_role`), so a typo costs no model call.
+- `--bg` is **detach-safe by construction**: the child gets `start_new_session=True` and file stdio (`spawn-logs/<id>.log`), because `tools/bash.py` kills whole process groups and grace-kills pipe-holding children — so a background run survives only with both halves.
+- Two output channels, always both: an answer file under `~/.miniouto/subagent-results/` and **exactly one** inbox message whose first line is `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` and which names that file. A third channel is only a promise: the `spawn-logs/<id>.json` liveness marker.
+- Because the run is a separate process, `register_all`/preset setup is independent of it — it builds its **own** runtime, and it gets the **identical tool list** to outo (`Computer` included; separate processes own separate vwayland screens). Full reference in `docs/cli.md`.
 
 ## Path resolution
 
@@ -286,8 +344,8 @@ If you need the agent to operate relative to a different directory, pass an abso
 
 1. Create `src/miniouto/tools/<name>.py` with a single function `<name>(**kwargs) -> str` (or `async def`). Keep it **pure stdlib** — no `coreouto` import. If the tool needs to return media (image/video/audio bytes), return a plain data structure (like `media.py`'s `LoadedMedia`) and let `registry.py` build the `co.ContentBlock`s. See `tools/media.py` for the pattern.
 2. Add the function's description, schema, and handler to `tools/registry.py`. Add `_<name>_handler`, `_<name>_schema`, `_<name>_description` and wire them via `_register_if_missing` inside `register_all`. (Note: per "A note on schemas" above, the schema dict is currently discarded at registration — the description string is what reaches the model.) **For multimodal tools**, the handler returns `list[co.ContentBlock]` instead of `str` — see the `Image` / `Video` / `Audio` handlers for the exact shape.
-3. Add the name to `core/runtime.BASE_TOOLS` (this controls which tools are visible to both outo and subagent presets — every `register_agent_preset(..., tools=BASE_TOOLS + OUTO_ONLY_TOOLS [...], ...)` call references it). `call_subagent` is NOT in this list — it's registered conditionally based on the active style.
-4. If the tool should only be visible to outo (not subagent), add its name to `core/runtime.OUTO_ONLY_TOOLS` instead of `BASE_TOOLS`. **Do not confuse this with `parse_style`** — that function only resolves the style *prompts*, not the tool lists.
+3. Add the name to `core/runtime.BASE_TOOLS` — every run gets it (an interactive outo turn **and** a delegated `miniouto chat --role <tag>` run, since there is one preset and two modes that differ only in the system prompt).
+4. If the tool's registration is **platform-conditional** (like `Computer`), add its name to `core/runtime.PLATFORM_GATED_TOOLS` instead; `build_runtime` appends that list in every mode, filtered down to what actually registered, so an unsupported platform never sees it. **Do not confuse this with `parse_style`**, which only resolves the style *prompts* (the roles `chat --role` can select), not the tool lists.
 5. Add the tool name to `_LOGGABLE_TOOL_NAMES` and the tool-name set in `_make_tool_call_dispatcher` (plus a branch in `_short_arg_summary`) in `core/chat.py`, so loop events and failure diagnostics render the new tool nicely. (The media tools `Image` / `Video` / `Audio` are examples of this wiring.)
 6. Update `default_style/*.md` if the tool's name or behavior should be documented to the model.
 7. Add a `Bash`-style test for the new tool's edge cases (none exist yet, so this is a chance to start the test suite).

@@ -1,12 +1,47 @@
-"""Context window monitoring and auto-summarization."""
+"""Context window monitoring: model caps, and the explicit summary trigger.
+
+Two duties, deliberately kept apart:
+
+* **Caps** — the lma-backed lookups (`get_max_output_tokens`,
+  `get_context_window`) that pin the output floor and the window size. This
+  is invariant 4's machinery and is unchanged.
+* **The summary trigger** — this harness never summarizes *implicitly*: no
+  compaction, no silent history rewrite, no second LLM rewriting the
+  transcript behind the model's back. Instead :func:`make_context_monitor`
+  watches how full the window is and, at
+  :data:`CONTEXT_SUMMARY_TRIGGER_PCT`, drops **one** request into the session
+  inbox. The existing BEFORE_LLM_CALL inbox hook delivers it to the model as
+  a user message; the text itself (what to write, where, and the
+  `continue_session` follow-up) belongs to `core/summary.py`.
+
+Delivery through the inbox rather than a direct `messages.append` is what
+makes the request visible: it is recorded, replayed and rendered exactly
+like any other alarm.
+"""
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable
 from typing import Any
 
+from . import inbox
 from . import lma as lma_api
+from .summary import build_summary_request, summary_dir_for
 
-SUMMARIZE_THRESHOLD = 0.8
+# The measured context usage (percent of the window) at which the model is
+# asked to summarize. Deliberately late: at this point the remaining window
+# is still enough to write the summary documents and hand off, which is the
+# only thing left that needs context.
+CONTEXT_SUMMARY_TRIGGER_PCT = 80
+
+# Source stamped on the injected summary request, so a receiver can tell a
+# context trigger apart from a delegated run's completion alarm.
+SUMMARY_SOURCE = "context"
+
+# Rough chars-per-token ratio used ONLY by the estimate fallback in
+# `_estimate_tokens` (for providers that report no usage at all).
+_CHARS_PER_TOKEN = 4
 
 # Hard floor for max_output_tokens. Some providers (Anthropic in particular)
 # default to 1024 if you don't set it explicitly, which is far too small
@@ -102,228 +137,93 @@ def get_max_output_tokens(model: str, provider_name: str | None = None) -> int:
     caps = _fetch_model_caps(model, provider_name)
     return caps.get("maxOutputTokens") or caps.get("contextWindow") or DEFAULT_MAX_OUTPUT_TOKENS
 
+def _estimate_tokens(messages: Any) -> int | None:
+    """Fallback occupancy estimate when a provider reports no usage at all.
 
-def make_summarize_hook(model: str, session_name: str, provider_name: str | None = None) -> Any:
-    """Create a hook that compacts the live message list at 80% context.
+    Counts the characters actually in the live transcript and divides by
+    `_CHARS_PER_TOKEN`. `None` when the messages carry no text, so the
+    caller stays silent rather than guessing.
+    """
 
-    The compaction is a **context handoff**, not a prose summary: the agent
-    continues the task with ONLY the compacted message, so everything it
-    still needs — the verbatim task, file paths, commands run, decisions,
-    errors, next steps — must survive inside it. Three hard-won rules:
+    if not isinstance(messages, list):
+        return None
+    chars = 0
+    for message in messages:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            chars += len(content)
+        elif content is not None:
+            chars += len(str(content))
+        for call in getattr(message, "tool_calls", None) or []:
+            chars += len(str(getattr(call, "arguments", None) or ""))
+    return chars // _CHARS_PER_TOKEN if chars else None
 
-    - The conversation fed to the summarizer LLM must include the tool
-      CALLS (which command produced which result), not just truncated
-      result tails — otherwise the handoff cannot name what was done.
-    - The compacted message embeds the current task verbatim (extracted
-      deterministically, never LLM-paraphrased) inside a minimal positive
-      frame — the conversation was compacted, read the handoff and
-      continue naturally. No prohibitions: naming forbidden recovery
-      behavior (sessions, `.miniouto`, transcripts) plants the very idea,
-      and a handoff that carries everything leaves nothing to recover.
-    - The summarizer agent gets its own `max_tokens` — without it the
-      active provider's low default (Anthropic: 1024) silently truncates
-      the handoff mid-section, which is the same confusion by another door.
 
-    Reimplements `coreouto.contrib.hooks.auto_summarize_hook` with one
-    critical difference: if the summarizer ever returns a non-iterable
-    (None, dict, scalar), coreouto's stock hook does
-    `messages.clear(); messages.extend(summarized)` which both wipes the
-    conversation AND raises `'NoneType' object is not iterable`. Our
-    wrapper refuses to clear messages unless the summarizer returned a
-    real list, so a single buggy summarizer can't destroy a turn.
+def _tokens_used(response: Any, messages: Any) -> int | None:
+    """How full the context window is, in tokens — provider accounting first.
 
-    Returns `(on_iteration, before_llm_call)` — two hooks. The compaction
-    itself runs in `before_llm_call`, NOT in `on_iteration`: coreouto
-    fires ON_ITERATION *before* executing the response's tool calls, so
-    compacting there would wipe the just-appended assistant tool_use and
-    leave the upcoming tool results orphaned (provider 400: "tool result's
-    tool id not found"). BEFORE_LLM_CALL of the next iteration is the
-    safe point — every tool-call pair in the list is complete.
-    `before_llm_call` (and the summarizer it awaits) must be **async**:
-    the hook fires inside coreouto's running event loop, where a
-    synchronous `call_sync` (its own `asyncio.run`) raises "cannot be
-    called from a running event loop" — with the old sync hook the LLM
-    handoff silently never worked and every compaction fell back.
+    `response.usage.prompt_tokens` is the size of the request that was
+    just sent, i.e. the true occupancy; `total_tokens` (prompt +
+    completion) is the next best and is what providers that omit the split
+    still report. Only when neither exists does the chars/4 estimate over
+    the live messages stand in.
+    """
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        for attr in ("prompt_tokens", "total_tokens"):
+            value = getattr(usage, attr, None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return _estimate_tokens(messages)
+
+
+def make_context_monitor(
+    *, model: str, session: str, provider_name: str | None = None
+) -> Callable[..., None] | None:
+    """Build the ON_ITERATION hook that ASKS for a summary at the threshold.
+
+    Returns `None` when the window size is unknown — without it there is no
+    threshold to measure against, and inventing a window would fire the
+    request at an arbitrary moment.
+
+    Fires at most once per hook instance, and `build_runtime` builds a fresh
+    one per turn (the same lifecycle the watchdog trackers have), so the
+    guard is per turn without any module-level state to reset.
     """
 
     window = get_context_window(model, provider_name)
-    if not window:
-        noop = lambda **kwargs: None  # noqa: E731
-        return noop, noop
+    if not window or not session or not session.strip():
+        return None
 
-    threshold = int(window * SUMMARIZE_THRESHOLD)
+    fired = False
 
-    def _compact_frame(task_verbatim: str, handoff: str) -> str:
-        frame = (
-            "[Summary — compacted context]\n"
-            "The earlier conversation was compacted into the handoff "
-            "below. Read it carefully, then continue the task naturally "
-            "from where it stands.\n"
-        )
-        parts = [frame]
-        if task_verbatim:
-            parts.append(f"\n## Current task (verbatim)\n{task_verbatim}")
-        parts.append(f"\n## Context handoff\n{handoff}")
-        return "".join(parts)
-
-    def _serialize_conversation(
-        existing_summary: str | None, msgs_to_summarize: list[Any]
-    ) -> str:
-        import json
-
-        lines: list[str] = []
-        if existing_summary:
-            lines.append(f"Previous compaction (already summarized; carry its facts forward):\n{existing_summary}")
-
-        for m in msgs_to_summarize:
-            if m.role == "user" and m.content:
-                lines.append(f"User: {m.content}")
-            elif m.role == "assistant":
-                if m.content:
-                    lines.append(f"Agent: {m.content}")
-                # The tool CALLS are the record of what was actually done —
-                # without them the results below are unattributable output.
-                for tc in getattr(m, "tool_calls", None) or []:
-                    try:
-                        args = json.dumps(tc.arguments or {}, ensure_ascii=False)
-                    except Exception:
-                        args = repr(getattr(tc, "arguments", None))
-                    lines.append(f"Agent tool call: {tc.name}({args})")
-            elif m.role == "tool" and m.content:
-                name = getattr(m, "name", None) or "tool"
-                text = m.content if isinstance(m.content, str) else str(m.content)
-                lines.append(f"Tool result [{name}]: {text[:4000]}")
-        return "\n".join(lines)
-
-    async def summarizer(messages: list[Any]) -> list[Any]:
-        if len(messages) <= 2:
-            return messages
-
-        system_msgs = [m for m in messages if m.role == "system"]
-        other_msgs = [m for m in messages if m.role != "system"]
-
-        existing_summary: str | None = None
-        msgs_to_summarize: list[Any] = []
-
-        for m in other_msgs:
-            if m.role == "user" and m.content.startswith("[Summary"):
-                existing_summary = m.content
-            else:
-                msgs_to_summarize.append(m)
-
-        # Deterministic verbatim task extraction — never trust the LLM to
-        # preserve the user's exact request.
-        task_verbatim = ""
-        for m in reversed(msgs_to_summarize):
-            if m.role == "user" and m.content and not m.content.startswith("[Summary"):
-                task_verbatim = m.content
-                break
-
-        conversation = _serialize_conversation(existing_summary, msgs_to_summarize)
-
-        summary_prompt = (
-            "You are writing a CONTEXT HANDOFF that will REPLACE the "
-            "conversation for the working agent. The agent continues the "
-            "task with ONLY this document — every detail it still needs "
-            "must survive here. Write it for the agent, not for a human "
-            "reviewer.\n\n"
-            "Produce exactly these sections:\n"
-            "1. TASK — what the user asked for, in order; keep key "
-            "phrasing verbatim (requests, constraints, preferences)\n"
-            "2. DONE — completed work: file paths, commands run, outcomes\n"
-            "3. IN PROGRESS — the exact step in flight when compaction "
-            "happened\n"
-            "4. FILES — every file read/created/modified: path + one line "
-            "on its role and what changed in it\n"
-            "5. DECISIONS — design choices made, alternatives rejected, "
-            "user-imposed constraints, forbidden actions\n"
-            "6. ERRORS — failures hit, root causes identified, fixes "
-            "applied, unresolved ones\n"
-            "7. NEXT — remaining steps in order, plus the verification "
-            "commands that will prove completion\n\n"
-            "Rules: paths, commands, and identifiers verbatim — never "
-            "paraphrased. Specifics over prose. No preamble, no "
-            "meta-commentary.\n\n"
-            f"Conversation to compact:\n{conversation}"
-        )
-
-        from coreouto._types import Message
-
-        try:
-            import coreouto as co
-            # Resolve the output cap the same way the main agent does
-            # (provider TUI override > lma max_output_tokens > lma
-            # context_window > DEFAULT_MAX_OUTPUT_TOKENS floor), fresh at
-            # compaction time so mid-session override edits apply. A
-            # hardcoded value either truncates the handoff (too small) or
-            # gets the request rejected by the provider (too large — the
-            # failure mode observed with 8192 on providers whose real cap
-            # is lower).
-            summary_agent = co.Agent(co.AgentConfig(
-                name="summarizer",
-                model=model,
-                provider=provider_name or "",
-                system_prompt=(
-                    "You are a context-compaction engine. You produce "
-                    "complete, dense, structured handoff documents for a "
-                    "working agent. You never chat."
+    def hook(*, messages: Any = None, response: Any = None, **_kwargs: Any) -> None:
+        nonlocal fired
+        if fired:
+            return
+        used = _tokens_used(response, messages)
+        if used is None:
+            return
+        pct = used * 100 // window
+        if pct < CONTEXT_SUMMARY_TRIGGER_PCT:
+            return
+        fired = True
+        # A broken inbox must not take the turn down with it (the same
+        # rule the delivery hook follows) — the request is a courtesy, not
+        # part of the loop's contract.
+        with contextlib.suppress(Exception):
+            inbox.insert(
+                session,
+                build_summary_request(
+                    session=session,
+                    pct=pct,
+                    window_tokens=window,
+                    used_tokens=used,
+                    summary_dir=summary_dir_for(session),
                 ),
-                max_iterations=1,
-                provider_config={
-                    "max_tokens": get_max_output_tokens(model, provider_name)
-                },
-            ))
-            result = await summary_agent.call(summary_prompt)
-            handoff = result.content or ""
-        except Exception as exc:
-            # Visible, not silent: a summarizer that fails every compaction
-            # silently degrades every long turn to the fallback tail.
-            from rich.console import Console
-            Console(stderr=True).print(
-                f"[yellow]⚠ LLM summarization failed "
-                f"({type(exc).__name__}: {exc}); falling back to verbatim "
-                "tail.[/yellow]",
-                highlight=False,
-            )
-            # Deterministic fallback: a truncated recent tail of the real
-            # transcript preserves far more than a content-free apology.
-            handoff = (
-                "(LLM summarization failed — verbatim tail of the recent "
-                f"conversation follows)\n{conversation[-6000:]}"
+                kind=inbox.ALARM_KIND,
+                source=SUMMARY_SOURCE,
             )
 
-        summary_msg = Message(role="user", content=_compact_frame(task_verbatim, handoff))
-        return [*system_msgs, summary_msg]
-
-    total: list[int] = [0]
-    pending: list[bool] = [False]
-
-    def on_iteration(*, iteration: int, messages: list[Any], response: Any, **_kwargs: Any) -> None:
-        if response is None or getattr(response, "usage", None) is None:
-            return
-        total[0] += response.usage.total_tokens
-        if total[0] >= threshold:
-            pending[0] = True
-
-    async def before_llm_call(*, messages: list[Any], **_kwargs: Any) -> None:
-        if not pending[0]:
-            return
-        pending[0] = False
-        summarized = await summarizer(messages)
-        if not isinstance(summarized, list):
-            from rich.console import Console
-            Console(stderr=True).print(
-                "[yellow]⚠ summarize_fn returned "
-                f"{type(summarized).__name__} (expected list); "
-                "keeping original messages.[/yellow]",
-                highlight=False,
-            )
-            return
-        messages.clear()
-        messages.extend(summarized)
-        # Reset after compaction (coreouto examples/23 pattern): without
-        # this, every later iteration that reports usage re-triggers the
-        # LLM summarizer, turning one compaction into a per-iteration tax.
-        total[0] = 0
-
-    return on_iteration, before_llm_call
+    return hook

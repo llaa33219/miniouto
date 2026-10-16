@@ -8,7 +8,7 @@ A cookbook of real-world examples for every CLI command — flags, output shapes
   - [Basic usage](#basic-usage)
   - [Session management (`--name`, `--continue`)](#session-management---name---continue)
   - [Output modes (verbose / `--answer-only` / `--with-session`)](#output-modes-verbose---answer-only----with-session)
-  - [Runtime overrides (`--provider`, `--model`, `--style`)](#runtime-overrides---provider---model---style)
+  - [Runtime overrides (`--pm`, `--style`)](#runtime-overrides---pm---style)
   - [Generation parameters (`--max-tokens`, `--temperature`)](#generation-parameters---max-tokens---temperature)
 - [`miniouto provider` — provider management](#miniouto-provider--provider-management)
 - [`miniouto style` — style management](#miniouto-style--style-management)
@@ -131,7 +131,7 @@ outo: tests pass. Here is the final code.
 
 ### Session management (`--name`, `--continue`)
 
-Without an explicit name a fresh one is generated each call and stored in `settings.toml`'s `session` field. To carry a conversation across calls combine `--name` with `--continue`.
+Without an explicit name a fresh one is generated each call and stored in `settings.toml`'s `session` field — but only for a **plain** chat. A delegated run (`--role`, `--alarm-session`, `--return`, `--bg`) is a guest: it writes its own session file under its own generated name and never repoints your active session. To carry a conversation across calls combine `--name` with `--continue`.
 
 ```bash
 # Name the session explicitly (persisted to settings.session)
@@ -181,32 +181,41 @@ Exact differences across the three modes:
 
 > Use `--answer-only` when a script wants just the answer; use `--with-session` when you run several sessions in parallel and need to tell which answer belongs to which. Parsing recipes are in [`automation.md`](./automation.md#3-parsing-chat-output-by-mode).
 
-### Runtime overrides (`--provider`, `--model`, `--style`)
+### Runtime overrides (`--pm`, `--style`)
 
-Apply a different provider/model/style for just this call without touching the saved settings.
+Apply a different provider/model/reasoning/style for just this call without touching the saved settings or the session's pin.
 
 ```bash
-# Use a different model just for this call
-miniouto chat "needs heavy reasoning" --model claude-opus-4
-miniouto chat "just a quick classification" --model gpt-5.5-mini
+# Provider + model for this call only (both must already be registered)
+miniouto chat "hello" --pm "openai/gpt-5.5"
 
-# Use a different provider just for this call (must already be registered)
-miniouto chat "hello" --provider openai
+# Reasoning effort rides along as a ':' suffix
+miniouto chat "needs heavy reasoning" --pm "anthropic/claude-opus-4.5:high"
+
+# A model name may itself contain '/', and the reasoning is split off the LAST ':'
+miniouto chat "deep dive" --pm "together/meta-llama/Llama-4-70B:medium"
+
+# Reasoning omitted (or a trailing ':') leaves it to the session pin / default
+miniouto chat "just a quick classification" --pm "openai/gpt-5.5-mini:"
 
 # Use a different style just for this call
 miniouto chat "review this code" --style default
 miniouto chat "orchestrate this for me" --style coding-pro
 
 # Combinable
-miniouto chat "summarize" --provider anthropic --model claude-sonnet-4 --style coding
+miniouto chat "summarize" --pm "anthropic/claude-sonnet-4.5" --style coding
 ```
 
-Model resolution order (first match wins, see [`README.md`](../README.md#model-resolution)):
+`--pm 'PROVIDER/MODEL[:REASONING]'` is the **only** provider/model/reasoning override `chat` has; `--provider`, `--model`, `--reasoning`, `--subagent-provider` and `--subagent-model` were removed in favour of it. A missing `/`, or an empty provider or model, is rejected before any resolution, so a typo costs no model call.
 
-1. `chat --model <name>` (this call only)
-2. `settings.model` (the TUI model picker clears this — effectively legacy)
-3. `provider.default_model`
-4. error — no model can be inferred
+Provider/model/reasoning resolution order (first match wins, per key — see [`README.md`](../README.md#model-resolution)):
+
+1. `--pm` (this call only)
+2. this session's pin, `session-config/<session>.toml` — frozen at the session's first resolution
+3. the global default: `settings.provider` + the provider record's `default_model` / `reasoning_effort`
+4. error — no provider configured / no model can be inferred
+
+Pin a long-running session so a model switch in another process can't move it, and start a fresh one on something else with `--pm`.
 
 ### Generation parameters (`--max-tokens`, `--temperature`)
 
@@ -222,7 +231,7 @@ miniouto chat "strict facts only" --temperature 0.0
 miniouto chat "summarize" --max-tokens 512 --temperature 0.3
 ```
 
-> When `--max-tokens` is omitted, `core/context.py:get_max_output_tokens` queries the lma `/model` endpoint for the model's real cap and uses it, with a 16384-token floor (prevents Anthropic's 1024 default from silently truncating long tool calls, e.g. heredoc file writes, mid-stream). A per-provider override can be set in the TUI custom-model editor for providers lma has no data on.
+> When `--max-tokens` is omitted, `core/context.py:get_max_output_tokens` queries the lma `/model` endpoint for the model's real cap and uses it, with a 16384-token floor (prevents Anthropic's 1024 default from silently truncating long tool calls, e.g. heredoc file writes, mid-stream). A per-provider `max_output_tokens` / `max_context_window` override is set when the provider is added (the TUI `+ add custom…` wizard asks for them) or by hand in `providers.toml`, for endpoints lma has no data on.
 
 ---
 
@@ -304,7 +313,7 @@ miniouto provider remove my-local
 
 ## `miniouto style` — style management
 
-A style is a markdown system prompt at `~/.miniouto/style/<name>.md`. It declares one `<outo>` body plus zero or more **named subagent** bodies — each `<name>...</name>` top-level tag is one subagent, and the tag name IS the persona name (e.g. `editor`, `file-picker`). An outo-only style declares no named subagents and the `call_subagent` tool is not registered. Format details in [`styles.md`](./styles.md).
+A style is a markdown system prompt at `~/.miniouto/style/<name>.md`. It declares one `<outo>` body plus zero or more **role** bodies — each `<name>...</name>` top-level tag is one role, and the tag name IS the role name you pass to `miniouto chat "<brief>" --style <style> --role <tag>` (e.g. `editor`, `file-picker`). A style with no named tags is still fully delegating: `Bash` is always registered, so the `chat` form works — it just has no roles to select. Format details in [`styles.md`](./styles.md).
 
 ```bash
 # Five bundles are pre-installed: default, coding, coding-pro, coding-work, coding-ultra
@@ -342,7 +351,7 @@ miniouto style update
 
 ## `miniouto skill` — inspecting skills
 
-Skills live at `~/.agents/skills/<name>/SKILL.md` (NOT under `~/.miniouto/` — the Anthropic-compatible path). The `skill` command is **read-only**; to add a skill, just create the directory and file. See [`skills.md`](./skills.md) and [`automation.md`](./automation.md#6-auto-registering-skills).
+Skills live at `./skills/<name>/SKILL.md` (project-local) or `~/.agents/skills/<name>/SKILL.md` (NOT under `~/.miniouto/` — the Anthropic-compatible path); both are default roots, project-local first. The `skill` command is **read-only**; to add a skill, just create the directory and file. See [`skills.md`](./skills.md) and [`automation.md`](./automation.md#6-auto-registering-skills).
 
 ```bash
 # List installed skills (hidden=true skills are excluded)
@@ -365,7 +374,7 @@ miniouto skill show git-master
 # [full SKILL.md body]
 ```
 
-Skills are automatically listed (name + description, plus their on-disk location) in the outo system prompt and in each named subagent's prompt on every chat call (`core/runtime.py:_load_active_skills`); the agent reads the full SKILL.md via Bash when a task matches.
+Skills are listed (name + description, plus their on-disk location) wherever a style's prompt places the `{skills}` token — in the outo body and in each role body alike — on every chat call; the agent reads the full SKILL.md via Bash when a task matches. A style that names no skills token tells the model about none. See [`styles.md`](./styles.md) § Dynamic tokens.
 
 ---
 
@@ -387,15 +396,31 @@ A Textual-based interactive UI. Key bindings:
 | Open a chip | click it, or focus + `Enter` |
 | Close a modal | `Esc` |
 
-The three chips in the bottom panel:
+The chips in the bottom panel (two left/right-anchored pairs, `outo`/`style` then `subagent`/`session`):
 
-- **model** — click → if the provider is catalog (`source == "lma"`) a model-list selection modal opens; if custom, a free-text input modal. Saving updates `provider.default_model` and clears any legacy `settings.model` override.
-- **provider** — click → list of registered providers plus two sentinels: `+ add from catalog…` and `+ add custom…`.
+- **outo** — click → the provider settings popup: three rows, `Provider` / `Model` / `Reasoning`, each opening its own picker. The `Provider` row lists registered providers plus two sentinels (`+ add from catalog…`, `+ add custom…`); `Model` fetches the catalog list for a catalog provider and falls back to a free-text id for a hand-added endpoint; `Reasoning` lists the levels lma reports for the resolved model. **Picking a Provider or a Model resets Reasoning** to that model's default — an effort level belongs to a model — and Reasoning is one more click away.
+- **subagent** — the same popup, editing the `subagent_provider` / `subagent_model` / `subagent_reasoning` trio; empty still reads `same as outo`, which is what a delegated run inherits.
 - **style** — click → list of installed styles.
+- **session** — click → the session picker, grouped by the session's creation directory, plus `+ new session…`.
 
-> There is no session chip in the TUI. Change sessions via `Ctrl+P` → "Pick session" / "New session".
+Every provider/model/reasoning edit writes **two** places: this session's pin (`session-config/<session>.toml`, so the edit survives a later default change) and the global default (so other processes and the next session follow the newest choice). Per-session resolution is `overrides > session pin > global default`, and a session freezes its pin the first time it resolves — which is what lets several miniouto processes run side by side on different providers without redirecting each other.
 
-The Header shows the current working directory on the left and `miniouto v<version>` on the right (the same version also appears under the splash logo). Tool calls (Bash / Image / Video / Audio) render as **collapsible boxes** in the chat log: each box starts collapsed as a single `▸ <summary>` line and expands on click or `Enter` to show the full command and, once the call finishes, its output (tool rows cap the display at ~4000 chars). Errors gain a red border-left and a subtle `✗` marker on the header. A background subagent gets a `SubagentRow` at launch, and clicking it opens the internal-step detail screen. Since `call_subagent` is fire-and-forget, no result is rendered inline anymore: the job's completion arrives as the **alarm** — a user message starting with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` plus the result-file path under `~/.miniouto/subagent-results/`, which the model reads (e.g. with `cat`). In the TUI the alarm is delivered even when outo's turn already ended: the chat auto-starts a turn whose prompt is the alarm text (rendered as a user message), so the model wakes up and continues with the result. Non-alarm subagent internals (tool/thinking) stay in the subagent detail screen; the SubagentRow itself flips to ✓/✗ as soon as the job finishes.
+> There is no standalone provider/model editor any more, and none that edits a provider's context/output caps: those are set when the provider is added, or by hand in `providers.toml`.
+
+### Theme
+
+The TUI boots on **`miniouto`**, the harness's own dark theme, comfort-tuned for long sessions: a lifted blue-black `#0a0e14` background (still darker than Textual's stock dark) with surfaces stepping up to `#1d2530`, and a **three-layer text hierarchy** so the agent's final answer is the thing your eye lands on — **answer** `#c5d0d8` at 12.33:1 on the background (painted only by the answer row, so it is the brightest layer on screen), **body** `#a9bac5` at 9.69:1 (up from a flat 8.76:1 and no longer the gray it was), and **muted** `#7b8490` at 5.11:1 for event, tool and thinking rows. The semantic colors are desaturated one notch, and a `#2fc2ff` accent is used for the focus rules, block cursors, scrollbar, splash logo and tool-row toggle glyph. Nothing to configure.
+
+To use a different one, either pick it at runtime (`Ctrl+P` → **Theme**, which offers `miniouto` alongside the stock Textual themes and writes the choice to `settings.theme`), or set the key by hand — the next launch uses it:
+
+```toml
+# ~/.miniouto/settings.toml
+theme = "gruvbox"      # any registered Textual theme name
+```
+
+A name no registered theme matches falls back to `miniouto` instead of failing the launch.
+
+The Header shows the current working directory on the left and `miniouto v<version>` on the right (the same version also appears under the splash logo). Tool calls (Bash / Image / Video / Audio / Computer / continue_session) render as **collapsible boxes** in the chat log: each box starts as a single dimmed `▶ <summary>` header line and expands on a plain click anywhere on the box (glyph, header text, expanded body, output) or `Enter` to show the full command and, once the call finishes, its output (tool rows cap the display at ~4000 chars). The click is told apart from a text-selection by the gesture: dragging over the text selects it and never toggles the box, and double-clicking no longer selects the whole row. Errors gain a red border-left and a subtle `✗` marker on the header. Delegation is a `Bash` call to `miniouto chat "<brief>" --style <style> --role <tag>`, so a delegated run has **no per-invocation row or detail screen** — it is a separate process with its own transcript. What reaches this chat is its **completion alarm**: a user message starting with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` plus the result-file path under `~/.miniouto/subagent-results/`, which the model reads (e.g. with `cat`). The alarm is delivered even when outo's turn already ended — the TUI polls the session's inbox every second and auto-starts a turn whose prompt is the alarm text, so the model wakes up and continues with the result. You can post into the same channel yourself mid-turn or from a script: `miniouto message insert --session <name> "text"`. **Long turns hand off too:** there is no implicit summarization — at ~80% context a system alarm message (`[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` + `Context budget: ...`) asks the model to write summary documents under `./.miniouto/summary/<session>/` and call `continue_session`, and the conversation then continues in a fresh `cont-*` session. In the TUI the marker `------summary → <new>------` closes the old conversation on screen, and the continuation is delivered automatically; `miniouto chat` does the same inside the same invocation. Other TUI details: the log column is capped at 150 cells (the header chips sit in two left/right-anchored pairs and render their values whole, never truncated), the TUI **pins** its session name (minted at first dispatch, or set by the session picker / "new session") so an external change to `settings.toml`'s `session` can't redirect a live conversation, and `PgUp` / `PgDn` / `Home` / `End` scroll it instantly (a jump-to-bottom button sits below).
 
 ---
 
@@ -421,5 +446,24 @@ miniouto chat "step 1: analyze" --name pipeline -a > step1.txt
 miniouto chat "step 2: design from step 1" --name pipeline -c -a > step2.txt
 miniouto chat "step 3: code from step 2" --name pipeline -c -a > step3.txt
 ```
+
+## Waking a session from its inbox
+
+A `chat` run **never waits**: it answers its prompt, prints one `------finish------`, and exits, even with background runs of its own still going. Messages that arrive afterwards wait in `~/.miniouto/inbox/<session>/` for the next **wakeup**, and there are exactly two of them: the TUI's 1 s poll, and the explicit CLI one:
+
+```bash
+# Anything can insert, from any process
+miniouto message insert --session pipeline "the deploy finished"
+
+# Wake the session: the queued texts become the turn's prompt.
+# -c is mandatory (history is never loaded implicitly), and no prompt may be given.
+miniouto chat --alarms -c --name pipeline
+
+# Empty inbox → one line, exit 0, no turn at all
+$ miniouto chat --alarms -c --name pipeline
+no pending messages in session 'pipeline'.
+```
+
+That makes an alarm a **wakeup**, not a wait: the producing side never needs a live process to answer, and monitoring is a matter of peeking (`miniouto message list --session <s>`) and polling the `spawn-logs/<id>.json` liveness markers. The insert / observe / wake recipes, the polling loops, and how to pull a transcript out of a session file are in [`automation.md`](./automation.md) § 3 and § 4.
 
 Non-interactive automation (CI, Docker, cron, Python API embedding) is covered in [`automation.md`](./automation.md).

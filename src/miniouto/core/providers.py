@@ -160,7 +160,7 @@ def clear_coreouto_state() -> None:
 
 
 def reset_subagent_registration() -> None:
-    """Remove any stale `call_subagent` tool left over from a prior run."""
+    """Remove stale registry entries left over from a prior run."""
 
     with contextlib.suppress(Exception):
         co.clear_tools()

@@ -12,10 +12,6 @@ exactly the scope here: pruning is a LIVE-turn repair, never a
 cross-process rehydration (ids from a previous process are meaningless
 and are simply never matched, so a reloaded session just keeps the
 events it already recorded).
-
-The summarizer is deliberately EXCLUDED: it compacts history wholesale
-because the context window demands it, while the display transcript is
-the human record of what happened. Compaction must never erase rows.
 """
 
 from __future__ import annotations
@@ -30,7 +26,7 @@ from textual.widgets import Static
 
 from miniouto.cli.tui import ChatTUI, TUIEventSink, _RowWindow
 from miniouto.core import chat as chat_mod
-from miniouto.core import context as context_mod
+from miniouto.core import inbox
 from miniouto.core import runtime as rt
 from miniouto.core.events import ConsoleEventSink, EventSink, LoopEvent, NullSink
 from miniouto.storage import sessions as session_store
@@ -223,7 +219,16 @@ def test_events_without_a_message_never_carry_a_ref() -> None:
     # Given: events that are not produced from a live message
     sink = _RawSink()
     chat_mod._make_alarm_dispatcher(sink)(
-        [rt.subagents.Alarm(sid="abc123", name="editor", text="job done")]
+        [
+            inbox.InboxMessage(
+                id="20260101-000000-000000-abcdef",
+                kind=inbox.ALARM_KIND,
+                text="job done",
+                ts="2026-01-01T00:00:00",
+                source="spawn",
+                meta={"id": "abc123", "role": "editor"},
+            )
+        ]
     )
     chat_mod._make_provider_error_dispatcher(sink)(
         status_code=400,
@@ -431,7 +436,6 @@ def test_watchdog_restart_prunes_the_sink_for_the_truncated_tail(
             "go",
             None,
             live_key="outo",
-            level=0,
             on_wakeup=lambda *args: None,
             on_removed=sink.remove_events,
             states=(_Activity(), _Progress(), {"outo": live}),
@@ -469,50 +473,6 @@ def test_folding_the_explanation_into_the_user_message_prunes_nothing() -> None:
     assert set(removed[0]) == {str(id(poisoned)), str(id(result_msg))}
     assert user.content.startswith("do it")
     assert "removed from the history" in user.content
-
-
-# ── 5. summarizer compaction is explicitly NOT a removal ─────────────────────
-
-
-def test_summarizer_compaction_leaves_the_display_record_intact(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: a real summarize hook with a tiny context window, so the
-    # next BEFORE_LLM_CALL compacts the conversation
-    monkeypatch.setattr(context_mod, "get_context_window", lambda *a, **k: 100)
-
-    class _SummaryAgent:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-        async def call(self, prompt: str) -> Any:
-            return co.Response(content="handoff", messages=[], iterations=1)
-
-    monkeypatch.setattr(co, "Agent", _SummaryAgent)
-    sink = _recording(_RawSink())
-    driver = _TurnDriver(sink)
-    messages = [
-        co.Message(role="system", content="prompt"),
-        co.Message(role="user", content="go"),
-    ]
-    assistant = driver.iteration(messages, iteration=1, call_id="a1", command="ls")
-    messages.append(_result("a1"))
-    before = list(sink.events)
-
-    on_iteration, before_llm_call = context_mod.make_summarize_hook("m", "s", "p")
-    on_iteration(iteration=1, messages=messages, response=_FakeResponse())
-
-    # When: the compaction runs on the next iteration
-    asyncio.run(before_llm_call(messages=messages))
-
-    # Then: history really was compacted...
-    assert len(messages) == 2
-    assert messages[0].role == "system"
-    # ...and NOT ONE recorded event was dropped: the transcript is the
-    # human record of what happened, history is the model-context layer
-    assert sink.events == before
-    assert sink._inner.pruned == []
-    assert any(e.get("msg_ref") == str(id(assistant)) for e in sink.events)
 
 
 # ── 6. cross-turn pruning on disk ────────────────────────────────────────────

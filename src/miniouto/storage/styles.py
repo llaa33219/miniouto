@@ -18,9 +18,9 @@ from .paths import BUNDLED_STYLE_DIR, STYLE_DIR, STYLE_REPOS_FILE, ensure_dirs
 class SubagentSpec:
     """One named subagent declared by a style document.
 
-    ``name`` is the raw tag name (e.g. ``"editor"``, ``"file-picker"``) and is
-    used both as the ``name`` argument of the ``call_subagent`` tool and in
-    actor labels like ``editor-abc123``.
+    ``name`` is the raw tag name (e.g. ``"editor"``, ``"file-picker"``): it is
+    the role tag selected by ``miniouto chat --role <name>``, and it is also
+    what a spawned run is labelled with.
     """
 
     name: str

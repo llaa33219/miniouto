@@ -74,3 +74,46 @@ def test_old_style_event_dict_still_loads() -> None:
     assert event.detail == "ls -la"
     assert event.subagent_name == "reviewer"
     assert event.msg_ref is None
+
+
+def test_the_new_user_kind_round_trips_with_its_inbox_detail() -> None:
+    # Given: a drained inbox message recorded as a `user` event
+    event = LoopEvent(
+        actor="outo",
+        kind="user",
+        text="proceed with plan B",
+        subagent_id="abc123",
+        subagent_name="editor",
+        detail="inbox:20260101-000000-000000-abcdef",
+    )
+
+    # When: it is serialized and reloaded
+    restored = LoopEvent.from_dict(event.to_dict())
+
+    # Then: the kind, the spawn identity and the de-duplication handle all
+    # survive — the display layer keys off every one of them
+    assert restored.kind == "user"
+    assert restored.text == "proceed with plan B"
+    assert restored.subagent_id == "abc123"
+    assert restored.subagent_name == "editor"
+    assert restored.detail == "inbox:20260101-000000-000000-abcdef"
+    assert restored.msg_ref is None
+
+
+def test_retired_subagent_kinds_still_load_from_older_sessions() -> None:
+    # Given: `subagent_start` / `subagent_end` events persisted before the
+    # in-process subagent engine was erased
+    start = LoopEvent.from_dict(
+        {"actor": "editor-abc123", "kind": "subagent_start", "text": "fix the bug"}
+    )
+    end = LoopEvent.from_dict(
+        {"actor": "editor-abc123", "kind": "subagent_end", "text": "done"}
+    )
+
+    # Then: they deserialize untouched instead of raising or being coerced —
+    # nothing is emitted with these kinds any more, but a session file
+    # written by an older build must still open
+    assert start.kind == "subagent_start"
+    assert end.kind == "subagent_end"
+    assert start.subagent_id is None
+    assert end.text == "done"

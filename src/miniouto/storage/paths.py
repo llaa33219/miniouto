@@ -11,10 +11,21 @@ SETTINGS_FILE = ROOT / "settings.toml"
 STYLE_DIR = ROOT / "style"
 STYLE_REPOS_FILE = ROOT / "style_repos.toml"
 SESSION_DIR = ROOT / "sessions"
-# Background-subagent result files (core/subagents.py); the job completion
-# alarm handed to the model points here.
+# Result files written by a finished `miniouto chat --bg` run; the completion
+# alarm message handed to the model points here.
 SUBAGENT_RESULTS_DIR = ROOT / "subagent-results"
 LOG_DIR = ROOT / "logs"
+# Cross-process message inbox (core/inbox.py): one directory per session,
+# one atomically-renamed JSON file per pending message.
+INBOX_DIR = ROOT / "inbox"
+# One log file per detached `chat` child process.
+SPAWN_LOG_DIR = ROOT / "spawn-logs"
+# Screenshots the Computer tool saves for a spawned process to read.
+COMPUTER_SCREENS_DIR = ROOT / "computer-screens"
+# One TOML file per session pinning that session's provider/model/reasoning
+# (storage/session_config.py), so processes with different settings do not
+# redirect each other.
+SESSION_CONFIG_DIR = ROOT / "session-config"
 BUNDLED_STYLE_DIR = Path(__file__).parent.parent / "default_style"
 
 # Bundled styles renamed at 0.8.1: the old seeded copy under ~/.miniouto/style/
@@ -37,7 +48,17 @@ def ensure_dirs() -> None:
     left untouched.
     """
 
-    for p in (ROOT, STYLE_DIR, SESSION_DIR, SUBAGENT_RESULTS_DIR, LOG_DIR):
+    for p in (
+        ROOT,
+        STYLE_DIR,
+        SESSION_DIR,
+        SUBAGENT_RESULTS_DIR,
+        LOG_DIR,
+        INBOX_DIR,
+        SPAWN_LOG_DIR,
+        COMPUTER_SCREENS_DIR,
+        SESSION_CONFIG_DIR,
+    ):
         p.mkdir(parents=True, exist_ok=True)
 
     if BUNDLED_STYLE_DIR.is_dir():

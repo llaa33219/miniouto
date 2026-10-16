@@ -58,17 +58,16 @@ message never ends, so its boundary is minutes away. The whole-message
 path skips a message the stream already counted, so no repeat is ever
 counted twice (invariant 8's double-count hazard).
 
-ACTORS. Counters are keyed by an actor key its caller supplies
-(`current_subagent_id() or "outo"`), so one subagent looping can never
-trip another subagent or outo. Enforcement is deliberately asymmetric,
-because the actors are not supervised the same way:
+ACTORS. Counters are keyed by an actor key its caller supplies. One
+process supervises exactly one actor now — the spawned-run model makes
+every other actor a separate `miniouto chat --bg` process with its own
+watchdog — so the key in practice is the literal `"outo"`, but the
+parameterized key shape is kept: it costs nothing, keeps every function
+testable in isolation, and survives a future second in-process actor.
 
-- outo's turn runs under `core.runtime.supervised_run`, which force-stops
-  the attempt and RESUMES it with the alarm as the new user message.
-- a background job (`core.subagents.submit`) runs on the daemon loop with
-  no supervisor, so repetition there is enforced by
-  `cancel_background_loop`: the job is cancelled and its own existing
-  completion path reports the stop (result file + one alarm).
+Enforcement is uniform: the turn runs under `core.runtime.supervised_run`,
+which force-stops the attempt and RESUMES it with the alarm as the new
+user message.
 
 Counters live for one turn: `reset()` is called from
 `runtime._register_watchdog_trackers`, where the live message lists are
@@ -92,8 +91,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from . import subagents
-from .subagents import ALARM_HEADER
+from .inbox import ALARM_HEADER
 
 # User-facing contract: how much repetition counts as a loop. The phrase
 # number counts UNIT REPETITIONS, not segments — one phrase 50x in a row is
@@ -364,33 +362,6 @@ def reset() -> None:
     with _LOCK:
         _ACTORS.clear()
         _STREAMS.clear()
-
-
-def cancel_background_loop(actor_key: str) -> LoopVerdict | None:
-    """Cancel a background job whose own loop tripped. No-op for any other actor.
-
-    A background job has no supervisor, so there is nothing to restart: the
-    only honest enforcement is to stop the job. Its existing completion path
-    then writes the result file and queues exactly ONE alarm, so the parent
-    turn learns the job stopped without a second channel here. Returns the
-    verdict that caused the cancel, or None if nothing was done.
-
-    A supervised actor is deliberately untouched: its verdict stays sticky
-    for `runtime.supervised_run` to poll and resume.
-
-    Called on EVERY tool call, so it must not disturb an actor that has not
-    tripped — hence the peek before the consume (which clears the counters).
-    """
-
-    if not subagents.is_running(actor_key) or check(actor_key) is None:
-        return None
-    verdict = consume_verdict(actor_key)
-    if verdict is None:
-        return None
-    subagents.cancel_job(
-        actor_key, reason=f"repetition: {verdict.kind} loop ({verdict.detail})"
-    )
-    return verdict
 
 
 def alarm_text(verdict: LoopVerdict) -> str:

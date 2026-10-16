@@ -7,11 +7,12 @@ Schema v2 splits a session into two sections:
   `agent.call_sync(history=...)` on resume, so it contains the full loop —
   intermediate assistant messages, tool calls, and tool results — matching
   coreouto `examples/21_loop_history.py`. Rewritten in full after every
-  turn from `Response.messages` (minus system), which keeps it consistent
-  with whatever the summarize hook compacted mid-loop. Additionally, the
-  chat runner persists a sanitized snapshot at every loop iteration
-  (`update_history`), so a force-killed process still leaves a resumable
-  transcript instead of rolling back to the previous turn.
+  turn from `Response.messages` (minus system), so it is always exactly what
+  the model saw — nothing rewrites it mid-loop (summarization is explicit:
+  `core/summary.py` + the `continue_session` tool hand work to a NEW session
+  instead). Additionally, the chat runner persists a sanitized snapshot at
+  every loop iteration (`update_history`), so a force-killed process still
+  leaves a resumable transcript instead of rolling back to the previous turn.
 
 - `turns`: display-only records (user prompt, loop events, final answer).
   Thinking/reasoning lives here as `kind="thinking"` events — coreouto's

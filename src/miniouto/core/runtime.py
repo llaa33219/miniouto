@@ -1,98 +1,66 @@
-"""Build a runtime: register providers, presets, subagent tool, and resolve outo."""
+"""Build a runtime: register providers, presets, and resolve outo.
+
+One process supervises exactly ONE actor. Delegation is cross-process
+(a detached `miniouto chat --bg` run + the inbox in `core/inbox.py`), so there
+is no in-process
+subagent engine, no subagent tool, and no second preset: a spawned run
+is the SAME runtime built with `role` set, which swaps the system prompt for
+one of the active style's named subagent specs. That is the ONLY difference:
+the tool list, the preset, and every hook are identical in both modes.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import re
 import threading
 from collections.abc import Callable
-from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import coreouto as co
 
 from ..paths_runtime import INVOCATION_CWD
 from ..storage import providers as provider_store
+from ..storage import session_config
 from ..storage import settings as settings_store
 from ..storage import skills as skill_store
 from ..storage import styles as style_store
-from ..storage.paths import SUBAGENT_RESULTS_DIR
 from ..storage.styles import SubagentSpec
 from ..tools import bash as bash_tool
 from ..tools import registry as tool_registry
-from . import repetition, subagents
+from . import inbox, repetition
 from .providers import API_STALL_TIMEOUT_SECONDS, build_coreouto_provider, clear_coreouto_state
 
-# Tools visible to both presets. The subagent tool is appended per-preset
-# only when the active style declares ≥1 named subagent (see build_runtime).
-BASE_TOOLS = ["Bash", "Image", "Video", "Audio"]
-SUBAGENT_TOOL_NAME = "call_subagent"
-# ALL_TOOLS kept for any external imports; the per-preset tool lists below
-# compose BASE_TOOLS + (subagent tool when registered) explicitly so a
-# zero-subagent style exposes no subagent tool at all.
-ALL_TOOLS = [*BASE_TOOLS, SUBAGENT_TOOL_NAME]
+# Tools every runtime sees, in every mode — role-mode (spawned) runs
+# included. See the module docstring.
+BASE_TOOLS = ["Bash", "Image", "Video", "Audio", "continue_session"]
 
-# Computer is outo-only: it drives a single shared virtual screen, and
-# parallel subagents clicking/typing on that screen would interleave
-# unpredictably. Subagents that need GUI work must ask outo to do it.
-# Registration itself is conditional (see tools.registry.register_all), so
-# the preset below filters this list down to what actually got registered —
-# on unsupported platforms the outo preset simply has no Computer tool.
-OUTO_ONLY_TOOLS = ["Computer"]
-
-# Tracks how deep we are inside a `call_subagent` invocation. 0 = outo (or
-# after `build_runtime` has just been called), >=1 = inside a subagent.
-# Read by `core.chat` dispatchers to decide whether a tool call came
-# from outo (no prefix) or a nested subagent (`subagent-<id>:` prefix).
-# Mutated only by the wrapper installed around `call_subagent`'s handler.
-_SUBAGENT_DEPTH: ContextVar[int] = ContextVar("miniouto_subagent_depth", default=0)
-
-# Stable per-invocation id (6 hex chars) of the innermost active subagent
-# call. Set alongside _SUBAGENT_DEPTH so every hook fired inside that
-# subagent's loop (tool calls, thinking, iterations) can be attributed to
-# one specific invocation — with parallel subagents this is the only way
-# to tell them apart. ContextVars are copied per asyncio task, so
-# concurrent `call_subagent` handlers each see their own id.
-_SUBAGENT_ID: ContextVar[str | None] = ContextVar("miniouto_subagent_id", default=None)
-
-# Name of the innermost active subagent's spec ("editor", "file-picker",
-# "subagent", ...). None outside a `call_subagent` invocation. Feeds the
-# actor label the sinks render (`name-<sid>` — e.g. `editor-abc123`); the
-# `subagent-<sid>` shape is preserved for the legacy `subagent` spec by
-# construction (the tag name IS the subagent name, and legacy
-# `<subagent>...</subagent>` blocks are parsed as a spec named `subagent`).
-_SUBAGENT_NAME: ContextVar[str | None] = ContextVar(
-    "miniouto_subagent_name", default=None
-)
-
-# Lifecycle observer for subagent invocations:
-# callable(phase, sid, name, text) where phase ∈ {"start", "wakeup", "end"}.
-# `name` is the spec name of the subagent running this invocation
-# ("subagent" for legacy <subagent> blocks). Set per-turn by
-# `core.chat.run_chat` (the hooks are global, so this module-level slot
-# is the bridge between the wrapped handler and the active turn's sink).
-# None outside a turn.
-_SUBAGENT_OBSERVER: Callable[[str, str, str, str], None] | None = None
+# Platform-gated tools. Registration is conditional (see
+# tools.registry.register_all), so the preset below filters this list down to
+# what actually got registered — on unsupported platforms the preset simply has
+# no Computer tool. NOT about mode parity: a role-mode run sees the same list.
+PLATFORM_GATED_TOOLS = ["Computer"]
 
 # Watchdog state (coreouto >= 0.11 contrib trackers), rebuilt by every
 # build_runtime call alongside the hooks that feed them. The supervised
-# runners (`supervised_run`) read them to decide whether a call is wedged:
+# runner (`supervised_run`) reads them to decide whether a call is wedged:
 #   _ACTIVITY_STATE — seconds since the last loop event of any kind
 #   _PROGRESS_STATE — current phase ("llm_call" / "tool_call" / None)
-#   _LIVE_MESSAGES  — live message lists keyed by actor: "outo" for the
-#                     top-level agent, the 6-hex sid per subagent
-#                     invocation (by reference; the loop keeps mutating
-#                     them, so they are always current)
+#   _LIVE_MESSAGES  — the live message list under the literal key "outo"
+#                     (by reference; the loop keeps mutating it, so it is
+#                     always current)
 _ACTIVITY_STATE: Any = None
 _PROGRESS_STATE: Any = None
 _LIVE_MESSAGES: dict[str, Any] = {}
 
-# Active supervisor levels (0 = outo's turn, >=1 = nested subagent
-# invocations). A supervisor defers to deeper ones: if any level > its own
-# is active, the silence belongs to the deeper call's supervisor, which
-# will do the cancelling and restart. Keys are unique tokens (parallel
-# sibling subagents share a level, so a bare set would collapse them).
+# Tokens of the supervisors currently running. The level bookkeeping is gone
+# (one actor, one supervisor); the registry stays so the supervisor can tell
+# "is a supervisor of mine active" from a future second one, and so tests can
+# assert nothing leaked.
 _ACTIVE_SUPERVISORS: dict[object, int] = {}
 
 WATCHDOG_CHECK_SECONDS = 5.0
@@ -384,7 +352,6 @@ async def supervised_run(
     history: list[co.Message] | None,
     *,
     live_key: str,
-    level: int,
     on_wakeup: Callable[[int, float, Any], None],
     cancel_event: threading.Event | None = None,
     states: tuple[Any, Any, dict[str, Any]] | None = None,
@@ -405,23 +372,20 @@ async def supervised_run(
 
     When nothing has happened for the stall limit AND the loop is not
     inside a tool (tools carry their own bounds — Bash has
-    BASH_TIMEOUT_SECONDS) AND no deeper supervisor is active, the attempt
-    task is cancelled, the actor's live message list is sanitized, and
-    the call restarts — transcript-only when anything is recoverable,
-    the original prompt otherwise. Up to WATCHDOG_MAX_WAKEUPS restarts,
-    then LoopStalledError (inside a subagent handler this becomes an
-    error ToolResult, so the parent sees the failure and can re-delegate).
-    The `cancel_event` fast path (outo only) makes ESC ESC responsive
-    during an in-flight LLM call, which the hook-boundary cancel guard
-    alone cannot interrupt.
+    BASH_TIMEOUT_SECONDS), the attempt task is cancelled, the actor's live
+    message list is sanitized, and the call restarts — transcript-only when
+    anything is recoverable, the original prompt otherwise. Up to
+    WATCHDOG_MAX_WAKEUPS restarts, then LoopStalledError.
+    The `cancel_event` fast path makes ESC ESC responsive during an
+    in-flight LLM call, which the hook-boundary cancel guard alone cannot
+    interrupt.
 
-    REPETITION (`restart_on_repetition` = the actor key, e.g. "outo").
+    REPETITION (`restart_on_repetition` = the actor key, "outo").
     A repeating model is active, not stalled, so this check runs BEFORE
     the stall test and has its own budget (REPEAT_MAX_RESTARTS, unrelated
     to WATCHDOG_MAX_WAKEUPS) and its own terminal error
-    (LoopRepeatedError). It is per-actor and only this supervisor consumes
-    its actor's verdict, so the deeper-supervisor deferral below does not
-    apply to it.
+    (LoopRepeatedError). It is per-actor, and only this supervisor consumes
+    its actor's verdict.
 
     ENFORCEMENT IS EVENT-DRIVEN AND COVERS THE COMPLETION PATH. A verdict
     trips at note time, so this supervisor subscribes to it with
@@ -429,7 +393,7 @@ async def supervised_run(
     a `trip.wait()` task alongside the attempt: the force-stop is immediate
     instead of arriving with the next WATCHDOG_CHECK_SECONDS poll, which
     stays the stall check's cadence. `call_soon_threadsafe` is required —
-    a background job notes from the daemon thread.
+    a verdict may be noted from a thread that is not the event loop's.
 
     The verdict is also consulted when the attempt task is ALREADY DONE.
     The bug that forces this: coreouto fires ON_ITERATION (where the reply
@@ -449,10 +413,10 @@ async def supervised_run(
     say that — so the alarm is delivered as the resumed attempt's user
     message (`start(alarm, history)`), which also lands in
     `Response.messages` and therefore in the persisted session history.
-    It is deliberately NOT pushed through `subagents`' alarm deque: that
-    deque is drained into the live list by `_make_alarm_hook` and would
-    deliver the same text a second time. `on_repetition` covers the
-    display side (one `alarm` loop event on the turn's sink).
+    It is deliberately NOT routed through the inbox: a `drain()` by
+    `_make_alarm_hook` would deliver the same text a second time.
+    `on_repetition` covers the display side (one `alarm` loop event on the
+    turn's sink).
 
     `on_removed` is the display side of BOTH restart paths: every
     `sanitize_history` truncation it performs reports the discarded
@@ -469,7 +433,7 @@ async def supervised_run(
         return await start(prompt, history)
 
     token = object()
-    _ACTIVE_SUPERVISORS[token] = level
+    _ACTIVE_SUPERVISORS[token] = 0
     loop = asyncio.get_running_loop()
     trip = asyncio.Event()
     previous_notifier = repetition._TRIP_NOTIFIER
@@ -483,8 +447,7 @@ async def supervised_run(
         # PEEK before consuming: `consume_verdict` pops the actor's counters
         # even when it returns None, so an unconditional poll erases the
         # counts every WATCHDOG_CHECK_SECONDS and a loop slower than the poll
-        # interval (5s in production) can never reach a threshold. Same
-        # discipline as `repetition.cancel_background_loop`.
+        # interval (5s in production) can never reach a threshold.
         if repetition.check(restart_on_repetition) is None:
             return None
         return repetition.consume_verdict(restart_on_repetition)
@@ -555,8 +518,6 @@ async def supervised_run(
                         await task
                     task = resume_with_alarm(verdict)
                     continue
-            if any(lv > level for lv in _ACTIVE_SUPERVISORS.values()):
-                continue  # a deeper supervisor owns the current silence
             silent = activity.seconds_since_last_activity()
             if silent <= API_STALL_TIMEOUT_SECONDS or progress.phase == "tool_call":
                 continue
@@ -609,191 +570,47 @@ def _make_cancel_guard(cancel_event: threading.Event) -> Callable[..., None]:
     return _guard
 
 
-def current_subagent_depth() -> int:
-    """Return how many subagent layers we're currently nested inside."""
-
-    return _SUBAGENT_DEPTH.get()
-
-
-def current_subagent_id() -> str | None:
-    """Return the innermost active subagent invocation id, or None for outo."""
-
-    return _SUBAGENT_ID.get()
-
-
-def current_subagent_name() -> str | None:
-    """Return the innermost active subagent spec name, or None for outo.
-
-    The actor label format the sinks render is `f"{name}-{sid}"`, which
-    for a legacy `<subagent>` block (spec name "subagent") produces the
-    historical `subagent-<sid>` shape by construction.
-    """
-
-    return _SUBAGENT_NAME.get()
-
-
-def set_subagent_observer(
-    observer: Callable[[str, str, str, str], None] | None,
-) -> None:
-    """Install (or clear, with None) the subagent lifecycle observer."""
-
-    global _SUBAGENT_OBSERVER
-    _SUBAGENT_OBSERVER = observer
-
-
-def _notify_subagent(phase: str, sid: str, name: str, text: str) -> None:
-    observer = _SUBAGENT_OBSERVER
-    if observer is not None:
-        # an observer must never break the subagent loop
-        with contextlib.suppress(Exception):
-            observer(phase, sid, name, text)
-
-
-def _wrap_subagent_handler(
-    agents: dict[str, Any],
-    specs: list[SubagentSpec],
-) -> Callable[..., Any]:
-    """Build `call_subagent`'s handler: resolve a name, start a background job.
-
-    Fire-and-forget. The handler validates `(name, task)`, hands the brief and
-    the per-spec Agent to `subagents.submit` (which owns the id, the daemon
-    event loop, and the completion alarm) and returns an acknowledgement. The
-    subagent's answer is NEVER in the return value: it reaches the model later
-    as a synthetic user message carrying the completion alarm, delivered by
-    `_make_alarm_hook` at the next `BEFORE_LLM_CALL`. Several calls in one turn
-    start several concurrent jobs, so no fan-out parameters are needed.
-
-    `agents` maps each declared spec name to the `co.Agent` built for it by
-    `_build_subagent_tool` — the job engine only needs something with
-    `call(brief)`.
-    """
-
-    def _resolve(requested: str) -> str:
-        """Resolve a name to one of `specs`. Empty → fallback rules.
-
-        Fallback: a spec literally named `subagent` (legacy compat),
-        else the sole declared spec, else ValueError. An explicit name
-        that matches nothing fails fast, before any job is started.
-        """
-
-        if requested:
-            if not any(s.name == requested for s in specs):
-                raise ValueError(
-                    f"Unknown subagent name {requested!r}. "
-                    f"Available names: {', '.join(s.name for s in specs)}"
-                )
-            return requested
-        if any(s.name == "subagent" for s in specs):
-            return "subagent"
-        if len(specs) == 1:
-            return specs[0].name
-        raise ValueError(
-            "`name` is required when multiple subagents are declared. "
-            f"Available names: {', '.join(s.name for s in specs)}"
-        )
-
-    async def wrapped(name: str = "", task: str = "") -> str:
-        if not isinstance(task, str) or not task.strip():
-            raise ValueError(
-                "call_subagent requires `task`: one self-contained brief. "
-                "To run several subagents at once, issue several calls."
-            )
-        resolved = _resolve(name)
-        job = subagents.submit(agents[resolved], resolved, task)
-        # The result file's own name is only known once the job finishes, so
-        # the ack points at the directory the alarm will name a file in.
-        return (
-            f"Started background subagent '{resolved}-{job.sid}' (id: {job.sid}). "
-            "It runs in the background and this returns immediately — this "
-            "text is NOT the result. When it finishes you will receive a user "
-            "message starting with [SYSTEM ALARM - THIS IS NOT A USER MESSAGE] "
-            f"naming the result file at {SUBAGENT_RESULTS_DIR}. Do not wait or "
-            "poll; continue with other work."
-        )
-
-    return wrapped
-
-
-def _build_subagent_tool(
-    *,
-    specs: list[SubagentSpec],
-    provider_config: dict[str, Any],
-    provider_passthrough: dict[str, Any] | None = None,
-) -> Callable[..., Any]:
-    """Build `call_subagent`'s handler with one Agent per named spec.
-
-    Invariant 5 — DO NOT simplify to `coreouto.contrib.agent_as_tool`:
-    that helper drops `provider_config` when calling `preset.to_config()`,
-    so the subagent would inherit the provider's low hard default
-    (Anthropic: 1024 tokens) and silently truncate long tool calls
-    (heredoc writes). We build the per-name Agents ourselves so every one
-    carries our `provider_config` (incl. `max_tokens`) AND
-    `provider_passthrough` (incl. reasoning).
-
-    Each spec becomes one `co.Agent`, built from a deep copy of the
-    shared "subagent" preset's config with that spec's `prompt` set as
-    `system_prompt`, so no two personas share mutable config. The returned
-    handler is registered with coreouto, which derives the model-facing
-    JSON schema from its type hints.
-    """
-
-    preset = co.get_agent_preset("subagent")
-    base_config = preset.to_config()
-    if provider_config:
-        base_config.provider_config.update(provider_config)
-    if provider_passthrough:
-        base_config.provider_passthrough.update(provider_passthrough)
-
-    agents: dict[str, Any] = {}
-    for spec in specs:
-        cfg = base_config.model_copy(deep=True)
-        cfg.system_prompt = spec.prompt
-        agents[spec.name] = co.Agent(cfg)
-
-    return _wrap_subagent_handler(agents, specs)
-
-
 def _make_alarm_hook(
-    on_alarms: Callable[[list[subagents.Alarm]], None] | None = None,
+    session: str | None,
+    on_messages: Callable[[list[inbox.InboxMessage]], None] | None = None,
 ) -> Callable[..., None]:
-    """Build the BEFORE_LLM_CALL hook that delivers background-subagent alarms.
+    """Build the BEFORE_LLM_CALL hook that drains the cross-process inbox.
 
-    A job that finished — mid-turn or between turns — queued a completion
-    alarm naming its result file. Every iteration this hook drains the queue
-    and, if anything came back, appends the alarms to the LIVE `messages`
-    list as ONE synthetic user message (joined with a blank line), so the very
-    next `provider.create` already carries them.
+    A detached `chat --bg` process that finished drops one JSON file per message
+    into the session's inbox directory. Every iteration this hook drains it
+    and, if anything came back, appends the texts to the LIVE `messages` list
+    as ONE synthetic user message (joined with a blank line), so the very next
+    `provider.create` already carries them.
 
     Appended directly, never through `Agent.inject_user_message`: that queue
     is drained at the TOP of the loop iteration (coreouto agent.py:301-307),
-    i.e. BEFORE this hook runs, so an alarm queued from here would only land
+    i.e. BEFORE this hook runs, so a message queued from here would only land
     a full LLM round-trip later.
 
-    FOLD RULE: if the last message is already a user message, the alarms are
+    FOLD RULE: if the last message is already a user message, the text is
     folded into it instead of appended — providers reject two consecutive
     user messages, the same hazard `_cut_poisoned_turn` works around.
 
-    Gated to outo depth: a subagent's own loop must never consume outo's
-    alarms. `on_alarms` (from `core.chat`) records one loop event per alarm so
-    the session and the TUI show the completion; a broken sink must not break
-    the provider path.
+    `on_messages` (from `core.chat`) records one loop event per drained
+    message so the session and the TUI show it; a broken sink must not break
+    the provider path, so the whole body runs under `contextlib.suppress`.
     """
 
     def hook(*, messages: Any = None, **_kwargs: Any) -> None:
-        if messages is None or current_subagent_depth() != 0:
+        if messages is None:
             return
-        alarms = subagents.take_pending_alarms()
-        if not alarms:
-            return
-        text = "\n\n".join(alarm.text for alarm in alarms)
-        last = messages[-1] if messages else None
-        if last is not None and last.role == "user" and isinstance(last.content, str):
-            last.content = f"{last.content}\n\n{text}" if last.content else text
-        else:
-            messages.append(co.Message(role="user", content=text))
-        if on_alarms is not None:
-            with contextlib.suppress(Exception):
-                on_alarms(alarms)
+        with contextlib.suppress(Exception):
+            batch = inbox.drain(session or "default")
+            if not batch:
+                return
+            text = "\n\n".join(message.text for message in batch)
+            last = messages[-1] if messages else None
+            if last is not None and last.role == "user" and isinstance(last.content, str):
+                last.content = f"{last.content}\n\n{text}" if last.content else text
+            else:
+                messages.append(co.Message(role="user", content=text))
+            if on_messages is not None:
+                on_messages(batch)
 
     return hook
 
@@ -803,9 +620,16 @@ class RuntimeConfig:
     provider_name: str
     model: str
     style_name: str
+    # Role mode: run AS one of the style's named subagent specs instead of as
+    # outo. Set by `miniouto chat --role`; None = the interactive outo run.
+    role: str | None = None
     subagent_model: str | None = None
     subagent_provider: str | None = None
     subagent_reasoning: str | None = None
+    # The session pin's outo reasoning (storage/session_config.py). A
+    # per-call `reasoning` argument to build_runtime still wins; this is
+    # the lane between it and the provider's own `reasoning_effort`.
+    reasoning: str | None = None
     session: str | None = None
 
 
@@ -814,6 +638,7 @@ class ChatOverrides:
     provider: str | None = None
     model: str | None = None
     style: str | None = None
+    role: str | None = None
     subagent_provider: str | None = None
     subagent_model: str | None = None
 
@@ -833,17 +658,24 @@ def build_runtime(
     on_provider_error: Callable[..., None] | None = None,
     on_history_repair: Callable[[list[Any]], None] | None = None,
     on_messages_removed: Callable[[list[str]], None] | None = None,
-    on_alarms: Callable[[list[subagents.Alarm]], None] | None = None,
+    on_inbox_messages: Callable[[list[inbox.InboxMessage]], None] | None = None,
     reasoning: str | None = None,
     cancel_event: threading.Event | None = None,
 ) -> co.Agent:
-    """Construct the outo Agent with the active style and subagent wired in.
+    """Construct the outo Agent from the active style (or, with `role`, a role spec).
+
+    The style-derived prompt text — the outo body AND every role (`--role`)
+    body — is token-expanded via `expand_prompt_tokens` against
+    `runtime.session` and `runtime.style_name`. That expansion is the WHOLE
+    system prompt: nothing (no cwd preamble, no skill catalog) is prepended
+    implicitly, so a style decides for itself whether and where to place
+    `{cwd}` and `{skills}`.
 
     `provider_config` is merged into the outo Agent's `provider_config` so that
     canonical settings (max_tokens, temperature, ...) flow through coreouto's
     normalizer without us having to mutate the config after construction.
-    `on_tool_call` is called for every tool invocation (outo and subagent)
-    with `(tool_name, arguments)`. Pass None to skip.
+    `on_tool_call` is called for every tool invocation with
+    `(tool_name, arguments)`. Pass None to skip.
     `on_tool_result` is called after every tool handler returns (coreouto's
     AFTER_TOOL_CALL) with `(tool_name, result)` where result is coreouto's
     ToolResult — this is the only way to surface tool return values to a
@@ -876,18 +708,18 @@ def build_runtime(
     the turn record describes exactly the messages that survived.
     Additions (a filled-in tool result, the explanation note folded into
     the preceding user message) are never reported. Pass None to skip.
-    `on_alarms` is called with every completion alarm the BEFORE_LLM_CALL
-    alarm hook drained, after appending them to the live message list —
-    `core.chat` turns each into an `alarm` loop event so the session and
-    the TUI show the background job completing. Pass None to skip the
-    display only; the alarms are still delivered to the model.
+    `on_inbox_messages` is called with every message the BEFORE_LLM_CALL
+    inbox hook drained, after appending it to the live message list —
+    `core.chat` turns each into a loop event (`alarm` or `user`, see
+    `inbox.ALARM_KIND` / `inbox.USER_KIND`) so the session and the TUI show
+    what the spawned processes reported. Pass None to skip the display
+    only; the messages are still delivered to the model.
     `reasoning` overrides reasoning for this call (effort level / "on" /
     token budget / "none"). None = auto: the provider's stored
     `reasoning_effort` wins if set, otherwise lma's per-model default.
     Resolved by `core.reasoning.resolve_reasoning_passthrough` into
-    provider-native kwargs merged into `provider_passthrough` for both
-    outo and subagent — this is what makes providers return thinking
-    blocks at all.
+    provider-native kwargs merged into `provider_passthrough` — this is
+    what makes providers return thinking blocks at all.
     `cancel_event` (optional) is a threading.Event polled at every
     BEFORE_LLM_CALL / BEFORE_TOOL_CALL hook; once set, the hook raises
     LoopCancelledError, terminating the loop at the next hook boundary.
@@ -899,17 +731,16 @@ def build_runtime(
     next step.
     """
 
-    from .context import get_max_output_tokens, make_summarize_hook
+    from .context import make_context_monitor
     from .reasoning import resolve_reasoning_passthrough
 
     # ---- Slow resolution, hoisted ABOVE `clear_coreouto_state()` ----
     # Everything below this point must be pure in-memory work: the clear
-    # wipes coreouto's global provider/preset/tool/hook registries, and a
-    # background subagent job resolves its provider and tools by NAME at
-    # `call()` entry — so a multi-second network fetch inside the
-    # clear+register window is a real race (the subagent would find an
-    # empty registry). Style file I/O and both lma lookups therefore
-    # resolve first; only dict/registry operations follow the clear.
+    # wipes coreouto's global provider/preset/tool/hook registries, so a
+    # multi-second network fetch or file read inside the clear+register
+    # window leaves them empty for as long as it takes. Style file I/O and
+    # both lma lookups therefore resolve first; only dict/registry
+    # operations follow the clear.
     provider = provider_store.get(runtime.provider_name)
     if provider is None:
         raise RuntimeError(
@@ -918,55 +749,44 @@ def build_runtime(
         )
 
     outo_style, parsed_specs = _resolve_both_styles(runtime.style_name, style_overrides)
-    outo_prompt = _with_cwd("outo", outo_style)
-    # Per-spec cwd prepending happens here, not in _resolve_both_styles —
-    # cwd is a runtime-derived value (INVOCATION_CWD) regenerated every
-    # build_runtime call, so it must not be baked into the style loader.
+    # `{this_session}` resolves to the SAME session value the inbox hook
+    # drains below (`runtime.session`, defaulting to "default"), so a style
+    # can teach a delegation command with a literal `--alarm-session`.
+    session_for_tokens = runtime.session or "default"
+    outo_prompt = expand_prompt_tokens(
+        outo_style, session=session_for_tokens, style=runtime.style_name
+    )
     specs = [
-        SubagentSpec(name=spec.name, prompt=_with_cwd("subagent", spec.prompt))
+        SubagentSpec(
+            name=spec.name,
+            prompt=expand_prompt_tokens(
+                spec.prompt, session=session_for_tokens, style=runtime.style_name
+            ),
+        )
         for spec in parsed_specs
     ]
 
-    # Subagent runs the same model (or its override) and must share
-    # the output-token cap, otherwise long tool calls it issues
-    # (heredoc file writes) get truncated at the provider's low
-    # default (1024 for Anthropic) and we end up with a half-written
-    # file and an "I cut off mid-function" loop. Pull the cap from
-    # the same lma endpoint as outo so it tracks the subagent's
-    # model when one is configured. `setdefault` still lets a CLI
-    # `--max-tokens` override win.
-    subagent_model = runtime.subagent_model or runtime.model
-    subagent_provider_config: dict[str, Any] = dict(provider_config or {})
-    subagent_passthrough: dict[str, Any] = {}
-    sub_provider: Any = None
-    sub_provider_name: str = ""
-    if specs:
-        sub_provider_name = runtime.subagent_provider or runtime.provider_name
-        sub_provider = provider_store.get(sub_provider_name)
-        if sub_provider is None:
-            raise RuntimeError(
-                f"Subagent provider {sub_provider_name!r} is not configured."
+    # ROLE MODE (`miniouto chat --role <name>`). The spawned process runs
+    # the SAME agent on the SAME preset with the SAME tools; only the system
+    # prompt changes. The prompt is one of the `specs` above — expanded
+    # through the same single token pass as the outo body — so there is no
+    # second assembly path to drift.
+    system_prompt = outo_prompt
+    if runtime.role:
+        role_spec = next((s for s in specs if s.name == runtime.role), None)
+        if role_spec is None:
+            raise ValueError(
+                f"Unknown role {runtime.role!r}. "
+                f"Available roles: {', '.join(s.name for s in specs) or '(none)'}"
             )
-        subagent_provider_config.setdefault(
-            "max_tokens", get_max_output_tokens(subagent_model, sub_provider_name)
-        )
-        subagent_choice = (
-            reasoning
-            if reasoning is not None
-            else (runtime.subagent_reasoning or sub_provider.reasoning_effort)
-        )
-        subagent_passthrough = resolve_reasoning_passthrough(
-            sub_provider.api_format,
-            subagent_model,
-            sub_provider_name,
-            subagent_choice,
-        )
+        system_prompt = role_spec.prompt
 
     # Thinking display (ON_THINKING → CLI/TUI) only works when the model is
     # asked to reason — providers never emit thinking blocks unrequested.
     # The resolver consults lma's per-model reasoning_options; an explicit
-    # `reasoning` choice wins over the provider's stored reasoning_effort.
-    outo_choice = reasoning if reasoning is not None else provider.reasoning_effort
+    # `reasoning` choice wins over the session pin (runtime.reasoning),
+    # which in turn wins over the provider's stored reasoning_effort.
+    outo_choice = reasoning if reasoning is not None else (runtime.reasoning or provider.reasoning_effort)
     outo_passthrough = resolve_reasoning_passthrough(
         provider.api_format,
         runtime.model,
@@ -974,10 +794,12 @@ def build_runtime(
         outo_choice,
     )
 
-    # make_summarize_hook also consults lma for the context window (unless
-    # a provider override supplies it) — resolved here, hooked below.
-    summarize_on_iteration, summarize_before_llm = make_summarize_hook(
-        runtime.model, runtime.session or "default", runtime.provider_name
+    # The context monitor resolves the window size once (lma, unless a
+    # provider override supplies it) — above the clear, hooked below.
+    context_monitor = make_context_monitor(
+        model=runtime.model,
+        session=runtime.session or "default",
+        provider_name=runtime.provider_name,
     )
 
     # ---- Registry rebuild: pure in-memory from here to the return ----
@@ -1000,55 +822,20 @@ def build_runtime(
     # tools/registry._make_computer_handler).
     tool_registry.register_all(api_format=provider.api_format)
 
-    # outo preset is always registered. The subagent tool is added to its
-    # tool list ONLY when the active style declared ≥1 subagent; otherwise
-    # outo exposes no subagent tool and the model never sees it in its
-    # schema. OUTO_ONLY_TOOLS (Computer) is filtered by registration —
-    # unsupported platforms never see it.
+    # ONE preset, one tool list — role mode included: a spawned run differs
+    # only in its system prompt. PLATFORM_GATED_TOOLS is filtered by
+    # registration, so unsupported platforms never see Computer in either mode.
     outo_tools: list[str] = list(BASE_TOOLS)
-    if specs:
-        outo_tools.append(SUBAGENT_TOOL_NAME)
-    outo_tools.extend(t for t in OUTO_ONLY_TOOLS if co.get_tool(t) is not None)
+    outo_tools.extend(t for t in PLATFORM_GATED_TOOLS if co.get_tool(t) is not None)
 
     co.register_agent_preset(
         "outo",
         model=runtime.model,
         provider=runtime.provider_name,
-        system_prompt=outo_prompt,
+        system_prompt=system_prompt,
         tools=outo_tools,
         max_iterations=None,
     )
-
-    # Per-turn conditional registration. Because `clear_coreouto_state()`
-    # wipes providers/presets/tools/hooks at the top of every call, the
-    # TUI's mid-session style switches (a style with subagents → one
-    # without, or vice versa) correctly add or remove the tool and the
-    # preset between turns. No extra caching of specs across turns.
-    if specs:
-        build_coreouto_provider(sub_provider)
-
-        # The "subagent" preset is a config carrier: it provides the
-        # model/provider/tools base that `_build_subagent_tool` deep-copies
-        # once per spec to build one Agent per named subagent. Its own
-        # system_prompt is never seen by the model (every per-spec Agent
-        # overrides it with that spec's prompt).
-        co.register_agent_preset(
-            "subagent",
-            model=runtime.subagent_model or runtime.model,
-            provider=sub_provider_name,
-            system_prompt=parsed_specs[0].prompt,
-            tools=[*BASE_TOOLS, SUBAGENT_TOOL_NAME],
-            max_iterations=None,
-        )
-
-        subagent_handler = _build_subagent_tool(
-            specs=specs,
-            provider_config=subagent_provider_config,
-            provider_passthrough=subagent_passthrough,
-        )
-        co.register_tool(
-            SUBAGENT_TOOL_NAME, description=_subagent_description(parsed_specs)
-        )(subagent_handler)
 
     if on_tool_call is not None:
         co.register_hook(co.BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
@@ -1056,18 +843,19 @@ def build_runtime(
     if on_tool_result is not None:
         co.register_hook(co.AFTER_TOOL_CALL, _make_tool_result_logger(on_tool_result))
 
-    co.register_hook(co.ON_ITERATION, summarize_on_iteration)
-    # Compaction runs at BEFORE_LLM_CALL (all tool-call pairs complete) —
-    # see make_summarize_hook's docstring for why ON_ITERATION is unsafe.
-    # Registered before the watchdog's capture hook below, so the captured
-    # list is the post-compaction one.
-    co.register_hook(co.BEFORE_LLM_CALL, summarize_before_llm)
+    # Nothing is ever summarized implicitly. At the usage threshold the
+    # monitor inserts ONE summary request into the session inbox; the alarm
+    # hook below delivers it to the model as a user message.
+    if context_monitor is not None:
+        co.register_hook(co.ON_ITERATION, context_monitor)
 
     # Unconditional (like the repair hook): a job that finished between
     # turns has no other way to reach the model. Registered before the
     # watchdog's capture hook below, so the live message list the
     # supervisor holds already carries the delivered alarms.
-    co.register_hook(co.BEFORE_LLM_CALL, _make_alarm_hook(on_alarms))
+    co.register_hook(
+        co.BEFORE_LLM_CALL, _make_alarm_hook(runtime.session, on_inbox_messages)
+    )
 
     _register_watchdog_trackers()
 
@@ -1116,11 +904,10 @@ def _register_watchdog_trackers() -> None:
     every sign of life (LLM responses, tool results, iterations, provider
     retries, stream chunks — miniouto always streams, so a long healthy
     stream must count as activity), the progress tracker records which
-    phase the loop is in,     and the BEFORE_LLM_CALL capture keeps a
-    reference to each actor's live message list (keyed by subagent id,
-    "outo" for the top level) so supervisors can recover history after
-    cancelling a wedged call. Subagent entries are popped by the wrapper
-    when the invocation ends, so the dict does not grow across turns.
+    phase the loop is in, and the BEFORE_LLM_CALL capture keeps a
+    reference to the live message list (under the literal key "outo") so
+    the supervisor can recover history after cancelling a wedged call.
+    The dict is cleared on every call, so it never grows across turns.
     """
 
     global _ACTIVITY_STATE, _PROGRESS_STATE
@@ -1147,7 +934,7 @@ def _register_watchdog_trackers() -> None:
     repetition.reset()
 
     def capture_messages(*, messages: Any, **_kwargs: Any) -> None:
-        _LIVE_MESSAGES[_SUBAGENT_ID.get() or "outo"] = messages
+        _LIVE_MESSAGES["outo"] = messages
 
     co.register_hook(co.BEFORE_LLM_CALL, capture_messages)
 
@@ -1255,8 +1042,7 @@ def _make_thinking_logger(callback: Callable[[str], None]):
     """Build the ON_THINKING hook that streams reasoning text.
 
     coreouto fires ON_THINKING once per LLM response that carries thinking
-    (Anthropic extended thinking, OpenAI reasoning summaries). Fired inside
-    subagent loops too, so the ContextVars above attribute it correctly.
+    (Anthropic extended thinking, OpenAI reasoning summaries).
     """
 
     def hook(*, thinking: str, **kwargs: Any) -> None:
@@ -1264,34 +1050,6 @@ def _make_thinking_logger(callback: Callable[[str], None]):
             callback(thinking)
 
     return hook
-
-
-def _subagent_description(specs: list[SubagentSpec]) -> str:
-    available = ", ".join(s.name for s in specs)
-    base = (
-        "Delegate one self-contained brief to a named background subagent "
-        "and return immediately.\n\n"
-        "This call does NOT block: the subagent runs in the background, "
-        "possibly across turns. The return value is only an acknowledgement "
-        '("started ..."), never the subagent\'s answer. When the subagent '
-        "finishes, you will receive a user message starting with "
-        "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE] naming its result file "
-        "under ~/.miniouto/subagent-results/ — read that file (e.g. with "
-        "`cat`) to see what it produced. Do not poll for or re-ask the "
-        "result.\n\n"
-        "To run several subagents at once, issue several calls (each with "
-        "one brief) — they run concurrently in the background.\n\n"
-        "Arguments:\n"
-        "- name: which persona to run. Required when several subagents are "
-        "declared; may be omitted when exactly one is declared (or when one "
-        'is literally named "subagent").\n'
-        "- task: ONE self-contained brief. The subagent sees only its own "
-        "persona prompt and this brief — include all file paths, "
-        "constraints, and success criteria it needs."
-    )
-    if available:
-        base += f"\n\nAvailable names: {available}"
-    return base
 
 
 def _resolve_both_styles(
@@ -1302,28 +1060,25 @@ def _resolve_both_styles(
     The parser (`storage.styles.parse_style`) yields one `SubagentSpec` per
     named tag — `<editor>...</editor>` becomes a spec named `editor`, the
     legacy `<subagent>...</subagent>` becomes a spec named `subagent`,
-    and a style with no other tags yields zero specs (no subagents at
-    all — `build_runtime` will not register the `call_subagent` tool).
+    and a style with no other tags yields zero specs. A spec is a ROLE:
+    `build_runtime` selects one of them as the system prompt when the run
+    was started with `miniouto chat --role <name>`.
 
-    Active skills are prepended to BOTH the outo prompt and to each spec's
-    prompt (new `SubagentSpec` instances — the dataclass is frozen). An
-    empty/whitespace spec body falls back to `_fallback_style("subagent")`
-    content as that spec's prompt.
+    Active skills and the working directory are NOT prepended here: a style
+    body places them with the `{cwd}` / `{skills}` tokens, which
+    `build_runtime` expands (a runtime-derived value must never be baked into
+    the style loader). An empty/whitespace spec body falls back to
+    `_fallback_style("subagent")` content as that spec's prompt.
     """
 
     raw = _read_raw_style(style_name, overrides)
     outo_part, parsed_specs = style_store.parse_style(raw)
 
-    skills_content = _load_active_skills()
     fallback_sub = _fallback_style("subagent")
     specs: list[SubagentSpec] = []
     for spec in parsed_specs:
         body = spec.prompt.strip() or fallback_sub
-        prompt = (skills_content + "\n\n" + body) if skills_content else body
-        specs.append(SubagentSpec(name=spec.name, prompt=prompt))
-
-    if skills_content:
-        outo_part = skills_content + "\n\n" + outo_part
+        specs.append(SubagentSpec(name=spec.name, prompt=body))
 
     return outo_part, specs
 
@@ -1339,56 +1094,128 @@ def _read_raw_style(name: str, overrides: dict[str, str] | None) -> str:
     return content
 
 
-def _load_active_skills() -> str:
-    """List installed skills (name + description + on-disk location) for lazy loading.
+_SKILLS_TOKEN = re.compile(r"\{skills(?::([^}]*))?\}")
 
-    Only the catalog is injected into the prompt — the model reads the full
-    SKILL.md itself (via Bash) when a task matches a skill's description.
+
+def expand_prompt_tokens(text: str, *, session: str, style: str) -> str:
+    """Substitute the style tokens into a style body.
+
+    `{cwd}` becomes the invocation directory, `{skills}` (or
+    `{skills:dir,dir}`) the lazy-load skill catalog, `{this_session}` the
+    run's own session name, `{style}` the resolved style name, and
+    `{subagent_pm}` the EFFECTIVE subagent provider config rendered in the
+    `--pm` spelling (`PROVIDER/MODEL[:REASONING]`) — so a style can teach a
+    delegation command whose values vary per run while the model still copies
+    a fully literal command (Bash idempotency) — it never sees the token
+    syntax. Expansion is plain `str.replace` (plus one regex pass for the
+    parameterized `{skills:...}` form) on the style-derived body, applied to
+    the outo body AND every role body. Any other `{...}` text is left
+    verbatim — there is no escape mechanism and an unknown token is not an
+    error.
+
+    The catalog is a *catalog*: skill bodies are never injected, the model
+    reads the matching SKILL.md via Bash when a task calls for it.
     """
 
-    skills = skill_store.list_skills()
-    if not skills:
-        return ""
+    text = _SKILLS_TOKEN.sub(_replace_skills_token, text)
+    text = text.replace("{cwd}", str(INVOCATION_CWD))
+    text = text.replace("{this_session}", session).replace("{style}", style)
+    if "{subagent_pm}" not in text:
+        return text
+    subagent_pm = _effective_subagent_pm(session)
+    # An unresolvable provider/model leaves the token LITERAL (same rule as
+    # any unknown token) — a half-filled `--pm` would be a malformed command
+    # for the model to copy.
+    return text.replace("{subagent_pm}", subagent_pm) if subagent_pm else text
 
+
+def _replace_skills_token(match: re.Match[str]) -> str:
+    return _skills_catalog(_resolve_skill_roots(match.group(1)))
+
+
+def _resolve_skill_roots(arg: str | None) -> list[Path]:
+    """The skill roots a `{skills...}` token names, in the order listed.
+
+    An empty argument (bare `{skills}` or `{skills:}`) means the default roots
+    — the invocation directory's `./skills/` FIRST, then `~/.agents/skills/`,
+    so project-local skills take precedence in the catalog. `~` is expanded; a
+    relative path resolves against INVOCATION_CWD, so a style can point at
+    `./skills`. Duplicates are kept — a style listing the same root twice is its
+    own business.
+    """
+
+    raw = [part.strip() for part in (arg or "").split(",") if part.strip()]
+    if not raw:
+        return skill_store.default_roots(INVOCATION_CWD)
+    roots = [Path(part).expanduser() for part in raw]
+    return [root if root.is_absolute() else INVOCATION_CWD / root for root in roots]
+
+
+def _skills_catalog(roots: list[Path]) -> str:
+    """Render the lazy-load skill catalog for `roots`, or "" if none exist.
+
+    Ordering is (root order as listed, then name within a root), because a
+    style listing several roots states a precedence. A root that yields
+    nothing — missing, unreadable, or no visible SKILL.md — is dropped from
+    the catalog entirely rather than advertised to the model. A name present
+    in two roots appears twice: the two entries live at distinct paths, and
+    each line names the root it came from when there is more than one.
+    """
+
+    entries = [(skill, root) for root in roots for skill in skill_store.list_skills(root)]
+    if not entries:
+        return ""
+    listed = list(dict.fromkeys(root for _, root in entries))
+    where = " or ".join(f"{root}/<name>/" for root in listed)
     lines = [
         "# Available Skills",
         "",
         "The following skills are installed. Each lives in its own directory at "
-        f"{skill_store.SKILLS_DIR}/<name>/ containing a SKILL.md with "
+        f"{where} containing a SKILL.md with "
         "instructions plus any supporting files it references. When a task "
         "matches a skill's description, read that skill's SKILL.md (and the "
         "files it references) via Bash before proceeding — skill instructions "
         "take precedence over the default workflow.",
         "",
     ]
-    for skill in skills:
-        lines.append(f"- {skill.name}: {skill.description}")
-
+    for skill, root in entries:
+        origin = f"  ({root})" if len(listed) > 1 else ""
+        lines.append(f"- {skill.name}: {skill.description}{origin}")
     return "\n".join(lines)
 
 
-def _with_cwd(role: str, body: str) -> str:
-    """Prepend an absolute-cwd preamble to a style body at runtime.
+def _effective_subagent_pm(session: str) -> str:
+    """The effective subagent trio as a `--pm` value, or "" if unresolvable.
 
-    The preamble tells the model where the user invoked miniouto from so
-    relative paths and bash commands resolve against the right directory.
-    Not stored on disk — injected fresh each build_runtime call.
+    Mirrors `_resolve_subagent`'s "same as outo" semantics, per key: the
+    session pin's subagent trio, then the global default's subagent trio
+    (`settings.subagent_*`), then the effective OUTO trio for any key still
+    empty (the pin's outo keys, then the global outo default) — which is
+    what `chat --use-subagent-provider` would resolve to if the run that
+    copies the command were the pinned one. A pin read with
+    `session_config.read` (never `effective`, which would freeze it): the
+    token must not have the side effect of writing a pin file.
     """
 
-    if role == "subagent":
-        preamble = (
-            f"You operate inside this working directory: {INVOCATION_CWD}\n"
-            "All relative paths and shell commands resolve against it. "
-            "Use absolute paths when in doubt.\n\n"
-        )
-    else:
-        preamble = (
-            f"The user invoked miniouto from: {INVOCATION_CWD}\n"
-            "When delegating to the subagent, pass relative paths verbatim "
-            "or absolute paths explicitly — the subagent's tools resolve "
-            "against this directory.\n\n"
-        )
-    return preamble + body
+    pinned = session_config.read(session) or session_config.EMPTY
+    default = default_provider_config()
+    provider = (
+        pinned.subagent_provider
+        or default.subagent_provider
+        or pinned.provider
+        or default.provider
+    )
+    model = pinned.subagent_model or default.subagent_model or pinned.model or default.model
+    reasoning = (
+        pinned.subagent_reasoning
+        or default.subagent_reasoning
+        or pinned.reasoning
+        or default.reasoning
+    )
+    if not provider or not model:
+        return ""
+    suffix = f":{reasoning}" if reasoning else ""
+    return f"{provider}/{model}{suffix}"
 
 
 def _fallback_style(name: str) -> str:
@@ -1408,11 +1235,57 @@ def _fallback_style(name: str) -> str:
     )
 
 
+def default_provider_config() -> session_config.ProviderConfig:
+    """The GLOBAL provider settings a session with no pin falls back to.
+
+    Mirrors the pre-pin fallback chain exactly: `settings.provider` /
+    `settings.model`, the resolved provider record's `default_model` /
+    `reasoning_effort`, and the `subagent_*` trio (which stays empty when
+    unset — empty means "inherit outo"). Lives here, not in
+    `storage.session_config`, because storage is the disk layer and must
+    not import core.
+    """
+
+    s = settings_store.load()
+    provider = provider_store.get(s.provider) if s.provider else None
+    return session_config.ProviderConfig(
+        provider=s.provider,
+        model=s.model or (provider.default_model if provider else ""),
+        reasoning=(provider.reasoning_effort or "") if provider else "",
+        subagent_provider=s.subagent_provider,
+        subagent_model=s.subagent_model,
+        subagent_reasoning=s.subagent_reasoning,
+    )
+
+
+def _pinned_for(s: settings_store.Settings) -> session_config.ProviderConfig:
+    """The run's session pin, read (and frozen) above the registry rebuild.
+
+    The session a turn resolves IS `settings.session` — the same value the
+    inbox hook drains and `{this_session}` expands — so this is where the
+    delegated-run borrow (`cli/chat.py:_runtime_session_scope`) takes
+    effect.
+    """
+
+    return session_config.effective(
+        s.session or "default", default=default_provider_config
+    )
+
+
 def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> RuntimeConfig:
     s = settings_store.load()
     overrides = overrides or ChatOverrides()
 
-    provider_name = overrides.provider or s.provider
+    # Lane 2 of the resolution order (see storage/session_config): explicit
+    # overrides > this session's pin > the global default. An override that
+    # moves outo to ANOTHER provider invalidates the pinned model/reasoning
+    # — those belong to the pinned provider — so the whole outo trio is
+    # dropped and the global chain answers for the override's provider.
+    pinned = _pinned_for(s)
+    if overrides.provider and overrides.provider != pinned.provider:
+        pinned = dataclasses.replace(pinned, provider="", model="", reasoning="")
+
+    provider_name = overrides.provider or pinned.provider or s.provider
     if not provider_name:
         raise RuntimeError(
             "No default provider set. Run `miniouto provider add` and "
@@ -1422,7 +1295,7 @@ def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> Run
     if provider is None:
         raise RuntimeError(f"Provider {provider_name!r} is not configured.")
 
-    model = overrides.model or s.model or provider.default_model
+    model = overrides.model or pinned.model or provider.default_model
     if not model:
         raise RuntimeError(
             f"No model specified for provider {provider_name!r}. "
@@ -1430,36 +1303,49 @@ def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> Run
             "`miniouto provider add --default-model <name>`."
         )
 
-    subagent_provider, subagent_model = _resolve_subagent(overrides, s)
+    subagent_provider, subagent_model = _resolve_subagent(overrides, s, pinned)
 
     return RuntimeConfig(
         provider_name=provider_name,
         model=model,
         style_name=overrides.style or s.style or "default",
+        role=overrides.role or None,
         session=s.session or "default",
+        reasoning=pinned.reasoning or None,
         subagent_provider=subagent_provider,
         subagent_model=subagent_model,
-        subagent_reasoning=s.subagent_reasoning or None,
+        subagent_reasoning=pinned.subagent_reasoning or s.subagent_reasoning or None,
     )
 
 
 def _resolve_subagent(
-    overrides: ChatOverrides, s: settings_store.Settings
+    overrides: ChatOverrides,
+    s: settings_store.Settings,
+    pinned: session_config.ProviderConfig | None = None,
 ) -> tuple[str | None, str | None]:
-    """Resolve the subagent's provider/model for build_runtime.
+    """Resolve the provider/model a SPAWNED run should use.
 
-    Provider precedence: CLI override > settings > None (None = inherit
-    outo's provider — build_runtime's `runtime.subagent_provider or
-    runtime.provider_name` fallback handles it).
-    Model precedence: CLI override > settings > subagent provider's
-    default_model > None (None = inherit outo's model via the same
-    `or`-fallback in build_runtime). A model-only override (no subagent
-    provider) is valid: the subagent then runs outo's provider with a
-    different model.
+    Kept as a standalone helper (build_runtime no longer needs it) because
+    the spawn CLI resolves it while assembling the child process's
+    RuntimeConfig.
+
+    Provider precedence: CLI override > this session's pin > settings >
+    None (None = inherit outo's provider). Model precedence: CLI override >
+    pin > settings > subagent provider's default_model > None (None =
+    inherit outo's model). A model-only override (no subagent provider) is
+    valid: the spawned run then uses outo's provider with a different
+    model. `pinned` is taken as an argument so the caller resolves the pin
+    once per turn; omitted, it is read from `s.session` so a direct
+    `--use-subagent-provider` call honours the same pin.
     """
 
-    subagent_provider = overrides.subagent_provider or s.subagent_provider or None
-    subagent_model = overrides.subagent_model or s.subagent_model or None
+    if pinned is None:
+        pinned = _pinned_for(s)
+
+    subagent_provider = (
+        overrides.subagent_provider or pinned.subagent_provider or s.subagent_provider or None
+    )
+    subagent_model = overrides.subagent_model or pinned.subagent_model or s.subagent_model or None
     if subagent_provider is None:
         return None, subagent_model
 

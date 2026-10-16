@@ -9,13 +9,16 @@ The `core/` subpackage is where the agent loop is wired together. It is a thin o
 | File | LOC | Purpose |
 |---|---|---|
 | `chat.py` | ~320 | Per-turn chat runner, history persistence, failure diagnostics, sink dispatchers |
-| `context.py` | ~185 | Context-window monitoring (lma `/model`), auto-summarization hook |
+| `context.py` | ~230 | Context-window monitoring (lma `/model` caps, invariant-4 floors), the explicit summary trigger |
 | `error_rules.py` | ~190 | Per-format `ErrorRule` lists for coreouto >= 0.10 provider-level `error_handling` |
 | `events.py` | ~115 | `LoopEvent`, `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI rendering) |
+| `inbox.py` | ~185 | Cross-process message inbox: `ALARM_HEADER`, `insert` / `drain` / `pending_count` / `prune`, `InboxMessage` |
 | `lma.py` | ~140 | `lma.blp.sh` REST client: list_providers, list_models, get_model, find_provider, slugify |
 | `providers.py` | ~135 | Maps `Provider` records → coreouto provider classes; clears global state; maps lma SDKs to coreouto formats |
 | `reasoning.py` | ~200 | Resolves reasoning choices into provider-native request kwargs from lma `reasoning_options`; UI picker helpers |
-| `runtime.py` | ~400 | `RuntimeConfig`, `build_runtime`, subagent tool, hooks |
+| `runtime.py` | ~400 | `RuntimeConfig`, `build_runtime` (incl. role mode), inbox alarm hook, watchdogs, history repair |
+| `spawn_state.py` | ~130 | File-based liveness markers for detached `chat --bg` runs (`SpawnMarker`, pid-aware `pending_spawns`) |
+| `summary.py` | ~330 | The explicit summarization contract: the two pinned messages, `SUMMARY_FORMAT_SPEC`, `Handoff` state, the run-contract slot |
 
 ## Data flow at the core layer
 
@@ -35,27 +38,23 @@ build_runtime(runtime, *, style_overrides, provider_config,
    │  ├─ build_coreouto_provider(runtime.provider)      → co.register_provider
    │  ├─ build_coreouto_provider(subagent_provider)
    │  ├─ tools.registry.register_all()                   → Bash/Image/Video/Audio
-    │  ├─ parse_style + _load_active_skills               → outo body + list[SubagentSpec]
-    │  ├─ co.register_agent_preset("outo", …)
-    │  ├─ co.register_agent_preset(<name> for each SubagentSpec, …)
-    │  ├─ _build_subagent_tool(specs, …)                  → co.register_tool
-    │  │    └─ _wrap_subagent_handler: hands (name, brief) to subagents.submit
-    │  │       (skipped when specs is empty — outo-only style)
-   │  ├─ co.register_hook(BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
-   │  ├─ co.register_hook(AFTER_TOOL_CALL, _make_tool_result_logger(on_tool_result))
-   │  ├─ co.register_hook(ON_ITERATION, make_summarize_hook(...) → (on_iteration, before_llm_call)) + BEFORE_LLM_CALL compaction hook
-   │  ├─ co.register_hook(BEFORE_LLM_CALL, _make_alarm_hook(on_alarms))   ← background-job completion alarms
-    │  ├─ co.register_hook(ON_ITERATION, _make_iteration_logger(on_iteration))
-    │  ├─ co.register_hook(AFTER_LLM_CALL, _make_response_logger(on_response))
-    │  ├─ co.register_hook(ON_THINKING, _make_thinking_logger(on_thinking))
-    │  ├─ co.register_hook(ON_STREAM_TEXT / ON_STREAM_THINKING, _make_stream_logger(...))
-    │  └─ co.register_hook(ON_PROVIDER_ERROR, _make_provider_error_logger(on_provider_error))
-   │
-   ▼
-run_chat(ChatOptions, sink=None) → str
+│  ├─ parse_style + expand_prompt_tokens              → outo body + list[SubagentSpec] (token-expanded; nothing else is prepended)
+   │  ├─ ROLE MODE: runtime.role picks the matching spec's prompt as the system prompt
+   │  ├─ co.register_agent_preset("outo", …)               (ONE preset; BASE_TOOLS, + Computer when registered)
+    │  ├─ co.register_hook(BEFORE_TOOL_CALL, _make_tool_call_logger(on_tool_call))
+    │  ├─ co.register_hook(AFTER_TOOL_CALL, _make_tool_result_logger(on_tool_result))
+    │  ├─ co.register_hook(ON_ITERATION, make_context_monitor(...))  ← asks for a summary at 80% (inbox, not compaction)
+    │  ├─ co.register_hook(BEFORE_LLM_CALL, _make_alarm_hook(session, on_inbox_messages))   ← drains core/inbox.py
+     │  ├─ co.register_hook(ON_ITERATION, _make_iteration_logger(on_iteration))
+     │  ├─ co.register_hook(AFTER_LLM_CALL, _make_response_logger(on_response))
+     │  ├─ co.register_hook(ON_THINKING, _make_thinking_logger(on_thinking))
+     │  ├─ co.register_hook(ON_STREAM_TEXT / ON_STREAM_THINKING, _make_stream_logger(...))
+     │  └─ co.register_hook(ON_PROVIDER_ERROR, _make_provider_error_logger(on_provider_error))
+    │
+    ▼
+ run_chat(ChatOptions, sink=None) → str
    ├─ wrap sink in _RecordingSink (captures LoopEvents for the session turn)
    ├─ load history (if continue_session): session history dicts → co.Message.model_validate
-    ├─ set_subagent_observer(_make_subagent_dispatcher(sink))
     ├─ asyncio.run(_run_with_watchdog(agent, prompt, core_msgs, sink=..., cancel_event=...))
     │     ├─ agent.call() runs as a task; a 5s poll watches the contrib tracker states
     │     │    (activity / progress / live-messages — installed by build_runtime)
@@ -64,14 +63,14 @@ run_chat(ChatOptions, sink=None) → str
     │     │    repetition verdict (checked FIRST) → cancel task, sanitize live history,
     │     │    restart with the [SYSTEM ALARM] text AS the user message (own 3× budget)
     │     ├─ cancel_event set → cancel task promptly, raise LoopCancelledError
-    │     ├─ ON_ITERATION hooks → summarize at 80% (counter resets); emit progress LoopEvent
+    │     ├─ ON_ITERATION hooks → context monitor inserts ONE summary request at 80% (once per turn); emit progress LoopEvent
    │     ├─ LLM call → provider → response
-   │     ├─ AFTER_LLM_CALL hook → on_response(content, has_tool_calls) → LoopEvent
-   │     ├─ ON_THINKING hook → on_thinking(text) → LoopEvent(kind="thinking")
-    │     ├─ call_subagent start → observer → LoopEvent(subagent_start, subagent_id, subagent_name)
-    │     ├─ background job finished (this or an earlier turn) → BEFORE_LLM_CALL alarm hook
-    │     │    appends the alarm as a user message → LoopEvent(alarm, actor="outo")
-   │     └─ other tool call?
+│     ├─ AFTER_LLM_CALL hook → on_response(content, has_tool_calls) → LoopEvent
+     │     ├─ ON_THINKING hook → on_thinking(text) → LoopEvent(kind="thinking")
+     │     ├─ cross-process message arrived (spawn completion alarm, or a human
+     │     │    interjection) → BEFORE_LLM_CALL inbox hook appends the joined text as
+     │     │    ONE user message → LoopEvent(kind="alarm"|"user", detail="inbox:<id>")
+     │     └─ other tool call?
    │          ├─ BEFORE_TOOL_CALL → _make_tool_call_logger bridges to on_tool_call closure
    │          ├─ handler(**args)
    │          └─ AFTER_TOOL_CALL → on_tool_result(name, result) → LoopEvent(kind="tool_result")
@@ -87,8 +86,8 @@ run_chat(ChatOptions, sink=None) → str
 
 The sink layer — a tiny abstraction so the chat loop can emit progress/trace events without coupling to either the CLI (`rich.Console`) or the TUI (Textual widgets). Introduced when the TUI was added so `run_chat` could drive both surfaces from the same code path.
 
-- **`LoopEvent`** — dataclass with `actor: str` (`"outo"` / `"{name}-{6hex}"` — `"subagent-<6hex>"` for the legacy `"subagent"` name — / `"provider"` / `"watchdog"`), `kind: str`, `text: str`, optional `tool_name`, optional `subagent_id` (the 6-hex invocation id, set on every event emitted inside a subagent), optional `subagent_name` (the persona name — `"editor"`, `"reviewer"`, … — set alongside `subagent_id`), optional `detail` (extra payload not shown by the CLI — currently the full untruncated Bash command on `kind="tool"` events). optional `msg_ref` (`str(id(message))` of the live coreouto `Message` the event came from — the prune key for invariant 18). Kinds: `"tool"` / `"tool_result"` / `"response"` / `"thinking"` / `"context"` / `"error"` / `"wakeup"` / `"alarm"` / `"subagent_start"` / `"subagent_end"`. `to_dict()`/`from_dict()` provide the sparse JSON form stored in session turns (optional fields are only serialized when truthy, so older session files load unchanged).
-- **`EventSink`** — `Protocol`: `begin_working()`, `update_activity(text)`, `end_working()`, `emit_loop_event(event)`, `emit_final_answer(content, session_name)`, `emit_stream_delta(kind, text)`, `remove_events(msg_refs)`. `emit_stream_delta` is **transient and display-only** (`kind` is `"text"` or `"thinking"` — the `StreamKind` literal): deltas are incremental fragments of a message the model is still generating, never records. All four implementers must define it — hooks are global and there is no `__getattr__` delegation, so a missing method raises `AttributeError` on the first delta. `NullSink` and `ConsoleEventSink` are no-ops (the CLI renders whole messages only, keeping its output byte-identical), `_RecordingSink` forwards without recording, `TUIEventSink` coalesces into a live row. `remove_events(msg_refs)` is the display-prune entry point: it drops every recorded event carrying one of those `msg_ref`s, forwards to the wrapped sink (the TUI removes matching rows, the console prints a dim `[removed N corrupted messages from the record]` note), and is called **only** by the two removal sources (history repair + `sanitize_history`) — never by the summarizer.
+- **`LoopEvent`** — dataclass with `actor: str` (always `"outo"` — plus `"provider"` / `"watchdog"` for synthetic events), `kind: str`, `text: str`, optional `tool_name`, optional `subagent_id` / `subagent_name` (**spawn bookkeeping, not actor identity** — they are copied off the drained inbox message's `meta`, and are `None` for `kind="user"` messages), optional `detail` (extra payload not shown by the CLI — the full untruncated Bash command on `kind="tool"`, and `inbox:<id>` on drained inbox messages), optional `msg_ref` (`str(id(message))` of the live coreouto `Message` the event came from — the prune key for invariant 18). Kinds: `"tool"` / `"tool_result"` / `"response"` / `"thinking"` / `"context"` / `"error"` / `"wakeup"` / `"alarm"` / `"user"` / `"subagent_start"` / `"subagent_end"` (the last two survive only for old session files). `to_dict()`/`from_dict()` provide the sparse JSON form stored in session turns (optional fields are only serialized when truthy, so older session files load unchanged).
+- **`EventSink`** — `Protocol`: `begin_working()`, `update_activity(text)`, `end_working()`, `emit_loop_event(event)`, `emit_final_answer(content, session_name)`, `emit_stream_delta(kind, text)`, `remove_events(msg_refs)`. `emit_stream_delta` is **transient and display-only** (`kind` is `"text"` or `"thinking"` — the `StreamKind` literal): deltas are incremental fragments of a message the model is still generating, never records. All four implementers must define it — hooks are global and there is no `__getattr__` delegation, so a missing method raises `AttributeError` on the first delta. `NullSink` and `ConsoleEventSink` are no-ops (the CLI renders whole messages only, keeping its output byte-identical), `_RecordingSink` forwards without recording, `TUIEventSink` coalesces into a live row. `remove_events(msg_refs)` is the display-prune entry point: it drops every recorded event carrying one of those `msg_ref`s, forwards to the wrapped sink (the TUI removes matching rows, the console prints a dim `[removed N corrupted messages from the record]` note), and is called **only** by the two removal sources (history repair + `sanitize_history`) — never by the summary hand-off, which changes sessions rather than editing history.
 - **`NullSink`** — no-op implementation (used when `run_chat` is called without a sink).
 - **`ConsoleEventSink`** — CLI implementation. Renders loop events as `{actor}: {text}` in `orange3`; `kind="thinking"` renders the **full** reasoning text as `{actor}:thinking: {text}` (dim); `subagent_start`/`subagent_end` render as a single-line preview (whitespace-flattened, 120 chars; `subagent_end` dim); `kind="tool_result"` is **ignored** (early return — the events exist for the TUI; CLI output stays byte-identical to the pre-tool_result behavior); `kind="alarm"` falls into the default branch and prints the whole alarm text as `outo: [SYSTEM ALARM - THIS IS NOT A USER MESSAGE] …`, since the user needs the result-file path in the transcript; runs a `rich.status` spinner updated by `update_activity`; writes the final answer as plain stdout followed by a `------finish------` marker.
 
@@ -98,9 +97,9 @@ The sink layer — a tiny abstraction so the chat loop can emit progress/trace e
 
 ### Module-level state
 
-- `_tool_trace: list[dict]` + `_tool_trace_lock: threading.Lock` — last 5 tool calls observed this turn, used by failure diagnostics. Locked because subagent handlers may run concurrently.
-- `_LOGGABLE_TOOL_NAMES = ("Bash", "Image", "Video", "Audio", "call_subagent")` — tools whose arguments get summarized in failure output.
-- `pending_responses` / `pending_thinking` / `turn_refs` — per-actor buffers created in `_run_chat_prepared` (see the dispatchers below). `turn_refs` is the per-actor `str(id(assistant_message))` published by `ON_ITERATION` and read by the two tool dispatchers, which is why a call row and its result row always share one `msg_ref`.
+- `_tool_trace: list[dict]` + `_tool_trace_lock: threading.Lock` — last 5 tool calls observed this turn, used by failure diagnostics. Locked because tool handlers may run concurrently.
+- `_LOGGABLE_TOOL_NAMES = ("Bash", "Image", "Video", "Audio", "Computer")` — the live tool set, one entry per tool registered by `tools/registry.py`, so every tool call a turn can make gets a readable `_short_arg_summary` in failure output instead of a raw `repr(args)`. Delegation is deliberately absent: it rides on `Bash` (`miniouto chat … --role <tag>`), and a delegated run's completion comes back as an inbox alarm message, not as a tool call.
+- `pending_responses` / `pending_thinking` / `turn_refs` — buffers created in `_run_chat_prepared` (see the dispatchers below). Since every actor is `outo`, each is keyed by `""`. `turn_refs` is the `str(id(assistant_message))` published by `ON_ITERATION` and read by the two tool dispatchers, which is why a call row and its result row always share one `msg_ref`.
 - `_fail_console = rich.Console(stderr=True, soft_wrap=False, highlight=False)` — for diagnostic output (failure trace + traceback to stderr).
 - Imports `EventSink, LoopEvent, NullSink` from `.events`.
 
@@ -114,6 +113,7 @@ class ChatOptions:
     provider: str | None = None
     model: str | None = None
     style: str | None = None
+    role: str | None = None           # ROLE MODE — the <name> tag body to run as
     subagent_provider: str | None = None
     subagent_model: str | None = None
     max_tokens: int | None = None
@@ -123,7 +123,7 @@ class ChatOptions:
     cancel_event: threading.Event | None = None
 ```
 
-Mirrors the CLI flags for `miniouto chat`. The CLI is responsible for translating `--name` → `session`, `--continue` → `continue_session`, etc.
+Mirrors the CLI flags for `miniouto chat`. The CLI is responsible for translating `--name` → `session`, `--continue` → `continue_session`, etc. `role` is set **only** by `cli/chat.py` from `--role`, never by the TUI — see "Role mode" under `core/runtime.py`.
 
 ### `ToolCallArgsError(Exception)`
 
@@ -135,12 +135,11 @@ The main entry point. `sink=None` defaults to `NullSink()`; either way the sink 
 
 1. Resolves a `RuntimeConfig` from settings + overrides.
 2. Computes `provider_config` — `max_tokens` defaults to `get_max_output_tokens(runtime.model, runtime.provider_name)` so providers with low hard caps (Anthropic's 1024) don't truncate long tool calls (e.g. heredoc file writes). The `provider_name` argument scopes the lma lookup so we don't accept the first cross-provider match.
-3. Builds the sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_stream_dispatcher` ×2, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`, `_make_alarm_dispatcher`) plus the `on_iteration` / `on_history_repair` / `on_messages_removed` persistence bridges (all three depth-gated to outo — a subagent's transcript is not the session's record), and calls `build_runtime(...)` to get a `co.Agent`.
+3. Builds the sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_stream_dispatcher` ×2, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`, `_make_alarm_dispatcher`) plus the `on_iteration` / `on_history_repair` / `on_messages_removed` persistence bridges, and calls `build_runtime(..., on_inbox_messages=_make_alarm_dispatcher(sink))` to get a `co.Agent`.
 4. Loads prior history if `continue_session=True` via `_load_coreouto_history` — session `history` dicts are validated back into `co.Message` objects; invalid entries degrade to plain text (media block lists are flattened via `_flatten_media_blocks`) but **keep `tool_call_id`/`name` for tool messages** so tool_use/tool_result pairing survives even unknown schema drift (without the id the provider 400s the whole request on resume).
-5. Installs `_make_subagent_dispatcher(sink)` as the subagent observer (`set_subagent_observer`), cleared in a `finally` after the call.
-6. Clears `_tool_trace`, runs the turn as `asyncio.run(_run_with_watchdog(agent, opts.prompt, core_msgs, sink=sink, cancel_event=opts.cancel_event, on_removed=sink.remove_events))` inside try/except — see the watchdog subsection below. The whole prepared run is wrapped by `run_chat` in a `try/except` that calls `providers.clear_coreouto_state()` before re-raising: hooks are global and close over this turn's sink and persister, so a turn dying during resolve/build (a provider deleted mid-session, a malformed style) must not leave the previous turn's hooks registered against the new state.
-7. On `LoopCancelledError` (the `cancel_event` was set), finishes the turn as `status="interrupted"` and re-raises WITHOUT `_dump_failure_diagnostics` — a user force-stop is a clean cancel, not a failure. On `LoopRepeatedError` (its own branch — a repeat is not a cancel) it records `repetition-stop: …` and follows the same interrupted/failure path. On any other exception, appends a record-only `kind="error"` LoopEvent (so a session reload shows why the turn ended), finishes the turn as `"interrupted"`, calls `_dump_failure_diagnostics`, re-raises.
-8. `_finish_turn`: on success rewrites the session `history` with `[_dump_message(m) for m in response.messages if m.role != "system"]` (media blocks flattened to text placeholders, tool pairing fields always preserved) and stamps the running `TurnRecord` done with `assistant` + recorded events; on cancel/error the incrementally persisted on-disk history is kept (it already reflects mid-turn progress). Persistence failures are swallowed — they must never mask the turn's outcome.
+5. Clears `_tool_trace`, runs the turn as `asyncio.run(_run_with_watchdog(agent, opts.prompt, core_msgs, sink=sink, cancel_event=opts.cancel_event, on_removed=sink.remove_events))` inside try/except — see the watchdog subsection below. There is no subagent observer to install and no level to pass: one process supervises one `"outo"`. The whole prepared run is wrapped by `run_chat` in a `try/except` that calls `providers.clear_coreouto_state()` before re-raising: hooks are global and close over this turn's sink and persister, so a turn dying during resolve/build (a provider deleted mid-session, a malformed style) must not leave the previous turn's hooks registered against the new state.
+6. On `LoopCancelledError` (the `cancel_event` was set), finishes the turn as `status="interrupted"` and re-raises WITHOUT `_dump_failure_diagnostics` — a user force-stop is a clean cancel, not a failure. On `LoopRepeatedError` (its own branch — a repeat is not a cancel) it records `repetition-stop: …` and follows the same interrupted/failure path. On any other exception, appends a record-only `kind="error"` LoopEvent (so a session reload shows why the turn ended), finishes the turn as `"interrupted"`, calls `_dump_failure_diagnostics`, re-raises.
+7. `_finish_turn`: on success rewrites the session `history` with `[_dump_message(m) for m in response.messages if m.role != "system"]` (media blocks flattened to text placeholders, tool pairing fields always preserved) and stamps the running `TurnRecord` done with `assistant` + recorded events; on cancel/error the incrementally persisted on-disk history is kept (it already reflects mid-turn progress). Persistence failures are swallowed — they must never mask the turn's outcome.
 9. Calls `sink.emit_final_answer(response.content)`; returns `response.content`.
 
 ### Incremental persistence (`_TurnPersister`)
@@ -149,20 +148,20 @@ The session is written **throughout** the turn, not just at the end, so a force-
 
 - `begin_turn` appends the turn as `status="running"` before the loop starts (and reaps stale running turns from dead writers).
 - `_RecordingSink.on_event` → `update_turn_events` on nearly every loop event; `thinking`/`context` events are throttled to one write per 0.5 s, structural events flush immediately.
-- The `ON_ITERATION` dispatcher additionally calls `persist_history`, which runs `sanitize_history` (drops the trailing assistant message whose tool calls have no results yet — ON_ITERATION fires before tool execution) and stores it via `update_history`. Guarded by `current_subagent_depth() == 0` — hooks are global, and a subagent's transcript is not the session's restorable history.
+- The `ON_ITERATION` dispatcher additionally calls `persist_history`, which runs `sanitize_history` (drops the trailing assistant message whose tool calls have no results yet — ON_ITERATION fires before tool execution) and stores it via `update_history`. Written unconditionally — every run in this process IS the session's transcript.
 - Combined with the atomic `sessions.save` (tmp file + `os.replace`), the worst-case loss on SIGKILL is a sub-second thinking line.
 
 ### `_run_with_watchdog(agent, prompt, history, *, sink, cancel_event, states=None) -> co.Response`
 
 Thin level-0 wrapper around `core/runtime.py:supervised_run` (see below): runs outo's `agent.call()` supervised, emitting `watchdog:` loop events (`kind="wakeup"`) on each restart, and wires the user's `cancel_event` into the fast path (ESC ESC hard-cancels even an in-flight LLM call within one 5 s poll — the hook-boundary cancel guard alone cannot interrupt one).
 
-### `supervised_run(start, prompt, history, *, live_key, level, on_wakeup, cancel_event=None, states=None, restart_on_repetition=None, on_repetition=None, on_removed=None)` (`core/runtime.py`)
+### `supervised_run(start, prompt, history, *, live_key, on_wakeup, cancel_event=None, states=None, restart_on_repetition=None, on_repetition=None, on_removed=None)` (`core/runtime.py`)
 
-The stall watchdog, following coreouto `examples/27_wakeup.py` + `examples/28_resume_interrupted.py` (coreouto >= 0.11.1). `start(prompt, history)` creates one attempt's coroutine; `start(None, history)` must resume from a transcript alone. **Only outo's turn is supervised today** (`_run_with_watchdog` passes `level=0`): a background subagent job runs on the daemon loop with no supervisor, because the watchdog state it would read is per-turn and every `build_runtime` clears it. A 5-second poll (`WATCHDOG_CHECK_SECONDS`) reads the contrib tracker states installed by `build_runtime` (`activity_tracker_hook` + `loop_progress_hook` + a BEFORE_LLM_CALL live-messages capture keyed by actor — see `_register_watchdog_trackers`):
+The stall watchdog, following coreouto `examples/27_wakeup.py` + `examples/28_resume_interrupted.py` (coreouto >= 0.11.1). `start(prompt, history)` creates one attempt's coroutine; `start(None, history)` must resume from a transcript alone. **There is no `level` parameter**: one process supervises one actor. That covers both a `chat`/TUI turn and a delegated `chat --role <tag>` run — a delegated run is a normal supervised turn in its own process, so it gets the same stall watchdog and the same repetition restart; what it does **not** share is the parent's event stream. `live_key` is `"outo"`. A 5-second poll (`WATCHDOG_CHECK_SECONDS`) reads the contrib tracker states installed by `build_runtime` (`activity_tracker_hook` + `loop_progress_hook` + a BEFORE_LLM_CALL live-messages capture keyed by actor — see `_register_watchdog_trackers`):
 
 - **Stall wakeup** — when `activity.seconds_since_last_activity() > API_STALL_TIMEOUT_SECONDS` (30 min) AND `progress.phase != "tool_call"` AND no deeper supervisor is active (`_ACTIVE_SUPERVISORS`), the attempt task is cancelled, the actor's live message list is recovered via `sanitize_history` (drops system messages and any trailing assistant turn with unanswered tool calls — providers 400 on dangling tool calls), `on_wakeup` fires, and the call restarts **without a user message**: coreouto >= 0.11.1's `call(history=...)` sends the sanitized transcript exactly as declared and simply continues. If nothing is recoverable (wedged before the first LLM call), it falls back to the original prompt. Max `WATCHDOG_MAX_WAKEUPS = 3` restarts, then `LoopStalledError`.
-- **Supervisor deferral** — a supervisor stays quiet while any deeper level is active (`_ACTIVE_SUPERVISORS`): the deeper call's supervisor owns the silence and does the cancelling/restart in place. Harmless with one level today, and the reason outo's level is 0.
-- **Repetition restart** (`restart_on_repetition` = the actor key, `"outo"`) — checked **before** the stall test, because a looping model is *active*, not wedged, so the stall path would never fire for it. On a sticky verdict the attempt is cancelled, the live history sanitized, `on_repetition` fires, and the call restarts with the **alarm as the user message**: `start(alarm, history)`, or `start(f"{prompt}\n\n{alarm}", history)` when no transcript is recoverable (otherwise the task itself would be lost). The alarm is deliberately **not** pushed through the subagent alarm deque — that deque is drained into the live list by `_make_alarm_hook` and would deliver the same text a second time. Budget: `REPEAT_MAX_RESTARTS = 3`, independent of `WATCHDOG_MAX_WAKEUPS`, then `LoopRepeatedError`. The deeper-supervisor deferral does not apply to it — it is per-actor and only this supervisor consumes its own actor's verdict.
+- **Supervisor deferral** — a supervisor stays quiet while another supervisor is active (`_ACTIVE_SUPERVISORS`): the inner call's supervisor owns the silence and does the cancelling/restart in place. Harmless with one supervisor in practice; the registry survives so the check can be asserted rather than assumed.
+- **Repetition restart** (`restart_on_repetition` = the actor key, `"outo"`) — checked **before** the stall test, because a looping model is *active*, not wedged, so the stall path would never fire for it. On a sticky verdict the attempt is cancelled, the live history sanitized, `on_repetition` fires, and the call restarts with the **alarm as the user message**: `start(alarm, history)`, or `start(f"{prompt}\n\n{alarm}", history)` when no transcript is recoverable (otherwise the task itself would be lost). The alarm is deliberately **not** routed through the inbox: a `drain()` by `_make_alarm_hook` would deliver the same text a second time. Budget: `REPEAT_MAX_RESTARTS = 3`, independent of `WATCHDOG_MAX_WAKEUPS`, then `LoopRepeatedError`. The deferral above does not apply to it — it is per-actor and only this supervisor consumes its own actor's verdict.
 - `on_removed` is the display side of **both** restart paths: every `sanitize_history` truncation reports the discarded messages' refs there, so the record loses the events of a turn the resumed attempt no longer has. A stall keeps the answered prefix; a repetition restart keeps it plus the alarm. A discarded tail is a discard either way.
 - **Phase exemption** — while `phase == "tool_call"` the watchdog stays quiet: tools carry their own bounds (Bash: `BASH_TIMEOUT_SECONDS`). A healthy nested agent keeps the global activity clock fresh through its own hook firings, so only a genuinely silent tool-free loop wakes a supervisor.
 
@@ -180,7 +179,7 @@ Raised by the cancel guard from a hook once the user's `cancel_event` is set. co
 
 ### `_actor_label() -> (str, str | None)`
 
-Shared by all dispatchers: returns `(f"{name}-{6hex}", sid)` inside a background subagent job where `name` is `_SUBAGENT_NAME` (so `"subagent-<6hex>"` for the legacy name, `"editor-abc123"` for an `editor` job), `("subagent", None)` as a defensive depth-only fallback, `("outo", None)` otherwise. The ContextVars it reads are set inside the job's own asyncio task by `subagents._enter_context`.
+Kept as the single place that answers "who is speaking"; it now always returns `("outo", None)`. The ContextVars it once read (`_SUBAGENT_DEPTH` / `_SUBAGENT_NAME` / `_SUBAGENT_ID`) are **deleted** along with in-process jobs — a spawned run is a separate process, so there is nothing in this address space to attribute. The dispatchers still call it rather than hardcoding the string, so the actor plumbing stays uniform.
 
 ### `_make_tool_call_dispatcher(sink: EventSink)`
 
@@ -188,9 +187,8 @@ Builds the `on_tool_call(name, arguments)` closure passed to `build_runtime`. Fo
 
 1. Validates `arguments` is a dict via `_validate_tool_call_args` (raises `ToolCallArgsError` otherwise).
 2. Computes actor + subagent id via `_actor_label()`.
-3. Feeds the repetition detector (`note_tool_call` + `cancel_background_loop`) **before any skip branch** — a model re-spawning the same brief forever must trip, and the subagent's internal calls carry the job's own sid. Appends to `_tool_trace`.
-4. For `call_subagent`, **emits nothing** — the subagent observer emits the `subagent_start` event with the minted id and persona name immediately after (the `BEFORE_TOOL_CALL` hook for `call_subagent` still runs in the *parent* context, so the id does not exist yet here).
-5. For `Bash/Image/Video/Audio`, emits a `LoopEvent(kind="tool", text=f"{name} {preview}", subagent_id=sid)` and updates the spinner activity (the subagent label when nested, else the tool name). For `Bash` the event also carries `detail=arguments["command"]` — the **full untruncated command, verbatim** (no newline flattening) — for sinks that want the raw input; `detail` is `None` for the media tools.
+3. Feeds the repetition detector (`note_tool_call`) **before any skip branch** — a model re-issuing the same call forever must trip. Appends to `_tool_trace`.
+4. Emits a `LoopEvent(kind="tool", text=f"{name} {preview}", subagent_id=sid)` and updates the spinner activity. For `Bash` the event also carries `detail=arguments["command"]` — the **full untruncated command, verbatim** (no newline flattening) — for sinks that want the raw input; `detail` is `None` for the media tools.
 
 Carries the per-actor `msg_ref` from `refs` (published by the iteration dispatcher), so the row and its result are pruned together.
 
@@ -198,39 +196,33 @@ Carries the per-actor `msg_ref` from `refs` (published by the iteration dispatch
 
 Builds the `on_tool_result(name, result)` closure wired into coreouto's `AFTER_TOOL_CALL` hook (via `_make_tool_result_logger`), where `result` is coreouto's `ToolResult` (`.content`, `.blocks`, `.is_error`, `.flatten_text()`). For each tool result:
 
-1. Skips `call_subagent` entirely — the subagent observer's `subagent_end` event already carries that result.
-2. Only emits for `Bash/Image/Video/Audio`.
-3. `text = result.flatten_text()`, prefixed with `"error: "` when `result.is_error` (mirrors the `subagent_end` "error:" convention the TUI keys on), truncated to 4000 chars with a `"\n… [truncated]"` suffix when over.
-4. Emits `LoopEvent(kind="tool_result", text=text, tool_name=name, subagent_id=sid, msg_ref=refs.get(sid or ""))` with the current actor/subagent id via `_actor_label()` — the **same** `msg_ref` the `tool` event carries, which is what keeps a removed message from orphaning its result row. The CLI's `ConsoleEventSink` ignores this kind; it exists so the TUI can display tool return values.
+1. Emits for every tool (`Bash` / `Image` / `Video` / `Audio` / `Computer` / `continue_session`).
+2. `text = result.flatten_text()`, prefixed with `"error: "` when `result.is_error` (the convention the TUI keys on), truncated to 4000 chars with a `"\n… [truncated]"` suffix when over.
+3. Emits `LoopEvent(kind="tool_result", text=text, tool_name=name, subagent_id=sid, msg_ref=refs.get(sid or ""))` with the current actor/subagent id via `_actor_label()` — the **same** `msg_ref` the `tool` event carries, which is what keeps a removed message from orphaning its result row. The CLI's `ConsoleEventSink` ignores this kind; it exists so the TUI can display tool return values.
+
+If the dispatcher was built with `on_handoff`, and this tool result left a pending `summary.pending_handoff()`, it calls `on_handoff()` — that is how the summary hand-off ends the loop cleanly.
 
 The whole body is wrapped in `try/except Exception` — a sink failure here must never break the agent loop.
 
-### `_make_subagent_dispatcher(sink: EventSink)`
-
-Builds the `(phase, sid, name, text)` lifecycle callback installed via `set_subagent_observer` (note the argument order: **sid before name**). Only `"start"` fires in v1: text is the brief preview (160 chars) and it emits `LoopEvent(kind="subagent_start", actor=f"{name}-{sid}", subagent_id=sid, subagent_name=name)`, switching the spinner activity to the subagent label. Completion is **not** reported here — it arrives as the `alarm` loop event from `_make_alarm_dispatcher`, so a job finishing mid-turn and one finishing between turns look identical. The dispatcher also still handles the `"wakeup"` / `"end"` phases defensively, but the background engine never emits them.
-
 ### `_make_thinking_dispatcher(sink: EventSink)`
 
-Builds the `on_thinking(thinking)` closure wired into coreouto's `ON_THINKING` hook. The text is **stashed** per actor and flushed by `_make_iteration_dispatcher` — coreouto fires `ON_THINKING` *before* it appends the assistant message, so there is no message to stamp a `msg_ref` with at that point. Repetition counting still runs here, at the earliest possible moment; only the display is deferred. Reasoning from a background job is labeled `{name}-{6hex}` automatically.
+Builds the `on_thinking(thinking)` closure wired into coreouto's `ON_THINKING` hook. The text is **stashed** per actor and flushed by `_make_iteration_dispatcher` — coreouto fires `ON_THINKING` *before* it appends the assistant message, so there is no message to stamp a `msg_ref` with at that point. Repetition counting still runs here, at the earliest possible moment; only the display is deferred.
 
 ### `_make_response_dispatcher(sink: EventSink, pending: dict)`
 
-Builds the `on_response(content, has_tool_calls)` closure. When `has_tool_calls` is true (intermediate LLM response that triggers a tool call), the text is **stashed in `pending`** (keyed by actor: `""` for outo, the subagent id inside a subagent) instead of being emitted immediately — coreouto fires `AFTER_LLM_CALL` *before* `ON_THINKING`, so an immediate emit would place the model's text above its own thinking row. The stash is flushed by `_make_iteration_dispatcher` (below), which `ON_ITERATION` guarantees runs after `ON_THINKING` — every sink therefore sees `thinking` → `response` in that order. The stashed tuple carries the actor/subagent id captured at stash time, so parallel subagent streams stay self-consistent.
+Builds the `on_response(content, has_tool_calls)` closure. When `has_tool_calls` is true (intermediate LLM response that triggers a tool call), the text is **stashed in `pending`** (keyed by actor: always `""` now) instead of being emitted immediately — coreouto fires `AFTER_LLM_CALL` *before* `ON_THINKING`, so an immediate emit would place the model's text above its own thinking row. The stash is flushed by `_make_iteration_dispatcher` (below), which `ON_ITERATION` guarantees runs after `ON_THINKING` — every sink therefore sees `thinking` → `response` in that order. The stashed tuple carries the actor captured at stash time.
 
 ### `_make_stream_dispatcher(sink: EventSink, kind: StreamKind)`
 
-Builds the `on_stream_delta(delta)` closure wired into coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` hooks, which fire **once per incremental fragment** (not the accumulated text) whenever the provider streams. It only calls `sink.emit_stream_delta(kind, delta)` — a display-only path. Two deliberate omissions:
-
-- **No repetition feed.** Deltas fragment mid-segment, so the phrase detector would count half-phrases; combined with the whole-message `note_text` calls in the thinking/response paths, every message would be counted twice and the 10x threshold would trip at 5 real repeats. The repetition watchdog therefore stays on whole-message boundaries, which cover the same content.
-- **No subagent deltas.** A subagent stream would need per-actor rows, and a *background* job has no hooks at all once the turn that started it has ended (it keeps streaming against its own agent loop), so v1 renders outo's own text only. Deltas arriving at `current_subagent_depth() > 0` are dropped.
+Builds the `on_stream_delta(delta)` closure wired into coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` hooks, which fire **once per incremental fragment** (not the accumulated text) whenever the provider streams. It calls `sink.emit_stream_delta(kind, delta)` — a display-only path — and in addition feeds `repetition.note_stream_delta(actor_key, delta)` and the turn's `_PartialStreams` (the verbatim text of the message in flight, which the force-stop records as a truncated answer). Stream feeding is what catches a model repeating inside **one** never-ending answer, whose boundary is the call returning, minutes later; the detector buffers the unfinished tail and counts each *completed* segment, sharing one splitter with the whole-message path so nothing is double-counted. A cross-process (`--bg`) run has no hooks left once its turn ends — its deltas never reach this sink at all.
 
 ### `_make_alarm_dispatcher(sink: EventSink)`
 
-Builds the `on_alarms(alarms)` callback that `runtime._make_alarm_hook` forwards drained completion alarms to. The hook has **already** put the alarm text into the model's live message list; this only records it: one `LoopEvent(actor="outo", kind="alarm", text=alarm.text, subagent_id=alarm.sid, subagent_name=alarm.name)` per alarm. The actor is `outo` on purpose — the alarm is outo's own next input, not the subagent speaking — and the TUI matches `subagent_id` against its running subagent rows to close them out.
+Builds the `on_inbox_messages(messages)` callback that `runtime._make_alarm_hook` forwards drained inbox messages to (wired in as `build_runtime(on_inbox_messages=…)`). The hook has **already** put each drained text into the model's live message list; this only records it: one `LoopEvent(actor="outo", kind=message.kind, text=message.text, subagent_id=message.meta.get("id"), subagent_name=message.meta.get("role"), detail=f"inbox:{message.id}")` per message. `kind` mirrors the inbox kind (`"alarm"` / `"user"`), the actor is `outo` because the message is outo's own next input rather than a spawned process speaking, and `subagent_id`/`subagent_name` are **spawn bookkeeping** carried over from the message's `meta` — both `None` for a human interjection. `detail="inbox:<id>"` is the optimistic-row suppression key: a message typed into the TUI mid-turn is rendered immediately, and this matching event is dropped rather than rendered twice.
 
 ### `_make_iteration_dispatcher(sink: EventSink, pending, pending_thinking, refs)`
 
-Builds the `on_iteration(*, iteration, messages, response, **kwargs)` closure. `ON_ITERATION` is where the turn's message identity becomes available: coreouto appends the assistant message and only then fires this hook, so `messages[-1]` IS the message every event of this iteration came from. Its `str(id(...))` is published into the per-actor `refs` slot and stamped as `msg_ref` onto everything flushed here — the stashed thinking and response text, and the progress line. The tool dispatchers read the same slot, which is why a `tool` event and its `tool_result` always share one ref and are pruned together. Flush order per iteration is thinking → response → context (net display order); the summarizer lives separately in `make_summarize_hook`, registered as a second `ON_ITERATION` hook. This dispatcher also feeds the phrase detector (`_note_repetition_text`) on the whole response text.
+Builds the `on_iteration(*, iteration, messages, response, **kwargs)` closure. `ON_ITERATION` is where the turn's message identity becomes available: coreouto appends the assistant message and only then fires this hook, so `messages[-1]` IS the message every event of this iteration came from. Its `str(id(...))` is published into the per-actor `refs` slot and stamped as `msg_ref` onto everything flushed here — the stashed thinking and response text, and the progress line. The tool dispatchers read the same slot, which is why a `tool` event and its `tool_result` always share one ref and are pruned together. Flush order per iteration is thinking → response → context (net display order); the context monitor lives separately in `core/context.py`, registered as a second `ON_ITERATION` hook. This dispatcher also feeds the phrase detector (`_note_repetition_text`) on the whole response text.
 
 ### `_make_provider_error_dispatcher(sink: EventSink)`
 
@@ -254,6 +246,7 @@ Per-tool one-liner:
 |---|---|
 | `Bash` | joined command, no length cap (literal `\n` → space) |
 | `Image` / `Video` / `Audio` | just the path |
+| `continue_session` | `args["summary_dir"]`, or `?` |
 | (other) | `str(args)[:120]` |
 
 ---
@@ -262,7 +255,8 @@ Per-tool one-liner:
 
 ### Constants
 
-- `SUMMARIZE_THRESHOLD = 0.8` — summarization fires at 80% of context window.
+- `CONTEXT_SUMMARY_TRIGGER_PCT = 80` — the measured context usage (%) at which the model is **asked** to summarize. Deliberately late: the remaining window is still enough to write the summary documents and hand off, which is the only thing left that needs context.
+- `SUMMARY_SOURCE = "context"` — the `source` stamped on the injected request, so a receiver can tell a context trigger apart from a delegated run's completion alarm.
 - `DEFAULT_MAX_OUTPUT_TOKENS = 16384` — hard floor. Rationale: Anthropic defaults to 1024 if you don't set it explicitly, silently truncating long tool-call outputs (e.g. file writes).
 - There is no ceiling. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
@@ -284,27 +278,78 @@ Resolution order (highest wins):
 
 No ceiling clamp. See `docs/lma.md` for rationale.
 
-### `make_summarize_hook(model, session_name, provider_name=None) -> tuple[Callable, Callable]`
+### `make_context_monitor(*, model, session, provider_name=None) -> Callable | None`
 
-Returns `(on_iteration, before_llm_call)` — a hook pair (registered as a second `ON_ITERATION` hook alongside `_make_iteration_logger`, plus a `BEFORE_LLM_CALL` hook). The `session_name` argument is captured but currently unused in the body. `provider_name` is threaded into `get_context_window` for an accurate lookup **and** used as the summarizer agent's provider (guaranteed registered by `build_runtime`).
+Builds the single `ON_ITERATION` hook that **asks** for a summary at the threshold. There is no compaction and no second LLM: nothing here rewrites the transcript.
 
-- If no context window is known, returns two no-op hooks.
-- The compaction is a **context handoff**, not a prose summary — the agent continues with ONLY the compacted message, so it must carry everything still relevant.
+- `build_runtime` builds a fresh monitor per turn (the same lifecycle as the watchdog trackers), so "fires at most once" is per turn with no module-level state to reset.
+- Returns `None` (no hook at all) when the window size or session name is unknown — a threshold needs a denominator, and inventing a window would fire the request at an arbitrary moment.
+- `hook(*, messages=None, response=None, **_kwargs)`:
+  1. `_tokens_used(response, messages)` measures occupancy, best-effort: `response.usage.prompt_tokens` → `usage.total_tokens` → `_estimate_tokens` (chars / 4 over the live messages, including tool-call arguments). `None` (no message at all) → stay silent.
+  2. `pct = used * 100 // window`; below `CONTEXT_SUMMARY_TRIGGER_PCT` it returns.
+  3. At the threshold it sets the one-shot flag and does exactly one thing: `inbox.insert(session, build_summary_request(...), kind=inbox.ALARM_KIND, source=SUMMARY_SOURCE)`. The insert runs under `contextlib.suppress(Exception)` — a broken inbox must not take the turn down; the request is a courtesy, not part of the loop's contract.
+- Delivery rides the existing `BEFORE_LLM_CALL` inbox hook, which is what makes the request **recorded, replayed and rendered** exactly like any other alarm rather than a private side channel.
 
-  **`on_iteration(*, iteration, messages, response, **_kwargs)`** — Accumulates `response.usage.total_tokens`. When the cumulative total reaches 80% of the window it only **arms a pending flag**; it never compacts here. coreouto fires `ON_ITERATION` *before* executing the response's tool calls, so compacting at that point would wipe the just-appended assistant tool_use and orphan the tool results that follow (provider 400: "tool result's tool id not found").
+---
 
-  **`before_llm_call(*, messages, **_kwargs)`** — When armed, runs the summarizer and replaces the message list. `BEFORE_LLM_CALL` of the next iteration is the safe point: every tool-call pair in the list is complete. Registered before the watchdog's `capture_messages` hook so the watchdog captures the post-compaction list.
+## `core/summary.py`
 
-  **`summarizer(messages) -> list[co.Message]`** — Builds the handoff by:
-  1. Splitting out system messages.
-  2. Detecting and carrying forward any previous `"[Summary…"` user message ("Previous compaction" — facts survive repeated compactions).
-  3. Flattening user/assistant/tool messages into text **including the assistant's tool CALLS** (`Agent tool call: Bash({...})` — without them the results are unattributable) with tool results truncated at 4000 chars.
-  4. Extracting the current task **verbatim in code** (never LLM-paraphrased).
-  5. Awaiting a separate **async** `co.Agent(name="summarizer", provider=provider_name, max_iterations=1, provider_config={"max_tokens": get_max_output_tokens(model, provider_name)})` call with a 7-section handoff prompt (TASK / DONE / IN PROGRESS / FILES / DECISIONS / ERRORS / NEXT; paths and commands verbatim). The output cap resolves through the normal precedence (provider TUI override > lma `max_output_tokens` > lma `context_window` > 16K floor), fresh at each compaction. The call must be async — the hook fires inside coreouto's running event loop, where a sync `call_sync` raises "cannot be called from a running event loop"; with the old sync hook the LLM handoff silently never worked.
-  6. On failure, prints the exception to stderr (visible, not silent) and falls back to a deterministic verbatim tail of the recent conversation — never a content-free apology.
-  7. Wrapping the result in a **minimal positive frame** — "the earlier conversation was compacted into the handoff below; read it carefully, then continue the task naturally" — with no prohibitions: naming forbidden recovery behavior (sessions, `.miniouto`, transcripts) plants the very idea, and a handoff that carries everything leaves nothing to recover. The frame embeds the verbatim task. **Always** returns `[*system_msgs, summary_msg]` — never overwrites with garbage.
+The explicit summarization contract — pure vocabulary, no disk, no provider, no registry.
 
-  **Critical guard:** if the summarizer returns a non-list, prints a yellow warning to stderr and keeps the original messages (this is the divergence from `coreouto.contrib.hooks.auto_summarize_hook`, which would `clear()` and `extend()` with the non-iterable and both corrupt the turn *and* raise `TypeError`). **The counter resets to 0 after each compaction** (coreouto `examples/23` pattern) — without the reset, every later iteration that reports usage re-triggers the LLM summarizer.
+### The two pinned messages
+
+Both texts are part of the model-facing contract, so they are literals with only the `{...}` values substituted. They share the harness's standard alarm header, `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` (`core/inbox.py:ALARM_HEADER`), followed by one message-specific line: the context-budget reading for the request, the "continue the previous work here" note for the continuation.
+
+- **`SUMMARY_REQUEST_HEADER_TEMPLATE`** = `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`, then `Context budget: {pct}% of this session's window is consumed ({used}/{window} tokens). Explicit summarization is required now.`
+- **`CONTINUATION_HEADER`** = `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`, then `New session opened from a summary — continue the previous work here.`
+
+### `summary_dir_for(session) -> Path`
+
+`<INVOCATION_CWD>/.miniouto/summary/<session>/`. **Project-local, not under `~/.miniouto/`**: a summary is a project artifact, meant to be read, reviewed and committed with the work it describes. Raises `ValueError` on an empty session name.
+
+### `build_summary_request(*, session, pct, window_tokens, used_tokens, summary_dir) -> str`
+
+The message asking the model to summarize before its context runs out. Sections, in order:
+
+1. the header + the context-budget line (`Context budget: {pct}% ... Explicit summarization is required now.`), whose token parenthetical (`{used}/{window} tokens`) is dropped rather than rendered with a hole when either figure is `None`;
+2. the current situation — the token figures (window / used);
+3. **WHY SUMMARIZE** — the remaining window isn't enough to finish, and *this harness does not summarize implicitly*: you write the summary yourself, as files;
+4. **HOW TO SUMMARIZE** — (1) `mkdir -p <summary_dir>` via Bash, (2) write documents per `SUMMARY_FORMAT_SPEC`, (3) the bar: reading only that folder must be enough to continue;
+5. **AFTER SUMMARIZING** — call `continue_session(summary_dir="<dir>")`; the current conversation ends there and a new session continues from the summary; a delegated run's alarm-session / result-file contract is carried over automatically;
+6. **IF YOU SKIP THIS** — skipping it fails at the context limit or loses earlier content, repeats work, or reverses settled decisions.
+
+### `SUMMARY_FORMAT_SPEC`
+
+The document layout, embedded verbatim: `./.miniouto/summary/<session>/` holding `00-overview.md` (required) plus any number of `NN-<topic>.md` (optional). The overview has **seven** sections: `## 1. Background & Goal (Why)` / `## 2. Current State (What)` / `## 3. Key Decisions & Rationale (Decisions)` / `## 4. Next Work (Next)` / `## 5. Gotchas & Verification (Gotchas & Verify)` / `## 6. File Map (File map)` / `## 7. Original Brief & Contract (Brief & contract)`.
+
+### `build_continuation_message(*, new_session, from_session, summary_dir, contract=None) -> str`
+
+The message that opens the NEW session: the shared header + "New session opened from a summary — continue the previous work here.", the summary folder, **WHAT TO DO** (read every document, `00-overview.md` first; continue `from_session`'s work), the **CAUTIONS** (the summary is a record of the past — verify against the code; the conversation was **not** carried over; follow its "Next Work" order; check files and test state before starting; keep updating the summary as you go) and **RECOMMENDED**. When `contract` is present, a **DELEGATION CONTRACT (carried over)** block appends one line per present key — role/style share an identity line, alarm session / result file get their own — and states that the contract must be completed in this session.
+
+### Hand-off state and the run contract
+
+- `Handoff` — frozen dataclass: `new_session`, `from_session`, `summary_dir`. Plus `request_handoff(...)` / `pending_handoff()` (peek) / `consume_handoff()` (read + clear) / `clear_handoff()`, guarded by a module lock. In-process by design: a delegated run is its own process, so nothing here has to survive the turn.
+- `set_run_contract(*, session, role=None, style=None, alarm_session=None, return_path=None)` / `get_run_contract()` (returns a copy) / `clear_run_contract()`. Empty values are dropped, so a plain outo run clears the slot instead of recording a blank block. `cli/chat.py:_register_run_contract` publishes it before the turn; the `continue_session` tool reads it so the hand-off can restate what the run owes its caller.
+
+---
+
+## `tools/continue_session.py`
+
+`continue_session(summary_dir: str) -> str` (sync, in `BASE_TOOLS`, so outo and every delegated role run have it). The only way a session changes.
+
+1. `_resolve` turns a relative path into `INVOCATION_CWD / path` (`~` expanded, `.resolve()`d) and validates it is an existing directory holding at least one `*.md`. **Anything else** — empty, missing, not a directory, no markdown — returns the reason as the tool result (never an exception), so the model can write the documents and retry. It deliberately does *not* judge whether the summary is *good*: only the session that reads it can.
+2. `_mint_session` produces `cont-<YYYYMMDD-HHMMSS>-<6hex>`.
+3. `inbox.insert(new_session, build_continuation_message(...), kind=inbox.ALARM_KIND, source="summary", meta={"from": from_session})`.
+4. `summary.request_handoff(new_session, from_session=..., summary_dir=str(directory))` — the entry layer consumes this; the loop layer never does.
+5. `_ack` tells the model the session's conversation is over, names the new session and folder, repeats that a delegation contract travelled along, and ends with "do no more work here, end your turn".
+
+### The hand-off, end to end
+
+1. **The loop layer stops, it does not move.** `run_chat` passes a `_StopOnHandoff` (a `threading.Event` subclass whose `is_set()` ORs the caller's cancel event with its own hand-off flag) as the turn's `cancel_event`, so `build_runtime`'s cancel guard sees it like any user stop. The `LoopCancelledError` is then **re-classified at the call site**: if `summary.pending_handoff()` is set, the turn is stamped `status="done"` with a final answer naming the summary folder and the new session, the incrementally persisted history is kept, and **the hand-off stays pending** — only the entry layer can move a conversation.
+2. **The entry layer moves it.** `cli/chat.py:_run_handoffs` checks `pending_handoff()` after each turn; `_apply_handoff` switches `opts.session`, re-registers the run contract under the new session and updates `settings.session` (the name `runtime.session` resolves to, i.e. what the `BEFORE_LLM_CALL` inbox hook drains). It prints `handoff_marker` (`------summary → <new>------` + `summary: <dir>`) followed by `------<new>------`. The continuation message is already waiting in the new session's inbox, so a one-shot drain (`_continuation_prompt`) turns it into the next prompt — and rebuilds it from `core.summary.build_continuation_message` plus the run contract if that drain came back empty. The same run continues; this is the ONE loop inside `run_turn_chain`, and it is not a wait on anything external.
+3. **`HANDOFF_MAX_TRANSITIONS = 5`** bounds the chain (`summary → cont-1 → cont-2` …); past it the chain warns, naming the session and the summary folder, and stops.
+4. **The TUI does the same thing without a chain.** `ChatTUI._apply_handoff` mounts the marker as a system row in the **old** conversation, persists it there for replay (`_persist_handoff_marker`, a trailing turn holding one `handoff` event), re-pins the new session, and lets the 1 s inbox poll auto-deliver the continuation.
+5. **The post-step reports the session it ended in.** `ChainState.session` is what the alarm's `Session:` line, the result file's name and a `--bg` marker's `session` field use; `_handoff_note` (`Continued from: <old> (summary: <dir>)`) is added to the alarm and, as a trailing `---` section, to the result markdown — which still leads with the answer.
 
 ---
 
@@ -366,7 +411,7 @@ Wipes four coreouto globals: `clear_providers()`, `clear_agent_presets()`, `clea
 
 ### `reset_subagent_registration()`
 
-Suppresses any exception from `co.clear_tools()` (used at start of new runs to remove a stale `call_subagent` from a previous process — relevant when the active style changed between turns and a no-longer-needed `call_subagent` is still registered).
+Docstring: *"Remove stale registry entries left over from a prior run."* Body is a single `with contextlib.suppress(Exception): co.clear_tools()` — a defensive "never let a stale tool registration break a run" guard. Since delegation is a separate `chat` process (not an in-process tool registration), nothing in the current code path calls it; the real reset is `clear_coreouto_state()` at the top of every `build_runtime`.
 
 ### `provider_kwargs(provider_config, passthrough)`
 
@@ -374,31 +419,42 @@ Helper that bundles the two dicts under the keys coreouto's `AgentConfig` expect
 
 ---
 
-## `core/subagents.py` — background job registry
+## `core/inbox.py` — the cross-process message inbox
 
-A job must outlive the turn that spawned it, and `run_chat` runs every turn under `asyncio.run(...)`, which tears down anything still detached at turn end. So the engine is a module-level registry over a **daemon thread that owns its own `asyncio.new_event_loop()`** and never stops (`_ensure_loop` / `_run_loop`).
+A session's inbox is `inbox/<session>/`, one JSON file per pending message. It is the durable hand-off from a detached `chat --bg` process back to the session that launched it: writer and drainer are separate OS processes, so the channel has to survive the writer exiting.
 
 | Symbol | Purpose |
 |---|---|
-| `ALARM_HEADER = "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]"` | First line of every completion alarm; single source of truth shared with `repetition.alarm_text` and the TUI |
-| `SPAWN_HANDSHAKE_TIMEOUT_SECONDS = 2.0` | How long `submit` waits for the job to prove it entered `agent.call` |
-| `BRIEF_PREVIEW_CHARS = 160` | Truncation of the brief in the `start` observer event |
-| `submit(agent, name, brief) -> Job` | Mints `sid = secrets.token_hex(3)`, registers the job, emits the `start` event, schedules `_run_job` on the daemon loop, waits out the handshake, returns the `Job` |
-| `take_pending_alarms() -> list[Alarm]` | Drain the completion deque, oldest first |
-| `running_jobs() -> list[(sid, name)]` / `is_running(sid) -> bool` | Liveness, for the ack text and for `repetition.cancel_background_loop` |
-| `cancel_job(sid, reason) -> bool` | Cancel a running job; its completion path still writes the file and queues the alarm, so the parent learns about the stop |
-| `reset()` | Test hook: bump `_GENERATION`, drop registry state, cancel futures — a completion landing afterwards writes no file and queues no alarm |
-| `format_completion_alarm(job) -> str` | The exact alarm text: header + "Background subagent '<name>' (id) finished (status)" + result-file path + the still-running list |
-| `Job` | Mutable record: `sid`, `name`, `brief`, `started`, `generation`, `status` (`running`/`done`/`error`/`stopped`), `result_path`, `stop_reason`, `spawned` (the handshake Event), `future` |
-| `Alarm` | Frozen `(text, sid, name)` — the text is the verbatim contract, the ids are for attribution without re-parsing |
+| `ALARM_HEADER = "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]"` | First line of every completion alarm; the single source of truth shared with `repetition.alarm_text`, `cli/chat.py`, and the TUI |
+| `ALARM_KIND = "alarm"` / `USER_KIND = "user"` / `VALID_KINDS` | Both kinds are **user messages** to the model; `alarm` is a system announcement, `user` a human/script interjection |
+| `MAX_INBOX_MESSAGES = 200` / `MAX_TEXT_CHARS = 100_000` | Prune bound and per-message text cap |
+| `InboxMessage` | Frozen `(id, kind, text, ts, source, meta)`; `id` is the filename stem |
+| `inbox_dir(session)` | `INBOX_DIR / session`; a blank name is a `ValueError` |
+| `insert(session, text, *, kind, source, meta) -> str` | Validate → write `<id>.tmp` → `os.replace` into place → `prune`; returns the id |
+| `drain(session) -> list[InboxMessage]` | `listdir → read → unlink`, oldest first; unlinks only after a successful parse |
+| `pending_count(session)` / `prune(session, keep=200)` | Count files / delete the oldest beyond `keep` |
+| `_read_one` / `_quarantine` | Parse one file; on corrupt content rename it `<stem>.bad` and skip — **never raises** |
 
-**Spawn handshake.** coreouto's `Agent.call()` resolves the provider and its tools **by NAME** from the global registries synchronously at `call()` entry, and the next turn's `build_runtime` wipes those registries. `_run_job` therefore sets `job.spawned` as its very first statement, before touching `agent.call`; `submit` waits on it. A turn cannot reach its next `build_runtime` before the tool handler that called `submit` returns, so the handshake proves `call()` was entered while the submitting turn's registries were intact. Resolution happens once, at entry — that is what makes the job safe to keep running.
+Two rules follow from the file-per-message shape:
 
-**Completion** (`_finish`, idempotent per job): writes `~/.miniouto/subagent-results/<sid>-<YYYY-MM-DD-HH-MM>.md` (meta header: id, name, status, started, finished; then `## Brief` and `## Result`) and enqueues **exactly one** `Alarm`. `cancel_job` and an exception route through the same path, so a stopped or failed job is reported identically.
+1. **Insert-vs-drain is safe by construction.** A writer never appends to a file somebody else is reading — it creates its own file and renames it atomically — so a drainer sees a message either not at all or complete. An append-only `.jsonl` could not offer this: consuming it needs a lock held across the read while the writer waits on it.
+2. **One consumer per session, deliberately.** Nothing serializes two *drainers*: whichever process lists the directory first unlinks the file and the other never sees it. Two live processes bound to one session would steal each other's messages — isolate them with a distinct `MINIOUTO_HOME` (or session name) instead of adding a locking protocol here.
 
-**ContextVars**: `_enter_context` / `_exit_context` set runtime's `_SUBAGENT_DEPTH` / `_SUBAGENT_ID` / `_SUBAGENT_NAME` at the top of the job's own asyncio task, which is what gives concurrent jobs distinguishable actor labels.
+Delivery is at-least-once (the unlink happens after the parse, so a crash re-delivers rather than drops).
 
-**v1 limitations** (deliberate, documented): no per-job stall supervisor (the watchdog state is per-turn and every `build_runtime` clears it) and no job-internal event streaming (hooks are resolved live per event, so a job keeps streaming against an agent whose hooks the next turn replaced). A wedged job therefore stays in `running_jobs()` until `cancel_job` ends it. The result file and the completion alarm are the only channels.
+## `core/spawn_state.py` — liveness markers for detached runs
+
+`miniouto chat --bg` detaches a real OS process, so an in-memory job registry inside the launching process cannot tell another process whether that run is still going to alarm it. One JSON marker per run under `spawn-logs/<id>.json`, next to the run's stdio log, is that signal.
+
+| Symbol | Purpose |
+|---|---|
+| `SpawnMarker` | Frozen `id`, `alarm_session`, `started`, `role`, `style`, `return_path`, `status` (`running`/`done`/`error`/`stopped`), `finished`, `log`; `to_payload()` writes exactly those keys |
+| `write_marker(marker)` | Atomic write (tmp + `os.replace`), returns the path |
+| `finish_marker(job_id, status, *, finished=None)` | Stamp a terminal status; idempotent, no-op when the marker is absent |
+| `pending_spawns(session) -> list[SpawnMarker]` | Every marker of `session` still claiming `running`, sorted by id |
+| `read_marker(path)` | Parse one marker; missing or corrupt content yields `None`, never a raise |
+
+A monitor's whole rule is `pending_spawns(session)` — non-empty means "something may still write an alarm into this session's inbox". Nothing inside `miniouto chat` waits on it: a run answers its prompt, prints one `------finish------` and exits, and the queued alarm is delivered by the next wakeup (`chat --alarms -c`, or the TUI's poll). The filter is pid-aware, so it keeps only markers whose process is still alive (`is_pid_alive`; an unknown pid counts as alive). **Liveness is a promise, not a proof**: a SIGKILLed run never calls `finish_marker`, so its marker would say `running` forever — the pid probe is what makes that harmless for a monitor.
 
 ## `core/repetition.py` — repetition watchdog
 
@@ -413,13 +469,14 @@ A model that has stopped making progress rarely goes quiet, so the stall watchdo
 | `MAX_UNIT_SEGMENTS = 8` | Longest phrase unit, in segments, that run detection recognises; bounds the check to at most 8 block comparisons per segment |
 | `note_text(actor_key, text)` / `note_tool_call(actor_key, name, arguments)` | Count one message / one tool call toward that actor's detectors |
 | `check` / `consume_verdict(actor_key)` | Peek at a sticky verdict / take it and clear the counters, so a resumed attempt must earn a new one |
-| `reset()` / `reset_actor(actor_key)` | Drop every / one actor's counters; `reset()` runs once per turn from `runtime._register_watchdog_trackers` |
+| `reset()` / `reset_actor(actor_key)` | Drop every / one actor's counters; `reset()` runs once per turn from `runtime._register_watchdog_trackers` (counters live for one turn) |
 | `flush_stream(actor_key)` | Count the buffered, still-unfinished tail as a final segment (message boundary + force-stop path), so a phrase cut mid-sentence is never lost |
 | `reset_phrases(actor_key)` | Discard a dropped tail's run state and buffer WITHOUT flushing — the stall-restart path, so a sanitized-away tail cannot leak into the resumed attempt |
-| `cancel_background_loop(actor_key)` | Enforcement for unsupervised jobs: cancel the job instead of restarting it; a supervised actor is deliberately left alone so its sticky verdict survives |
 | `alarm_text(verdict)` | The exact resumed user message: the phrase shape tells the model to proceed with a *different pattern*; the tool shape adds *try a different method* if repeating is not producing progress |
 
-Segments come from splitting on newlines, sentence enders (`.?!。？！`), then collapsing whitespace and casefolding. The actor key is `current_subagent_id() or "outo"`, and one lock covers every actor because hooks fire on both the turn's loop and the daemon loop. Counters are fed from the whole-message paths — the thinking dispatcher, the iteration dispatcher's response flush, and every tool call (`call_subagent` included, counted before the skip branches) — plus the stream deltas (see invariant 8). A tool call is not a phrase segment, so it neither grows nor breaks a run, symmetric with the tool streak, which narration does not break.
+Segments come from splitting on newlines, sentence enders (`.?!。？！`), then collapsing whitespace and casefolding. The actor key is always `"outo"` — there is no other actor in a process — and one lock covers every actor. Counters are fed from the whole-message paths (the thinking dispatcher, the iteration dispatcher's response flush, and every tool call) **and** from the stream deltas (invariant 8), because message-boundary counting cannot see a model repeating inside one never-ending answer. A tool call is not a phrase segment, so it neither grows nor breaks a run, symmetric with the tool streak, which narration does not break.
+
+**There is no unsupervised actor.** `cancel_background_loop` is **deleted**: every run — a `chat`/TUI turn *and* every delegated `chat --role <tag>` run, which supervises itself inside its own process — executes inside `supervised_run`, so a trip is always enforced by restart, never by cancelling a job.
 
 ---
 
@@ -427,53 +484,53 @@ Segments come from splitting on newlines, sentence enders (`.?!。？！`), then
 
 ### Module-level constants / state
 
-- `BASE_TOOLS = ["Bash", "Image", "Video", "Audio"]` — the shared tool set used for both presets. `call_subagent` is **not** part of the shared list — it is registered conditionally on every `build_runtime` based on whether the active style declares ≥1 named subagent.
-- `OUTO_ONLY_TOOLS = ["Computer"]` — appended for the outo preset only (the virtual screen is a single shared resource).
-- `_SUBAGENT_DEPTH: ContextVar[int]` — defaults to 0. Read by `chat.py` dispatchers (via `current_subagent_depth()`) as a defensive fallback label, and as the outo/alarm gate. Mutated only by `subagents._enter_context` / `_exit_context`, inside the background job's asyncio task.
-- `_SUBAGENT_NAME: ContextVar[str | None]` — defaults to None. The persona name of the running background job (e.g. `"editor"`, `"reviewer"`, `"subagent"`); read by `chat._actor_label()` to build `{name}-{6hex}` labels. ContextVars are copied per asyncio task, so concurrent jobs each see their own name + id.
-- `_SUBAGENT_ID: ContextVar[str | None]` — defaults to None. The 6-hex id of the running background job; read by `chat._actor_label()` to build the id half of the label, and used as the repetition **actor key** (`sid or "outo"`).
-- `_SUBAGENT_OBSERVER` — module-level `(phase, sid, name, text) -> None` slot set per turn by `chat.run_chat` via `set_subagent_observer()`. Note the order: **sid before name**. Because coreouto's hooks are global, this slot is the bridge between the background job engine and the active turn's sink. Observer exceptions are suppressed (`contextlib.suppress`) so a broken sink can never break a job. Only the `"start"` phase is ever emitted (invariant 6).
+- `BASE_TOOLS = ["Bash", "Image", "Video", "Audio"]` — the tool set every run gets. Delegation is **not** a tool: it rides on `Bash` as `miniouto chat "<brief>" --style <style> --role <tag>` (AGENTS.md invariant 5), so a Bash-less harness could not delegate at all.
+- `PLATFORM_GATED_TOOLS = ["Computer"]` — **platform-gated** tools (the constant is just "tools appended when the platform registered them"). It is appended in role mode too: a delegated run is a separate process with its own vwayland screens, so there is no shared screen to interleave on, and the tool list must stay identical to outo's. The list is filtered down to what `register_all` actually registered (`co.get_tool(t) is not None`), so an unsupported platform never sees `Computer` in either mode.
+- The `_SUBAGENT_DEPTH` / `_SUBAGENT_NAME` / `_SUBAGENT_ID` ContextVars and the `_SUBAGENT_OBSERVER` slot are **deleted** along with in-process jobs. A delegated run is a separate OS process, so there is nothing in this address space to attribute: every actor is `outo`. Spawn metadata still rides on `LoopEvent.subagent_id` / `subagent_name`, copied off the drained inbox message's `meta`.
+- `_ACTIVITY_STATE` / `_PROGRESS_STATE` / `_LIVE_MESSAGES` — the watchdog's per-turn contrib-tracker state. `_LIVE_MESSAGES` is keyed by the literal `"outo"`.
+- `_ACTIVE_SUPERVISORS: dict[object, int]` — tokens of the supervisors currently running. The `level` bookkeeping is gone (one actor, one supervisor); the registry stays so the supervisor can tell "a supervisor of mine is active" from a future second one, and so tests can assert nothing leaked.
 
-### `current_subagent_depth() -> int` / `current_subagent_name() -> str | None` / `current_subagent_id() -> str | None`
+### Prompt assembly: the token-expanded style body
 
-ContextVar getters read by `chat.py`.
+The system prompt is **one layer**: `expand_prompt_tokens(<style body>)` and nothing else. The implicit cwd preamble and the automatic skill-catalog prepend are **deleted** (neither helper exists any more), and there is no compatibility fallback.
 
-### `set_subagent_observer(observer | None)`
+Before (two extra layers on top of every body):
 
-Installs/clears the lifecycle observer.
+```
+<cwd preamble>
+<# Available Skills catalog from ./skills/ (local) + ~/.agents/skills>
+<the style body>
+```
 
-### `_wrap_subagent_handler(agents, specs)`
+After (the body alone; the style decides the layout):
 
-Returns the async handler registered as `call_subagent`. Fire-and-forget:
+```
+<the style body, with {cwd} / {skills} / {skills:…} / {this_session} / {style} / {subagent_pm} expanded>
+```
 
-1. `task` must be a non-empty string, else `ValueError("call_subagent requires `task`: one self-contained brief. To run several subagents at once, issue several calls.")`.
-2. `_resolve(requested)` picks the persona: an explicit `name` must match a declared spec or it fails fast (before any job starts) with the available names; `""` resolves to a spec literally named `"subagent"` (legacy compat), else the sole declared spec, else `ValueError`.
-3. `subagents.submit(agents[resolved], resolved, task)` mints the 6-hex sid, schedules the job on the daemon loop, waits out the spawn handshake, and returns a `Job`.
-4. Returns the **acknowledgement** string only: the job id, an explicit "this text is NOT the result", the alarm header the model will later receive, the `SUBAGENT_RESULTS_DIR` the alarm will name a file in, and "do not wait or poll; continue with other work".
+A body naming no tokens tells the model no working directory and no skills, which is a legitimate choice. Both the outo body and every role body go through the same call, so there is no second assembly path. See `docs/styles.md` § Dynamic tokens for the per-token rules and `AGENTS.md` invariant 3 for the invariant form.
 
-There is **one brief per call** and no fan-out parameter. Several calls in one turn start several concurrent jobs, which is how parallelism is expressed now. An unknown persona name fails fast; there is no combined numbered result and no per-brief error section.
+### Role mode (`miniouto chat "<brief>" --style <style> --role <tag>`)
 
-### `_make_alarm_hook(on_alarms=None)`
+A delegated run executes **the same agent on the same `"outo"` preset**; exactly one thing changes:
 
-The `BEFORE_LLM_CALL` hook that delivers background-subagent completion alarms **mid-turn**. When no turn is active the delivery path is different and lives outside this hook: the TUI drains the queue and starts a turn whose prompt IS the alarm text (`ChatTUI._deliver_pending_alarms`), and `miniouto chat` chains follow-up turns (`cli/chat.py:run_turn_chain`) — see AGENTS.md invariant 16. Registered **before** the watchdog's `capture_messages` hook, so the supervisor's live message list already carries the delivered alarms.
+1. `runtime.role` selects a parsed `SubagentSpec` by name and uses **its prompt as the system prompt** (`build_runtime`, right after token expansion). An unknown tag raises `ValueError` listing the available roles — and `cli/chat.py:_validate_role` catches a typo even earlier, before the turn starts, so a bad `--role` costs no model call. `role=None` runs the `<outo>` body as before.
 
-- Gated to outo depth (`current_subagent_depth() == 0`) — a subagent's own loop must never consume outo's alarms.
-- Drains `subagents.take_pending_alarms()`, joins the texts with a blank line, and appends **one** `co.Message(role="user")` to the live `messages` list, so the very next `provider.create` already carries it.
-- **Appends directly, never `Agent.inject_user_message`**: that queue is drained at the TOP of the loop iteration (coreouto `agent.py:301-307`), i.e. *before* this hook, so an alarm queued from here would land a full LLM round-trip later.
+That is the whole difference. **The tool list, the preset, and every hook are identical in both modes** — including `Computer`, which is why it is no longer gated on `runtime.role is None`. (The old shared-screen rationale for hiding it is void: separate processes own separate vwayland screens.)
+
+The role prompt is one of the specs built by `_resolve_both_styles`, expanded by the same `expand_prompt_tokens` call as the outo body — the same single layer outo gets, with the same tokens available to it. A role body that needs the working directory or the skill catalog places `{cwd}` / `{skills}` itself; nothing is added implicitly. There is no second assembly path to drift. `ChatOptions.role` is set only by `cli/chat.py` from `--role`; the TUI never sets it.
+
+### `_make_alarm_hook(session, on_messages=None)`
+
+The `BEFORE_LLM_CALL` hook that drains the **cross-process inbox** into the live message list, **mid-turn**. The session it drains is `runtime.session`, which `resolve_runtime_from_settings` resolves from `settings.session`. A **delegated** run therefore borrows its own name for the duration of its turn (`cli/chat.py:_runtime_session_scope`, a scoped write to `settings.session` restored in `finally`, because a delegated run may not persist its own guest name): without the borrow the child would drain the **caller's** inbox and answer messages addressed to the caller. When no turn is active the delivery path is different and lives outside this hook: the TUI polls its session's inbox every second (`ChatTUI._deliver_pending_messages`) and starts a turn whose prompt IS the joined message text, and `miniouto chat --alarms -c [--name <s>]` does the same explicitly — drained queue as the prompt, `-c` mandatory, the named session required to exist, an empty inbox a no-op — see AGENTS.md invariant 16. A plain one-shot `chat` **never waits**: `run_turn_chain` is one turn plus hand-off transitions, so anything queued afterwards stays in the queue for the next wakeup. Registered **before** the watchdog's `capture_messages` hook, so the supervisor's live message list already carries the delivered messages.
+
+- **No depth gate.** The inbox is per-session, not per-actor, so any run bound to that session consumes it.
+- `inbox.drain(session or "default")`, join the texts with a blank line, and append **one** `co.Message(role="user")` to the live `messages` list, so the very next `provider.create` already carries it.
+- **Appends directly, never `Agent.inject_user_message`**: that queue is drained at the TOP of the loop iteration (coreouto `agent.py:301-307`), i.e. *before* this hook, so a message queued from here would land a full LLM round-trip later — and it could never wake a turn that already ended.
 - **Fold rule**: if the last message is already a user message the text is folded into it — providers reject two consecutive user messages, the same hazard `_cut_poisoned_turn` works around.
-- Each drained alarm is forwarded to `on_alarms` (from `core.chat._make_alarm_dispatcher`) under `contextlib.suppress`, so a broken sink can't break the provider path.
+- The batch is forwarded to `on_messages` (from `core.chat._make_alarm_dispatcher`), and the whole body runs under `contextlib.suppress` so a broken sink can never break the provider path.
 
-### `_subagent_description(specs)`
-
-The model-facing contract string for `call_subagent`. States that the call does **not** block, that the return value is only an acknowledgement (never the answer), that completion arrives as a user message starting with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` naming a result file under `~/.miniouto/subagent-results/`, that polling or re-asking is forbidden, that several calls run concurrently, and what `name`/`task` mean. Lists the available `name=` values when more than one subagent is declared.
-
-### `_build_subagent_tool(*, specs, provider_config, provider_passthrough)`
-
-Reimplements `coreouto.contrib.agent_as_tool` for one specific reason: the stock helper drops `provider_config` when calling `preset.to_config()`. This version:
-
-1. Takes the shared `"subagent"` preset's config, merges `provider_config` (contains at least `max_tokens`) AND `provider_passthrough` (the resolved reasoning kwargs) into it, then deep-copies it per `SubagentSpec` with that spec's `prompt` as `system_prompt` and builds one `co.Agent` per spec. Merging both is load-bearing — without `max_tokens` a subagent file-writing call inherits the provider's low hard cap (Anthropic → 1024 → silent truncation), and without `provider_passthrough` the reasoning keys would land on `provider_config` and be forwarded raw to a user-chosen provider name, which `normalize_provider_config` does not translate.
-2. Returns `_wrap_subagent_handler(agents, specs)`, registered via `co.register_tool("call_subagent", description=_subagent_description(specs))(handler)`. coreouto derives the model-facing JSON schema from the handler's type hints, so the model sees exactly `name` and `task`.
-3. Registration is conditional: `build_runtime` calls this only when `specs` is non-empty. An outo-only style produces no `call_subagent` at all (the model simply has no way to delegate).
+**Who writes into that inbox:** the delegation post-step in `cli/chat.py` (`_run_delegated` → `_complete`). A delegated run writes its answer file, inserts **exactly one** alarm (`kind="alarm"`, `source="chat"`, first line `ALARM_HEADER`), and stamps its `SpawnMarker` — in a `finally`, so success, error and Ctrl-C all report the same way, and only once the whole run has ended (after any summarization hand-offs). See `docs/cli.md` § `Delegation: the post-step`.
 
 ### `RuntimeConfig`
 
@@ -483,7 +540,8 @@ class RuntimeConfig:
     provider_name: str
     model: str
     style_name: str = "default"
-    subagent_model: str | None = None      # falls back to `model`
+    role: str | None = None                # ROLE MODE: run as this style tag; None = outo
+    subagent_model: str | None = None      # the defaults a spawned run inherits
     subagent_provider: str | None = None   # falls back to `provider_name`
     subagent_reasoning: str | None = None  # falls back to subagent provider's `reasoning_effort`
     session: str | None = None             # defaults to "default"
@@ -499,39 +557,40 @@ class ChatOverrides:
     provider: str | None = None
     model: str | None = None
     style: str | None = None
+    role: str | None = None
     subagent_provider: str | None = None
     subagent_model: str | None = None
 ```
 
 Per-call overrides from CLI flags. All optional.
 
-### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_tool_result=None, on_response=None, on_thinking=None, on_stream_text=None, on_stream_thinking=None, on_iteration=None, on_provider_error=None, on_history_repair=None, on_alarms=None, reasoning=None, cancel_event=None) -> co.Agent`
+### `build_runtime(runtime, *, style_overrides=None, provider_config=None, on_tool_call=None, on_tool_result=None, on_response=None, on_thinking=None, on_stream_text=None, on_stream_thinking=None, on_iteration=None, on_provider_error=None, on_history_repair=None, on_messages_removed=None, on_inbox_messages=None, reasoning=None, cancel_event=None) -> co.Agent`
 
 The heart of miniouto. Steps:
 
-1. **`clear_coreouto_state()`** — Reset all four coreouto registries.
-   - **`cancel_event` guard** — If a `threading.Event` is passed, a `_make_cancel_guard` hook is registered FIRST on both `BEFORE_LLM_CALL` and `BEFORE_TOOL_CALL`: once the event is set the hook raises `LoopCancelledError`, which coreouto's `trigger` does not swallow, so it propagates out of the turn. This is cooperative cancellation — the loop stops before the next step; an in-flight tool execution is not interrupted by the guard (Bash polls the same event and kills its own process). Independently, the watchdog's poll (`core/chat.py:_run_with_watchdog`) checks the same event every 5 s and hard-cancels the task, so even an in-flight LLM call is interrupted promptly. Inside a `call_subagent` handler the raise is caught by coreouto's tool-call wrapper and surfaces as an error `ToolResult` (killing the subagent immediately); the outo loop then stops at its next `BEFORE_LLM_CALL`.
-2. **Provider registration** — Look up `runtime.provider_name` in the provider store; raise `RuntimeError` if missing. Call `build_coreouto_provider` for it. Repeat for the subagent provider (which may differ).
-3. **`tools.registry.register_all()`** — Registers `Bash/Image/Video/Audio` tools in coreouto.
-4. **`parse_style` + `_load_active_skills`** — Loads the named style document (or `builtin_default` for `"default"`), parses it via `parse_style` into `(outo_body, list[SubagentSpec])`, and prepends the lazy-load skill catalog to the outo body. Each subagent's body is paired with its own per-call skill catalog + cwd preamble (built lazily, not persisted).
-5. **`_with_cwd(role, body)`** — Prepends an absolute-cwd preamble (using `INVOCATION_CWD` from `paths_runtime.py`) so the model knows where the user invoked miniouto from.
-6. **Register presets** — `"outo"` (uses runtime provider + model), then one preset per `SubagentSpec` named after the spec (uses sub-provider + sub-model). All get `tools=BASE_TOOLS + ("Computer"` for outo only`) and `max_iterations=None`. When `specs` is empty, no subagent presets are registered at all.
-7. **Subagent `provider_config` + `provider_passthrough`** — Pulls `max_tokens` from `get_max_output_tokens(subagent_model, sub_provider_name)` via lma, so subagent file-writing calls don't hit Anthropic's 1024 default. The reasoning kwargs (from step 11) are merged into every subagent preset too.
-8. **Build `call_subagent` tool (conditional)** — When `specs` is non-empty, calls `_build_subagent_tool(specs, description=_subagent_description(specs), provider_config=subagent_provider_config, provider_passthrough=subagent_passthrough)`. The handler is pre-wrapped with `_wrap_subagent_handler` to track depth + name + id. Registered via `co.register_tool(name, description=description)(wrapped_handler)` (function-call form, not decorator). **When `specs` is empty, this step is skipped entirely** — `call_subagent` is not advertised to the model.
- 9. **Register hooks:**
+1. **Slow resolution, all hoisted ABOVE the clear** — provider lookup, `_resolve_both_styles` file I/O, `expand_prompt_tokens` per body (which reads the skill roots a body names), both reasoning passthroughs, and the context monitor's window lookup (`make_context_monitor`). Everything below the `clear_coreouto_state()` line must be pure in-memory dict work: the clear wipes coreouto's global registries, so a network fetch or file read inside the clear+register window leaves them empty for as long as it takes.
+   - **`clear_coreouto_state()`** — Reset all four coreouto registries.
+   - **`cancel_event` guard** — If a `threading.Event` is passed, a `_make_cancel_guard` hook is registered FIRST on both `BEFORE_LLM_CALL` and `BEFORE_TOOL_CALL`: once the event is set the hook raises `LoopCancelledError`, which coreouto's `trigger` does not swallow, so it propagates out of the turn. This is cooperative cancellation — the loop stops before the next step; an in-flight tool execution is not interrupted by the guard (Bash polls the same event and kills its own process). Independently, the watchdog's poll (`core/chat.py:_run_with_watchdog`) checks the same event every 5 s and hard-cancels the task, so even an in-flight LLM call is interrupted promptly.
+2. **Provider registration** — `build_coreouto_provider(provider)` for `runtime.provider_name` (looked up above the clear; a missing provider is a `RuntimeError`).
+3. **`tools.registry.register_all(api_format=provider.api_format)`** — Registers `Bash/Image/Video/Audio` and, when `computer_supported()`, `Computer` (with `parallelizable=False`). The `api_format` refreshes the module flag that decides, at call time, whether `screenshot` may return an image or a notice.
+4. **`parse_style` + `expand_prompt_tokens`** — Loads the named style document (or `builtin_default` for `"default"`) and parses it into `(outo_body, list[SubagentSpec])`, then expands the style tokens in the outo body and in **every** spec body. That expansion **is** the system prompt: nothing else is prepended. Where `{cwd}` (`INVOCATION_CWD`) and `{skills}` land, and whether they appear at all, is the style's own decision; a body without them tells the model neither. Re-expanded on every call, never persisted.
+5. **Role selection** — If `runtime.role` is set, the matching spec's prompt becomes `system_prompt` (see "Role mode" above); otherwise the outo body. `ValueError` on an unknown role.
+6. **Register the preset** — `co.register_agent_preset("outo", model=…, provider=…, system_prompt=…, tools=outo_tools, max_iterations=None)`. **ONE preset, two modes**: `outo_tools` is `BASE_TOOLS` plus `PLATFORM_GATED_TOOLS`, filtered down to what actually registered — in **both** modes. There are no per-role presets and no per-role tool list: a role run *is* the outo run with a different system prompt.
+7. **Register hooks:**
    - `BEFORE_TOOL_CALL` → `_make_tool_call_logger(on_tool_call)` (only if `on_tool_call` is not None).
    - `AFTER_TOOL_CALL` → `_make_tool_result_logger(on_tool_result)` (only if `on_tool_result` is not None — `chat.run_chat` always supplies one).
-   - `ON_ITERATION` → `make_summarize_hook(runtime.model, runtime.session or "default", runtime.provider_name)` — always registered.
+   - `ON_ITERATION` → `context_monitor` from `make_context_monitor(model=runtime.model, session=runtime.session or "default", provider_name=runtime.provider_name)` — registered only when the window size is known (the hook is `None` otherwise).
    - `ON_ITERATION` → `_make_iteration_logger(on_iteration)` (only if `on_iteration` is not None — `chat.run_chat` always supplies one).
    - `AFTER_LLM_CALL` → `_make_response_logger(on_response)` (only if `on_response` is not None).
    - `ON_THINKING` → `_make_thinking_logger(on_thinking)` (only if `on_thinking` is not None — `chat.run_chat` always supplies one).
-   - `BEFORE_LLM_CALL` → `_make_alarm_hook(on_alarms)` (**always**, like the repair hook — a job that finished between turns has no other way to reach the model). Drains the subagent alarm deque and appends the alarms to the live message list as one user message (folded into a trailing user message when there is one). Registered **before** the watchdog's `capture_messages` hook so the supervisor's live list already carries them.
+   - `BEFORE_LLM_CALL` → `_make_alarm_hook(runtime.session, on_inbox_messages)` (**always**, like the repair hook — a spawn that finished between turns has no other way to reach the model). Drains `core/inbox.py` and appends the joined texts to the live message list as one user message (folded into a trailing user message when there is one), then forwards the batch to `on_inbox_messages` for the record. Registered **before** the watchdog's `capture_messages` hook so the supervisor's live list already carries them.
    - `ON_STREAM_TEXT` / `ON_STREAM_THINKING` → `_make_stream_logger(on_stream_text)` / `_make_stream_logger(on_stream_thinking)` (only if not None — `chat.run_chat` always supplies both). Registered **in addition to** the watchdog's own tracker registrations for the same two events; each forwards the per-delta `text` payload to the display-only stream dispatcher.
     - `ON_PROVIDER_ERROR` → `_make_provider_error_logger(on_provider_error)` (only if `on_provider_error` is not None — `chat.run_chat` always supplies one).
-    - `ON_PROVIDER_ERROR` → `_make_history_repair_hook(on_history_repair)` (**always**, unlike the sink loggers) — repairs the live message list in place before each retry attempt of the 400/422 tool-call rules in `core/error_rules.py`. Each fire first runs `_repair_pairing` (drop duplicate tool results, fill dangling tool calls on the last assistant turn with error results, inserted at the correct position right after that turn's existing results); if that changed nothing, `_cut_poisoned_turn` excises ONE suspect assistant tool-call turn plus its own results — preferring a turn with structurally malformed (non-dict) arguments, else the most recent tool-call turn, so repeated attempts walk backwards through history — and folds an explanatory note into the preceding user message (or inserts one), preserving later turns and the user's current prompt. Whenever a pass mutates the list, the `on_history_repair` callback (wired by `core.chat.run_chat`) persists the repaired history at outo depth, so the next turn doesn't reload the same poison from disk. Gated to `reaction == "retry"` with status 400/422; rate-limit/overload retries pass through untouched.
-    - **Watchdog trackers** (`_register_watchdog_trackers`, always) — `activity_tracker_hook` on `AFTER_LLM_CALL`/`AFTER_TOOL_CALL`/`ON_ITERATION`/`ON_PROVIDER_ERROR`/`ON_STREAM_TEXT`/`ON_STREAM_THINKING`, all five `loop_progress_hook` entries, and a `BEFORE_LLM_CALL` live-messages capture keyed by actor (`"outo"` or the subagent sid). Clears `_LIVE_MESSAGES` and calls `repetition.reset()` — repetition counters are scoped to one turn, exactly like the live lists. States are exposed via `watchdog_states()` for `supervised_run`.
-10. **Finalize the outo config** — `co.get_agent_preset("outo").to_config()`, merge in caller's `provider_config`, instantiate `co.Agent(outo_config)`. Returns the agent.
-11. **Reasoning resolution** — `core.reasoning.resolve_reasoning_passthrough(api_format, model, provider_name, choice)` turns the resolved reasoning choice plus lma's per-model `reasoning_options` into provider-native request kwargs, merged into `provider_passthrough` for both outo and subagent. This is what makes providers return thinking blocks at all (the `ON_THINKING` display path is dead without it). It must go through `provider_passthrough`, not `provider_config`: miniouto registers providers under user-chosen names, and coreouto's `normalize_provider_config` passes config through **untranslated** for unknown provider names — a canonical `reasoning_effort` key would reach the SDK raw and `TypeError`. Precedence (highest wins) for outo: `chat --reasoning <v>` > `Provider.reasoning_effort` (stored per provider) > lma's default for the model's option type (effort → `"medium"` or the middle non-`"none"` value; toggle/budget → `"on"`) > off (no kwargs when lma has no reasoning data — no blind defaults). For the **subagent**, the choice inserts one extra tier: `chat --reasoning <v>` (applies to both) > `RuntimeConfig.subagent_reasoning` (persisted `settings.subagent_reasoning`, via `miniouto subagent set --reasoning`) > the subagent provider's `reasoning_effort` > lma default. `"none"`/`"off"` always disables. Only two request shapes are ever emitted — an effort value and anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes (`enabled` + `budget_tokens`) are deliberately NOT emitted: many providers reject budget parameters, so lma `budget_tokens` models are driven as a plain toggle and legacy digit choices degrade to `"on"`. Mapping:
+    - `ON_PROVIDER_ERROR` → `_make_history_repair_hook(on_history_repair)` (**always**, unlike the sink loggers) — repairs the live message list in place before each retry attempt of the 400/422 tool-call rules in `core/error_rules.py`. Each fire first runs `_repair_pairing` (drop duplicate tool results, fill dangling tool calls on the last assistant turn with error results, inserted at the correct position right after that turn's existing results); if that changed nothing, `_cut_poisoned_turn` excises ONE suspect assistant tool-call turn plus its own results — preferring a turn with structurally malformed (non-dict) arguments, else the most recent tool-call turn, so repeated attempts walk backwards through history — and folds an explanatory note into the preceding user message (or inserts one), preserving later turns and the user's current prompt. Whenever a pass mutates the list, the `on_history_repair` callback (wired by `core.chat.run_chat`) persists the repaired history, so the next turn doesn't reload the same poison from disk. Gated to `reaction == "retry"` with status 400/422; rate-limit/overload retries pass through untouched.
+    - **Watchdog trackers** (`_register_watchdog_trackers`, always) — `activity_tracker_hook` on `AFTER_LLM_CALL`/`AFTER_TOOL_CALL`/`ON_ITERATION`/`ON_PROVIDER_ERROR`/`ON_STREAM_TEXT`/`ON_STREAM_THINKING`, all five `loop_progress_hook` entries, and a `BEFORE_LLM_CALL` live-messages capture stored under the literal key `"outo"`. Clears `_LIVE_MESSAGES` and calls `repetition.reset()` — repetition counters are scoped to one turn, exactly like the live lists. States are exposed via `watchdog_states()` for `supervised_run`.
+8. **Finalize the config** — `co.get_agent_preset("outo").to_config()`, merge in caller's `provider_config` and the resolved `provider_passthrough`, instantiate `co.Agent(outo_config)`. Returns the agent.
+
+> **Reasoning resolution** (done above the clear, listed here for the precedence rules) — `core.reasoning.resolve_reasoning_passthrough(api_format, model, provider_name, choice)` turns the resolved reasoning choice plus lma's per-model `reasoning_options` into provider-native request kwargs, merged into `provider_passthrough` for both outo and subagent. This is what makes providers return thinking blocks at all (the `ON_THINKING` display path is dead without it). It must go through `provider_passthrough`, not `provider_config`: miniouto registers providers under user-chosen names, and coreouto's `normalize_provider_config` passes config through **untranslated** for unknown provider names — a canonical `reasoning_effort` key would reach the SDK raw and `TypeError`. Precedence (highest wins) for outo: `chat --pm '…:REASONING'` > the session pin's `reasoning` (`session-config/<session>.toml`) > `Provider.reasoning_effort` (stored per provider) > lma's default for the model's option type (effort → `"medium"` or the middle non-`"none"` value; toggle/budget → `"on"`) > off (no kwargs when lma has no reasoning data — no blind defaults). For the **subagent**, the choice inserts one extra tier: the `--pm` reasoning suffix (applies to both) > `RuntimeConfig.subagent_reasoning` (the pin's `subagent_reasoning`, else the persisted `settings.subagent_reasoning` via `miniouto subagent set --reasoning`) > the subagent provider's `reasoning_effort` > lma default. `"none"`/`"off"` always disables. Only two request shapes are ever emitted — an effort value and anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes (`enabled` + `budget_tokens`) are deliberately NOT emitted: many providers reject budget parameters, so lma `budget_tokens` models are driven as a plain toggle and legacy digit choices degrade to `"on"`. Mapping:
 
     | api_format | lma option type | passthrough |
     |---|---|---|
@@ -554,29 +613,36 @@ The heart of miniouto. Steps:
 - **`_make_thinking_logger(callback)`** — Returns an `ON_THINKING` hook that invokes `callback(thinking)` for each LLM response carrying reasoning text. Providers never put thinking into history messages (coreouto's `format_assistant_message` drops it), so this hook is the only surface for reasoning.
 - **`_make_provider_error_logger(callback)`** — Returns an `ON_PROVIDER_ERROR` hook that forwards `status_code`, `error_message`, `reaction`, `reaction_message` (dropping the raw exception and the message list, which a sink can't render).
 - **`_make_history_repair_hook(on_repair, on_removed)`** — Returns the `ON_PROVIDER_ERROR` repair hook paired with the retry rules in `core/error_rules.py` (see step 9 of `build_runtime` and the `core/error_rules.py` section). Uses `_repair_pairing` / `_cut_poisoned_turn`; both report the `str(id(message))` of every message they removed through `on_removed`, so the display record can be pruned beside the repair.
-- **`_make_alarm_hook(on_alarms)`** — Returns the `BEFORE_LLM_CALL` hook that drains `subagents.take_pending_alarms()` and appends the alarms to the live message list. See its own section above.
+- **`_make_alarm_hook(session, on_messages)`** — Returns the `BEFORE_LLM_CALL` hook that drains `core/inbox.py` and appends the messages to the live message list. See its own section above.
 - **`_make_stream_logger(callback)`** — Returns an `ON_STREAM_TEXT` / `ON_STREAM_THINKING` hook forwarding one incremental `text` fragment per firing (not the accumulated message). Display-only.
 - **`_make_cancel_guard(cancel_event)`** — Returns the pair of `BEFORE_LLM_CALL` / `BEFORE_TOOL_CALL` hooks that raise `LoopCancelledError` once the event is set.
-- **`_subagent_description(specs)`** — The model-facing background-delegation contract. See its own section above.
-- **`_resolve_both_styles(style_name, overrides)`** — Calls `parse_style` on the raw style; returns `(outo_body, list[SubagentSpec])`. The `SubagentSpec.prompt` for each entry is already the body the runtime will assemble (with skills + cwd preamble) — no second parse happens at invocation time.
+- **`_resolve_both_styles(style_name, overrides)`** — Calls `parse_style` on the raw style; returns `(outo_body, list[SubagentSpec])`. Each spec's prompt is later token-expanded by `build_runtime` through the same `expand_prompt_tokens` call as the outo body, so a role run gets exactly the same single layer.
 - **`_read_raw_style(name, overrides)`** — Checks in-memory `overrides` first, then `style_store.read(name)`, then the builtin default.
-- **`_load_active_skills()`** — Lists skills and builds a lazy-load catalog: a `# Available Skills` heading, a note that each skill lives at `~/.agents/skills/<name>/` and should be read via Bash when matched, then `- <name>: <description>` lines. Skill bodies are NOT injected. Returns empty string if no skills.
-- **`_with_cwd(role, body)`** — Prepends role-specific preamble. Subagent (any named role): *"You operate inside this working directory: {INVOCATION_CWD}…"*; outo: *"The user invoked miniouto from: {INVOCATION_CWD}…"*. Regenerated on every call.
-- `_fallback_style(name)` is still used for unreadable style documents and for a subagent tag with an empty body. What is **gone** is the unconditional fallback subagent: an outo-only style (zero named subagents in the parsed style) intentionally registers no `call_subagent` tool at all — see invariant 2.
+- **`expand_prompt_tokens(text, *, session, style)`** — Substitutes the five style tokens into a style-derived body, and the result is the whole system prompt. `{cwd}` → `str(INVOCATION_CWD)`; `{skills}` / `{skills:<dir>…}` → the lazy-load skill catalog for the default roots (`<INVOCATION_CWD>/skills` first, then `~/.agents/skills`) or for the named roots (`~` expanded, relative paths against `INVOCATION_CWD`, missing roots skipped silently, entries ordered by root then name, duplicates listed once per root, `""` when nothing is found); `{this_session}` → the run's own session name (`runtime.session`, or `"default"` when empty; for a delegated run this is the borrowed guest name, invariant 5); `{style}` → the resolved style name (`runtime.style_name`); `{subagent_pm}` → the effective subagent trio in `--pm` spelling, **left literal** when it does not resolve. The parameterized `{skills…}` regex pass (`_SKILLS_TOKEN`) runs **first**, because the catalog text is itself brace-bearing; then the plain `str.replace` passes in source order (`{cwd}`, then `{this_session}` / `{style}`, then `{subagent_pm}`, which is only computed if the token survives the earlier passes). Applied to the outo body and to **every** role body. Any other `{...}` text is left verbatim: there is no escape mechanism and an unknown token is not an error. The model never sees the token syntax, only the expanded literal, which is what keeps a bundled style's delegation recipe copy-ready and Bash-idempotent (a `--alarm-session` that read `settings.session` behind the caller's back was not the same command twice). See `docs/styles.md` § Dynamic tokens.
+- **`_replace_skills_token(match)`** / **`_resolve_skill_roots(arg)`** — The regex callback and the root resolver behind `{skills…}`. An empty argument (bare `{skills}` or `{skills:}`) means the two default roots, local first (`skill_store.default_roots(INVOCATION_CWD)`); entries are comma-separated, stripped, `~`-expanded, and made absolute against `INVOCATION_CWD` when relative. Duplicate roots are kept.
+- **`_skills_catalog(roots)`** — Renders the lazy-load catalog: a `# Available Skills` heading, a note that each skill lives in its own directory under `<root>/<name>/` containing a `SKILL.md` to read via Bash when a task matches, then `- <name>: <description>` lines (each line names its root when more than one is listed). Reads each root through `storage.skills.list_skills(root)`. Skill bodies are NOT injected. Returns `""` when no root yields a visible skill.
+- `_fallback_style(name)` is still used for unreadable style documents and for a role tag with an empty body.
 
 ### `resolve_runtime_from_settings(overrides=None) -> RuntimeConfig`
 
+**Three lanes, per key, and the middle one is what makes many processes safe**: explicit override (`--pm` / `ChatOverrides`) > **this session's pin** > the global default.
+
 1. Loads `settings_store.load()` and the optional `ChatOverrides`.
-2. Provider: `overrides.provider or s.provider`; raises `RuntimeError("No default provider set. …")` if both are missing.
-3. Model: `overrides.model or s.model or provider.default_model`; raises `RuntimeError("No model specified for provider …")` if still missing. (Note the three-level resolution — `settings.model` is priority 2, kept for the `chat --model` CLI flag and legacy sessions.)
-4. Style: `overrides.style or s.style or "default"`.
-5. Session: `s.session or "default"`.
-6. Subagent (`_resolve_subagent`):
-   - Provider: `overrides.subagent_provider or s.subagent_provider or None` — `None` means inherit outo's provider (`build_runtime`'s `runtime.subagent_provider or runtime.provider_name` fallback handles it). When a provider IS resolved but isn't configured in the provider store, raises `RuntimeError("Subagent provider … is not configured. …")`.
-   - Model: `overrides.subagent_model or s.subagent_model or <subagent provider's default_model> or None`. When a subagent provider IS resolved but no model is, raises `RuntimeError("No model specified for subagent provider …")` telling the user to set one via `chat --subagent-model` or `miniouto subagent set --model`. A model-only override (no subagent provider) is valid — the subagent then runs outo's provider with the overridden model. (`None` model only ever reaches `build_runtime` together with a `None` provider, where both inherit outo's.)
-7. Subagent reasoning: `s.subagent_reasoning or None` — populated **independently** of whether a subagent provider/model is set (a reasoning-only subagent override on outo's provider+model is valid). Consumed by `build_runtime`'s `subagent_choice`.
+2. Reads the session's pin — `_pinned_for(s)` → `session_config.effective(s.session or "default", default=default_provider_config)`. `effective` **materializes** the pin: with no pin file it computes the current global default, writes it as the pin, and returns it, so a later global change (the TUI switching models in another process) can never redirect a session that is already running. The session a turn resolves IS `s.session` — the same value the inbox hook drains and `{this_session}` expands — so this is where a delegated run's guest-name borrow (`cli/chat.py:_runtime_session_scope`) takes effect. Writes are atomic and a corrupt pin is treated as absent rather than raised over.
+3. **Override invalidates a foreign pin.** If `overrides.provider` names a provider other than the pinned one, the pinned model/reasoning belong to the provider being left behind, so the whole outo trio is dropped (`dataclasses.replace(pinned, provider="", model="", reasoning="")`) and the global chain answers for the override's provider.
+4. Provider: `overrides.provider or pinned.provider or s.provider`; raises `RuntimeError("No default provider set. …")` if all are missing.
+5. Model: `overrides.model or pinned.model or provider.default_model`; raises `RuntimeError("No model specified for provider …")` if still missing. (A legacy `s.model` still reads at the bottom, inside `default_provider_config` — old installs keep working, and the TUI never writes it.)
+6. Reasoning: `pinned.reasoning or None` — the per-call tier is `overrides`, and a `build_runtime(reasoning=…)` argument still wins over the pin.
+7. Style: `overrides.style or s.style or "default"`. Role: `overrides.role or None` (`ChatOptions.role`, set only by `chat --role`).
+8. Session: `s.session or "default"`.
+9. Subagent (`_resolve_subagent(overrides, s, pinned)` — kept as a standalone helper because `cli/chat.py` calls it under `--use-subagent-provider` while assembling the run's `ChatOptions`; `build_runtime` no longer needs it, and it takes `pinned` as an argument so the caller resolves the pin **once per turn** against its own session):
+   - Provider: `overrides.subagent_provider or pinned.subagent_provider or s.subagent_provider or None` — `None` means inherit outo's provider (`build_runtime`'s `runtime.subagent_provider or runtime.provider_name` fallback handles it). When a provider IS resolved but isn't configured in the provider store, raises `RuntimeError("Subagent provider … is not configured. …")`.
+   - Model: `overrides.subagent_model or pinned.subagent_model or s.subagent_model or <subagent provider's default_model> or None`. When a subagent provider IS resolved but no model is, raises `RuntimeError("No model specified for subagent provider …")` telling the user to set one in the TUI's `subagent` popup or via `miniouto subagent set --model`. A model-only override (no subagent provider) is valid — the subagent then runs outo's provider with the overridden model. (`None` model only ever reaches `build_runtime` together with a `None` provider, where both inherit outo's.)
+10. Subagent reasoning: `pinned.subagent_reasoning or s.subagent_reasoning or None` — populated **independently** of whether a subagent provider/model is set (a reasoning-only override on outo's provider+model is valid). `cli/chat.py` reads it under `--use-subagent-provider`, where an explicit `--pm` reasoning suffix wins and otherwise the pin answers (the run then falls back to its provider's `reasoning_effort`).
 
 Returns a `RuntimeConfig` with `subagent_provider`/`subagent_model`/`subagent_reasoning` populated per the rules above.
+
+**Seeding** is the other half of the pin's safety story: `session_config.seed_from(new, source)` is copy-if-absent, and every mint path calls it — a delegated run's `chat-`/`spawn-` name (`cli/chat.py:_resolve_session`), a summary hand-off's `cont-*` name (`tools/continue_session.py`), and the TUI's "new session". So a new session continues on the provider its source was configured with, instead of freezing whatever the global default happened to be at its first turn.
 
 ## External API calls & I/O
 
@@ -586,8 +652,9 @@ Returns a `RuntimeConfig` with `subagent_provider`/`subagent_model`/`subagent_re
 | `core/context.py` | (via `core.lma.get_model`) | Fetch `context_window` + `max_output_tokens` for a model | Caught; a **transport failure is returned uncached** (the empty dict is never stored), so one blip can't pin a model to "no caps" for the process; a successful-but-empty answer IS cached. `_MODEL_CACHE` has no TTL; `clear_model_cache()` mirrors `lma.clear_cache()` |
 | `core/providers.py` | `co.register_provider`, `co.clear_*` | coreouto global registry I/O | None caught |
 | `core/runtime.py` | `tool_registry.register_all`, `co.register_agent_preset`, `co.register_tool`, `co.register_hook` | coreouto global registry I/O | None caught |
+| `core/inbox.py` | `INBOX_DIR/<session>/<ts>-<6hex>.json` | Cross-process message hand-off: one atomically-renamed file per pending message | Insert validates (kind/text/meta) and raises `ValueError`; `drain` never raises — corrupt files are renamed `.bad` |
 | `core/chat.py` | `session_store.begin_turn/update_turn_events/update_history/prune_turn_events/finish_turn`, `session_store.load` | JSON session persistence (schema v2, incremental) | Load is tolerant (never raises); write failures swallowed (`_TurnPersister`, `_finish_turn`) |
-| `core/subagents.py` | `SUBAGENT_RESULTS_DIR/<sid>-<ts>.md` | Writes each finished background job's markdown result file, and sends one completion alarm | `mkdir(parents=True, exist_ok=True)` before writing; a generation-retired job writes nothing |
+| `core/spawn_state.py` | `SPAWN_LOG_DIR/<id>.json` | Liveness marker for a detached `--bg` run, read by a monitor (nothing in `chat` waits on it) | Written atomically; `read_marker` never raises (missing/corrupt → `None`) |
 | `core/chat.py` | `_run_with_watchdog` → `agent.call(prompt, history=...)` | LLM call (network to configured provider) | Caught locally for diagnostics, re-raised |
 | `core/chat.py` | `_fail_console.print(...)` | Human-readable diagnostic lines to stderr | None — best-effort |
 
@@ -601,11 +668,12 @@ No file I/O directly inside `core/` — all disk access is delegated to `storage
 | `ValueError("Unsupported api_format: …")` | `core/providers.py` | `build_coreouto_provider` given a format not in `SUPPORTED_FORMATS` |
 | `ValueError("Unhandled api_format: …")` | `core/providers.py` | Defensive — `_instantiate` fallthrough (should be unreachable) |
 | `RuntimeError("Provider … is not configured.")` | `core/runtime.py` | `provider_store.get(name)` returned `None` in `build_runtime` |
-| `RuntimeError("Subagent provider … is not configured.")` | `core/runtime.py` | Subagent provider missing in `build_runtime` |
+| `RuntimeError("Subagent provider … is not configured.")` / `RuntimeError("No model specified for subagent provider …")` | `core/runtime.py:_resolve_subagent` | The `subagent_*` trio does not resolve — `cli/chat.py` under `--use-subagent-provider` turns either into a clean `✗` + exit 1 |
+| `ValueError("Unknown role … Available roles: …")` | `core/runtime.py` | `runtime.role` names a tag the parsed style does not declare (`cli/chat.py:_validate_role` pre-validates first) |
 | `RuntimeError("No default provider set. …")` | `core/runtime.py` | Neither override nor settings has a provider |
 | `RuntimeError("No model specified for provider …")` | `core/runtime.py` | Neither override nor `provider.default_model` is set |
 | `httpx.HTTPError` / `JSONDecodeError` | `core/context.py` | Caught silently inside `_fetch_model_caps` |
-| `Exception` in summarizer | `core/context.py` | Caught, returns static fallback message (never corrupts messages) |
+| `Exception` from the inbox insert in the context monitor | `core/context.py` | Suppressed; the turn continues (the summary request is a courtesy, not a loop contract) |
 | `Exception` from the turn (`_run_with_watchdog`) | `core/chat.py` | Caught to dump tool trace + traceback, then re-raised |
 | `LoopStalledError` | `core/runtime.py` → `core/chat.py` | Watchdog exhausted its 3 wakeups — loop re-wedges deterministically; normal failure-diagnostics path |
 | `LoopRepeatedError` | `core/runtime.py` → `core/chat.py` | Repetition budget exhausted (3 restarts) — the model kept repeating itself; own branch, not the cancel branch |
@@ -614,9 +682,9 @@ No file I/O directly inside `core/` — all disk access is delegated to `storage
 
 ## Defensive patterns worth highlighting
 
-1. **`context.py` summarizer** — refuses to `messages.clear(); messages.extend(summarized)` unless `summarized` is a `list`, preventing the bug in upstream `coreouto.contrib.hooks.auto_summarize_hook`.
+1. **`core/summary.py` is text-only** — it holds the two pinned model-facing messages, the hand-off slot and the run contract, and touches no disk, provider or registry, so the words the model reads and the words the entry layer acts on cannot drift apart.
 2. **`chat.py` ToolCallArgsError** — fires *before* coreouto's handler so the LLM sees a precise, single message about which argument is missing, and the user sees the tool name in the failure trace.
-3. **`runtime.py` subagent `max_tokens`** — re-implements `coreouto.agent_as_tool` because the stock helper drops `provider_config` from the preset, causing Anthropic to silently truncate long tool-call outputs (e.g. file writes) at 1024 tokens.
-4. **`subagents.py` `_enter_context`** — sets three `ContextVar`s (depth + per-job persona name + 6-hex id) inside the job's own asyncio task because coreouto's `BEFORE_TOOL_CALL` hook is global and has no per-agent context; the per-task context copy is what keeps concurrent background jobs distinguishable, and the persona name lets the actor label be `{name}-{sid}` instead of the legacy `subagent-<6hex>`.
-5. **`runtime.py` `_make_alarm_hook`** — appends drained alarms directly to the live message list instead of using `Agent.inject_user_message`, whose queue is drained *before* this hook and would delay the alarm by a full round-trip; and folds into a trailing user message because providers reject two consecutive user messages.
-6. **`chat.py` `_RecordingSink.remove_events`** — prunes the event list **in place** (slice assignment) because `_TurnPersister` holds that exact list object, notifies the persister unconditionally (a repair can cut a message from an earlier turn of a resumed session, whose events live only in the file), and excludes the summarizer: history compaction must never erase the human-visible record.
+3. **`cli/chat.py:_detach`** — the `--bg` child gets `stdin=DEVNULL`, file stdio and `start_new_session=True`. `tools/bash.py` kills whole process groups and grace-kills pipe-holding children, so a background run survives only with **both** halves; without the new session the parent Bash call would take it down, and without file stdio a pipe would keep it attached.
+4. **`core/inbox.py`** — file-per-message + `os.replace` makes insert-vs-drain safe without a lock (which a `.jsonl` would need across the read); corrupt content is quarantined as `.bad` instead of raising, exactly like session files; and one consumer per session is a deliberate constraint, not an oversight.
+5. **`runtime.py` `_make_alarm_hook`** — appends drained messages directly to the live message list instead of using `Agent.inject_user_message`, whose queue is drained *before* this hook and would delay the alarm by a full round-trip; folds into a trailing user message because providers reject two consecutive user messages; and runs under `contextlib.suppress` so a broken sink can never break the provider path.
+6. **`chat.py` `_RecordingSink.remove_events`** — prunes the event list **in place** (slice assignment) because `_TurnPersister` holds that exact list object, notifies the persister unconditionally (a repair can cut a message from an earlier turn of a resumed session, whose events live only in the file), and never fires for a summary hand-off: a hand-off switches sessions and must never erase the human-visible record.

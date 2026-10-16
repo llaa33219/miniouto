@@ -1,44 +1,29 @@
-"""Lock the completion-alarm delivery hook in src/miniouto/core/runtime.py.
+"""Lock the inbox delivery hook in src/miniouto/core/runtime.py.
 
-A background subagent that finishes mid-turn (or between turns) must reach
-outo's next LLM call as ONE synthetic user message. The rules under test:
-coalescing (N drained alarms -> 1 message), folding (never two consecutive
-user messages — the hazard `_cut_poisoned_turn` documents), depth gating
-(a subagent's own loop must not steal outo's alarms), and the LoopEvent each
-drained alarm produces for the session record and the TUI.
+A detached `chat --bg` process that finishes drops one file per message into the
+session's inbox directory, and that message must reach outo's next LLM call as
+ONE synthetic user message. The rules under test: coalescing (N drained
+messages -> 1 message), folding (never two consecutive user messages — the
+hazard `_cut_poisoned_turn` documents), the LoopEvent each drained message
+produces for the session record and the TUI, and that the delivery path cannot
+be broken by the display path.
+
+The messages here are written through the REAL `inbox.insert` / drained by the
+REAL hook rather than stubbed: the file-per-message shape is the whole reason a
+cross-process writer cannot lose a message, and a stubbed queue would pass even
+if the hook drained the wrong directory.
 """
 
 from __future__ import annotations
 
-import asyncio
-import threading
-import time
 from collections.abc import Iterator
 
 import coreouto as co
 import pytest
 
 from miniouto.core import chat as chat_mod
+from miniouto.core import inbox
 from miniouto.core import runtime as rt
-from miniouto.core import subagents
-
-
-class StubAgent:
-    """Async `call()` gated by a threading.Event, with a scripted answer."""
-
-    def __init__(self, *, result: str = "stub-result") -> None:
-        self.gate = threading.Event()
-        self.result = result
-
-    async def call(
-        self,
-        user_message: str | None = None,
-        *,
-        history: list[co.Message] | None = None,
-    ) -> co.Response:
-        while not self.gate.is_set():
-            await asyncio.sleep(0.005)
-        return co.Response(content=self.result, messages=[], iterations=1)
 
 
 class RecordingSink:
@@ -63,44 +48,48 @@ class RecordingSink:
         pass
 
 
-def _alarm(text: str, sid: str = "aaa111", name: str = "editor") -> subagents.Alarm:
-    return subagents.Alarm(text=text, sid=sid, name=name)
-
-
-def _queue(*alarms: subagents.Alarm, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace the alarm queue with exactly `alarms`."""
-    monkeypatch.setattr(subagents, "take_pending_alarms", lambda: list(alarms))
-
-
 @pytest.fixture(autouse=True)
-def _clean_registry() -> Iterator[None]:
-    subagents.reset()
+def _empty_inboxes() -> Iterator[None]:
+    """Every test posts into its own session directory; clear them all."""
+
     yield
-    subagents.reset()
+    for directory in inbox.INBOX_DIR.glob("coalescing-*"):
+        for path in directory.iterdir():
+            path.unlink(missing_ok=True)
+        directory.rmdir()
 
 
-def test_two_pending_alarms_land_in_one_user_message(monkeypatch: pytest.MonkeyPatch) -> None:
+def _post(text: str, session: str, **meta: object) -> str:
+    """Write one inbox message, the way a spawned process would."""
+
+    return inbox.insert(session, text, kind=inbox.ALARM_KIND, meta=dict(meta))
+
+
+def test_two_pending_messages_land_in_one_user_message() -> None:
     # Given: two jobs finished between iterations, mid-loop
-    first, second = _alarm("alarm one"), _alarm("alarm two", sid="bbb222", name="reviewer")
-    _queue(first, second, monkeypatch=monkeypatch)
+    session = "coalescing-two"
+    _post("alarm one", session, id="aaa111", role="editor")
+    _post("alarm two", session, id="bbb222", role="reviewer")
     messages = [
         co.Message(role="user", content="do the work"),
         co.Message(role="assistant", content="on it"),
     ]
 
     # When: the hook fires
-    rt._make_alarm_hook(None)(messages=messages)
+    rt._make_alarm_hook(session)(messages=messages)
 
-    # Then: exactly one new message carries both alarms, in drain order
+    # Then: exactly one new message carries both, in drain order
     assert len(messages) == 3
     assert messages[-1].role == "user"
     assert messages[-1].content == "alarm one\n\nalarm two"
 
 
-def test_alarm_folds_into_a_trailing_user_message(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_message_folds_into_a_trailing_user_message() -> None:
     # Given: the turn's own prompt is still the last message (a job finished
     # before the model answered), where appending would make two in a row
-    _queue(_alarm("alarm one"), _alarm("alarm two", sid="bbb222"), monkeypatch=monkeypatch)
+    session = "coalescing-fold"
+    _post("alarm one", session)
+    _post("alarm two", session)
     messages = [
         co.Message(role="user", content="do the work"),
         co.Message(role="assistant", content="on it"),
@@ -108,23 +97,24 @@ def test_alarm_folds_into_a_trailing_user_message(monkeypatch: pytest.MonkeyPatc
     ]
 
     # When: the hook fires
-    rt._make_alarm_hook(None)(messages=messages)
+    rt._make_alarm_hook(session)(messages=messages)
 
-    # Then: nothing is appended; both alarms are folded into the last message
+    # Then: nothing is appended; both are folded into the last message
     assert len(messages) == 3
     assert messages[-1].content == "any update?\n\nalarm one\n\nalarm two"
 
 
-def test_alarm_appends_after_an_assistant_message(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_message_appends_after_an_assistant_message() -> None:
     # Given: a normal mid-loop position (last message is the model's)
-    _queue(_alarm("alarm one"), monkeypatch=monkeypatch)
+    session = "coalescing-append"
+    _post("alarm one", session)
     messages = [
         co.Message(role="user", content="do the work"),
         co.Message(role="assistant", content="on it"),
     ]
 
     # When: the hook fires
-    rt._make_alarm_hook(None)(messages=messages)
+    rt._make_alarm_hook(session)(messages=messages)
 
     # Then: one new user message is appended
     assert len(messages) == 3
@@ -132,92 +122,126 @@ def test_alarm_appends_after_an_assistant_message(monkeypatch: pytest.MonkeyPatc
     assert messages[-1].content == "alarm one"
 
 
-def test_nothing_is_drained_for_a_subagents_own_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: we are inside a subagent, whose loop must not steal outo's alarms
-    drained: list[bool] = []
-    monkeypatch.setattr(
-        subagents, "take_pending_alarms", lambda: drained.append(True) or [_alarm("alarm one")]
-    )
-    depth_token = rt._SUBAGENT_DEPTH.set(1)
-    try:
-        messages = [co.Message(role="assistant", content="working")]
-        rt._make_alarm_hook(None)(messages=messages)
-    finally:
-        rt._SUBAGENT_DEPTH.reset(depth_token)
+def test_a_plain_user_message_is_delivered_verbatim() -> None:
+    # Given: a `kind="user"` message — no alarm banner of its own
+    session = "coalescing-user"
+    inbox.insert(session, "the editor says: file X is empty", kind=inbox.USER_KIND)
+    messages = [co.Message(role="assistant", content="working")]
 
-    # Then: the queue was never touched and the history is untouched
-    assert drained == []
-    assert len(messages) == 1
+    # When: the hook fires
+    rt._make_alarm_hook(session)(messages=messages)
+
+    # Then: the text lands unchanged — the hook adds no banner of its own
+    assert messages[-1].content == "the editor says: file X is empty"
 
 
-def test_each_drained_alarm_emits_one_annotated_loop_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: two drained alarms and a sink fed by the chat dispatcher
-    first = _alarm("alarm one", sid="aaa111", name="editor")
-    second = _alarm("alarm two", sid="bbb222", name="reviewer")
-    _queue(first, second, monkeypatch=monkeypatch)
+def test_the_inbox_is_drained_so_the_same_message_is_never_twice() -> None:
+    # Given: one pending message and a live message list
+    session = "coalescing-drain-once"
+    _post("alarm one", session)
+    messages = [co.Message(role="assistant", content="working")]
+
+    # When: the hook fires twice (two loop iterations)
+    rt._make_alarm_hook(session)(messages=messages)
+    rt._make_alarm_hook(session)(messages=messages)
+
+    # Then: the drain consumed the message file, so the second pass is a
+    # no-op instead of a duplicate delivery
+    assert len(messages) == 2
+    assert inbox.pending_count(session) == 0
+
+
+def test_each_drained_message_emits_one_annotated_loop_event() -> None:
+    # Given: two drained messages and a sink fed by the chat dispatcher
+    session = "coalescing-events"
+    _post("alarm one", session, id="aaa111", role="editor")
+    _post("alarm two", session, id="bbb222", role="reviewer")
     sink = RecordingSink()
-    on_alarms = chat_mod._make_alarm_dispatcher(sink)
     messages = [co.Message(role="assistant", content="working")]
 
     # When: the hook fires and forwards them
-    rt._make_alarm_hook(on_alarms)(messages=messages)
+    rt._make_alarm_hook(session, chat_mod._make_alarm_dispatcher(sink))(messages=messages)
 
-    # Then: one `alarm` event per drained alarm, carrying its identity
+    # Then: one event per message, carrying its spawn identity and the
+    # `inbox:<id>` de-duplication handle the display layer keys on
     assert [(e.kind, e.subagent_id, e.subagent_name) for e in sink.events] == [
         ("alarm", "aaa111", "editor"),
         ("alarm", "bbb222", "reviewer"),
     ]
     assert [e.text for e in sink.events] == ["alarm one", "alarm two"]
     assert all(e.actor == "outo" for e in sink.events)
+    assert [e.detail.split(":")[0] for e in sink.events] == ["inbox", "inbox"]
+    assert len({e.detail for e in sink.events}) == 2
 
 
-def test_delivered_text_is_the_alarm_text_verbatim() -> None:
-    # Given: a REAL completed job, so the text comes from the engine itself
-    agent = StubAgent(result="all checks passed")
-    job = subagents.submit(agent, "validator", "run the suite")
-    agent.gate.set()
-    deadline = time.monotonic() + 5.0
-    while job.status == "running" and time.monotonic() < deadline:
-        time.sleep(0.005)
-
-    # When: its alarm is delivered to a live message list
+def test_a_user_kind_message_emits_a_user_kind_event() -> None:
+    # Given: a `kind="user"` message drained through the dispatcher
+    session = "coalescing-user-event"
+    inbox.insert(session, "proceed with plan B", kind=inbox.USER_KIND)
+    sink = RecordingSink()
     messages = [co.Message(role="assistant", content="working")]
-    rt._make_alarm_hook(None)(messages=messages)
 
-    # Then: the user message is exactly what `format_completion_alarm` built
-    assert job.status == "done"
-    assert messages[-1].content == subagents.format_completion_alarm(job)
-    assert messages[-1].content.startswith(subagents.ALARM_HEADER)
+    # When: the hook fires
+    rt._make_alarm_hook(session, chat_mod._make_alarm_dispatcher(sink))(messages=messages)
+
+    # Then: the event kind mirrors the inbox kind, so a display can tell a
+    # plain user turn from a spawned process reporting back
+    assert [e.kind for e in sink.events] == ["user"]
+    assert [e.text for e in sink.events] == ["proceed with plan B"]
 
 
-def test_a_broken_sink_cannot_break_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_alarm_banner_survives_the_round_trip_verbatim() -> None:
+    # Given: a message written with the shared alarm header
+    session = "coalescing-banner"
+    _post(f"{inbox.ALARM_HEADER}\nthe validator finished", session)
+    messages = [co.Message(role="assistant", content="working")]
+
+    # When: the hook delivers it
+    rt._make_alarm_hook(session)(messages=messages)
+
+    # Then: the banner is the first line of the delivered text, which is what
+    # the model and the display both key on
+    assert messages[-1].content.splitlines()[0] == inbox.ALARM_HEADER
+
+
+def test_a_broken_sink_cannot_break_the_loop() -> None:
     # Given: an event callback that raises, as a failing sink would
-    _queue(_alarm("alarm one"), monkeypatch=monkeypatch)
+    session = "coalescing-broken-sink"
+    _post("alarm one", session)
 
-    def boom(_alarms: list[subagents.Alarm]) -> None:
+    def boom(_messages: list[inbox.InboxMessage]) -> None:
         raise RuntimeError("sink is gone")
 
     messages = [co.Message(role="assistant", content="working")]
 
-    # When/Then: the alarm still reaches the model and nothing propagates
-    rt._make_alarm_hook(boom)(messages=messages)
+    # When/Then: the message still reaches the model and nothing propagates
+    rt._make_alarm_hook(session, boom)(messages=messages)
     assert messages[-1].content == "alarm one"
 
 
-def test_no_pending_alarm_leaves_the_history_untouched(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: an empty queue (the common case, every other iteration)
-    _queue(monkeypatch=monkeypatch)
+def test_no_pending_message_leaves_the_history_untouched() -> None:
+    # Given: an empty inbox (the common case, every other iteration)
+    session = "coalescing-empty"
     messages = [co.Message(role="user", content="do the work")]
 
     # When: the hook fires
-    rt._make_alarm_hook(None)(messages=messages)
+    rt._make_alarm_hook(session)(messages=messages)
 
     # Then: no message is added or rewritten
     assert len(messages) == 1
     assert messages[0].content == "do the work"
+
+
+def test_the_drain_targets_the_session_it_was_built_for() -> None:
+    # Given: a message pending for a DIFFERENT session
+    other = "coalescing-other-session"
+    _post("not yours", other)
+    session = "coalescing-mine"
+    messages = [co.Message(role="assistant", content="working")]
+
+    # When: a hook bound to this session fires
+    rt._make_alarm_hook(session)(messages=messages)
+
+    # Then: the other session's message is neither delivered nor consumed
+    assert len(messages) == 1
+    assert inbox.pending_count(other) == 1

@@ -15,7 +15,10 @@ class Settings:
     model: str = ""
     style: str = "default"
     session: str = "default"
-    theme: str = ""
+    # TUI theme name. Defaults to the harness's own `miniouto` theme
+    # (`cli/tui.py:MINIOUTO_THEME`); any other registered name — a stock
+    # Textual theme, say — overrides it on the next TUI launch.
+    theme: str = "miniouto"
     # Subagent provider/model/reasoning overrides. Empty string = inherit
     # outo's provider/model and fall back to the subagent provider's
     # `reasoning_effort`. NOTE: `merge()` and `update()` skip empty-string

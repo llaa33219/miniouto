@@ -1,52 +1,54 @@
-"""A completed background job's alarm must reach the model as a user message.
+"""A queued inbox message must reach the model as a user message.
 
 The mid-turn delivery path (`core/runtime.py:_make_alarm_hook`, on
-BEFORE_LLM_CALL) only runs while a turn is in flight. A job that finishes
+BEFORE_LLM_CALL) only runs while a turn is in flight. A message that lands
 between turns — the common case, because outo ends its turn saying "I'll
-wait" — used to leave its alarm sitting in `subagents._PENDING_ALARMS`
+wait" — would otherwise sit invisible in `~/.miniouto/inbox/<session>/`
 until the user typed something: nothing appeared in the chat and the model
 never woke up.
 
-`ChatTUI._deliver_pending_alarms` closes that gap. The alarm text becomes
-the prompt of a real turn (so `turn.user` is the alarm, the live row is
-the alarm, and the model sees the alarm), and a completion observer keeps
-the delivery prompt when the job finishes while the TUI is idle.
+`ChatTUI._deliver_pending_messages` closes that gap, and it is now a poll
+(`set_interval(_INBOX_POLL_INTERVAL, …)`) because the writer is another
+process that may finish at any moment — no registry callback pushes it any
+more. The drained text becomes the prompt of a real turn, so `turn.user`,
+the live row and the model's own view are the same string by construction.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
-from datetime import datetime
 from typing import Any
 
 import pytest
 
 from miniouto.cli import tui as tui_module
 from miniouto.cli.tui import ChatTUI
-from miniouto.core import subagents
-from miniouto.core.subagents import ALARM_HEADER, Alarm, Job
+from miniouto.core import inbox
+from miniouto.core.inbox import ALARM_HEADER
 from miniouto.storage import sessions as session_store
 from miniouto.storage import settings as settings_store
 
+ALARM_TEXT = (
+    f"{ALARM_HEADER}\nSpawned run 'editor' (id: abc123) finished (status: done).\n"
+    "Result file: ~/.miniouto/subagent-results/abc123-2026-10-04-01-02.md"
+)
+
 
 @pytest.fixture(autouse=True)
-def _clean_registry() -> Iterator[None]:
-    subagents.reset()
+def _empty_inboxes() -> Any:
+    """The inbox is on-disk state in a shared test home: clear it per test."""
+
     yield
-    subagents.reset()
+    for directory in inbox.INBOX_DIR.glob("*"):
+        if directory.is_dir():
+            for message in directory.iterdir():
+                message.unlink(missing_ok=True)
 
 
-def _finished_job(name: str = "editor", sid: str = "abc123") -> Job:
-    """A job record the real completion path can retire."""
+def _deliver(text: str, session: str, *, kind: str = inbox.ALARM_KIND) -> str:
+    """Post one message, the way a spawned process would."""
 
-    return Job(
-        sid=sid,
-        name=name,
-        brief="fix the bug",
-        started=datetime.now(),
-        generation=subagents._GENERATION,
-    )
+    return inbox.insert(session, text, kind=kind, source="spawn")
 
 
 def _prompt_rows(app: ChatTUI) -> list[Any]:
@@ -93,7 +95,7 @@ async def _settle(pilot: Any, *, want: int, have: list[str]) -> None:
     raise AssertionError(f"expected {want} dispatch(es), got {have}")
 
 
-def test_idle_completion_arrives_as_a_user_message_and_starts_a_turn(
+def test_idle_message_arrives_as_a_user_message_and_starts_a_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prompts: list[str] = []
@@ -107,57 +109,56 @@ def test_idle_completion_arrives_as_a_user_message_and_starts_a_turn(
             await pilot.pause()
             _assign_session(app, "alarm-idle")
 
-            # Given: a background job that finished while no turn was running
-            job = _finished_job()
+            # Given: a background run that finished while no turn was running
             assert not app._busy
-            subagents._finish(job, "done", "the editor rewrote three functions")
-            expected = subagents.format_completion_alarm(job)
-            assert expected.startswith(ALARM_HEADER)
+            _deliver(ALARM_TEXT, "alarm-idle")
+            assert inbox.pending_count("alarm-idle") == 1
 
-            # When: the app picks the queued alarm up
-            app._deliver_pending_alarms()
+            # When: the idle delivery path picks the message up
+            app._deliver_pending_messages()
             await _settle(pilot, want=1, have=prompts)
 
-            # Then: the alarm is a user message, and it IS the turn's prompt
+            # Then: the message is a user message, and it IS the turn's prompt
             rows = _prompt_rows(app)
             assert len(rows) == 1
             assert _rendered(rows[0]).lstrip().startswith("> ")
             assert ALARM_HEADER in _rendered(rows[0])
-            assert prompts == [expected]
+            assert prompts == [ALARM_TEXT]
             # And the session records it as the turn's user message
             data = session_store.load("alarm-idle")
-            assert [t.user for t in data.turns] == [expected]
-            # The queue is drained: the hook or this path delivers, never both
-            assert subagents.take_pending_alarms() == []
+            assert [t.user for t in data.turns] == [ALARM_TEXT]
+            # The inbox is drained: the hook or this path delivers, never both
+            assert inbox.pending_count("alarm-idle") == 0
 
     asyncio.run(body())
 
 
-def test_busy_turn_keeps_the_queue_for_the_in_turn_hook() -> None:
+def test_busy_turn_keeps_the_inbox_for_the_in_turn_hook() -> None:
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=(80, 24)) as pilot:
             app._log.remove_children()
             app._reset_rows()
             await pilot.pause()
+            _assign_session(app, "alarm-busy")
             app._chat_started = True
+            _deliver(ALARM_TEXT, "alarm-busy")
 
-            # Given: a turn is in flight and a job completes mid-turn
+            # Given: a turn is in flight and a run finishes mid-turn
             app._busy = True
-            subagents._finish(_finished_job(), "done", "result")
 
             # When: the idle delivery path runs anyway
-            app._deliver_pending_alarms()
+            app._deliver_pending_messages()
             await pilot.pause()
 
             # Then: it drained nothing — the BEFORE_LLM_CALL hook owns it
-            assert len(subagents.take_pending_alarms()) == 1
+            assert inbox.pending_count("alarm-busy") == 1
             assert _prompt_rows(app) == []
 
     asyncio.run(body())
 
 
-def test_dispatch_tail_delivers_an_alarm_the_hook_never_saw(
+def test_dispatch_tail_delivers_a_message_the_hook_never_saw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prompts: list[str] = []
@@ -171,15 +172,15 @@ def test_dispatch_tail_delivers_an_alarm_the_hook_never_saw(
             await pilot.pause()
             _assign_session(app, "alarm-tail")
 
-            # Given: a job that finished after the turn's last LLM call, so no
-            # BEFORE_LLM_CALL ever ran again
-            subagents._finish(_finished_job(), "done", "result")
+            # Given: a message that landed after the turn's last LLM call, so
+            # no BEFORE_LLM_CALL ever ran again
+            _deliver(ALARM_TEXT, "alarm-tail")
 
             # When: a turn runs and ends
             await app._dispatch("what did you find?")
             await _settle(pilot, want=2, have=prompts)
 
-            # Then: the tail catch-up started a second turn with the alarm
+            # Then: the tail catch-up started a second turn with the message
             assert len(prompts) == 2
             assert prompts[0] == "what did you find?"
             assert ALARM_HEADER in prompts[1]
@@ -190,7 +191,7 @@ def test_dispatch_tail_delivers_an_alarm_the_hook_never_saw(
     asyncio.run(body())
 
 
-def test_simultaneous_completions_coalesce_into_one_message_and_one_turn(
+def test_simultaneous_messages_coalesce_into_one_prompt_and_one_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prompts: list[str] = []
@@ -204,12 +205,12 @@ def test_simultaneous_completions_coalesce_into_one_message_and_one_turn(
             await pilot.pause()
             _assign_session(app, "alarm-coalesce")
 
-            # Given: two jobs finishing back to back while the TUI is idle
-            subagents._finish(_finished_job("editor", "aaa111"), "done", "one")
-            subagents._finish(_finished_job("reviewer", "bbb222"), "done", "two")
+            # Given: two runs finishing back to back while the TUI is idle
+            _deliver(ALARM_TEXT.replace("editor", "editor"), "alarm-coalesce")
+            _deliver(ALARM_TEXT.replace("editor", "reviewer"), "alarm-coalesce")
 
             # When: delivery runs once
-            app._deliver_pending_alarms()
+            app._deliver_pending_messages()
             await _settle(pilot, want=1, have=prompts)
 
             # Then: one user row carrying both, and one turn
@@ -226,52 +227,61 @@ def test_simultaneous_completions_coalesce_into_one_message_and_one_turn(
     asyncio.run(body())
 
 
-def test_completion_observer_is_installed_on_mount_and_cleared_on_unmount() -> None:
+def test_the_idle_poll_picks_a_late_message_up_without_any_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompts: list[str] = []
+
     async def body() -> None:
+        _stub_run_chat(monkeypatch, prompts)
         app = ChatTUI()
-        # Given: no observer installed
-        assert subagents._COMPLETION_OBSERVER is None
-
         async with app.run_test(size=(80, 24)) as pilot:
-            # When: the app mounts
+            app._log.remove_children()
+            app._reset_rows()
             await pilot.pause()
-            # Then: it listens for completions
-            assert subagents._COMPLETION_OBSERVER is not None
+            _assign_session(app, "alarm-poll")
 
-        # And when the app is gone, the listener is gone with it
-        assert subagents._COMPLETION_OBSERVER is None
+            # Given: a run that finishes later, with the writer being another
+            # process — nothing can notify this one, so only the poll can
+            # deliver. The test's own `_deliver_pending_messages` is never
+            # called below.
+            _deliver(ALARM_TEXT, "alarm-poll")
+
+            # When: the scheduled poll fires on its own
+            await _settle(pilot, want=1, have=prompts)
+
+            # Then: the message became the turn's prompt without help
+            assert prompts == [ALARM_TEXT]
+            assert inbox.pending_count("alarm-poll") == 0
 
     asyncio.run(body())
 
 
-def test_set_completion_observer_fires_once_per_completed_job() -> None:
-    # Given: a completion observer
-    seen: list[Alarm] = []
-    subagents.set_completion_observer(seen.append)
-    job = _finished_job()
+def test_a_plain_user_kind_message_is_delivered_without_a_banner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompts: list[str] = []
 
-    # When: one job completes
-    subagents._finish(job, "done", "the result")
-    # Then: exactly one alarm, carrying the job's identity
-    assert len(seen) == 1
-    assert seen[0] is subagents.take_pending_alarms()[0]
-    assert seen[0].sid == job.sid
-    assert seen[0].name == "editor"
+    async def body() -> None:
+        _stub_run_chat(monkeypatch, prompts)
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._log.remove_children()
+            app._reset_rows()
+            await pilot.pause()
+            _assign_session(app, "inbox-user")
 
-    # And the idempotent second pass notifies nothing
-    subagents._finish(job, "done", "the result")
-    assert len(seen) == 1
+            # Given: a `miniouto message insert` from another run — a plain
+            # user message, with no alarm banner of its own
+            _deliver("proceed with plan B", "inbox-user", kind=inbox.USER_KIND)
 
+            # When: the idle delivery path runs
+            app._deliver_pending_messages()
+            await _settle(pilot, want=1, have=prompts)
 
-def test_reset_clears_the_completion_observer() -> None:
-    # Given: an installed observer
-    seen: list[Alarm] = []
-    subagents.set_completion_observer(seen.append)
+            # Then: it rides verbatim, banner or not
+            assert prompts == ["proceed with plan B"]
+            assert ALARM_HEADER not in prompts[0]
+            assert inbox.pending_count("inbox-user") == 0
 
-    # When: the registry is reset
-    subagents.reset()
-
-    # Then: a later completion notifies nobody
-    subagents._finish(_finished_job(), "done", "result")
-    assert seen == []
-    assert subagents._COMPLETION_OBSERVER is None
+    asyncio.run(body())

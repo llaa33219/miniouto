@@ -207,19 +207,17 @@ def test_stream_dispatcher_routes_delta_to_the_matching_kind(kind: str, delta: s
     assert raw.deltas == [(kind, delta)]
 
 
-def test_stream_dispatcher_ignores_subagent_deltas() -> None:
-    # Given: a delta arriving inside a subagent invocation
+def test_stream_dispatcher_forwards_every_delta_it_is_given() -> None:
+    # Given: a dispatcher wired to the repetition detector and a raw sink
     raw = _RawSink()
     on_delta = chat_mod._make_stream_dispatcher(raw, "text")
-    token = chat_mod.current_subagent_depth
-    chat_mod.current_subagent_depth = lambda: 1
-    try:
-        on_delta("from a subagent")
-    finally:
-        chat_mod.current_subagent_depth = token
 
-    # Then: it is dropped — v1 renders outo's own stream only
-    assert raw.deltas == []
+    # When: coreouto fires a fragment
+    on_delta("hello")
+
+    # Then: it is forwarded — there is one actor per process now, so no delta
+    # can belong to "someone else" and be dropped
+    assert raw.deltas == [("text", "hello")]
 
 
 def test_build_runtime_forwards_coreouto_stream_hooks_to_the_sink(
@@ -377,14 +375,14 @@ def test_thinking_deltas_extend_the_live_reasoning_row() -> None:
             row = app._window.rows[0]
             assert isinstance(row, ThinkingRow)
             assert row._thinking == "first second"
-            assert _rendered(row) == "▸ thinking ●"
+            assert _rendered(row) == "▶ thinking ●"
 
             # And: the completed message replaces the streamed text in place
             app._add_event_row(LoopEvent(actor="outo", kind="thinking", text="first second (full)"))
             await pilot.pause()
             assert len(app._window.rows) == 1
             assert app._window.rows[0]._thinking == "first second (full)"
-            assert _rendered(app._window.rows[0]) == "▸ thinking"
+            assert _rendered(app._window.rows[0]) == "▶ thinking"
 
     asyncio.run(body())
 

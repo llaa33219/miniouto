@@ -6,7 +6,7 @@ The active style is selected via `miniouto style set <name>` (or per-call via `m
 
 ## File structure
 
-A style document is plain Markdown with a **top-level XML structure**: one optional `<outo>` block (always the outo prompt) and zero or more named subagent blocks (each `<tag>` is one subagent). The tag name IS the subagent name.
+A style document is plain Markdown with a **top-level XML structure**: one optional `<outo>` block (always the outo prompt) and zero or more **named role** blocks (each `<tag>` is one role, selected by `miniouto chat "<brief>" --style <style> --role <tag>`). The tag name IS the role name.
 
 ```markdown
 # Optional top-level title or notes (ignored by the parser)
@@ -27,20 +27,15 @@ You are a file picker. Locate the right files. Do not edit. …
 </file-picker>
 ```
 
-Tags are then concatenated with:
-
-- A **per-call cwd preamble** prepended on top (different wording for outo vs subagent).
-- A **skill section** between the preamble and the style body.
+Nothing is concatenated onto the tags. The system prompt the model sees **is** the chosen body with its tokens expanded — the harness prepends no cwd preamble and no skill catalog, so where (and whether) the working directory and the skill listing appear is entirely the style author's decision. A body that names no tokens tells the model nothing about either.
 
 So the final outo prompt the model sees, top to bottom, is:
 
-1. cwd preamble: *"The user invoked miniouto from: {INVOCATION_CWD}…"*
-2. A skill catalog from `~/.agents/skills/`: a `# Available Skills` block listing each skill as `- <name>: <description>` plus a note that full instructions live at `~/.agents/skills/<name>/SKILL.md` (bodies are read on demand via Bash — see `docs/skills.md`).
-3. The `<outo>` section content (or the whole document if `<outo>` is missing).
+1. The `<outo>` section content (or the whole document if `<outo>` is missing), token-expanded per turn.
 
-Each named subagent prompt mirrors this with its own tag body and a different preamble: *"You operate inside this working directory: {INVOCATION_CWD}…"*.
+A role run (`miniouto chat "<brief>" --style <style> --role <tag>`) is the same story with that tag's body as the base. It is assembled by the **same** `build_runtime` call and through the same `expand_prompt_tokens` pass, so there is no second prompt-assembly path to drift. **Role bodies need their own tokens**: expansion is per body, so a role that must know the working directory or advertise skills carries `{cwd}` / `{skills}` itself. Every bundled style puts both in every body it defines, outo and role alike.
 
-**Legacy compat**: an old-style `<subagent>...</subagent>` block is parsed as a single subagent named `"subagent"`. Existing style files keep working unchanged; actor labels for those invocations stay `subagent-<6hex>`.
+**Legacy compat**: an old-style `<subagent>...</subagent>` block is parsed as a single role named `"subagent"`. Existing style files keep working unchanged — `--role subagent` runs them.
 
 ## `parse_style(content) -> tuple[str, list[SubagentSpec]]`
 
@@ -50,7 +45,7 @@ From `storage/styles.py`. Parses a style document with a single sequential scan 
 @dataclass(frozen=True)
 class SubagentSpec:
     name: str      # the tag name, e.g. "editor" or "subagent"
-    prompt: str    # the tag body (this subagent's system prompt)
+    prompt: str    # the tag body (this role's system prompt)
 
 def parse_style(content: str) -> tuple[str, list[SubagentSpec]]: ...
 ```
@@ -58,13 +53,63 @@ def parse_style(content: str) -> tuple[str, list[SubagentSpec]]: ...
 Rules:
 
 - `<outo>...</outo>` is extracted as the first element of the returned tuple. If absent, the **whole document** is used as the outo prompt.
-- Each **top-level** `<name>...</name>` pair outside `<outo>` becomes one `SubagentSpec`; the tag name IS the subagent name. Tag names match `[A-Za-z][A-Za-z0-9_-]*` (hyphens allowed: `file-picker`, `researcher-docs`).
-- `outo` is reserved — always the outo prompt, never a subagent.
-- A `<subagent>...</subagent>` block is parsed as a subagent named `"subagent"` (legacy compat).
-- **Zero subagent tags → zero `SubagentSpec`s → the `call_subagent` tool is NOT registered at all** (outo-only style = no delegation surface). There is no fallback subagent prompt anymore.
-- The parse is **top-level only**: a `<name>...</name>` pair nested inside another tag body is treated as content, not as a subagent.
+- Each **top-level** `<name>...</name>` pair outside `<outo>` becomes one `SubagentSpec`; the tag name IS the role name that `--role` takes. Tag names match `[A-Za-z][A-Za-z0-9_-]*` (hyphens allowed: `file-picker`, `researcher-docs`).
+- `outo` is reserved — always the outo prompt, never a role.
+- A `<subagent>...</subagent>` block is parsed as a role named `"subagent"` (legacy compat).
+- **Zero role tags is legal**: `chat` with no `--role` runs the outo prompt, and `--role <tag>` on a style with no matching tag **errors before the turn** (listing the available roles, or `(none)`), so a typo costs no model call.
+- The parse is **top-level only**: a `<name>...</name>` pair nested inside another tag body is treated as content, not as a role.
 - Stray prose outside any tag is ignored.
 - Duplicate tag names at the top level raise `ValueError`.
+- `parse_style` returns bodies **verbatim** — tokens included. Expansion happens later, at prompt assembly (below).
+
+## Dynamic tokens
+
+Five tokens are substituted into every style body at system-prompt assembly, by `core/runtime.py:expand_prompt_tokens`:
+
+| Token | Expands to |
+|---|---|
+| `{cwd}` | the directory miniouto was invoked from — `paths_runtime.INVOCATION_CWD`, captured at import, so it is stable for the whole process |
+| `{skills}` | the lazy-load skill catalog for the **default roots**: the invocation directory's `./skills/` **first**, then `~/.agents/skills` |
+| `{skills:<dir>[,<dir>…]}` | the same catalog merged from the named roots (an empty argument — bare `{skills}` or `{skills:}` — means the two default roots above), comma-separated, in the order listed. `~` is expanded; a relative path resolves against `INVOCATION_CWD`, so a style can point at `./skills`. Missing or unreadable roots are skipped silently; entries are ordered by root order then name; a name present in two roots appears twice, each line naming its own root; nothing found → the empty string |
+| `{this_session}` | this run's own session name — `runtime.session`, or `"default"` when it is empty |
+| `{style}` | the resolved style name — `runtime.style_name` |
+| `{subagent_pm}` | the effective subagent provider config in `--pm` form — `PROVIDER/MODEL` or `PROVIDER/MODEL:REASONING`. Resolved from the **subagent trio** (`session_config`'s `subagent_provider` / `subagent_model` / `subagent_reasoning`, else the `settings.subagent_*` global default, falling back to outo's own provider/model/reasoning per key). Left **literal** when the trio does not resolve |
+
+Six spellings, five tokens: `{skills}` is the no-argument form of `{skills:…}`, and a bare `{skills:}` means the same thing — both default to the **two** default roots, local before global.
+
+Three representative configurations:
+
+| Write this | To get |
+|---|---|
+| `{skills}` | both default roots, project-local `./skills/` first, then `~/.agents/skills` |
+| `{skills:~/.claude/skills}` | a Claude-style skills directory, listed **instead of** the defaults |
+| `{skills:./docs/skills,~/.agents/skills}` | the two defaults with an extra project-local root spliced in front |
+
+Rules:
+
+- Substitution happens per body: **both** the `<outo>` body **and** every role body, on every turn (nothing is persisted).
+- **Order matters.** The parameterized `{skills…}` regex pass runs **first** (the catalog text itself contains braces), then the plain `str.replace` passes: `{cwd}`, then `{this_session}` and `{style}`, then `{subagent_pm}`. `{subagent_pm}` is only resolved when the token is still present after the earlier passes.
+- **A body with no tokens simply has no cwd and no skills.** There is no compatibility fallback and no implicit layer — the layout is yours.
+- **Any other `{...}` text is left verbatim.** There is no escape mechanism, and an unknown token is not an error — so `{brief}` or a JSON-looking brace in your prose is safe.
+- **The model never sees the token syntax.** By the time the prompt reaches the model, the recipe line reads as a fully literal, copy-ready command. That is the point: the delegated command line is run through `Bash`, so it must be the same command every time it is typed, from any agent, in any session.
+
+A style author therefore writes the recipe with tokens, and expansion makes it concrete per run. Given a session `default` and the style `coding-work`, this line in `coding-work.md`:
+
+```
+miniouto chat "<self-contained brief>" --style {style} --role <tag> --bg --pm {subagent_pm} --alarm-session {this_session} --return
+```
+
+reaches the model as:
+
+```
+miniouto chat "<self-contained brief>" --style coding-work --role <tag> --bg --pm minimax/MiniMax-M3.1:high --alarm-session default --return
+```
+
+`<tag>` is **not** a token — the model picks a role name from the style's own roster.
+
+These tokens are what replaced the old ambient bare-flag defaults. A bare `--alarm-session` used to mean "my session" through `settings.session`, and a missing `--style` fell back to whatever the default style happened to be — so the same Bash command meant different things depending on who ran it. Now both values are mandatory on the delegation surface (`--role` requires `--style`; `--alarm-session` requires a session name), and the tokens are how a bundled style still teaches a literal, self-contained command. See [`cli.md`](./cli.md) § `miniouto chat` for the flag contract.
+
+**Precedence.** Values in the CURRENT assembled prompt beat anything in history. The prompt is rebuilt from the style file on every turn, so `{style}` and `{this_session}` are current by construction — but any command literal written into an earlier turn of the transcript is stale the moment the style changes (TUI style picker, `miniouto style set`). Models imitate historical commands, so the bundled styles carry the canonical sentence: take the delegation values **never from commands in earlier turns**. Style authors should keep that sentence wherever they teach a delegation command, next to the recipe itself.
 
 ## The tools section (required)
 
@@ -74,7 +119,8 @@ Every style should include a **Tools available** section that lists the tools th
 |---|---|
 | `Bash(command, *, cwd=None)` | Run a shell command — the ONLY file-manipulation tool (read via `cat`/`grep`, write via heredoc/`tee`, edit via `sed -i`/Python, delete via `rm`). 1-hour hard timeout (`BASH_TIMEOUT_SECONDS`). (`env` is accepted by the underlying `bash()` function but is **not** exposed through the model-facing schema — the registered `_bash_handler` does not accept it.) |
 | `Image(file_path)` / `Video(file_path)` / `Audio(file_path)` | View/listen to a media file (multimodal blocks). |
-| `call_subagent(name="", task="")` | Delegate **one** self-contained brief to a **background** named subagent and return immediately. `name=""` resolves to `"subagent"` if declared, else the sole subagent if exactly one, else an error. The return value is only an acknowledgement, never the answer; the answer is written to `~/.miniouto/subagent-results/<id>.md` and delivered later as a user message starting with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`. Several calls in one response = several subagents running concurrently. **Only registered when the active style declares ≥1 named subagent.** |
+| *(delegation is not a tool)* | There is **no** `call_subagent` tool — the word appears nowhere in the codebase. Delegation is a **Bash command**: `miniouto chat "<self-contained brief>" --style <style> --role <tag> --return` runs a nested run of the harness in its own process and prints its answer inline; add `--bg --alarm-session <session>` to fire and forget, in which case the answer arrives later as a user message starting with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` naming a file under `~/.miniouto/subagent-results/`. One brief per command; several commands in one Bash call = several concurrent runs. `Bash` is always registered, so **the delegation surface is never conditional on this style's tags** — what a style controls is only which role bodies exist. |
+| `Computer(action="screen", chars=…, color=…)` | (outo runs only) Dump the current virtual screen as Unicode half-block art to `~/.miniouto/computer-screens/*.art` and return a short text preview — the text-only channel that works where `screenshot` cannot. Render it with `miniouto computer show`. |
 
 There are deliberately **no** Write/Edit/Delete tools — file work goes through Bash (see `docs/tools.md` § "Why Bash is the only file tool"). All bundled styles describe the tools with **identical behavior summaries** (so the model doesn't see inconsistent tool docs across styles). The summaries come from `tools/registry.py`'s `_<name>_description` strings.
 
@@ -104,9 +150,11 @@ The five bundled templates live in `src/miniouto/default_style/`. They are seede
 | `coding-work.md` | ~38 KB | "**coding-work**" — pragmatic senior engineer orchestrator | **Aggressive but proportionate** (one subagent per slice, one reviewer when warranted) |
 | `coding-ultra.md` | ~81 KB | "**ultra**" — relentless MAX-mode execution orchestrator | **Aggressive** (layered subagent fan-out, best-of-N editors, multi-focus review) |
 
-`coding-pro.md`, `coding-work.md`, and `coding-ultra.md` include explicit guidance on when and how to delegate via `call_subagent`; `default.md` and `coding.md` are deliberately minimal.
+`coding-pro.md`, `coding-work.md`, and `coding-ultra.md` include explicit guidance on when and how to delegate, taught entirely as **Bash recipes** (`miniouto chat "<brief>" --style {style} --role <tag> --pm {subagent_pm} [--bg --alarm-session {this_session}] --return` — the tokens expand per run, see [Dynamic tokens](#dynamic-tokens)); `default.md` and `coding.md` compress the same mechanic to one or two lines.
 
-**Note on mechanics**: each bundled orchestrator style declares its roster as top-level named tags (one tag per role). At invocation time the model passes the role name via `call_subagent(name=...)` and the matching tag body is loaded as that subagent's system prompt — a per-role lean prompt replaces the old single shared subagent prompt. A mixed-role layer is just several `call_subagent` calls in the same response (an editor, then a reviewer), each carrying exactly one brief; each job runs in the background and reports through its own completion alarm. See each style file for its actual roster.
+**Note on which provider a delegated run uses**: bundled styles teach the recipe with `--pm {subagent_pm}`, so the command the model copies carries the subagent provider/model/reasoning **spelled out** — literal, idempotent, and not re-resolved against whatever the default says at the moment the command is typed. `--use-subagent-provider` remains available and does the same job by *resolving at call time*: it resolves the subagent trio **pin-first against the delegated run's own session** (`session-config/<session>.toml`, which it inherits copy-if-absent from the caller via `seed_from`), else the `settings.subagent_*` global default. Prefer `--pm` in a generated command; reach for `--use-subagent-provider` when the point is "whatever the subagent profile currently is".
+
+**Note on mechanics**: each bundled orchestrator style declares its roster as top-level named tags (one tag per role). The model delegates by running `miniouto chat "<brief>" --style <style> --role <tag>` through `Bash`, and that tag's body becomes the delegated run's system prompt — a per-role lean prompt in its own process. A mixed-role layer is just **several such commands issued together** (an editor, then a reviewer), each carrying exactly one brief; each run reports through its own completion alarm. See each style file for its actual roster.
 
 ### `default.md` — minimal fallback
 
@@ -114,7 +162,7 @@ The original "outo" prompt. Short, opinionated, deliberately sparse. Used when n
 
 Key points:
 - 7 outo operating principles: be brief, lead with the answer, finish with text + no tool call (or use `continue_loop`), treat tool results as loop input, match delegation scope to task size, never invent outputs, match the user's language, pass paths correctly when delegating.
-- A single legacy `<subagent>` block (named `"subagent"`): 10 principles — treat the brief as the whole spec (no clarifying questions), be terse, prefer targeted `sed`/Python edits over full-file rewrites, read first, return useful extracted output (not full dumps), plan + execute + synthesize for multi-step work, use `call_subagent` only when the subtask deserves its own context, finish with text + no tool call, tool results are loop input, match brief language, surface errors verbatim.
+- A single legacy `<subagent>` block (named `"subagent"`, selected with `--role subagent`): 10 principles — treat the brief as the whole spec (no clarifying questions), be terse, prefer targeted `sed`/Python edits over full-file rewrites, read first, return useful extracted output (not full dumps), plan + execute + synthesize for multi-step work, spawn a nested run only when the subtask deserves its own context, finish with text + no tool call, tool results are loop input, match brief language, surface errors verbatim.
 
 ### `coding.md`: expert coding agent, minimal
 
@@ -123,9 +171,10 @@ only the load-bearing rules. Both halves are a short ruleset:
 
 - **Identity**: "expert coding agent. Be precise, minimal, and verified."
 - **Tools**: one line each — Bash as the ONLY file tool (with the
-  read/create/edit/delete command forms), media viewers, Computer
-  (outo-only), and `call_subagent` with one self-contained brief per call
-  (several calls in one response run independently).
+  read/create/edit/delete command forms), media viewers, Computer,
+  and `miniouto chat "<brief>" --style <style> --role <tag>` with one
+  self-contained brief per command (several commands run as separate,
+  independent processes).
 - **Seven rules** (outo half): follow matching skills; read before editing
   and follow project conventions; smallest change; verify with real
   commands and never fabricate; fetch web content instead of recalling it;
@@ -150,16 +199,16 @@ that is "a teammate, not a tutor." It requires the following behaviors:
   language, stop and ask on material decisions, loop until done or
   hard-blocked.
 - **PARALLEL TOOL CALLS — the actual mechanics**: a dedicated section teaching
-  the exact parallelism mechanic — when spawning N independent subagents,
-  emit ALL N `call_subagent` tool_use blocks in a **single assistant
-  response** (not one per turn, not interleaved with text or Bash calls),
-  with worked wrong/right patterns and a self-check ("count the tool_use
-  blocks; fewer than N means you serialized"). Includes when you *cannot*
+  the exact parallelism mechanic — when delegating N independent subagents,
+  issue ALL N `miniouto chat … --bg` commands **in one Bash call / one
+  assistant response** (not one per turn, not serialized), with worked
+  wrong/right patterns and a self-check ("count the delegation commands; fewer
+  than N means you serialized"). Includes when you *cannot*
   batch (true data dependencies sequence across turns) and a mirror rule for
   each named subagent's body (batch independent reads/commands of its own).
 - **Delegate-vs-DIY decision framework**: a signal table (one quick read → do
-  it yourself; multi-file/multi-step/investigative → `call_subagent`; two or
-  more independent subtasks → one batched parallel call), with an explicit
+  it yourself; multi-file/multi-step/investigative → a delegated `chat --role` run; two or
+  more independent subtasks → one batched parallel batch), with an explicit
   ban on stringing together many small direct actions to avoid delegation.
 - **Five-stage execution loop**: EXPLORE → PLAN → EXECUTE → VERIFY → LOOP,
   with a project onboarding sweep for first contact.
@@ -167,7 +216,7 @@ that is "a teammate, not a tutor." It requires the following behaviors:
   `./.miniouto/plans/<name>.md`, plus optional `CHECKPOINTS.md` and
   `DECISIONS.md` companions (mirrors Karpathy's PLAN / EXPERIMENTS / NOTES
   pattern).
-- **6-section delegation brief**: every `call_subagent(name=..., task=...)` must carry TASK, EXPECTED OUTCOME, REQUIRED TOOLS, MUST DO, MUST NOT DO, CONTEXT — the subagent has no conversation history, so the brief is its entire spec.
+- **6-section delegation brief**: every spawn brief must carry TASK, EXPECTED OUTCOME, REQUIRED TOOLS, MUST DO, MUST NOT DO, CONTEXT — a spawned run starts with no conversation history, so the brief is its entire spec.
 - **Definition of done**: an explicit checklist (build/lint/typecheck/test
   exit 0, minimal diff, plan file updated, subagent claims confirmed by
   reading changed files, parallel batches actually emitted as N tool_use
@@ -217,8 +266,8 @@ It requires the following behaviors:
   surface) — everything else is decided autonomously.
 - **PARALLEL TOOL CALLS mechanics, two flavors**: Flavor 1 — batch your own
   independent reads/commands as N tool_use blocks in one response (the
-  small-task case); Flavor 2 — parallel `call_subagent` blocks in one
-  response for large splittable work (parallel context searches with
+  small-task case); Flavor 2 — several `miniouto chat … --bg` commands issued
+  together for large splittable work (parallel context searches with
   different angles on a broad codebase, or one editor per independent site
   of a multi-site change). Ceremony on small work is the named
   anti-pattern; the self-check counts tool_use blocks after each batch.
@@ -278,10 +327,10 @@ are decided autonomously). It requires the following behaviors:
   deep-thinker for non-obvious design decisions, a validator, and a verifier.
   Stated cost: 5–8x more tokens in exchange for meaningfully better output.
 - **PARALLEL TOOL CALLS mechanics**: an expanded version of `coding-pro.md`'s
-  section — every layer's N subagents go out as N `call_subagent` calls, each
-  with one brief, in ONE assistant response (mixed-role layers like an editor
+  section — every layer's N subagents go out as N `miniouto chat --role` commands,
+  each with one brief, issued together (mixed-role layers like an editor
   + a reviewer and same-role layers like three file-pickers are both just
-  several calls), with a concrete worked example (a six-call spawn batch for
+  several calls), with a concrete worked example (a six-call delegation batch for
   "add rate limiting to the auth endpoints"), a mandatory self-check after
   every layer, and the "Handling results" contract (never wait, never poll,
   never re-ask; read the file the alarm names).
@@ -364,7 +413,7 @@ Re-seeds all bundled styles from the miniouto package (same force-refresh that `
 
 ### Skills guidance in bundled styles
 
-The larger templates (`default.md`, `coding-pro.md`, `coding-work.md`, `coding-ultra.md`) include a **Skills — MANDATORY first check** section in their `<outo>` half (immediately before the tools list) and a mirror section in each named subagent's tag body as applicable. It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from `~/.agents/skills/`) before starting any work, and — when a skill matches the work's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in the delegation brief so the subagent follows it too. The minimal `coding.md` compresses this to a single rule ("if a listed skill matches the work, read its SKILL.md and follow it") in each role's prompt. Keep some form of this guidance when authoring a custom style; it is what makes installed skills actually get used.
+The larger templates (`default.md`, `coding-pro.md`, `coding-work.md`, `coding-ultra.md`) include a **Skills — MANDATORY first check** section in their `<outo>` half (immediately before the tools list) and a mirror section in each named subagent's tag body as applicable. It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from the default roots — the project's `./skills/` and `~/.agents/skills/`) before starting any work, and — when a skill matches the work's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in the delegation brief so the subagent follows it too. The minimal `coding.md` compresses this to a single rule ("if a listed skill matches the work, read its SKILL.md and follow it") in each role's prompt. Keep some form of this guidance when authoring a custom style; it is what makes installed skills actually get used.
 
 ### Web access guidance in bundled styles
 
@@ -379,4 +428,4 @@ Just `cp ~/.miniouto/style/<name>.md some/path.md`. The file is fully self-conta
 ## Known issues
 
 1. **`continue_loop` tool is referenced but not registered.** All bundled styles mention it as the way to "send progress to the user while still planning more tool calls." The coreouto integration would need a no-op tool registered in `tools/registry.py` and added to `core/runtime.BASE_TOOLS`. Models currently improvise (often emitting a tool-shaped message with no actual call), which can confuse some coreouto versions.
-2. **Outo-only styles advertise no delegation surface.** A style with no `<name>` named-subagent tags (or with only a `<subagent>` tag and a typo elsewhere) yields zero `SubagentSpec`s, so `build_runtime` skips registering `call_subagent` entirely. The model simply has no way to delegate. If you want delegation, add at least one top-level named subagent tag.
+2. **A style with no named tags can still delegate.** `Bash` — and therefore a delegated `miniouto chat --role <tag>` run — is always registered, so an outo-only style has a working delegation surface; it just has **no roles to select**, and `--role <tag>` against it fails before the turn with `Available roles: (none)`. Add a top-level `<name>` body for each role you want `--role` to be able to pick.

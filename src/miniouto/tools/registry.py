@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import coreouto as co
 
+from .ascii_art import GLYPH_MIX
 from .bash import bash
 from .computer import (
+    ART_DEFAULT_CHARS,
     ComputerAction,
+    GlyphStyle,
     Screenshot,
     ScrollDirection,
     computer,
     computer_supported,
 )
+from .continue_session import DESCRIPTION as CONTINUE_SESSION_DESCRIPTION
+from .continue_session import continue_session
 from .media import load_audio, load_image, load_video
 
 
@@ -36,6 +41,12 @@ def register_all(api_format: str | None = None) -> None:
     _register_if_missing("Image", _image_handler, _image_schema(), _image_description())
     _register_if_missing("Video", _video_handler, _video_schema(), _video_description())
     _register_if_missing("Audio", _audio_handler, _audio_schema(), _audio_description())
+    _register_if_missing(
+        "continue_session",
+        continue_session,
+        _continue_session_schema(),
+        CONTINUE_SESSION_DESCRIPTION,
+    )
     if computer_supported():
         # parallelizable=False: the virtual screen is one shared, order-
         # sensitive resource — it must never run concurrently with another
@@ -105,6 +116,19 @@ def _audio_handler(file_path: str) -> list:
         ),
         co.AudioBlock(data=media.data, mime_type=media.mime_type),
     ]
+
+
+def _continue_session_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "summary_dir": {
+                "type": "string",
+                "description": "Folder holding the summary documents (*.md) to continue from.",
+            },
+        },
+        "required": ["summary_dir"],
+    }
 
 
 def _bash_description() -> str:
@@ -248,6 +272,9 @@ def _computer_handler(
     scroll_amount: int = 3,
     duration: float = 1.0,
     screen: str | None = None,
+    chars: int = ART_DEFAULT_CHARS,
+    color: bool = True,
+    glyph: GlyphStyle = GLYPH_MIX,
 ) -> str | list:
     if action == "screenshot" and not _SCREENSHOTS_SUPPORTED:
         return _SCREENSHOT_UNSUPPORTED
@@ -260,10 +287,18 @@ def _computer_handler(
         scroll_amount=scroll_amount,
         duration=duration,
         screen=screen,
+        chars=chars,
+        color=color,
+        glyph=glyph,
     )
     if isinstance(result, Screenshot):
         # Same multimodal contract as the media handlers above: the model
-        # must receive the pixels, not a description of them.
+        # must receive the pixels, not a description of them. `action="screen"`
+        # never lands here — it returns a plain `str` (path + art preview), so
+        # it bypasses this gate entirely and stays usable where screenshots do not.
+        # A screenshot also wrote a `.art` sibling of its capture (best effort); the
+        # `Saved to:` line shape `screen` uses is the hook the TUI renders from.
+        saved = f"\nSaved to: {result.art_path}" if result.art_path else ""
         return [
             co.TextBlock(
                 text=(
@@ -271,6 +306,7 @@ def _computer_handler(
                     f"({result.width}x{result.height} pixels). "
                     "Click coordinates for the next action refer to this "
                     "image; (0, 0) is the top-left corner."
+                    f"{saved}"
                 )
             ),
             co.ImageBlock(data=result.data, mime_type=result.mime_type),
@@ -298,6 +334,19 @@ def _computer_description() -> str:
         "with several, omitting it is an error. "
         "Actions and their fields: "
         "screenshot: capture the screen; you receive the image itself. "
+        "screen: render the CURRENT screen as Unicode sub-cell art, written "
+        "to a `.art` file; you get the file path plus a short text preview of "
+        "it. Use it when you cannot receive images at all — it is text, so it "
+        "works where `screenshot` cannot. `chars` sets the art width in "
+        "terminal cells (default 100, clamped 16..200; larger = finer detail "
+        "and a taller file), `color=false` drops the colour escapes for a "
+        "plain luminance ramp, `glyph` picks the sub-cell glyph family: "
+        "\"mix\" (default) uses solid block octants for crisp colour "
+        "regions and braille dots where colours blend, \"braille\" forces "
+        "dots everywhere (for fonts with no block-octant coverage), "
+        "\"octant\" forces blocks. `cat` the file for the full art. Click "
+        "coordinates still come from `screenshot` — art carries no clickable "
+        "coordinates. "
         "launch: start a GUI app (text = command line, e.g. \"firefox\" "
         "or \"code --new-window\"). One app per screen — close_app "
         "before launching another on the same screen, or spawn a new "
@@ -326,8 +375,8 @@ def _computer_description() -> str:
         "kill: tear down a screen and its app (screen = id). "
         "list: show every screen with its size, app pid, and attach env "
         "vars. "
-        "Requires a vision-capable model: screenshots are returned as "
-        "image content."
+        "Requires a vision-capable model for `screenshot` (it returns the "
+        "pixels); the `screen` action is the text-only fallback."
     )
 
 
@@ -338,6 +387,7 @@ def _computer_schema() -> dict:
             "action": {
                 "enum": [
                     "screenshot",
+                    "screen",
                     "launch",
                     "close_app",
                     "mouse_move",
@@ -371,6 +421,20 @@ def _computer_schema() -> dict:
             "scroll_direction": {"enum": ["up", "down", "left", "right"]},
             "scroll_amount": {"type": "integer"},
             "duration": {"type": "number"},
+            "chars": {
+                "type": "integer",
+                "description": "screen action: art width in terminal cells (16..200, default 100).",
+            },
+            "color": {
+                "type": "boolean",
+                "description": "screen action: truecolour sub-cells (default) vs plain ramp.",
+            },
+            "glyph": {
+                "enum": ["mix", "octant", "braille"],
+                "description": "screen action: sub-cell glyph family — mix (default) uses "
+                "block octants for crisp regions and braille dots for blends; "
+                "braille is for fonts with no Unicode-16 octant coverage.",
+            },
             "screen": {
                 "type": "string",
                 "description": "Target screen id (from spawn/list).",

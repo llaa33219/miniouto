@@ -23,7 +23,7 @@ from typing import Any
 import coreouto as co
 import pytest
 
-from miniouto.core import repetition, subagents
+from miniouto.core import inbox, repetition
 from miniouto.core import runtime as rt
 from miniouto.core.providers import API_STALL_TIMEOUT_SECONDS
 
@@ -253,7 +253,6 @@ def test_supervised_run_force_stops_the_loop_and_resumes_with_the_alarm(
             "do the work",
             None,
             live_key="outo",
-            level=0,
             on_wakeup=lambda *_args: None,
             restart_on_repetition="outo",
             on_repetition=lambda verdict, alarm: repeats.append((verdict, alarm)),
@@ -268,7 +267,7 @@ def test_supervised_run_force_stops_the_loop_and_resumes_with_the_alarm(
     assert histories[1] == live
     assert repeats[0][0].kind == "tool"
     assert repeats[0][1] == repetition.alarm_text(repeats[0][0])
-    assert repeats[0][1].startswith(subagents.ALARM_HEADER)
+    assert repeats[0][1].startswith(inbox.ALARM_HEADER)
     assert rt._ACTIVE_SUPERVISORS == {}
 
 
@@ -298,8 +297,7 @@ def test_repeating_restarts_are_exhausted_without_touching_the_stall_counter(
                 "do the work",
                 None,
                 live_key="outo",
-                level=0,
-                on_wakeup=lambda *_args: None,
+                    on_wakeup=lambda *_args: None,
                 restart_on_repetition="outo",
                 states=_states(silent=API_STALL_TIMEOUT_SECONDS * 10),
             )
@@ -320,46 +318,6 @@ def test_loop_repeated_error_is_not_a_loop_cancelled_error() -> None:
     assert not issubclass(rt.LoopRepeatedError, rt.LoopCancelledError)
     assert not isinstance(rt.LoopRepeatedError(), rt.LoopCancelledError)
     assert not issubclass(rt.LoopStalledError, rt.LoopCancelledError)
-
-
-def test_a_looping_background_job_is_cancelled_and_never_restarted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Given: a live background job whose sid is the actor key, and a
-    # cancel_job that records the call instead of touching a real job
-    cancels: list[tuple[str, str]] = []
-    monkeypatch.setattr(subagents, "is_running", lambda sid: sid == "abc123")
-    monkeypatch.setattr(
-        subagents,
-        "cancel_job",
-        lambda sid, reason="cancelled": bool(cancels.append((sid, reason))),
-    )
-    # A hook polls the policy on every tool call, so polling a job that has
-    # not tripped must not touch its counters
-    for i in range(repetition.REPEAT_TOOL_THRESHOLD):
-        repetition.note_tool_call("abc123", "Bash", dict(TOOL_ARGS))
-        verdict = repetition.cancel_background_loop("abc123")
-        if i < repetition.REPEAT_TOOL_THRESHOLD - 1:
-            assert verdict is None
-            assert cancels == []
-
-    # Then: the job is cancelled with a repetition reason, and the verdict
-    # is consumed so the job cannot be "restarted" anywhere
-    assert verdict is not None
-    assert verdict.kind == "tool"
-    assert len(cancels) == 1
-    assert cancels[0][0] == "abc123"
-    assert "repetition" in cancels[0][1]
-    assert repetition.check("abc123") is None
-
-    # And a supervised actor is left strictly alone — its verdict stays
-    # sticky for supervised_run to poll and resume
-    for _ in range(repetition.REPEAT_PHRASE_THRESHOLD):
-        repetition.note_text("outo", f"{PHRASE}.")
-    assert repetition.check("outo") is not None
-    assert repetition.cancel_background_loop("outo") is None
-    assert cancels == [cancels[0]]
-    assert repetition.check("outo") is not None
 
 
 class _BoomError(RuntimeError):
@@ -395,7 +353,6 @@ def test_a_phrase_loop_force_stops_a_parked_attempt_and_resumes_with_the_alarm(
             "do the work",
             None,
             live_key="outo",
-            level=0,
             on_wakeup=lambda *_args: None,
             restart_on_repetition="outo",
             on_repetition=lambda verdict, alarm: repeats.append((verdict, alarm)),
@@ -409,7 +366,7 @@ def test_a_phrase_loop_force_stops_a_parked_attempt_and_resumes_with_the_alarm(
     assert prompts == ["do the work", repeats[0][1]]
     assert repeats[0][0].kind == "phrase"
     assert repeats[0][1] == repetition.alarm_text(repeats[0][0])
-    assert repeats[0][1].startswith(subagents.ALARM_HEADER)
+    assert repeats[0][1].startswith(inbox.ALARM_HEADER)
     assert rt._ACTIVE_SUPERVISORS == {}
 
 
@@ -438,7 +395,6 @@ def test_a_trip_wakes_the_supervisor_without_waiting_for_the_poll(
             "do the work",
             None,
             live_key="outo",
-            level=0,
             on_wakeup=lambda *_args: None,
             restart_on_repetition="outo",
             states=_states(),
@@ -475,8 +431,7 @@ def test_a_crashed_attempt_propagates_even_with_a_pending_verdict(
                 "do the work",
                 None,
                 live_key="outo",
-                level=0,
-                on_wakeup=lambda *_args: None,
+                    on_wakeup=lambda *_args: None,
                 restart_on_repetition="outo",
                 states=_states(),
             )
@@ -648,7 +603,6 @@ def test_a_stall_restart_opens_a_fresh_phrase_run(
             "do the work",
             None,
             live_key="outo",
-            level=0,
             on_wakeup=lambda *_args: None,
             restart_on_repetition="outo",
             states=_states(silent=API_STALL_TIMEOUT_SECONDS * 10),
@@ -670,14 +624,14 @@ def test_alarm_texts_are_exact_in_english() -> None:
 
     # Then: the delivered text is the shared contract, verbatim
     assert repetition.alarm_text(phrase) == (
-        f"{subagents.ALARM_HEADER}\n"
+        f"{inbox.ALARM_HEADER}\n"
         "Repetition detected: the same phrase has been repeated >= 50 times. "
         "The loop was force-stopped and is being resumed. Continue the work, "
         "but proceed with a DIFFERENT pattern or approach instead of repeating "
         "the same wording."
     )
     assert repetition.alarm_text(tool) == (
-        f"{subagents.ALARM_HEADER}\n"
+        f"{inbox.ALARM_HEADER}\n"
         "Repetition detected: the same tool call has been issued >= 30 times. "
         "The loop was force-stopped and is being resumed. Continue the work "
         "differently — if repeating the same action is not producing progress, "

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+
 import typer
 from rich.console import Console
 
 from .. import paths_runtime
 from ..storage import paths
+from . import computer as computer_module
+from . import message as message_module
 from . import provider as provider_module
 from . import skill as skill_module
 from . import style as style_module
@@ -14,7 +18,45 @@ from . import subagent as subagent_module
 from . import tui as tui_module
 from .chat import chat_cmd
 
-app = typer.Typer(
+# `--return` is the ONE flag whose value is optional: `--return` alone means
+# "the default path". Every other option demands its value, so that a command
+# line typed into a Bash tool is idempotent — it never reads ambient state
+# (`settings.session`, the default style) to fill in what was left out.
+_OPTIONAL_VALUE_FLAGS = frozenset({"--return"})
+
+
+def _expand_bare_value_flags(argv: list[str]) -> list[str]:
+    """Rewrite a bare `--return` to click's `--flag=` spelling.
+
+    Click treats `--flag <value>` as demanding that value, so the bare form
+    would be a usage error, and typer drops click's own `flag_value` support.
+    Only a following token starting with `-` (or nothing at all) counts as "no
+    value", so an ordinary path or session name is never swallowed.
+    """
+
+    expanded: list[str] = []
+    for index, token in enumerate(argv):
+        following = argv[index + 1] if index + 1 < len(argv) else ""
+        if token in _OPTIONAL_VALUE_FLAGS and (not following or following.startswith("-")):
+            token = f"{token}="
+        expanded.append(token)
+    return expanded
+
+
+class _App(typer.Typer):
+    """The root app, with the optional-value flag grammar applied on entry.
+
+    `miniouto` and `python -m miniouto` both go through `__call__`, so this is
+    the one seam that sees argv before click parses it.
+    """
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        if args:
+            return super().__call__(*(_expand_bare_value_flags(list(args[0])), *args[1:]), **kwargs)
+        return super().__call__(_expand_bare_value_flags(sys.argv[1:]), **kwargs)
+
+
+app = _App(
     name="miniouto",
     help="A minimal, file-driven CLI agent harness built on coreouto.",
     no_args_is_help=False,
@@ -25,6 +67,8 @@ app.add_typer(provider_module.app, name="provider")
 app.add_typer(style_module.app, name="style")
 app.add_typer(skill_module.app, name="skill")
 app.add_typer(subagent_module.app, name="subagent")
+app.add_typer(message_module.app, name="message")
+app.add_typer(computer_module.app, name="computer")
 app.command("chat", help="Run a single chat turn.")(chat_cmd)
 
 console = Console()
@@ -80,6 +124,7 @@ def status() -> None:
         (here_names if cwd == here else other_names).append(name)
     console.print(f"[bold]Sessions (this directory):[/bold] {', '.join(here_names) or '-'}")
     console.print(f"[bold]Sessions (other):[/bold]       {', '.join(other_names) or '-'}")
+
 
 
 if __name__ == "__main__":
