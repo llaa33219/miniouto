@@ -2,7 +2,7 @@
 
 Pure stdlib on purpose. py-Vwayland exposes a compositor screenshot ONLY as
 `Image.png_bytes`, and Pillow is deliberately not a miniouto dependency (the
-project pins eight packages and anything more needs discussion), so this
+project's dependency list is deliberately short and anything more needs discussion), so this
 module is the decoder. It must therefore import nothing from `miniouto` and
 nothing from coreouto: the tools layer rule is that only
 `tools/registry.py` speaks coreouto, and `tools/computer.py` (the caller) sits

@@ -298,6 +298,10 @@ def _computer_handler(
         # it bypasses this gate entirely and stays usable where screenshots do not.
         # A screenshot also wrote a `.art` sibling of its capture (best effort); the
         # `Saved to:` line shape `screen` uses is the hook the TUI renders from.
+        png = f"\nImage saved to: {result.png_path}" if result.png_path else ""
+        # The `.art` line stays LAST: it is the older, documented hook the
+        # TUI keys on, and an art line after the png line keeps the pair
+        # readable top-down (raw image first, then the text render).
         saved = f"\nSaved to: {result.art_path}" if result.art_path else ""
         return [
             co.TextBlock(
@@ -306,7 +310,7 @@ def _computer_handler(
                     f"({result.width}x{result.height} pixels). "
                     "Click coordinates for the next action refer to this "
                     "image; (0, 0) is the top-left corner."
-                    f"{saved}"
+                    f"{png}{saved}"
                 )
             ),
             co.ImageBlock(data=result.data, mime_type=result.mime_type),

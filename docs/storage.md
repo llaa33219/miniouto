@@ -31,6 +31,7 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 │   └── <id>.log                  # that run's stdout+stderr (only for --bg)
 ├── computer-screens/
 │   └── <screen>-<YYYY-MM-DD-HH-MM-SS>.art   # screen captures from the Computer tool
+│       (+ matching .png siblings for screenshots)  # newest 100 files kept (MAX_CAPTURE_FILES), oldest pruned per write
 │                                         # (action="screen"; action="screenshot" writes the
 │                                         # same art best-effort as a sibling of its capture)
 └── logs/                         # reserved (currently unused by code)
@@ -131,7 +132,7 @@ This file is the **global default** half of the resolution chain — what a sess
 
 ### `session-config/<session>.toml`
 
-One file per session: the provider config that session is pinned to.
+One file per session: the config that session is pinned to.
 
 ```toml
 provider = "openai"
@@ -140,6 +141,7 @@ reasoning = "high"
 subagent_provider = ""     # empty = follow the global default at read time
 subagent_model = ""
 subagent_reasoning = ""
+style = "coding-work"      # the style this session runs under
 ```
 
 Semantics (`storage/session_config.py`):
@@ -149,7 +151,9 @@ Semantics (`storage/session_config.py`):
 - **Freeze at first use.** `effective(session, default=…)` materializes the pin: a session with no file gets the current global default written as its pin and that value returned. A model switch made by the TUI in another process can never redirect a session that is already running.
 - **Seeding is copy-if-absent.** `seed_from(new, source)` copies a source session's pin into a freshly minted one — a delegated run's `chat-`/`spawn-` name, a summary hand-off's `cont-*` name, the TUI's "new session". A session that already carries a pin keeps it, and a source with no pin seeds nothing (the new session freezes the default itself).
 - Writes are atomic (tmp + `os.replace`), and a **corrupt pin is treated as absent**, not raised over — the session simply follows the default again (the same tolerance `sessions.load` applies).
-- Nothing else writes here. A TUI edit writes the pin **and** the global default at once (`cli/tui.py:_persist_trio`), so the edit survives a later default change while the newest choice still reaches other processes and the next session.
+- Nothing else writes here. A TUI **provider/model** edit writes the pin **and** the global default at once (`cli/tui.py:_persist_trio`), so the edit survives a later default change while the newest choice still reaches other processes and the next session. A TUI **style** edit goes through `core/runtime.py:set_active_style`, which writes the pin of the session making the change AND the global default, after freezing the existing sessions' styles into their own pins — so the last style chosen is the default for the next session, and the sessions already running keep the style they are on.
+- The **style** key resolves as: explicit `--style` > this session's pin > the global `settings.style` > `"default"`. It is pinned like the model, for the same reason.
+- **Choosing a style makes it the default AND leaves the running sessions alone.** `core/runtime.py:set_active_style` (the TUI's style picker and `miniouto style set` both call it) writes the global default and then freezes the style of every EXISTING session into that session's own pin (`freeze_style` — the `style` key only, never the provider trio). A session that already pins a style keeps it; one without a pin freezes the style it was running under. The new default therefore applies to sessions started from now on, and never to a conversation already under way.
 
 The `Settings` dataclass in `storage/settings.py` exposes `merge(overrides) -> Settings` — non-empty/non-None override values win. `to_dict()` drops empty values (same rule as `Provider`). Because `merge()`/`update()` skip empty strings, the `subagent_*` keys cannot be *cleared* through `update()` — `cli/subagent.py`'s `clear` command uses `save(replace(load(), subagent_provider="", subagent_model="", subagent_reasoning=""))` instead (and `set --reasoning ""` does the same for the reasoning key alone).
 

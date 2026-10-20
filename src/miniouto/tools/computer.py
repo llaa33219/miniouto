@@ -48,6 +48,7 @@ rendering live in `tools/ascii_art.py` (pure stdlib).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import re
@@ -109,6 +110,13 @@ ART_MIN_CHARS = 16
 ART_MAX_CHARS = 200
 ART_DEFAULT_CHARS = 100
 
+# Captures are display artifacts, not archives: a GUI-driving agent can take
+# hundreds of screenshots a session, and each is a `.png` (~1 MB) plus a
+# `.art` (~40 KB). Without a cap the directory grows without bound, so after
+# every write the oldest pairs are pruned — the same newest-wins discipline
+# as the session inbox (`core/inbox.py:MAX_INBOX_MESSAGES`).
+MAX_CAPTURE_FILES = 100
+
 # The tool-result cap is 4000 chars; the `screen` result reserves the rest for
 # the path, the header lines and the closing line.
 _ART_RESULT_LIMIT = 3800
@@ -152,6 +160,10 @@ class Screenshot:
     produced). The registry appends a `Saved to: <path>` line for it, which is
     the hook the TUI keys on to render the screen inline — the exact same line
     shape the `screen` action emits.
+
+    `png_path` is the raw PNG written next to the `.art` (also best effort):
+    the TUI's graphics-capable path renders THAT inline (Kitty TGP / Sixel
+    via textual-image) where `.art` is only the fallback.
     """
 
     data: bytes
@@ -159,6 +171,7 @@ class Screenshot:
     height: int
     mime_type: str = field(default="image/png")
     art_path: Path | None = None
+    png_path: Path | None = None
 
 
 class ComputerUseError(Exception):
@@ -382,6 +395,7 @@ def _dispatch(
             data=img.png_bytes,
             width=img.width,
             height=img.height,
+            png_path=_write_png_best_effort(img.png_bytes, sid),
             art_path=_write_art_best_effort(img.png_bytes, sid, chars, color, glyph),
         )
 
@@ -588,6 +602,9 @@ def _write_art(
     result, art_text, path = _render_screen_art(png_bytes, sid, chars, color, glyph)
     COMPUTER_SCREENS_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(art_text, encoding="utf-8")
+    # Pruning is housekeeping: it must never cost the capture.
+    with contextlib.suppress(Exception):
+        _prune_captures()
     return result, path
 
 
@@ -602,6 +619,52 @@ def _write_art_best_effort(
     """
     try:
         _result, path = _write_art(png_bytes, sid, chars, color, glyph)
+    except Exception:
+        return None
+    return path
+
+
+def _prune_captures() -> None:
+    """Keep only the newest `MAX_CAPTURE_FILES` capture files in the screens dir.
+
+    `.art` and `.png` are one pool: they share a stem, so pruning oldest-first
+    by name (the timestamp is in the name) retires a capture's two siblings
+    together. Best effort like the writes themselves — an unlink failure is
+    skipped, never raised into a tool call.
+    """
+
+    try:
+        files = sorted(COMPUTER_SCREENS_DIR.glob("*.*"))
+        doomed = files[: max(len(files) - MAX_CAPTURE_FILES, 0)]
+        for path in doomed:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+def _write_png_best_effort(png_bytes: bytes, sid: str) -> Path | None:
+    """The raw-PNG sibling for a `screenshot`, or None when it could not be made.
+
+    Same best-effort contract as the `.art` write: the pixels are already the
+    tool result, so a filesystem problem costs the sibling file, never the
+    capture. The TUI's graphics lane reads this file; the fallback lane reads
+    the `.art`. The name mirrors the `.art` name (same screen id + timestamp
+    second) so a directory listing pairs them; the art write immediately
+    follows and shares the second, so the pair only splits at a same-second
+    boundary failure, which costs nothing but an unmatched file.
+    """
+    try:
+        COMPUTER_SCREENS_DIR.mkdir(parents=True, exist_ok=True)
+        path = (
+            COMPUTER_SCREENS_DIR
+            / f"{_safe_file_part(sid)}-{datetime.now():%Y-%m-%d-%H-%M-%S}.png"
+        )
+        # No prune here: a `screenshot` is always followed by its `.art`
+        # write in `_dispatch`, which prunes the pair.
+        path.write_bytes(png_bytes)
     except Exception:
         return None
     return path

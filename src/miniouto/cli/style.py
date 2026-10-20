@@ -29,12 +29,19 @@ def list_cmd() -> None:
 
 @app.command("set")
 def set_cmd(name: str) -> None:
-    """Activate an installed style as the default."""
+    """Activate an installed style as the default.
+
+    The style becomes the default for sessions started from now on, and the
+    sessions that already exist keep the style they are running under
+    (their pin freezes it) — the same rule the TUI's style picker follows.
+    """
 
     if style_store.read(name) is None:
         console.print(f"[red]✗[/red] Style [bold]{name}[/bold] is not installed.")
         raise typer.Exit(code=1)
-    settings_store.update(style=name)
+    from ..core.runtime import set_active_style
+
+    set_active_style(name)
     console.print(f"[green]✓[/green] Active style is now [bold]{name}[/bold].")
 
 

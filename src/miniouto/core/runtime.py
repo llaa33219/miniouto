@@ -1255,7 +1255,43 @@ def default_provider_config() -> session_config.ProviderConfig:
         subagent_provider=s.subagent_provider,
         subagent_model=s.subagent_model,
         subagent_reasoning=s.subagent_reasoning,
+        # The style is part of the default a session with no pin freezes
+        # into its own pin — without this a fresh session would freeze an
+        # empty style and ignore the default it was supposed to start with.
+        style=s.style or "",
     )
+
+
+def set_active_style(style: str, *, session: str | None = None) -> str:
+    """Make `style` the default, and keep the running sessions on their own.
+
+    This is the ONE place a style becomes "the default", shared by the TUI
+    picker and `miniouto style set`, so both behave identically:
+
+    1. the global default (`settings.style`) becomes `style` — a session
+       that starts NOW runs it;
+    2. every session that already exists FREEZES the style it was running
+       under into its own pin, so a default change cannot move a
+       conversation the user is already in;
+    3. the session named by `session` (the one making the change) is pinned
+       to `style` outright.
+
+    The provider trio is NOT touched: a model change is meant to be the
+    newest default for everyone, but a style is per-conversation, and the
+    pin is what keeps an old conversation on the style it was started with.
+    """
+
+    from ..storage import sessions as session_store
+
+    previous = settings_store.load().style or "default"
+    # Freeze BEFORE the default moves: the sessions that exist now keep the
+    # style they are running under.
+    for name in session_store.list_sessions():
+        session_config.freeze_style(name, previous)
+    if session:
+        session_config.set_fields(session, style=style)
+    settings_store.update(style=style)
+    return style
 
 
 def _pinned_for(s: settings_store.Settings) -> session_config.ProviderConfig:
@@ -1305,10 +1341,16 @@ def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> Run
 
     subagent_provider, subagent_model = _resolve_subagent(overrides, s, pinned)
 
+    # The STYLE is pinned like the model: an explicit `--style` wins, then
+    # this session's own pin, then the global default. Without the pin, a
+    # style chosen for one session would follow the user into the next one
+    # through `settings.style` — the leak this key exists to stop.
+    style_name = overrides.style or pinned.style or s.style or "default"
+
     return RuntimeConfig(
         provider_name=provider_name,
         model=model,
-        style_name=overrides.style or s.style or "default",
+        style_name=style_name,
         role=overrides.role or None,
         session=s.session or "default",
         reasoning=pinned.reasoning or None,

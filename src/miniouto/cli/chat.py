@@ -771,8 +771,6 @@ def chat_cmd(
     else:
         turn_prompt = prompt
 
-    style_name = style or s.style or "default"
-    _validate_role(role, style_name)
     override = _parse_pm(pm) if pm is not None else None
     provider = override.provider if override else None
     model = override.model if override else None
@@ -781,6 +779,15 @@ def chat_cmd(
     session_name = _resolve_session(
         name, continue_session=continue_session, bg=bg, s=s
     )
+
+    # The STYLE is pinned per session, like the model: an explicit `--style`
+    # wins, then this session's pin, then the global default. Reading the
+    # pin here (not `effective`) keeps the lookup side-effect free — the
+    # pin is frozen later, by the run itself.
+    pinned_style = (session_config.read(session_name) or session_config.EMPTY).style
+    style_name = style or pinned_style or s.style or "default"
+    _validate_role(role, style_name)
+
     if alarms and not session_store.path_for(session_name).exists():
         raise _fail(f"nothing to wake: session '{session_name}' does not exist")
     # Drained here, not inside the turn: an inbox with nothing in it means no

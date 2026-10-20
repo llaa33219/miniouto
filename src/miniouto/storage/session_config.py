@@ -54,12 +54,18 @@ FIELDS = (
     "subagent_provider",
     "subagent_model",
     "subagent_reasoning",
+    "style",
 )
 
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    """One session's six provider keys; empty string = follow the default."""
+    """One session's pinned keys; empty string = follow the default.
+
+    The six provider keys plus `style`: the STYLE a session runs under is
+    pinned the same way the model is, so a style chosen for one session
+    cannot leak into the next one through the global default.
+    """
 
     provider: str = ""
     model: str = ""
@@ -67,6 +73,7 @@ class ProviderConfig:
     subagent_provider: str = ""
     subagent_model: str = ""
     subagent_reasoning: str = ""
+    style: str = ""
 
     def as_dict(self) -> dict[str, str]:
         return {k: v for k, v in asdict(self).items() if v}
@@ -114,6 +121,25 @@ def effective(
     pinned = (default or (lambda: EMPTY))()
     _save(session, pinned)
     return pinned
+
+
+def freeze_style(session: str, style: str) -> None:
+    """Pin `style` for `session` so a later default change cannot move it.
+
+    Only the STYLE key is touched: the provider trio stays as it is. A
+    session that already pins a style keeps it (the pin wins); a session
+    without one gets the style it was running under, frozen.
+
+    This is what makes "the style you last chose is the default, and the
+    sessions you were already in keep theirs" true at the same time.
+    """
+
+    if not style:
+        return
+    current = read(session)
+    if current is not None and current.style:
+        return  # already pinned: the session's own choice stands
+    set_fields(session, style=style)
 
 
 def set_fields(session: str, **fields: str) -> ProviderConfig:

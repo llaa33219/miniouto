@@ -43,6 +43,7 @@ from textual.selection import Selection
 from textual.strip import Strip
 from textual.theme import Theme
 from textual.timer import Timer
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Footer,
@@ -57,7 +58,7 @@ from textual.widgets import (
 
 from .. import __version__, paths_runtime
 from ..core import context as context_api
-from ..core import inbox, summary
+from ..core import inbox, runtime, summary
 from ..core import lma as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import STREAM_THINKING, LoopEvent
@@ -432,6 +433,132 @@ def art_path_in_result(result: str) -> str | None:
 
     match = _ART_SAVED_RE.search(result)
     return match.group("path") if match else None
+
+
+# A `screenshot` result ALSO names the raw PNG written next to the `.art`
+# (tools/registry.py appends `Image saved to: …`); on a graphics-capable
+# terminal that file is what the row renders and the `.art` is the fallback.
+_PNG_SAVED_RE = re.compile(r"Image saved to:\s*(?P<path>\S+\.png)\s*$", re.MULTILINE)
+
+
+def png_path_in_result(result: str) -> str | None:
+    """The raw-PNG path a Computer `screenshot` result names, or None."""
+
+    match = _PNG_SAVED_RE.search(result)
+    return match.group("path") if match else None
+
+
+# ── terminal graphics mode ──────────────────────────────────────────────────
+#
+# The mode is decided ONCE, BEFORE Textual starts: the probe reads the
+# terminal's reply to an escape query from stdin, and Textual's own reader
+# thread takes stdin over the moment the app runs — after that the reply is
+# never seen and the probe just burns its timeout. So the check belongs here,
+# not in the render path.
+#
+# `TEXT`     — the `.art` truecolour text render (always available)
+# `TGP`      — Kitty's Terminal Graphics Protocol (pixel-exact images)
+# `SIXEL`    — the Sixel graphics protocol
+#
+# The mode is a module-level value, set by `detect_graphics_mode()` and
+# read by the render path. A failed probe (no package, no tty, a dead
+# stdout, a timeout) is TEXT — the unchanged fallback, never an error.
+GRAPHICS_MODE_TEXT = "text"
+GRAPHICS_MODE_TGP = "tgp"
+GRAPHICS_MODE_SIXEL = "sixel"
+
+_GRAPHICS_MODE: str | None = None
+
+# The image widget classes, imported during detection (not at render time):
+# they pull in Pillow, and the render path must not pay for an import while
+# the user waits for a screenshot to appear.
+_IMAGE_WIDGETS: dict[str, Any] = {}
+
+
+def detect_graphics_mode() -> str:
+    """Probe the terminal ONCE and pick the graphics mode.
+
+    Call this BEFORE Textual starts (see `run_tui`). The probe asks the
+    terminal whether it speaks TGP or Sixel and reads the answer off stdin;
+    Textual's own reader thread takes stdin over the moment the app runs, and
+    after that the answer is never seen — the probe then only burns its
+    2-second timeout. So the check belongs here, not in the render path.
+
+    Returns `GRAPHICS_MODE_TGP` for Kitty-style graphics, `GRAPHICS_MODE_SIXEL`
+    for Sixel, and `GRAPHICS_MODE_TEXT` when neither is available (also the
+    result of ANY failure — a missing textual-image, a piped stdout, a
+    timeout, an unparsable reply). The result is cached for the process.
+
+    **Sixel wins when the terminal offers both.** TGP is the better protocol,
+    but its "image placement" scheme needs a terminal that implements the
+    placeholder protocol properly, and several terminals only *report* TGP
+    support (the query is answered) without implementing it — Konsole and
+    wezterm are the known cases, and there the TGP image never appears.
+    Sixel is a plain byte stream that any Sixel terminal renders, so it is
+    the safe choice whenever it is available. Only a terminal with Sixel
+    *absent* gets TGP — in practice Kitty, which is exactly the terminal
+    that implements the placeholder scheme properly. (textual-image's own
+    auto-renderable picks Sixel first for the same reason.)
+
+    When a graphics mode is found, the image widget is imported HERE too:
+    it pulls in Pillow (~0.3 s), and paying that during boot is better than
+    paying it on the first screenshot the user is waiting for.
+    """
+
+    global _GRAPHICS_MODE
+    if _GRAPHICS_MODE is not None:
+        return _GRAPHICS_MODE
+    mode = GRAPHICS_MODE_TEXT
+    try:
+        from textual_image._terminal import probe_terminal
+
+        caps = probe_terminal()
+        if caps.sixel:
+            mode = GRAPHICS_MODE_SIXEL
+        elif caps.tgp:
+            mode = GRAPHICS_MODE_TGP
+    except Exception:
+        # No textual-image, no tty, a closed stdout, a timeout: the text
+        # lane is the answer, and it is always available.
+        _GRAPHICS_MODE = GRAPHICS_MODE_TEXT
+        return _GRAPHICS_MODE
+    if mode != GRAPHICS_MODE_TEXT:
+        try:
+            # Warm the import now (PIL + the widget classes) so the first
+            # screenshot renders without an import stall.
+            from textual_image.widget import SixelImage
+
+            from .graphics import CachedTGPImage
+
+            # TGP gets the cached widget: the stock one re-uploads the whole
+            # image on every repaint (see cli/graphics.py). Sixel keeps the
+            # stock widget — it caches its encoded sixels itself.
+            _IMAGE_WIDGETS[GRAPHICS_MODE_TGP] = CachedTGPImage
+            _IMAGE_WIDGETS[GRAPHICS_MODE_SIXEL] = SixelImage
+        except Exception:
+            mode = GRAPHICS_MODE_TEXT
+            _IMAGE_WIDGETS.clear()
+    _GRAPHICS_MODE = mode
+    return mode
+
+
+def graphics_mode() -> str:
+    """The graphics mode for the render path — NEVER probes.
+
+    The probe is a terminal round-trip, and doing it lazily here (i.e.
+    after Textual has started) is exactly the stall this design avoids. So
+    this reads the detected mode and reports TEXT when detection never ran:
+    an undetected terminal is treated as a non-graphics one, which is the
+    safe, always-available lane.
+    """
+
+    return _GRAPHICS_MODE or GRAPHICS_MODE_TEXT
+
+
+def terminal_graphics_supported() -> bool:
+    """True when the terminal can show REAL graphics (Kitty TGP or Sixel)."""
+
+    return graphics_mode() != GRAPHICS_MODE_TEXT
 
 
 # Tolerance (lines) for "the log is at the bottom". Sub-pixel scroll
@@ -1792,6 +1919,9 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
         self._expanded = False
         self._tool_name = tool_name
         self._unbounded_result = unbounded_result
+        self._image_widget: Widget | None = None
+        self._image_failed = False
+        self._image_visible = False
 
     @property
     def tool_name(self) -> str | None:
@@ -1824,7 +1954,9 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
                 (self._header, ""),
                 (" ✗", f"bold {theme.error}") if self._is_error else ("", ""),
             )
+            self._image_visible = False
             self.update(header)
+            self._sync_image_display()
             return
         pieces: list[tuple[str, str]] = [
             self._glyph_piece(EXPANDED_GLYPH, glyph_style),
@@ -1846,9 +1978,13 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
             if art is not None:
                 body.append("\n")
                 body.append_text(art)
+            self._image_visible = art is not None and self._image_widget is not None
             self.update(body)
+            self._sync_image_display()
             return
+        self._image_visible = False
         self.update(Text.assemble(*pieces))
+        self._sync_image_display()
 
     def _result_text(self) -> str:
         """The result with any SGR stripped.
@@ -1876,8 +2012,23 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
         the filesystem on load.
         """
 
+        if self._tool_name != "Computer":
+            return None
+        # A graphics-capable terminal renders the raw PNG inline instead of
+        # the unicode art; the widget carries the pixels, this Text keeps the
+        # caption. Any failure (no png sibling, import error, decode error)
+        # falls through to the `.art` below — the current behavior. The gate
+        # is the PNG line: a `screen` action writes only the `.art`, so it
+        # always renders as text art, image-capable terminal or not.
+        #
+        # The PNG is checked BEFORE the `.art`: a capture whose art file
+        # could not be written (a full disk, a read-only home) still has its
+        # pixels, and those are exactly what the graphics lane shows.
+        png = png_path_in_result(self._result or "")
+        if png is not None and self._mount_screen_image():
+            return Text(f"── screen image ({png}) ──", style="dim")
         path = art_path_in_result(self._result or "")
-        if path is None or self._tool_name != "Computer":
+        if path is None:
             return None
         try:
             art = ascii_art.parse_art(Path(path).read_text(encoding="utf-8"))
@@ -1893,6 +2044,100 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
                 f"\n… {hidden} more rows (miniouto computer show {path})", style="dim"
             )
         return block
+
+    def _mount_screen_image(self) -> bool:
+        """Mount the screenshot's raw PNG as real graphics; False = caller falls back.
+
+        The image is mounted as a SIBLING row in the log, right after this
+        row — NOT as a child of it. Two reasons, both found by rendering the
+        real app:
+
+        * A child widget is laid out at the TOP of the parent's content
+          area, which is exactly where the parent's own text is — the
+          caption and the image would be drawn ON TOP OF EACH OTHER.
+        * A `Static` with ANY child becomes a container, and a container
+          whose only child is `display: none` computes its auto height as
+          ZERO — so hiding the image collapsed the whole row out of
+          existence instead of just hiding the picture.
+
+        As a sibling row, the image has its own line, and hiding it leaves
+        the text row's height alone.
+
+        Gate order, cheapest first: the row must be a Computer row whose
+        result names a PNG sibling, the terminal must actually do TGP/Sixel
+        (the DETECTED mode — the render path never probes), and the image
+        widget must build (PIL decode, size maths). ANY failure is a no-op
+        False: the `.art` text render is the unchanged fallback.
+        """
+
+        if self._tool_name != "Computer":
+            return False
+        try:
+            attached = self.is_attached
+        except Exception:
+            # No app context (a unit test, a half-torn-down app): mounting is
+            # impossible, which is exactly the fallback signal.
+            return False
+        if not attached:
+            return False
+        png = png_path_in_result(self._result or "")
+        if png is None:
+            return False
+        if self._image_widget is not None:
+            return True
+        if self._image_failed:
+            return False
+        mode = graphics_mode()
+        if mode == GRAPHICS_MODE_TEXT:
+            # No graphics terminal: the `.art` text lane, unchanged.
+            return False
+        widget_class = _IMAGE_WIDGETS.get(mode)
+        if widget_class is None:
+            # Detection never ran, or it found no graphics: the text lane.
+            return False
+        try:
+            # The widget class follows the DETECTED mode, so the renderer and
+            # the probe can never disagree about the protocol.
+            widget = widget_class(Path(png))
+            # The image fills the LOG's content width (`100%`), never a fixed
+            # cell count: a fixed width overflows a narrow terminal and paints
+            # over the log beside it. The height follows the capture's aspect
+            # at that width.
+            widget.styles.width = "100%"
+            widget.styles.height = "auto"
+        except Exception:
+            self._image_failed = True
+            return False
+        try:
+            log = self._image_log()
+            if log is None:
+                return False
+            log.mount(widget, after=self)
+        except Exception:
+            self._image_failed = True
+            return False
+        self._image_widget = widget
+        return True
+
+    def _image_log(self) -> Any | None:
+        """The scrollable log the image row is mounted into, or None."""
+
+        try:
+            parent = self.parent
+        except Exception:
+            return None
+        return parent if parent is not None else None
+
+    def _sync_image_display(self) -> None:
+        """Show the image row only while this row is expanded in image mode.
+
+        The widget stays mounted (re-mounting would re-send the pixels to
+        the terminal); `display: none` removes it from layout so a collapsed
+        or art-fallback row carries no dead space.
+        """
+
+        if self._image_widget is not None:
+            self._image_widget.display = self._image_visible
 
 
 class AnswerRow(RowStatic):
@@ -3033,17 +3278,28 @@ class ChatTUI(App):
         if not styles:
             self._spinner_status("No styles installed. Run `miniouto style add <repo>`.")
             return
-        s = settings_store.load()
+        # The style shown is the one THIS session resolves: its own pin, else
+        # the global default. `_config_session` (not `_pinned_session`): the
+        # pin belongs to the session the CONVERSATION runs on, and adopting
+        # a session as a side effect of opening a picker would be wrong.
+        session = self._config_session()
+        current = (session_config.read(session) or session_config.EMPTY).style
+        current = current or settings_store.load().style
 
         def _on_close(result: str | None) -> None:
             if not result:
                 return
-            settings_store.update(style=result)
+            # The choice becomes the DEFAULT (like a provider/model change)
+            # and every session that already exists freezes the style it is
+            # running under — so this conversation and the ones already
+            # running keep theirs, and a session started NEXT picks the new
+            # one up. The provider trio is untouched.
+            runtime.set_active_style(result, session=session)
             self._refresh_chips()
             self._spinner_status(f"style → {result}")
 
         self.push_screen(
-            SelectionModal("Select style", styles, current=s.style, allow_none=False),
+            SelectionModal("Select style", styles, current=current, allow_none=False),
             _on_close,
         )
 
@@ -3162,7 +3418,11 @@ class ChatTUI(App):
         else:
             self._panel.set_value("subagent", "same as outo")
 
-        self._panel.set_value("style", s.style or "-")
+        # The style chip reads the SESSION's pinned style, the same
+        # read-through the provider/model chips do: a style chosen for one
+        # session must not show up (or apply) in another one.
+        pinned_style = config.style or s.style
+        self._panel.set_value("style", pinned_style or "-")
         name = self._session_name if self._chat_started and self._session_name else ""
         self._panel.set_session(name)
 
@@ -3655,6 +3915,12 @@ class ChatTUI(App):
 
 
 def run_tui() -> None:
+    # Probe the terminal BEFORE Textual starts: the graphics probe reads the
+    # terminal's reply on stdin, and Textual's reader thread takes stdin
+    # over the moment the app runs — after that the reply is never seen and
+    # the probe only burns its timeout. Doing it here means the mode is
+    # known before the first frame, and the render path never waits.
+    detect_graphics_mode()
     ChatTUI().run()
 
 

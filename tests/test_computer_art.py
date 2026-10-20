@@ -242,12 +242,14 @@ def test_screenshot_tool_result_carries_the_saved_to_line(one_screen, monkeypatc
     blocks = _computer_handler(action="screenshot", screen="wl-1")
 
     # Then: the text block names the .art file in the screen action's line
-    # shape, on its own last line — what the TUI keys on to render the screen
+    # shape, on its own last line — what the TUI keys on to render the screen —
+    # and the raw-PNG sibling rides the line just above it
     text = blocks[0].text
     assert text.splitlines()[-1].startswith("Saved to: ")
     assert art_path_in_result(text) == Path(
         text.split("Saved to: ", 1)[1].splitlines()[-1]
     ).as_posix()
+    assert "Image saved to: " in text
 
 
 def test_screenshot_art_failure_costs_only_the_saved_to_line(one_screen, monkeypatch) -> None:
@@ -259,11 +261,15 @@ def test_screenshot_art_failure_costs_only_the_saved_to_line(one_screen, monkeyp
     shot = computer("screenshot")
     blocks = _computer_handler(action="screenshot", screen="wl-1")
 
-    # Then: the pixels still come back, with no art path and no line appended
+    # Then: the pixels still come back with no art path, and no line appended
+    # for a sibling that was never written — the png write shares the broken
+    # render only if it too breaks, which it does not, so the png line stays
     assert (shot.width, shot.art_path) == (1280, None)
     assert len(blocks) == 2
     assert art_path_in_result(blocks[0].text) is None
-    assert blocks[0].text.endswith("is the top-left corner.")
+    # the art failure costs ONLY the art line; the raw png sibling is
+    # independent of the art renderer and is still written and named
+    assert blocks[0].text.rstrip().endswith(".png")
 
 
 def test_screenshot_chars_and_color_reach_the_art_render(one_screen, isolated_screens_dir) -> None:
@@ -361,3 +367,34 @@ def test_unknown_glyph_falls_back_to_the_default_mix(isolated_screens_dir) -> No
     # Then: it renders exactly like the default does, never raising
     _r, default, _p = computer_mod._render_screen_art(_edge_png(), "wl-1", 16, True)
     assert parse_art(wrong).body == parse_art(default).body
+
+
+def test_captures_are_pruned_to_the_newest_cap(one_screen, tmp_path, monkeypatch) -> None:
+    # Given: a screens dir already holding 100 capture files (50 pairs)
+    monkeypatch.setattr(computer_mod, "COMPUTER_SCREENS_DIR", tmp_path)
+    for i in range(50):
+        stem = f"wl-1-2026-01-01-00-00-{i:02d}"
+        (tmp_path / f"{stem}.art").write_text("old", encoding="utf-8")
+        (tmp_path / f"{stem}.png").write_bytes(b"old")
+
+    # When: one more screenshot lands (png + art = 102 files)
+    computer("screenshot")
+
+    # Then: the pool is back at the cap, and the oldest pair went together
+    files = sorted(tmp_path.glob("*.*"))
+    assert len(files) == 100
+    assert not (tmp_path / "wl-1-2026-01-01-00-00-00.art").exists()
+    assert not (tmp_path / "wl-1-2026-01-01-00-00-00.png").exists()
+    assert (tmp_path / "wl-1-2026-01-01-00-00-02.art").exists()
+
+
+def test_a_full_prune_dir_never_breaks_the_capture(one_screen, tmp_path, monkeypatch) -> None:
+    # Given: a screens dir that cannot be listed or unlinked (prune failure)
+    monkeypatch.setattr(computer_mod, "COMPUTER_SCREENS_DIR", tmp_path)
+    monkeypatch.setattr(
+        computer_mod, "_prune_captures", lambda: (_ for _ in ()).throw(OSError("boom"))
+    )
+
+    # When / Then: the screenshot still succeeds — pruning is best effort
+    shot = computer("screenshot")
+    assert shot.art_path is not None and shot.art_path.is_file()
