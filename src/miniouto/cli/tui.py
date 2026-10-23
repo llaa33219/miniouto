@@ -2329,6 +2329,12 @@ class ChatScroll(VerticalScroll):
         self.scroll_end(animate=False, x_axis=self.scroll_x == self.max_scroll_x)
 
 
+# Loop event kinds that close the current streamed message: the live row
+# is retired for them, so any buffered tail must flush first (see
+# `TUIEventSink.emit_loop_event`).
+_STREAM_BOUNDARY_KINDS = frozenset({"thinking", "response", "tool", "context"})
+
+
 class _StreamCoalescer:
     """Fold per-token deltas into one UI update per flush window.
 
@@ -2426,6 +2432,14 @@ class TUIEventSink:
             self._app._apply_stream_text(text)
 
     def emit_loop_event(self, event: LoopEvent) -> None:
+        # A message-boundary event (thinking / response / tool / context)
+        # retires the current live stream row. Flush the buffered tail first
+        # so it renders on the row it belongs to — otherwise the coalescer's
+        # last (< interval) window survives the boundary and lands on the
+        # NEXT message's live row, which reads as the previous message's
+        # ending reappearing at the top of the new one.
+        if event.kind in _STREAM_BOUNDARY_KINDS:
+            self._flush_stream()
         self._app.call_from_thread(self._post_loop_event, event)
 
     def _post_loop_event(self, event: LoopEvent) -> None:
@@ -2695,9 +2709,11 @@ class ChatTUI(App):
         # gets and which inbox the idle poll drains. `_pin_session` sets it at
         # the three user-visible session events (mint / picker / new session),
         # which also publish it to `settings.session` — the cross-surface
-        # "active session" convention. It is never read back once pinned: a
-        # delegated `miniouto chat` run writes that same key, and trusting it
-        # made the TUI write to another session's files and lose its alarms.
+        # "active session" convention. It is never read back: a delegated
+        # `miniouto chat` run writes that same key, and trusting it made the
+        # TUI write to another session's files and lose its alarms; until the
+        # pin exists the fallback is "default" (never `settings.session`), so
+        # an idle TUI never drains another live session's inbox.
         self._session_name: str | None = None
         # Inbox message id -> the row rendered when it was inserted mid-turn.
         # Its keys ARE the optimistic set: a drained event whose id is here is
@@ -2824,7 +2840,10 @@ class ChatTUI(App):
         because this only ever runs on a name this call just minted.
         """
 
-        source = self._pinned_session()
+        # The seed source is the published active session, read once here —
+        # it must NOT go through `_pinned_session`, or this TUI's routing
+        # (and its inbox drain) would adopt another process's session.
+        source = settings_store.load().session or _DEFAULT_SESSION
         name = self._mint_session_name()
         session_config.seed_from(name, source)
         self._pin_session(name)
@@ -2832,14 +2851,19 @@ class ChatTUI(App):
     def _pinned_session(self) -> str:
         """The session this conversation routes on (see `_session_name`).
 
-        Before the first session event there is no pin, so the published
-        active session is adopted — once, and frozen from that moment. The
-        mint in `_dispatch` still replaces it with this TUI's own `tui-…`
-        name, which is why a CLI run's `--name` is never continued here.
+        Before the first session event there is no pin, so this falls back
+        to "default" WITHOUT adopting the published active session: the 1 s
+        inbox poll reads this value, and adopting `settings.session` here
+        made a session-less TUI drain another live session's inbox and steal
+        its alarms. The provider-config seed for the mint is read separately
+        in `_adopt_minted_session`, which is the only place that value is
+        wanted. The mint in `_dispatch` still replaces the fallback with
+        this TUI's own `tui-…` name, which is why a CLI run's `--name` is
+        never continued here.
         """
 
         if self._session_name is None:
-            self._session_name = settings_store.load().session or _DEFAULT_SESSION
+            self._session_name = _DEFAULT_SESSION
         return self._session_name
 
     def _inbox_session(self) -> str:

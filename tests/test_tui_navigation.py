@@ -246,12 +246,13 @@ def _pin_test_session(app: ChatTUI, name: str = "tui-chip-fixture") -> str:
     """Pin a session of this test's own, so the chips read a config no other
     test can have frozen.
 
-    A fresh TUI adopts `settings.session` and follows whatever pin that shared
-    name carries — correct in production, ambiguous in a suite where one
-    filesystem serves every test.
+    The publish mirrors what a real session event does: the "active session"
+    is the provider-config seed a mint copies from, so a pin that stayed
+    unpublished would seed its continuations from a stale shared name.
     """
 
     app._session_name = name
+    settings_store.update(session=name)
     session_config.clear(name)
     app._chat_started = True
     return name
@@ -1409,6 +1410,59 @@ def test_new_session_pins_and_publishes_the_new_name() -> None:
             assert re.fullmatch(r"tui-\d{8}-\d{6}-[0-9a-f]{6}", app._session_name)
             assert settings_store.load().session == app._session_name
             assert app._inbox_session() == app._session_name
+
+    asyncio.run(body())
+
+
+def test_a_session_less_tui_never_adopts_the_published_active_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def body() -> None:
+        routed: list[str] = []
+        _stub_run_chat(monkeypatch, routed)
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            # Given: another live TUI published its own session as the active one
+            settings_store.update(session="other-live-session")
+            await pilot.pause()
+            # Then: the session-less TUI routes on "default", not on that name —
+            # adopting it made the idle inbox poll drain the OTHER session's
+            # inbox and steal its alarms.
+            assert app._inbox_session() == "default"
+            # And: the first turn still mints this TUI's own session, seeded
+            # from the published provider config as before
+            await app._dispatch("first prompt")
+            assert re.fullmatch(r"tui-\d{8}-\d{6}-[0-9a-f]{6}", app._session_name)
+            assert routed == [app._session_name]
+
+    asyncio.run(body())
+
+
+def test_an_idle_session_less_tui_never_steals_another_sessions_alarms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def body() -> None:
+        prompts: list[str] = []
+        _stub_run_chat(monkeypatch, prompts)
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            # Given: TUI A published its session and has an alarm waiting in it,
+            # while this TUI (TUI B) is mounted with no session of its own
+            settings_store.update(session="session-a")
+            inbox.insert(
+                "session-a",
+                f"{inbox.ALARM_HEADER}\nresult ready",
+                kind=inbox.ALARM_KIND,
+                source="spawn",
+            )
+            await pilot.pause()
+            # When: B's idle poll fires
+            app._deliver_pending_messages()
+            await pilot.pause()
+            # Then: A's alarm is still in A's inbox and B started no turn
+            assert inbox.pending_count("session-a") == 1
+            assert prompts == []
+            assert not app._chat_started
 
     asyncio.run(body())
 

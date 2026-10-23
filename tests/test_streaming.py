@@ -613,6 +613,76 @@ def test_replay_of_a_streamed_session_has_no_stream_rows() -> None:
     asyncio.run(body())
 
 
+class _Clock:
+    """A manual monotonic clock for the coalescer's time gate."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+# ── message-boundary flush: a stream tail never leaks into the next message ──
+
+
+def test_a_message_boundary_event_flushes_the_buffered_stream_tail() -> None:
+    """A gated tail must land on ITS message's row before the boundary retires it.
+
+    The coalescer holds the last (< flush-interval) window until the next
+    forced flush or `end_working`. Without a boundary flush, a message that
+    ends in a tool call leaves its tail buffered: the `response`/`tool`
+    events retire the live row, and the tail rides the NEXT message's first
+    forced flush onto the new row — the user sees the previous answer's
+    ending reappear at the top of the following message.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            clock = _Clock()
+            sink = TUIEventSink(app)
+            sink._stream = _StreamCoalescer(clock=clock)
+            sink._stream._last_flush = -1.0  # the first delta flushes at once
+
+            async def from_worker(fn: Any) -> None:
+                await asyncio.to_thread(fn)
+                await pilot.pause(0.05)
+
+            # Given: message 1 streamed, with its tail still inside the window
+            await from_worker(lambda: sink.emit_stream_delta("text", "msg1 body."))
+            assert app._stream_text_row is not None
+            clock.t += 0.001
+            await from_worker(lambda: sink.emit_stream_delta("text", " TAIL"))
+            assert "TAIL" not in app._stream_text_row.content
+
+            # When: the message completes and the loop moves on (tool call,
+            # next iteration) — each a message boundary
+            await from_worker(lambda: sink.emit_loop_event(
+                LoopEvent(actor="outo", kind="response", text="msg1 body. TAIL", msg_ref="r1")
+            ))
+            await from_worker(lambda: sink.emit_loop_event(
+                LoopEvent(actor="outo", kind="tool", text="Bash ls", tool_name="Bash", msg_ref="r1")
+            ))
+            await from_worker(lambda: sink.emit_loop_event(
+                LoopEvent(actor="outo", kind="context", text="iter 2", msg_ref="r1")
+            ))
+            # And: message 2 streams
+            clock.t += 1.0
+            await from_worker(lambda: sink.emit_stream_delta("text", "msg2 body."))
+            sink._drain_stream()
+            await pilot.pause(0.05)
+
+            # Then: each message's row holds exactly its own text — the tail
+            # closed message 1's row instead of prepending message 2's.
+            rows = [r for r in app._window.rows if isinstance(r, StreamRow)]
+            contents = [str(r.content) for r in rows]
+            assert contents == ["msg1 body. TAIL", "msg2 body."]
+
+    asyncio.run(body())
+
+
 # ── CLI stays byte-identical ────────────────────────────────────────────────
 
 

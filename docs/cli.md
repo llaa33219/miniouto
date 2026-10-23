@@ -91,7 +91,7 @@ Tool rows start as a single `▶ <summary>` line whose toggle glyph highlights o
 
 ### Live token streaming
 
-While the provider is streaming, the TUI renders text and reasoning **as it arrives** (coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` fire once per token). Per-token hooks fire 100+/s, so `TUIEventSink` folds them through `_StreamCoalescer` into a single UI-thread update roughly every **33 ms (~30 Hz)** — fast enough to read as typing, cheap enough that a long answer repaints a few dozen times instead of hundreds. The final `< interval` window is drained when the turn's spinner stops, so no tail fragment is lost.
+While the provider is streaming, the TUI renders text and reasoning **as it arrives** (coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` fire once per token). Per-token hooks fire 100+/s, so `TUIEventSink` folds them through `_StreamCoalescer` into a single UI-thread update roughly every **33 ms (~30 Hz)** — fast enough to read as typing, cheap enough that a long answer repaints a few dozen times instead of hundreds. The final `< interval` window is drained when the turn's spinner stops, so no tail fragment is lost — and every message-boundary event (`thinking` / `response` / `tool` / `context`) flushes the buffer first, so a tail never rides the next message's live row.
 
 Deltas are **display-only**: they are never written to the session file (`_RecordingSink` forwards them to the wrapped sink without recording), so a reloaded session is byte-identical to a pre-streaming one. Nor are they fed to the repetition watchdog — that stays on whole-message boundaries to avoid counting each phrase twice.
 

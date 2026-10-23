@@ -10,6 +10,8 @@ actually consume: the file on disk and the tool-result string.
 from __future__ import annotations
 
 import re
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -398,3 +400,50 @@ def test_a_full_prune_dir_never_breaks_the_capture(one_screen, tmp_path, monkeyp
     # When / Then: the screenshot still succeeds — pruning is best effort
     shot = computer("screenshot")
     assert shot.art_path is not None and shot.art_path.is_file()
+# ── ESC ESC cancellation ─────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def cleared_cancel():
+    """Leave no per-turn cancel slot armed after the test."""
+
+    yield
+    computer_mod.set_cancel_event(None)
+
+
+def test_a_cancelled_wait_returns_immediately(cleared_cancel) -> None:
+    # Given: a turn whose cancel event the user just set (esc esc)
+    cancel = threading.Event()
+    computer_mod.set_cancel_event(cancel)
+    cancel.set()
+
+    # When/Then: a 20 s wait refuses instead of riding the duration out —
+    # the loop's cancel guard only fires BETWEEN steps, so a cancel-blind
+    # wait is exactly the "stop takes a while" the user reported.
+    start = time.monotonic()
+    with pytest.raises(ComputerUseError, match="cancelled"):
+        computer("wait", duration=20.0)
+    assert time.monotonic() - start < 1.0
+
+
+def test_a_wait_interrupted_midway_stops_at_the_cancel(cleared_cancel) -> None:
+    cancel = threading.Event()
+    computer_mod.set_cancel_event(cancel)
+    threading.Timer(0.2, cancel.set).start()
+
+    start = time.monotonic()
+    with pytest.raises(ComputerUseError, match="cancelled"):
+        computer("wait", duration=20.0)
+    elapsed = time.monotonic() - start
+    assert 0.1 < elapsed < 2.0
+
+
+def test_a_queued_action_refuses_once_the_turn_is_cancelled(cleared_cancel, one_screen) -> None:
+    cancel = threading.Event()
+    computer_mod.set_cancel_event(cancel)
+    cancel.set()
+
+    with pytest.raises(ComputerUseError, match="cancelled"):
+        computer("screenshot")
+    # The compositor was never touched — the refusal is pre-dispatch.
+    assert one_screen.screenshots == 0

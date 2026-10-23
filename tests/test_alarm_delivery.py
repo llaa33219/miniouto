@@ -26,7 +26,6 @@ from miniouto.cli.tui import ChatTUI
 from miniouto.core import inbox
 from miniouto.core.inbox import ALARM_HEADER
 from miniouto.storage import sessions as session_store
-from miniouto.storage import settings as settings_store
 
 ALARM_TEXT = (
     f"{ALARM_HEADER}\nSpawned run 'editor' (id: abc123) finished (status: done).\n"
@@ -62,10 +61,16 @@ def _rendered(row: Any) -> str:
 
 
 def _assign_session(app: ChatTUI, name: str) -> None:
+    """Stand the app on `name` exactly the way a real session event does.
+
+    `_pin_session` is the production pin: it publishes the name to
+    `settings.session` and flips both assignment flags, so the idle poll
+    drains THIS inbox — an earlier draft set the flags without pinning the
+    name, which left the poll on the "default" fallback and dropped delivery.
+    """
+
     session_store.create(name)
-    settings_store.update(session=name)
-    app._chat_started = True
-    app._session_assigned = True
+    app._pin_session(name)
 
 
 def _stub_run_chat(monkeypatch: pytest.MonkeyPatch, prompts: list[str]) -> None:

@@ -31,6 +31,7 @@ from ..storage import skills as skill_store
 from ..storage import styles as style_store
 from ..storage.styles import SubagentSpec
 from ..tools import bash as bash_tool
+from ..tools import computer as computer_tool
 from ..tools import registry as tool_registry
 from . import inbox, repetition
 from .providers import API_STALL_TIMEOUT_SECONDS, build_coreouto_provider, clear_coreouto_state
@@ -805,6 +806,7 @@ def build_runtime(
     # ---- Registry rebuild: pure in-memory from here to the return ----
     clear_coreouto_state()
     bash_tool.set_cancel_event(cancel_event)
+    computer_tool.set_cancel_event(cancel_event)
 
     if cancel_event is not None:
         # Register first so the guard runs before any logging hook on the

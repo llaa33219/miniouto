@@ -187,6 +187,22 @@ _LOCK = threading.Lock()
 _SCREENS = {}  # id (str) -> vwayland.Compositor; insertion order = spawn order
 _SUPPORTED: bool | None = None  # cached computer_supported() verdict
 
+# Per-turn cancel slot, set by core.runtime.build_runtime. Computer handlers
+# are SYNC (coreouto runs them via asyncio.to_thread), so the loop's task
+# cancellation cannot interrupt an in-flight action — the cooperative check
+# below is the only way ESC ESC shortens a long `wait` or blocks a queued
+# action. It mirrors the same slot in `tools/bash.py`.
+_CANCEL_EVENT: threading.Event | None = None
+
+
+def set_cancel_event(event: threading.Event | None) -> None:
+    global _CANCEL_EVENT
+    _CANCEL_EVENT = event
+
+
+def _cancelled() -> bool:
+    return _CANCEL_EVENT is not None and _CANCEL_EVENT.is_set()
+
 _MIN_GLIBC = (2, 28)
 _ENV_DISABLE = {"0", "off", "no", "false"}
 _ENV_ENABLE = {"1", "on", "yes", "true"}
@@ -253,6 +269,8 @@ def computer(
     action ignores all three.
     """
     sid = None
+    if _cancelled():
+        raise ComputerUseError("Action cancelled by user (esc esc).")
     with _LOCK:
         try:
             if action == "spawn":
@@ -438,7 +456,11 @@ def _dispatch(
             comp.click(x, y, button=button)
             where = f"({x}, {y})"
         if action == "double_click":
-            time.sleep(_DOUBLE_CLICK_GAP_SECONDS)
+            deadline = time.monotonic() + _DOUBLE_CLICK_GAP_SECONDS
+            while time.monotonic() < deadline:
+                if _cancelled():
+                    raise ComputerUseError("Action cancelled by user (esc esc).")
+                time.sleep(0.02)
             comp.click(button=button)
             return f"Double-clicked at {where}."
         return f"Clicked {button} at {where}."
@@ -506,7 +528,14 @@ def _dispatch(
             raise ComputerUseError(
                 f"duration must be in (0, {_MAX_WAIT_SECONDS:g}] seconds."
             )
-        time.sleep(seconds)
+        deadline = time.monotonic() + seconds
+        while True:
+            if _cancelled():
+                raise ComputerUseError("Action cancelled by user (esc esc).")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.05))
         return f"Waited {seconds:g} s."
 
     if action == "resize":
