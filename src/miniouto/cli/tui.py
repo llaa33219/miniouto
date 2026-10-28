@@ -22,6 +22,7 @@ import asyncio
 import re
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -88,8 +89,8 @@ _SENTINEL_NO_REASONING = object()
 # Two escape presses within this window (seconds) while busy force-stop the loop.
 _ESC_DOUBLE_PRESS_WINDOW = 2.0
 
-# Session name used until this TUI has pinned one of its own (see
-# `ChatTUI._pinned_session`). Mirrors the `Settings.session` default.
+# Config-only fallback before a TUI has chosen a session. It is deliberately
+# NOT an inbox destination: every unassigned TUI needs its own pending queue.
 _DEFAULT_SESSION = "default"
 
 
@@ -2709,12 +2710,11 @@ class ChatTUI(App):
         # gets and which inbox the idle poll drains. `_pin_session` sets it at
         # the three user-visible session events (mint / picker / new session),
         # which also publish it to `settings.session` — the cross-surface
-        # "active session" convention. It is never read back: a delegated
-        # `miniouto chat` run writes that same key, and trusting it made the
-        # TUI write to another session's files and lose its alarms; until the
-        # pin exists the fallback is "default" (never `settings.session`), so
-        # an idle TUI never drains another live session's inbox.
+        # "active session" convention. It is never read back for routing.
         self._session_name: str | None = None
+        # A distinct, private queue until this instance chooses its real
+        # session. Two freshly opened TUIs must never both drain `default`.
+        self._unassigned_inbox = f"tui-pending-{uuid.uuid4().hex[:12]}"
         # Inbox message id -> the row rendered when it was inserted mid-turn.
         # Its keys ARE the optimistic set: a drained event whose id is here is
         # already on screen, so the real row is suppressed, and an idle drain
@@ -2852,18 +2852,16 @@ class ChatTUI(App):
         """The session this conversation routes on (see `_session_name`).
 
         Before the first session event there is no pin, so this falls back
-        to "default" WITHOUT adopting the published active session: the 1 s
-        inbox poll reads this value, and adopting `settings.session` here
-        made a session-less TUI drain another live session's inbox and steal
-        its alarms. The provider-config seed for the mint is read separately
-        in `_adopt_minted_session`, which is the only place that value is
-        wanted. The mint in `_dispatch` still replaces the fallback with
-        this TUI's own `tui-…` name, which is why a CLI run's `--name` is
-        never continued here.
+        to a unique per-instance queue WITHOUT adopting the published active
+        session. The provider-config seed for the mint is read separately in
+        `_adopt_minted_session`, which is the only place that global value is
+        wanted. The mint in `_dispatch` still replaces the fallback with this
+        TUI's own `tui-…` name, which is why a CLI run's `--name` is never
+        continued here.
         """
 
         if self._session_name is None:
-            self._session_name = _DEFAULT_SESSION
+            self._session_name = self._session_name or self._unassigned_inbox
         return self._session_name
 
     def _inbox_session(self) -> str:

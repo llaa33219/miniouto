@@ -1425,10 +1425,10 @@ def test_a_session_less_tui_never_adopts_the_published_active_session(
             # Given: another live TUI published its own session as the active one
             settings_store.update(session="other-live-session")
             await pilot.pause()
-            # Then: the session-less TUI routes on "default", not on that name —
-            # adopting it made the idle inbox poll drain the OTHER session's
-            # inbox and steal its alarms.
-            assert app._inbox_session() == "default"
+            # Then: the session-less TUI uses its private pending inbox, not
+            # the published active session or the shared `default` inbox.
+            assert app._inbox_session().startswith("tui-pending-")
+            assert app._inbox_session() != "other-live-session"
             # And: the first turn still mints this TUI's own session, seeded
             # from the published provider config as before
             await app._dispatch("first prompt")

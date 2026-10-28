@@ -4,8 +4,8 @@
 pending hand-off, because the chain is the only thing that can keep a run
 alive across the transition:
 
-* the chain moves its routing (and `settings.session`, which is what the
-  runtime's inbox hook actually drains) into the new session, so the
+* the chain moves its explicit turn routing into the new session, independently
+  of the globally published active session, so the
   continuation message the tool already put in that session's inbox becomes
   the next turn;
 * the marker is printed in the established `------…------` idiom, so a
@@ -190,17 +190,30 @@ def test_the_chain_continues_in_the_new_session(
     assert [h.new_session for h in state.transitions] == [state.session]
 
 
-def test_the_transition_moves_the_runtime_inbox_routing(
+def test_the_transition_moves_the_explicit_turn_routing(
     fake: FakeSummary, calls: list[ChatOptions], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Given/When: a run that hands off to a new session
     monkeypatch.setattr(chat_mod, "run_chat", _summarizing(fake, calls))
     chat_mod.run_turn_chain(ChatOptions(prompt="go", session="handoff-old"), quiet=True)
 
-    # Then: `settings.session` followed, because that is the name the runtime's
-    # BEFORE_LLM_CALL hook drains — a turn left on the old name would never see
-    # its own continuation message
-    assert settings_store.load().session == calls[1].session
+    # Then: the next turn itself carries the new name — the runtime does not
+    # consult the globally active session to select its inbox. A plain run
+    # still publishes its final session so an unnamed `-c` wakeup can find it.
+    assert calls[1].session.startswith("cont-1-")
+    assert calls[1].session != "handoff-old"
+
+
+def test_a_plain_transition_publishes_the_new_active_session(
+    fake: FakeSummary, calls: list[ChatOptions], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unnamed later `-c` wakeup belongs at the plain run's final session."""
+
+    monkeypatch.setattr(chat_mod, "run_chat", _summarizing(fake, calls))
+    code, _ = _chat("go", "--name", "handoff-old")
+    assert code == 0
+    assert calls[-1].session.startswith("cont-1-")
+    assert settings_store.load().session == calls[-1].session
 
 
 def test_the_marker_has_the_finish_marker_dash_shape() -> None:
@@ -348,11 +361,15 @@ def test_the_transition_republishes_the_contract_under_the_new_session(
     )
 
     # When: the chain hands off
-    chat_mod.run_turn_chain(ChatOptions(prompt="go", session="handoff-old"), quiet=True, state=state)
+    chat_mod.run_turn_chain(
+        ChatOptions(prompt="go", session="handoff-old"), quiet=True, state=state,
+        publish_session=False,
+    )
 
     # Then: the same contract is published again, naming the new session, so a
-    # second summary targets the right one
+    # second summary targets the right one; the GUEST does not publish itself.
     assert fake.contracts == [{"session": state.session, "role": "editor"}]
+    assert settings_store.load().session == "handoff-fixture-session"
 
 
 # ── the delegation post-step fires from the FINAL session ─────────────────────

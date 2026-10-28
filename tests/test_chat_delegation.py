@@ -852,7 +852,9 @@ def test_a_delegated_run_resolves_its_own_session_during_the_turn(
     resolved: list[str] = []
 
     def record_session(opts: ChatOptions, sink: object = None) -> str:
-        resolved.append(toml_io.load(SETTINGS_FILE).get("session", ""))
+        resolved.append(opts.session)
+        # A guest never has to change the published active session to route.
+        assert toml_io.load(SETTINGS_FILE).get("session", "") == "boss-session"
         return "ANSWER"
 
     monkeypatch.setattr(chat_mod, "run_chat", record_session)
@@ -860,9 +862,8 @@ def test_a_delegated_run_resolves_its_own_session_during_the_turn(
     # When: it runs
     result = _chat("brief", "--name", "guest-session", "--return", "--alarm-session", "boss-session")
 
-    # Then: the turn resolved the GUEST name — the inbox hook drains that
-    # session, and on the caller's name it would steal the caller's messages —
-    # and the caller's name is what survives on disk
+    # Then: ChatOptions carries the guest name directly into runtime resolution
+    # (inbox + `{this_session}` + pin), while the caller stays the active session
     assert result.exit_code == 0
     assert resolved == ["guest-session"]
     assert _stored_session() == "boss-session"

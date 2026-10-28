@@ -45,14 +45,12 @@ ended in rather than the one it started in.
 
 from __future__ import annotations
 
-import contextlib
 import datetime
 import os
 import secrets
 import subprocess
 import sys
 import uuid
-from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -64,11 +62,11 @@ from ..core.events import ConsoleEventSink
 from ..core.inbox import ALARM_HEADER
 from ..core.runtime import ChatOverrides, _resolve_subagent, default_provider_config
 from ..core.spawn_state import SpawnMarker, finish_marker, write_marker
-from ..storage import session_config, toml_io
+from ..storage import session_config
 from ..storage import sessions as session_store
 from ..storage import settings as settings_store
 from ..storage import styles as style_store
-from ..storage.paths import SETTINGS_FILE, SPAWN_LOG_DIR, SUBAGENT_RESULTS_DIR
+from ..storage.paths import SPAWN_LOG_DIR, SUBAGENT_RESULTS_DIR
 
 # A run NEVER waits. A queued message — a detached run's completion alarm, a
 # human's interjection — is a WAKEUP for whoever is awake, not a debt this
@@ -105,7 +103,8 @@ _THIS_PROCESS = object()
 
 
 def run_turn_chain(
-    opts: ChatOptions, *, quiet: bool, state: ChainState | None = None
+    opts: ChatOptions, *, quiet: bool, state: ChainState | None = None,
+    publish_session: bool = True,
 ) -> str:
     """Run the prompt's turn, then follow any summarization hand-off. Nothing else.
 
@@ -130,7 +129,9 @@ def run_turn_chain(
     answer = _run_turn(opts, quiet=quiet)
     if state is not None:
         state.session = opts.session
-    return _run_handoffs(opts, quiet=quiet, state=state, last=answer) or answer
+    return _run_handoffs(
+        opts, quiet=quiet, state=state, last=answer, publish_session=publish_session
+    ) or answer
 
 
 def _run_turn(opts: ChatOptions, *, quiet: bool) -> str:
@@ -157,7 +158,8 @@ def _print_answer(answer: str, *, quiet: bool, finish: bool) -> None:
 
 
 def _run_handoffs(
-    opts: ChatOptions, *, quiet: bool, state: ChainState | None = None, last: str = ""
+    opts: ChatOptions, *, quiet: bool, state: ChainState | None = None, last: str = "",
+    publish_session: bool = True,
 ) -> str:
     """Continue the run in each session a summarization hand-off moves it to.
 
@@ -179,7 +181,9 @@ def _run_handoffs(
         _print_answer(last, quiet=quiet, finish=False)
         transitions += 1
         summary.consume_handoff()
-        opts = _apply_handoff(opts, handoff, quiet=quiet, state=state)
+        opts = _apply_handoff(
+            opts, handoff, quiet=quiet, state=state, publish_session=publish_session
+        )
         last = _run_turn(
             replace(opts, prompt=_continuation_prompt(handoff, opts.session), continue_session=True),
             quiet=quiet,
@@ -215,20 +219,22 @@ def _apply_handoff(
     *,
     quiet: bool,
     state: ChainState | None,
+    publish_session: bool,
 ) -> ChatOptions:
     """Point the chain at the session the summary hand-off opened, and say so.
 
-    Three things move together, or the continuation would be lost: the routing
-    (`opts.session`), the published run contract (so a second hand-off
-    summarizes the right session), and `settings.session` — which is the name
-    the runtime's BEFORE_LLM_CALL inbox hook actually drains. A delegated run's
-    `_runtime_session_scope` puts the caller's value back in its `finally`.
+    The next turn carries `opts.session` into `ChatOverrides.session`, which
+    selects its inbox, `{this_session}` and session pin directly. The run
+    contract moves too, so a second hand-off summarizes the new session. Only
+    a plain run publishes the new active session for later `-c` wakeups; a
+    delegated guest never writes that shared setting.
     """
 
     if not quiet:
         sys.stdout.write(f"{handoff_marker(handoff)}\n------{handoff.new_session}------\n")
         sys.stdout.flush()
-    settings_store.update(session=handoff.new_session)
+    if publish_session:
+        settings_store.update(session=handoff.new_session)
     if state is not None:
         state.session = handoff.new_session
         state.transitions.append(handoff)
@@ -336,34 +342,6 @@ def _is_plain_run(run: _Run, *, bg: bool) -> bool:
     """
 
     return not bg and run.role is None and not run.delegated
-
-
-@contextlib.contextmanager
-def _runtime_session_scope(run: _Run) -> Iterator[None]:
-    """Make `runtime.session` resolve to THIS run's name, then put it back.
-
-    `resolve_runtime_from_settings` has no per-call session override, so the
-    session a turn resolves — the one the inbox hook drains and `{this_session}`
-    expands — is `settings.session`. A delegated run must resolve its own: left
-    on the caller's name, its turn would drain the CALLER's inbox and answer
-    with messages addressed to it. Persisting the guest name is not an option
-    (`_is_plain_run`), so the write is scoped to the turn and rolled back.
-    """
-
-    previous = settings_store.load().session
-    if previous == run.session:
-        yield
-        return
-    settings_store.update(session=run.session)
-    try:
-        yield
-    finally:
-        restored = toml_io.load(SETTINGS_FILE)
-        if previous:
-            restored["session"] = previous
-        else:
-            restored.pop("session", None)
-        toml_io.save(SETTINGS_FILE, restored)
 
 
 # ── resolution ────────────────────────────────────────────────────────────────
@@ -756,6 +734,18 @@ def chat_cmd(
             "--role requires --style (the default style may differ per session; "
             "make the run self-contained)."
         )
+    guest = (
+        role is not None
+        or alarm_session is not None
+        or return_path is not None
+        or bg
+        or bg_child
+    )
+    if guest and continue_session and not alarms and name is None:
+        raise _fail(
+            "a delegated --continue run requires --name SESSION; "
+            "the published active session belongs to its caller."
+        )
 
     s = settings_store.load()
 
@@ -800,8 +790,8 @@ def chat_cmd(
     turn_prompt = "\n\n".join(m.text for m in woken) if alarms else turn_prompt
 
     if use_subagent_provider:
-        # THIS run's session, not `settings.session`: a delegated run borrows
-        # its own name for the turn, so its subagent trio is its own pin.
+        # Resolve against this explicitly selected session, not the published
+        # active session, which another process may change at any moment.
         pinned = session_config.effective(session_name, default=default_provider_config)
         try:
             sub_provider, sub_model = _resolve_subagent(
@@ -964,12 +954,13 @@ def _run_foreground(run: _Run) -> None:
     state = ChainState(session=run.session, contract=_register_run_contract(run))
     if not run.delegated:
         _print_answer(
-            run_turn_chain(_chat_options(run), quiet=quiet, state=state), quiet=quiet, finish=True
+            run_turn_chain(
+                _chat_options(run), quiet=quiet, state=state, publish_session=True
+            ), quiet=quiet, finish=True
         )
         return
 
-    with _runtime_session_scope(run):
-        _run_delegated(run, state, quiet=quiet)
+    _run_delegated(run, state, quiet=quiet)
 
 
 def _run_delegated(run: _Run, state: ChainState, *, quiet: bool) -> None:
@@ -978,7 +969,9 @@ def _run_delegated(run: _Run, state: ChainState, *, quiet: bool) -> None:
     write_marker(_marker(run))
     status, answer = _STATUS_DONE, ""
     try:
-        answer = run_turn_chain(_chat_options(run), quiet=quiet, state=state)
+        answer = run_turn_chain(
+            _chat_options(run), quiet=quiet, state=state, publish_session=False
+        )
     except KeyboardInterrupt:
         status, answer = _STATUS_STOPPED, "stopped: cancelled"
     except Exception as exc:

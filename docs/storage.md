@@ -119,7 +119,7 @@ Notes on the on-disk format:
 provider = "openai"     # global DEFAULT provider name (must match a top-level table in providers.toml)
 model    = ""           # optional; legacy, read-only (the TUI never writes it; reads at the bottom of the default chain)
 style    = "default"    # default style (must exist in ~/.miniouto/style/)
-session  = "default"    # active session name; written by PLAIN `miniouto chat` (`_is_plain_run`: no --role/--alarm-session/--return/--bg) and by TUI user actions (first dispatch, session picker, "new session"). Delegated runs never write it — they borrow it scoped to their chain (`_runtime_session_scope`) and restore it, so they don't repoint the caller's active session.
+session  = "default"    # active session name; written by PLAIN `miniouto chat` (`_is_plain_run`: no --role/--alarm-session/--return/--bg) and by TUI user actions (first dispatch, session picker, "new session"). Delegated runs never write it, including across hand-offs; their explicit `ChatOptions.session` selects routing without touching this global fallback.
 theme    = "miniouto"   # TUI theme name. `miniouto` is the harness's own dark theme (registered in cli/tui.py); any other REGISTERED name — a stock Textual theme, e.g. `gruvbox` — replaces it, and the TUI writes back whatever is picked at runtime (Ctrl+P → Theme). An unregistered name falls back to `miniouto` rather than failing the launch.
 subagent_provider = ""  # optional; subagent provider override (empty = inherit outo's provider)
 subagent_model    = ""  # optional; subagent model override (empty = subagent provider's default_model, else inherit outo's model)

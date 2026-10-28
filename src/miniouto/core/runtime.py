@@ -636,6 +636,9 @@ class RuntimeConfig:
 
 @dataclass
 class ChatOverrides:
+    # Immutable identity of the turn being resolved. The global active
+    # session is only a fallback for callers that have not selected one.
+    session: str | None = None
     provider: str | None = None
     model: str | None = None
     style: str | None = None
@@ -1296,30 +1299,27 @@ def set_active_style(style: str, *, session: str | None = None) -> str:
     return style
 
 
-def _pinned_for(s: settings_store.Settings) -> session_config.ProviderConfig:
-    """The run's session pin, read (and frozen) above the registry rebuild.
-
-    The session a turn resolves IS `settings.session` — the same value the
-    inbox hook drains and `{this_session}` expands — so this is where the
-    delegated-run borrow (`cli/chat.py:_runtime_session_scope`) takes
-    effect.
-    """
+def _pinned_for(
+    s: settings_store.Settings, *, session: str | None = None
+) -> session_config.ProviderConfig:
+    """Resolve and freeze the pin of THIS turn, not the global active session."""
 
     return session_config.effective(
-        s.session or "default", default=default_provider_config
+        session or s.session or "default", default=default_provider_config
     )
 
 
 def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> RuntimeConfig:
     s = settings_store.load()
     overrides = overrides or ChatOverrides()
+    session = overrides.session or s.session or "default"
 
     # Lane 2 of the resolution order (see storage/session_config): explicit
     # overrides > this session's pin > the global default. An override that
     # moves outo to ANOTHER provider invalidates the pinned model/reasoning
     # — those belong to the pinned provider — so the whole outo trio is
     # dropped and the global chain answers for the override's provider.
-    pinned = _pinned_for(s)
+    pinned = _pinned_for(s, session=session)
     if overrides.provider and overrides.provider != pinned.provider:
         pinned = dataclasses.replace(pinned, provider="", model="", reasoning="")
 
@@ -1354,7 +1354,7 @@ def resolve_runtime_from_settings(overrides: ChatOverrides | None = None) -> Run
         model=model,
         style_name=style_name,
         role=overrides.role or None,
-        session=s.session or "default",
+        session=session,
         reasoning=pinned.reasoning or None,
         subagent_provider=subagent_provider,
         subagent_model=subagent_model,

@@ -305,6 +305,7 @@ def run_chat(opts: ChatOptions, sink: EventSink | None = None) -> str:
 def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
     runtime = resolve_runtime_from_settings(
         ChatOverrides(
+            session=opts.session,
             provider=opts.provider,
             model=opts.model,
             style=opts.style,

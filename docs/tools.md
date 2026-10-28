@@ -327,7 +327,7 @@ Sync, registered unconditionally, in `BASE_TOOLS` — so outo and every delegate
 
 **Why the loop ends there.** `core/chat.py` builds the turn's cancel event as a `_StopOnHandoff` — a `threading.Event` whose `is_set()` ORs the caller's cancel event with its own hand-off flag — and the `AFTER_TOOL_CALL` dispatcher fires that flag when it sees a pending hand-off. The loop stops cooperatively at its next step rather than letting the model burn the rest of a nearly-full context on work the new session is about to redo. The resulting `LoopCancelledError` is re-classified at the call site into a clean `status="done"` turn; the hand-off stays pending for the entry layer.
 
-**Invocation points.** Exactly two, at the end of a turn: `cli/chat.py:_run_handoffs` (`_apply_handoff` moves `opts.session`, re-registers the run contract under the new session, updates `settings.session`, and prints `------summary → <new>------` + `summary: <dir>`) and `cli/tui.py:ChatTUI._apply_handoff` (mounts the same marker in the old conversation, persists it for replay, re-pins the new session, and lets the 1 s inbox poll auto-deliver the continuation).
+**Invocation points.** Exactly two, at the end of a turn: `cli/chat.py:_run_handoffs` (`_apply_handoff` moves `opts.session`, re-registers the run contract under the new session, publishes the new session for a plain run only, and prints `------summary → <new>------` + `summary: <dir>`) and `cli/tui.py:ChatTUI._apply_handoff` (mounts the same marker in the old conversation, persists it for replay, re-pins the new session, and lets the 1 s inbox poll auto-deliver the continuation).
 
 ## Delegation is a Bash command, not a tool
 
