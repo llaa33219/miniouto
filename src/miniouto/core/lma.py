@@ -137,3 +137,24 @@ def slugify(name: str) -> str:
     s = (name or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     return s.strip("-")
+
+
+
+def find_provider_by_slug(slug: str) -> dict[str, Any] | None:
+    """Resolve a stored provider name to its exact catalog entry.
+
+    Kept separate from the CLI's fuzzy name lookup: a short stored slug such
+    as `ai` must not change which provider a user typing `provider add ai` gets.
+    """
+
+    try:
+        providers = list_providers()
+    except Exception:
+        return None
+    target = slugify(slug)
+    if not target:
+        return None
+    return next(
+        (p for p in providers if slugify(str(p.get("name", ""))) == target),
+        None,
+    )

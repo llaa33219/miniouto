@@ -112,12 +112,14 @@ Each `StatusChip` is a focusable widget. Click it (or focus it with `Tab` and pr
 
 | Chip | Modal | Notes |
 |---|---|---|
-| `outo` | `ProviderSettingsPopup` — three rows, `Provider` / `Model` / `Reasoning`, each opening its own picker | `TrioTarget` = `OUTO_TARGET` (`provider`/`model`/`reasoning`) |
+| `outo` | `ProviderSettingsPopup` — trio rows `Provider` / `Model` / `Reasoning`, then `Compatibility` for catalog providers or `Caps` for custom ones | `TrioTarget` = `OUTO_TARGET` (`provider`/`model`/`reasoning`) |
 | `subagent` | the **same** `ProviderSettingsPopup`, with `SUBAGENT_TARGET` (`subagent_provider`/`subagent_model`/`subagent_reasoning`) | empty still reads `same as outo`, and an empty subagent key means "inherit" |
 | `style` | `SelectionModal` — list of installed styles | writes `settings.style` |
 | `session` | `SelectionModal` with `sections=` — grouped by the session's creation directory, plus `+ new session…` | writes the session **pin** (`self._pinned_session`), which is what `_dispatch` and the inbox poll route on |
 
 **Every provider/model/reasoning edit goes through `_persist_trio`, which writes BOTH halves** (`docs/storage.md` § `session-config/`): the session pin at `session-config/<pinned session>.toml`, so the edit survives a later default change, and the global default, so other processes and the next session follow the most recently changed choice. For the **outo** trio the global half is `settings.provider` + the provider record's `default_model` / `reasoning_effort` (`dataclasses.replace` + `provider_store.upsert`); `settings.model` is never written. For the **subagent** trio it is the three `settings.subagent_*` keys. **Provider and Model both reset Reasoning** — an effort level belongs to a model, so either pick lands on that model's default (the provider record's own preference, else lma's auto default); Reasoning is one more click away when that is not what you want. An empty value clears the pin key and hands it back to the global default.
+
+The catalog `Compatibility` row shows the saved lma dialect (or `native SDK` for a legacy record). Its picker lists supported/likely dialects and their exact base URLs, plus a `native SDK` restore option and the saved choice when the current catalog no longer reports it; selecting one persists `catalog_dialect`, `api_format`, and `base_url` on the provider record. Like `Caps`, this is provider-global, not part of the session trio. An inheriting subagent popup edits the effective outo provider.
 
 There is **no standalone provider or model editor any more** — the popup's rows replaced both, and so did the one that edited an existing provider's `max_context_window` / `max_output_tokens`. Those caps are set when the provider is added (the `+ add custom…` wizard asks for them) or by hand in `providers.toml`.
 
@@ -127,7 +129,7 @@ The "Pick session" modal is the one place that uses `SelectionModal`'s opt-in `s
 
 The popup's `Provider` row accepts two sentinels (rendered as `extra_options` rows at the bottom of the list):
 
-- `+ add from catalog…` — runs `_catalog_add_flow`: fetches `https://lma.blp.sh/provider`, filters to entries whose `sdk` maps to a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="lma"` and the first model returned by lma as `default_model`. See `core/lma.py` and `core/providers.py:sdk_to_format`.
+- `+ add from catalog…` — runs `_catalog_add_flow`: fetches `https://lma.blp.sh/provider`, filters to entries whose SDK or detected dialect maps to a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="lma"` and the first model returned by lma as `default_model`. See `core/lma.py` and `core/providers.py:sdk_to_format`.
 - `+ add custom…` — runs `_open_custom_add_wizard`: a five-step wizard (name → api_format → base_url → api_key → default_model), saving with `source="custom"`.
 
 Modal results are persisted through `_persist_trio` (provider/model/reasoning — see above) or `storage.settings.update(...)` (style), and the chip row re-renders. The active Textual theme is persisted to `settings.theme` and restored on launch.
@@ -493,7 +495,7 @@ The provider command has three groups: **catalog** browse/add (`providers`, `mod
 
 ### `provider providers`
 
-Calls `GET https://lma.blp.sh/provider`. Prints a rich `Table` titled `Catalog providers (N)` with columns `Name | SDK | API URL | miniouto format | Addable?`. The "Addable?" column is `✓` when `core.providers.sdk_to_format(sdk, api)` returns a non-`None` format. Empty result → yellow "No providers returned by the catalog." (exit 0). Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
+Calls `GET https://lma.blp.sh/provider`. Prints a rich `Table` titled `Catalog providers (N)` with columns `Name | SDK | API URL | miniouto format | Detected compatibility | Selected base URL | Addable?`. Detected dialects are labelled `(supported)` or `(likely)`; `typesafe-systemone` is omitted. The selected format/URL comes from `resolve_catalog_dialect`, falling back to `sdk_to_format`. The "Addable?" column is `✓` when either resolver returns a format. Empty result → yellow "No providers returned by the catalog." (exit 0). Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
 
 ### `provider models <provider-name>`
 
@@ -536,9 +538,9 @@ add_custom(
 
 Pretty-prints a `rich.table.Table` titled `Providers` with columns:
 
-| Name | Type | Format | Base URL | Default Model | Reasoning | Default |
+| Name | Type | Format | Compatibility | Base URL | Default Model | Reasoning | Default |
 
-The `Type` column renders `custom` or `catalog` based on `provider.source` (`SOURCE_CUSTOM` → "custom", `SOURCE_LMA` → "catalog"). The `Reasoning` column shows the provider's stored `reasoning_effort` (or `-`). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
+The `Compatibility` column shows the saved catalog dialect, `sdk` for a legacy catalog record, or `manual` for a custom provider. The `Type` column renders `custom` or `catalog` based on `provider.source` (`SOURCE_CUSTOM` → "custom", `SOURCE_LMA` → "catalog"). The `Reasoning` column shows the provider's stored `reasoning_effort` (or `-`). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
 
 If no providers are configured, prints yellow "No providers configured. Run `miniouto provider add <name>` or `miniouto provider custom add`."
 

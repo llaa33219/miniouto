@@ -94,6 +94,8 @@ default_model = "gpt-5.5"      # used when neither chat --pm nor the session pin
 name = "anthropic"
 api_format = "anthropic"
 source = "lma"                 # added via `provider add Anthropic …`
+catalog_dialect = "anthropic-messages"  # selected lma dialect; omitted for legacy/custom records
+base_url = "https://api.anthropic.com"  # exact URL reported for that dialect
 default_model = "claude-opus-4.5"
 
 # Optional per-provider model-cap overrides (set when the provider is added,
@@ -111,6 +113,7 @@ Notes on the on-disk format:
 - Empty-string fields (`base_url=""`, `api_key=""`) are **omitted on write** by `Provider.to_dict()` (which filters `None`/`{}`/`""`). `from_dict()` restores them to defaults on read, so round-trips cleanly.
 - `name` is redundantly stored inside the table body (it is also the table key); `from_dict(name, body)` ignores the body's `name` for the field but does not put it in `extra`.
 - `source` is always written (its default `"custom"` is non-empty so survives the filter).
+- `catalog_dialect` records the lma wire-dialect choice. Changing Compatibility in the TUI rewrites it together with `api_format` and that dialect's `base_url`; these endpoint fields are provider-global, not session-pinned. Empty/missing preserves legacy catalog and custom records.
 - `extra` (default `{}`) is omitted on write and reconstituted as unknown keys on read.
 
 ### `settings.toml`
@@ -414,6 +417,7 @@ class Provider:
     api_key: str = ""
     default_model: str = ""
     source: str = SOURCE_CUSTOM     # one of SOURCE_CUSTOM | SOURCE_LMA
+    catalog_dialect: str = ""       # selected lma dialect; empty = native/custom
     max_context_window: int | None = None   # TUI-only override of default_model's context window
     max_output_tokens: int | None = None    # TUI-only override of default_model's max output tokens
     extra: dict[str, Any] = field(default_factory=dict)

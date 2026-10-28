@@ -55,6 +55,10 @@ class Provider:
     # string = token budget. None = auto (lma default). Read by
     # core/reasoning.py via core/runtime.py.
     reasoning_effort: str | None = None
+    # Selected lma dialect id. Empty retains the legacy SDK-derived mapping.
+    # Kept on the provider record so format and dialect-specific URL survive
+    # catalog refreshes; custom providers leave this unset.
+    catalog_dialect: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,7 +70,7 @@ class Provider:
         known = {
             "name", "api_format", "base_url", "api_key", "default_model",
             "source", "max_context_window", "max_output_tokens",
-            "reasoning_effort",
+            "reasoning_effort", "catalog_dialect",
         }
         extra = {k: v for k, v in data.items() if k not in known}
         source = data.get("source") or SOURCE_CUSTOM
@@ -82,6 +86,7 @@ class Provider:
             max_context_window=_coerce_positive_int(data.get("max_context_window")),
             max_output_tokens=_coerce_positive_int(data.get("max_output_tokens")),
             reasoning_effort=_coerce_optional_str(data.get("reasoning_effort")),
+            catalog_dialect=_coerce_optional_str(data.get("catalog_dialect")) or "",
             extra=extra,
         )
 

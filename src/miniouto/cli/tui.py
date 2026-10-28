@@ -63,14 +63,21 @@ from ..core import inbox, runtime, summary
 from ..core import lma as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import STREAM_THINKING, LoopEvent
-from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
+from ..core.providers import (
+    SUPPORTED_FORMATS,
+    CatalogDialect,
+    add_provider_from_lma,
+    catalog_compatibility,
+    resolve_catalog_dialect,
+    sdk_to_format,
+)
 from ..core.runtime import LoopCancelledError, default_provider_config
 from ..storage import paths, session_config
 from ..storage import providers as provider_store
 from ..storage import sessions as session_store
 from ..storage import settings as settings_store
 from ..storage import styles as style_store
-from ..storage.providers import SOURCE_CUSTOM
+from ..storage.providers import SOURCE_CUSTOM, SOURCE_LMA
 from ..tools import ascii_art
 from .chat import handoff_marker
 
@@ -81,6 +88,7 @@ SENTINEL_SAME_AS_OUTO = "__same_as_outo__"
 # Field name of the settings-popup row that edits a custom provider's caps.
 # `SettingRow` capitalizes the field, so this value IS the visible label.
 CAPS_FIELD = "caps"
+COMPATIBILITY_FIELD = "compatibility"
 
 # Sentinel for `_construct_provider_with_reasoning(reasoning_effort=...)`:
 # don't touch the provider's existing value (vs. None which would clear it).
@@ -860,6 +868,7 @@ class SelectionModal(ModalScreen[str | None]):
         none_label: str = "(none — clear)",
         extra_options: list[tuple[str, str]] | None = None,
         sections: list[tuple[str, list[tuple[str, str]]]] | None = None,
+        dialog_width: int = 60,
     ) -> None:
         super().__init__()
         self._title = title
@@ -869,13 +878,15 @@ class SelectionModal(ModalScreen[str | None]):
         self._none_label = none_label
         self._extra_options = list(extra_options or [])
         self._sections = list(sections or [])
+        self._dialog_width = dialog_width
         self._row_values: dict[ListItem, str | None] = {}
         # Option label -> its row in the ListView, which stops matching the
         # option index as soon as header rows are inserted above it.
         self._row_index_by_value: dict[str, int] = {}
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="selection-dialog"):
+        with Vertical(id="selection-dialog") as dialog:
+            dialog.styles.width = self._dialog_width
             yield Label(self._title, id="selection-title")
             items: list[ListItem] = []
             row = 0
@@ -1089,10 +1100,10 @@ class ProviderSettingsPopup(ModalScreen[None]):
     click away whenever that default is not what the user wants.
 
     A fourth row, `Caps`, exists only while the trio runs on a CUSTOM
-    provider: caps are an endpoint property of a hand-added record, and a
-    catalog provider's caps come from lma, so there is nothing to edit. Unlike
-    the trio rows it writes the provider RECORD alone — caps are global per
-    provider, never part of a session pin.
+    provider. A catalog provider instead gets `Compatibility`, which selects
+    one of lma's supported/likely dialects and its exact base URL. Both are
+    endpoint properties: unlike the trio rows they write the provider RECORD
+    alone, globally, never an individual session pin.
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -1187,6 +1198,27 @@ class ProviderSettingsPopup(ModalScreen[None]):
         rows["model"].set_value(model)
         rows["reasoning"].set_value(reasoning, enabled=enabled)
         self._sync_caps_row()
+        self._sync_compatibility_row()
+
+    def _sync_compatibility_row(self) -> None:
+        """Show the saved catalog dialect, or the legacy/native SDK choice."""
+
+        record = self._compatibility_record()
+        row = next(
+            (r for r in self.query(SettingRow) if r.field == COMPATIBILITY_FIELD),
+            None,
+        )
+        if record is None:
+            if row is not None:
+                row.remove()
+            return
+        value = record.catalog_dialect or "native SDK"
+        if row is None:
+            self.query_one("#provider-settings-rows", Vertical).mount(
+                SettingRow(COMPATIBILITY_FIELD, value)
+            )
+            return
+        row.set_value(value)
 
     def _sync_caps_row(self) -> None:
         """Keep the `Caps` row present exactly while a custom provider is selected."""
@@ -1217,6 +1249,8 @@ class ProviderSettingsPopup(ModalScreen[None]):
             self._pick_model()
         elif event.row.field == CAPS_FIELD:
             self._pick_caps()
+        elif event.row.field == COMPATIBILITY_FIELD:
+            self._pick_compatibility()
         else:
             self._pick_reasoning()
 
@@ -1348,6 +1382,141 @@ class ProviderSettingsPopup(ModalScreen[None]):
             ),
             on_close,
         )
+
+    def _compatibility_record(self) -> provider_store.Provider | None:
+        """The effective catalog provider, including for an inheriting trio."""
+
+        provider, _ = _reasoning_target(self._target, _effective_config(self._session))
+        record = _record(provider)
+        if record is None or record.source != SOURCE_LMA:
+            return None
+        return record
+
+    def _pick_compatibility(self) -> None:
+        record = self._compatibility_record()
+        if record is None:
+            self._report("Compatibility is selectable for catalog providers only.")
+            return
+        self.app.run_worker(self._compatibility_flow(record.name), exclusive=False)
+
+    async def _compatibility_flow(self, provider_name: str) -> None:
+        """Refresh lma's dialects, then persist the chosen format and URL."""
+
+        try:
+            catalog_provider = await asyncio.to_thread(
+                catalog_api.find_provider_by_slug, provider_name
+            )
+        except Exception as exc:
+            self._report(f"compatibility lookup failed: {exc}")
+            return
+        if catalog_provider is None:
+            self._report("No catalog metadata found for this provider.")
+            return
+        options = catalog_compatibility(catalog_provider)
+        current = self._compatibility_record()
+        if current is None:
+            return
+        current_dialect = current.catalog_dialect
+        saved_label = ""
+        native_format, native_url = sdk_to_format(
+            catalog_provider.get("sdk"), catalog_provider.get("api")
+        )
+        native_label = (
+            f"native SDK ({native_format}) — {native_url or 'SDK default URL'}"
+            if native_format is not None
+            else ""
+        )
+        choices: list[str] = []
+        if current_dialect:
+            current_option = next(
+                (option for option in options if option.dialect == current_dialect),
+                None,
+            )
+            if (
+                current_option is not None
+                and current.api_format == current_option.api_format
+                and current.base_url == current_option.base_url
+            ):
+                saved_label = self._compatibility_label(current_option)
+            else:
+                # Keep a dialect whose URL/version disappeared from current
+                # lma results selectable: confirmation must not silently move
+                # the provider to a different endpoint.
+                saved_label = (
+                    f"{current_dialect} (saved) — {current.base_url or 'SDK default URL'}"
+                )
+            choices.append(saved_label)
+            choices.extend(
+                self._compatibility_label(option)
+                for option in options
+                if self._compatibility_label(option) != saved_label
+            )
+        else:
+            saved_label = native_label or (
+                f"native SDK ({current.api_format}) — "
+                f"{current.base_url or 'SDK default URL'}"
+            )
+            choices.append(saved_label)
+            if native_label:
+                choices.append(native_label)
+            choices.extend(self._compatibility_label(option) for option in options)
+        if native_label and current_dialect:
+            choices.append(native_label)
+        if not choices:
+            self._report("No compatibility mapping is available for this provider.")
+            return
+        picked = await self.app.push_screen_wait(
+            SelectionModal(
+                f"Compatibility ({provider_name})",
+                choices,
+                current=saved_label,
+                allow_none=False,
+                # Dialect labels carry a full endpoint URL; the stock 60-cell
+                # picker would clip exactly the information this choice needs.
+                dialog_width=min(100, self.app.screen.size.width),
+            )
+        )
+        if not picked:
+            return
+        latest = self._compatibility_record()
+        if latest is None or latest.name != provider_name:
+            return
+        if picked == saved_label:
+            return
+        if picked == native_label:
+            provider_store.upsert(
+                replace(
+                    latest,
+                    api_format=native_format,
+                    base_url=native_url or "",
+                    catalog_dialect="",
+                )
+            )
+        else:
+            option = next(
+                (
+                    option
+                    for option in options
+                    if self._compatibility_label(option) == picked
+                ),
+                None,
+            )
+            if option is None:
+                return
+            provider_store.upsert(
+                replace(
+                    latest,
+                    api_format=option.api_format,
+                    base_url=option.base_url,
+                    catalog_dialect=option.dialect,
+                )
+            )
+        self.query_one("#provider-settings-status", Label).update("")
+        self.refresh_rows()
+
+    @staticmethod
+    def _compatibility_label(option: CatalogDialect) -> str:
+        return f"{option.dialect} ({option.confidence}) — {option.base_url}"
 
     def _caps_record(self) -> provider_store.Provider | None:
         """The record the `Caps` row edits, or None when there is nothing to edit.
@@ -3006,7 +3175,10 @@ class ChatTUI(App):
         name_to_provider: dict[str, dict[str, Any]] = {}
         for p in all_providers:
             fmt, _ = sdk_to_format(p.get("sdk"), p.get("api"))
-            if fmt:
+            selected = resolve_catalog_dialect(
+                p.get("sdk"), p.get("api"), p.get("dialects")
+            )
+            if fmt or selected is not None:
                 name_to_provider[p["name"]] = p
         if not name_to_provider:
             self._spinner_status("No catalog providers have a supported api_format.")
@@ -3093,6 +3265,7 @@ class ChatTUI(App):
                 api=catalog_p.get("api"),
                 default_model=default_model,
                 reasoning_effort=reasoning_effort,
+                dialects=catalog_p.get("dialects"),
             )
         except TypeError:
             # Parallel `reasoning_effort` kwarg hasn't landed yet; build
@@ -3103,6 +3276,7 @@ class ChatTUI(App):
                 sdk=catalog_p.get("sdk"),
                 api=catalog_p.get("api"),
                 default_model=default_model,
+                dialects=catalog_p.get("dialects"),
             )
         except ValueError as exc:
             self._spinner_status(f"add failed: {exc}")

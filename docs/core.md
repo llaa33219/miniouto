@@ -391,11 +391,11 @@ Whitelist of `Provider.api_format` values. Validated by `cli/provider.py:add_cus
 
 ### `sdk_to_format(sdk, api) -> (api_format, base_url)`
 
-Maps an lma provider's `sdk`/`api` pair to a `(api_format, base_url)` tuple. Returns `(None, None)` when the SDK cannot be hosted by any supported coreouto builtin (e.g. `amazon-bedrock`, `bedrock`, anything else without an `api` URL). Unknown SDKs with a non-null `api` URL fall back to `("openai", api)` — the universal gateway shape. Used by `cli/provider.py:providers_cmd` (catalog browse) and `cli/provider.py:add_cmd` (catalog add), plus the TUI `_catalog_add_flow` to filter `lma.list_providers` output to addable entries. See `docs/lma.md` for the full mapping table.
+Maps an lma provider's `sdk`/`api` pair to a `(api_format, base_url)` tuple. Returns `(None, None)` when the SDK cannot be hosted by any supported coreouto builtin (e.g. `amazon-bedrock`, `bedrock`, anything else without an `api` URL). Unknown SDKs with a non-null `api` URL fall back to `("openai", api)` — the universal gateway shape. This remains the legacy/no-dialect fallback. `catalog_compatibility()` parses lma's hostable supported/likely dialects, and `resolve_catalog_dialect()` picks confirmed over tentative, then native-SDK-matching within that confidence group, returning the dialect's exact URL. See `docs/lma.md` for both mapping tables.
 
-### `add_provider_from_lma(name, api_key, sdk, api, default_model="", reasoning_effort=None) -> Provider`
+### `add_provider_from_lma(name, api_key, sdk, api, default_model="", reasoning_effort=None, dialects=None) -> Provider`
 
-Builds a `storage.providers.Provider` from lma metadata + a user-supplied API key, with `source="lma"` set. `reasoning_effort` is stored verbatim on the Provider (see step 11 of `build_runtime`). Raises `ValueError` when `sdk_to_format` returns `(None, None)`. Used by `cli/provider.py:add_cmd` (catalog add) and `cli/tui.py:_catalog_add_flow`.
+Builds a `storage.providers.Provider` from lma metadata + a user-supplied API key, with `source="lma"` set. `reasoning_effort` is stored verbatim on the Provider (see step 11 of `build_runtime`). A selected dialect supplies `api_format`, `base_url`, and `catalog_dialect`; absent dialect data retains `sdk_to_format`. Raises `ValueError` only when neither path yields a host. Used by `cli/provider.py:add_cmd` (catalog add) and `cli/tui.py:_catalog_add_flow`.
 
 ### `build_coreouto_provider(provider: Provider) -> None`
 

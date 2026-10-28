@@ -7,6 +7,7 @@ classes: `openai`, `openai-response`, `anthropic`, `google`.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass
 from typing import Any
 
 import coreouto as co
@@ -37,6 +38,83 @@ _SDK_TO_FORMAT: dict[str, tuple[str, str | None]] = {
     "google-vertex": ("google", None),
 }
 
+# lma's wire-protocol ids -> coreouto's provider formats. In particular,
+# typesafe-systemone is intentionally absent: it is not an LLM wire protocol
+# miniouto can host.
+DIALECT_TO_FORMAT: dict[str, str] = {
+    "openai-chat": "openai",
+    "openai-responses": "openai-response",
+    "anthropic-messages": "anthropic",
+    "gemini-generate": "google",
+}
+
+
+@dataclass(frozen=True)
+class CatalogDialect:
+    """One usable endpoint advertised by lma's keyless dialect probe."""
+
+    dialect: str
+    api_format: str
+    base_url: str
+    confidence: str  # "supported" = confirmed; "likely" = tentative
+
+
+def catalog_compatibility(catalog_provider: dict[str, Any]) -> list[CatalogDialect]:
+    """Return hostable dialects, confirmed first, in deterministic order.
+
+    A dialect occurs in at most one lma confidence group. Be defensive about
+    that upstream contract anyway: supported wins if malformed data repeats
+    an id in both groups, and unrelated/non-string entries never reach a
+    provider constructor.
+    """
+
+    dialects = catalog_provider.get("dialects")
+    if not isinstance(dialects, dict):
+        return []
+    options: list[CatalogDialect] = []
+    seen: set[str] = set()
+    for confidence in ("supported", "likely"):
+        entries = dialects.get(confidence)
+        if not isinstance(entries, dict):
+            continue
+        for dialect, api_format in DIALECT_TO_FORMAT.items():
+            if dialect in seen:
+                continue
+            base_url = entries.get(dialect)
+            if not isinstance(base_url, str) or not base_url.strip():
+                continue
+            options.append(
+                CatalogDialect(dialect, api_format, base_url.strip(), confidence)
+            )
+            seen.add(dialect)
+    return options
+
+
+def resolve_catalog_dialect(
+    sdk: str | None,
+    api: str | None,
+    dialects: dict[str, Any] | None,
+) -> CatalogDialect | None:
+    """Choose the default endpoint, retaining the SDK mapping as a preference.
+
+    Confirmed endpoints always outrank tentative ones. Within either
+    confidence group a protocol matching the provider's declared SDK wins;
+    this also recovers entries whose native SDK miniouto cannot host directly.
+    """
+
+    options = catalog_compatibility({"dialects": dialects})
+    if not options:
+        return None
+    native_format, _ = sdk_to_format(sdk, api)
+    for confidence in ("supported", "likely"):
+        group = [option for option in options if option.confidence == confidence]
+        native = next((option for option in group if option.api_format == native_format), None)
+        if native is not None:
+            return native
+        if group:
+            return group[0]
+    return None  # unreachable: options is non-empty and has only these groups
+
 
 def sdk_to_format(sdk: str | None, api: str | None) -> tuple[str | None, str | None]:
     """Returns `(None, None)` when the SDK has no supported host."""
@@ -59,10 +137,15 @@ def add_provider_from_lma(
     api: str | None,
     default_model: str = "",
     reasoning_effort: str | None = None,
+    dialects: dict[str, Any] | None = None,
 ) -> Provider:
     """Build a Provider from lma metadata. Raises ValueError on unsupported SDK."""
 
-    fmt, base_url = sdk_to_format(sdk, api)
+    selected = resolve_catalog_dialect(sdk, api, dialects)
+    if selected is not None:
+        fmt, base_url = selected.api_format, selected.base_url
+    else:
+        fmt, base_url = sdk_to_format(sdk, api)
     if fmt is None:
         raise ValueError(
             f"Cannot map lma provider {name!r} (sdk={sdk!r}) to a supported "
@@ -77,6 +160,7 @@ def add_provider_from_lma(
         default_model=default_model,
         source=SOURCE_LMA,
         reasoning_effort=reasoning_effort,
+        catalog_dialect=selected.dialect if selected is not None else "",
     )
 
 
@@ -142,7 +226,20 @@ def _instantiate(api_format: str, api_key: str | None, base_url: str) -> Any:
 
         http_options: dict[str, Any] | None = None
         if base_url:
+            # google-genai appends api_version to base_url itself. lma's
+            # gemini-generate SDK base already includes that version, so split
+            # it back out instead of producing /v1beta/v1beta/... .
+            from urllib.parse import urlsplit, urlunsplit
+
+            parsed = urlsplit(base_url)
+            path = parsed.path.rstrip("/")
+            root, separator, version = path.rpartition("/")
             http_options = {"base_url": base_url}
+            if separator and version.startswith("v") and version[1:].isalnum():
+                http_options = {
+                    "base_url": urlunsplit((parsed.scheme, parsed.netloc, root, "", "")),
+                    "api_version": version,
+                }
         return GoogleProvider(
             api_key=api_key, http_options=http_options, stream=True,
             timeout=API_STALL_TIMEOUT_SECONDS,

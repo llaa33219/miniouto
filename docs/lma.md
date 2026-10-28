@@ -2,12 +2,13 @@
 
 `miniouto` integrates [lma](https://github.com/llaa33219/llm-model-api) — a re-shaped, fuzzy-search view of [`models.dev/api.json`](https://models.dev/api.json) deployed to [`https://lma.blp.sh`](https://lma.blp.sh) via Cloudflare Workers. lma covers **144 providers** and **5,000+ models** with a 10-minute server-side cache.
 
-miniouto uses lma for four things:
+miniouto uses lma for five things:
 
 1. **Provider discovery** — `miniouto provider providers` lists every known provider and whether miniouto can host it.
 2. **Model discovery** — `miniouto provider models <provider>` lists every model lma knows for a provider; the TUI provider-add wizard and the popup's `Model` row fetch the same data.
 3. **Per-model context / max-output caps** — `core/context.py` calls lma's `/model` endpoint to look up `context_window` and `max_output_tokens` instead of the older `lcw-api.blp.sh/context-window` endpoint.
 4. **Per-model reasoning metadata** — `core/reasoning.py` reads `reasoning_options` from the same `/model` endpoint to resolve reasoning request kwargs (see below).
+5. **Provider dialect / base-URL detection** — `core/providers.py` reads `/provider`'s `dialects.supported` (confirmed) and `dialects.likely` (tentative) maps to choose a hostable wire format and its exact endpoint URL.
 
 ### Per-provider overrides (custom providers)
 
@@ -93,7 +94,22 @@ lma passes through `models.dev`'s `sdk` and `api` URL for every provider. miniou
 | anything else | `openai` (fallback) **iff** lma `api` is non-null | lma `api` |
 | anything else with no `api` | `(None, None)` — not addable | — |
 
-When `sdk_to_format` returns `(None, None)`, the provider is **not addable** — miniouto's four built-in coreouto providers (`openai`, `openai-response`, `anthropic`, `google`) cannot host it. Such providers appear in `miniouto provider providers` with `Addable? = ✗` and are filtered out of the TUI add list.
+### Dialect detection and base URLs
+
+The `/provider` response may also carry `dialects`, with `supported` and `likely` maps from a dialect id to a complete **SDK base URL** (detector 0.2.0+, not a raw POST endpoint). `supported` is a confirmed detection; `likely` is tentative. `catalog_compatibility()` exposes only dialects miniouto can host, confirmed first:
+
+| lma dialect | `api_format` |
+|---|---|
+| `openai-chat` | `openai` |
+| `openai-responses` | `openai-response` |
+| `anthropic-messages` | `anthropic` |
+| `gemini-generate` | `google` |
+
+`typesafe-systemone` is deliberately ignored. `resolve_catalog_dialect()` prefers `supported` over `likely`, and within either confidence group prefers the dialect matching the native SDK. If no usable dialect is present it returns `None`, preserving the `sdk_to_format` behavior above. If a dialect is available it can also make a provider addable when its native SDK has no mapping. The dialect's URL replaces lma's generic `api` URL rather than being derived by trimming it. Google is the one SDK adaptation: a trailing `v1beta`/`v1` path segment is passed as google-genai's `api_version` so the SDK does not append it twice. OpenAI-compatible URLs remain exactly as detected; version-less gateway routes are valid and must not receive a blanket `/v1` suffix.
+
+`add_provider_from_lma(..., dialects=...)` persists the selected dialect id in `Provider.catalog_dialect` and its format/URL in `api_format` / `base_url`. This keeps later turns on the user's selected endpoint even if lma's detection changes. Existing catalog records without that field retain their saved native configuration. Custom providers are never probed or rewritten.
+
+When neither `resolve_catalog_dialect` nor `sdk_to_format` finds a host, the provider is **not addable** — miniouto's four built-in coreouto providers (`openai`, `openai-response`, `anthropic`, `google`) cannot host it. Such providers appear in `miniouto provider providers` with `Addable? = ✗` and are filtered out of the TUI add list. The CLI catalog list shows each supported/likely dialect and the selected URL; `provider list` shows the saved dialect and effective URL.
 
 ## TUI integration
 
@@ -102,10 +118,11 @@ When `sdk_to_format` returns `(None, None)`, the provider is **not addable** —
 1. **The provider settings popup's `Provider` row** (`ProviderSettingsPopup`, reached from either the `outo` or `subagent` chip) has two sentinels at the bottom of its list (`cli/tui.py`):
    - `+ add from catalog…` → `ChatTUI._catalog_add_flow()` fetches `/provider`, filters to addable entries, shows a `SelectionModal`, then a `TextInputModal` for the API key, then saves with `source="lma"` and the first model from `/model-list` as `default_model`.
    - `+ add custom…` → `ChatTUI._open_custom_add_wizard()` runs a 5-step wizard saving with `source="custom"`.
-2. **The popup's `Model` row** (`ProviderSettingsPopup._model_flow`) dispatches on `provider.source`:
+2. **The popup's `Compatibility` row** appears for catalog providers after the three trio rows. It shows the saved dialect (or `native SDK` for a legacy record), fetches current catalog metadata on click, and offers every hostable supported/likely dialect with its URL. A pick updates the shared provider record's `catalog_dialect`, `api_format`, and `base_url`; it does not alter the model/reasoning session pin. An inheriting subagent popup edits the effective outo provider record. Custom providers get the existing `Caps` row instead.
+3. **The popup's `Model` row** (`ProviderSettingsPopup._model_flow`) dispatches on `provider.source`:
    - `source == "lma"` → fetches `/model-list` and shows a `SelectionModal` with `id — name` rows.
    - `source == "custom"` → the same flow's "no models" fallback shows a free-text `TextInputModal` (a hand-added endpoint need not exist in the catalog).
-3. **Saving any of the three rows** goes through `_persist_trio`, which writes **both** halves of the resolution: the session pin (`session-config/<session>.toml`) and the global default — `settings.provider` plus the provider record's `default_model` / `reasoning_effort` (`dataclasses.replace` + `provider_store.upsert`) for the outo trio, the three `settings.subagent_*` keys for the subagent one. `settings.model` is never written. Picking a Provider or a Model also resets Reasoning to that model's default. See `docs/cli.md` § Clickable chips.
+4. **Saving any of the three trio rows** goes through `_persist_trio`, which writes **both** halves of the resolution: the session pin (`session-config/<session>.toml`) and the global default — `settings.provider` plus the provider record's `default_model` / `reasoning_effort` (`dataclasses.replace` + `provider_store.upsert`) for the outo trio, the three `settings.subagent_*` keys for the subagent one. `settings.model` is never written. Picking a Provider or a Model also resets Reasoning to that model's default. See `docs/cli.md` § Clickable chips.
 
 ## Provider.source field
 
@@ -113,8 +130,9 @@ When `sdk_to_format` returns `(None, None)`, the provider is **not addable** —
 
 ```python
 source: str = "custom"   # one of SOURCE_CUSTOM | SOURCE_LMA
+catalog_dialect: str = ""  # selected lma dialect; empty = legacy/native SDK
 ```
 
-`SOURCE_LMA` is set by `provider add` (catalog) and by the TUI `+ add from catalog…` wizard. `SOURCE_CUSTOM` is set by `provider custom add` and the TUI `+ add custom…` wizard. Legacy TOML files (pre-this-change) load with `source="custom"` because the field defaults when missing — they continue to work; only the model-picker UI differs (text input vs. catalog picker).
+`SOURCE_LMA` is set by `provider add` (catalog) and by the TUI `+ add from catalog…` wizard. `SOURCE_CUSTOM` is set by `provider custom add` and the TUI `+ add custom…` wizard. Legacy TOML files (pre-this-change) load with `source="custom"` because the field defaults when missing — they continue to work; only the model-picker UI differs (text input vs. catalog picker). `catalog_dialect` is optional for backward-compatible catalog records and is omitted when empty.
 
 `SOURCE_CUSTOM`, `SOURCE_LMA`, and the `VALID_SOURCES = (SOURCE_CUSTOM, SOURCE_LMA)` tuple are exported from `storage.providers`.

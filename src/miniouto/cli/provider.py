@@ -16,11 +16,18 @@ from rich.console import Console
 from rich.table import Table
 
 from ..core import lma as catalog_api
-from ..core.providers import SUPPORTED_FORMATS, add_provider_from_lma, sdk_to_format
+from ..core.providers import (
+    SUPPORTED_FORMATS,
+    add_provider_from_lma,
+    catalog_compatibility,
+    resolve_catalog_dialect,
+    sdk_to_format,
+)
 from ..core.reasoning import default_reasoning_choice
 from ..storage import paths
 from ..storage import providers as provider_store
 from ..storage import settings as settings_store
+from ..storage.providers import SOURCE_LMA
 
 app = typer.Typer(help="Manage LLM providers (catalog browse + custom config).")
 custom_app = typer.Typer(help="Manually configure a custom provider (advanced).")
@@ -62,15 +69,26 @@ def providers_cmd() -> None:
     table.add_column("SDK")
     table.add_column("API URL")
     table.add_column("miniouto format", style="magenta")
+    table.add_column("Detected compatibility")
+    table.add_column("Selected base URL")
     table.add_column("Addable?", justify="center")
     for p in providers:
         name = p.get("name", "?")
         sdk = p.get("sdk") or "-"
         api = p.get("api") or "-"
-        fmt, _ = sdk_to_format(sdk, api)
+        selected = resolve_catalog_dialect(sdk, api, p.get("dialects"))
+        fmt, legacy_url = sdk_to_format(sdk, api)
+        if selected is not None:
+            fmt, selected_url = selected.api_format, selected.base_url
+        else:
+            selected_url = legacy_url
         fmt_str = fmt or "[red]unsupported[/red]"
+        detected = ", ".join(
+            f"{option.dialect} ({option.confidence})"
+            for option in catalog_compatibility(p)
+        ) or "-"
         addable = "[green]✓[/green]" if fmt else "[dim]✗[/dim]"
-        table.add_row(name, sdk, api, fmt_str, addable)
+        table.add_row(name, sdk, api, fmt_str, detected, selected_url or "-", addable)
     console.print(table)
 
 
@@ -146,6 +164,7 @@ def add_cmd(
             api=api,
             default_model=default_model,
             reasoning_effort=reasoning,
+            dialects=catalog_provider.get("dialects"),
         )
     except ValueError as exc:
         console.print(f"[red]✗[/red] {exc}")
@@ -161,6 +180,7 @@ def add_cmd(
                     sdk=sdk,
                     api=api,
                     default_model=models[0].get("id", ""),
+                    dialects=catalog_provider.get("dialects"),
                     reasoning_effort=reasoning,
                 )
         except Exception:
@@ -205,6 +225,7 @@ def list_cmd() -> None:
     table.add_column("Name", style="cyan")
     table.add_column("Type")
     table.add_column("Format")
+    table.add_column("Compatibility")
     table.add_column("Base URL")
     table.add_column("Default Model")
     table.add_column("Reasoning")
@@ -216,6 +237,7 @@ def list_cmd() -> None:
             p.name,
             kind,
             p.api_format,
+            p.catalog_dialect or ("sdk" if p.source == SOURCE_LMA else "manual"),
             p.base_url or "-",
             p.default_model or "-",
             p.reasoning_effort or "-",
