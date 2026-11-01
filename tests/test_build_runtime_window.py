@@ -1,8 +1,8 @@
 """Lock the clear+register window of `core.runtime.build_runtime`.
 
 `clear_coreouto_state()` wipes coreouto's global provider/preset/tool/hook
-registries. Anything slow that runs *inside* that window (style file I/O, lma
-lookups for the output cap, lma lookups for reasoning options) leaves the
+registries. Anything slow that runs *inside* that window (style file I/O, modelslist
+lookups for the output cap, modelslist lookups for reasoning options) leaves the
 registries empty for as long as it takes. So every slow resolution must be
 hoisted above the clear, and the window itself must be pure in-memory dict
 operations.
@@ -36,7 +36,7 @@ def _install_provider() -> str:
             api_key="k",
             default_model="m",
             # Set so the context monitor resolves the window from the
-            # override instead of hitting lma.
+            # override instead of hitting modelslist.
             max_context_window=200_000,
         )
     )
@@ -72,7 +72,7 @@ def test_slow_resolution_completes_before_the_clear(monkeypatch: pytest.MonkeyPa
         rt.RuntimeConfig(provider_name=name, model="m", style_name="probe", session="probe")
     )
 
-    # Then: the last remaining lma lookup landed before the clear, and the
+    # Then: the last remaining modelslist lookup landed before the clear, and the
     # clear itself happens exactly once
     assert timeline.count("clear") == 1
     clear_at = timeline.index("clear")

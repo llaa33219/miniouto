@@ -9,8 +9,15 @@ from . import toml_io
 from .paths import PROVIDERS_FILE, ensure_dirs
 
 SOURCE_CUSTOM = "custom"
-SOURCE_LMA = "lma"
-VALID_SOURCES = (SOURCE_CUSTOM, SOURCE_LMA)
+SOURCE_LMA = "lma"  # legacy catalog records; no lma requests are made
+SOURCE_MODELSLIST = "modelslist"
+VALID_SOURCES = (SOURCE_CUSTOM, SOURCE_LMA, SOURCE_MODELSLIST)
+
+
+def is_catalog_source(source: str) -> bool:
+    """Both new modelslist records and existing lma records use catalog UI."""
+
+    return source in (SOURCE_LMA, SOURCE_MODELSLIST)
 
 
 def _coerce_positive_int(value: Any) -> int | None:
@@ -46,18 +53,18 @@ class Provider:
     default_model: str = ""
     source: str = SOURCE_CUSTOM
     # Per-provider overrides for default_model's caps. Win over anything
-    # lma reports; None = no override. Written only by the TUI custom-model
+    # modelslist reports; None = no override. Written only by the TUI custom-model
     # editor, read only by core/context.py.
     max_context_window: int | None = None
     max_output_tokens: int | None = None
     # Per-provider reasoning preference for default_model: "none"/"off" =
     # disabled, "on" = toggle on, an effort level ("medium"), or a decimal
-    # string = token budget. None = auto (lma default). Read by
+    # string = token budget. None = auto (modelslist default). Read by
     # core/reasoning.py via core/runtime.py.
     reasoning_effort: str | None = None
-    # Selected lma dialect id. Empty retains the legacy SDK-derived mapping.
-    # Kept on the provider record so format and dialect-specific URL survive
-    # catalog refreshes; custom providers leave this unset.
+    # Selected modelslist format id. Kept with its exact URL so a catalog
+    # refresh cannot silently change the endpoint. Custom providers leave it
+    # unset; old lma ids remain displayable on legacy records.
     catalog_dialect: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 

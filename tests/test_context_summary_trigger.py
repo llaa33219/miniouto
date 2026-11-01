@@ -131,7 +131,7 @@ def test_a_fresh_turn_gets_its_own_request(monkeypatch: pytest.MonkeyPatch) -> N
 def test_without_a_window_the_monitor_is_not_registered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Given: no lma answer and no provider override for the window
+    # Given: no modelslist answer and no provider override for the window
     monkeypatch.setattr(context, "get_context_window", lambda *a, **k: None)
 
     # When / Then: no hook exists, because there is no threshold to measure

@@ -17,7 +17,7 @@ This directory contains a complete reference for the project. Read [`architectur
 | [`tools.md`](./tools.md) | The Bash + media + Computer + `continue_session` tools — handlers, schemas, multimodal blocks, the `.art` screen-art channel, and why delegation is a Bash command. |
 | [`styles.md`](./styles.md) | Style document format (tag-as-name grammar: `<outo>` + role tags selected by `chat --role`), the five bundled templates. |
 | [`skills.md`](./skills.md) | Skill discovery from `./skills/` (project-local) and `~/.agents/skills/`, frontmatter schema. |
-| [`lma.md`](./lma.md) | lma (llm-model-api) integration: provider/model discovery, context caps, the `provider providers/models/add` CLI commands, TUI add flows. |
+| [`modelslist.md`](./modelslist.md) | modelslist (`https://modelslist.blp.sh`) integration: the root provider index, `modelLists source="modelslist"`, the `data` model envelope (`context_length`, `top_provider.max_completion_tokens`, `reasoning_options`), the 300-second cache, supported formats, and the `provider providers/models/add` CLI + TUI add flows. |
 | [`development.md`](./development.md) | Install, build, lint, release, contributing notes, known issues. |
 
 ## Source map
@@ -39,13 +39,13 @@ src/miniouto/
 │   ├── subagent.py          # subagent show/set/clear (what `chat --use-subagent-provider` reads)
 │   └── tui.py               # ChatTUI, run_tui(), model/provider pickers, catalog/custom add wizards
 ├── core/                    # Chat loop + runtime assembly   → see core.md
-│   ├── __init__.py          # re-exports chat, events, lma, providers, runtime
+│   ├── __init__.py          # re-exports chat, events, modelslist, providers, runtime
 │   ├── chat.py              # ChatOptions, run_chat, ToolCallArgsError, diagnostics, sink dispatchers
-│   ├── context.py           # lma fetcher (caps) + make_context_monitor (the summary trigger)   → see core.md
+│   ├── context.py           # modelslist cap fetcher + make_context_monitor (the summary trigger)   → see core.md
 │   ├── events.py            # LoopEvent, EventSink protocol, NullSink, ConsoleEventSink
 │   ├── error_rules.py       # per-format ErrorRule lists for provider error_handling (coreouto >= 0.10)
-│   ├── lma.py               # lma REST client + slugify          → see lma.md
-│   ├── providers.py         # SUPPORTED_FORMATS, sdk_to_format, build_coreouto_provider
+│   ├── modelslist.py        # modelslist REST client + slugify  → see modelslist.md
+│   ├── providers.py         # SUPPORTED_FORMATS, DIALECT_TO_FORMAT, add_provider_from_catalog, build_coreouto_provider
 │   ├── reasoning.py         # reasoning choice → provider_passthrough
 │   ├── repetition.py        # repetition watchdog (phrase / tool loops)   → see core.md
 │   ├── runtime.py           # RuntimeConfig, build_runtime (role mode), inbox alarm hook, watchdogs, history repair

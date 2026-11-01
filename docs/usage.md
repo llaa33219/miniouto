@@ -22,22 +22,23 @@ A cookbook of real-world examples for every CLI command — flags, output shapes
 
 The first `miniouto` invocation (any subcommand) runs `storage/paths.py:ensure_dirs()`, which creates the `~/.miniouto/` skeleton and seeds the five bundled styles automatically. After that you register one provider, set it as default, and you're ready to chat.
 
-**Path A — pull from the lma catalog (recommended):**
+**Path A — pull from the modelslist catalog (recommended):**
 
 ```bash
-# 1. See what's available (≈144 catalog providers)
+# 1. See what's available (a curated index — provider counts change, don't hard-code one)
 miniouto provider providers
 
 # 2. List models for a specific provider (name is fuzzy-matched, case/space insensitive)
-miniouto provider models anthropic
-miniouto provider models "open ai"
+miniouto provider models Kimi
+miniouto provider models "mini max"      # → MiniMax
+miniouto provider models deepseek
 
 # 3. Just the API key — base_url, format, and default model are auto-filled
-miniouto provider add Anthropic --api-key sk-ant-...
-miniouto provider add OpenAI --api-key sk-... --default-model gpt-5.5
+miniouto provider add Kimi --api-key sk-...
+miniouto provider add DeepSeek --api-key sk-... --default-model deepseek-v4-pro
 
 # 4. Set as default
-miniouto provider default anthropic
+miniouto provider default kimi
 
 # 5. Pick a style (all five bundles are already installed)
 miniouto style list
@@ -220,7 +221,7 @@ Pin a long-running session so a model switch in another process can't move it, a
 ### Generation parameters (`--max-tokens`, `--temperature`)
 
 ```bash
-# Cap output tokens explicitly (default pulls the model's real cap from lma, floor 16384)
+# Cap output tokens explicitly (default pulls the model's real cap from modelslist, floor 16384)
 miniouto chat "keep it short" --max-tokens 256
 
 # Sampling temperature
@@ -231,7 +232,7 @@ miniouto chat "strict facts only" --temperature 0.0
 miniouto chat "summarize" --max-tokens 512 --temperature 0.3
 ```
 
-> When `--max-tokens` is omitted, `core/context.py:get_max_output_tokens` queries the lma `/model` endpoint for the model's real cap and uses it, with a 16384-token floor (prevents Anthropic's 1024 default from silently truncating long tool calls, e.g. heredoc file writes, mid-stream). A per-provider `max_output_tokens` / `max_context_window` override is set when the provider is added (the TUI `+ add custom…` wizard asks for them) or by hand in `providers.toml`, for endpoints lma has no data on.
+> When `--max-tokens` is omitted, `core/context.py:get_max_output_tokens` reads the model's real cap from modelslist (`top_provider.max_completion_tokens`, falling back to `context_length`) and uses it, with a 16384-token floor (prevents Anthropic's 1024 default from silently truncating long tool calls, e.g. heredoc file writes, mid-stream). A per-provider `max_output_tokens` / `max_context_window` override is set when the provider is added (the TUI `+ add custom…` wizard asks for them) or by hand in `providers.toml`, for endpoints the catalog has no data on.
 
 ---
 
@@ -242,28 +243,28 @@ Three groups: catalog browse/add (`providers`, `models`, `add`), management of r
 ### Catalog browsing
 
 ```bash
-# All catalog providers (≈144 from lma.blp.sh)
+# The curated catalog index (modelslist.blp.sh)
 miniouto provider providers
-# Columns: Name | SDK | API URL | miniouto format | Addable?
-# Only Addable? = ✓ providers can be added (those with a sdk_to_format mapping)
+# Columns: Name | Slug | miniouto format | Selected base URL | Available compatibility | Addable?
+# Only Addable? = ✓ providers can be added (those with a hostable formats[] entry)
 
 # Models for a specific provider (fuzzy-matched name)
-miniouto provider models Anthropic
-miniouto provider models anthropic       # case-insensitive
-miniouto provider models "open ai"       # space/hyphen-insensitive
+miniouto provider models Kimi
+miniouto provider models kimi            # case-insensitive
+miniouto provider models "mini max"      # space/hyphen/punctuation-insensitive
 ```
 
 ### Adding from the catalog
 
 ```bash
 # Default — uses the first model the catalog lists as default_model
-miniouto provider add Anthropic --api-key sk-ant-...
+miniouto provider add Kimi --api-key sk-...
 
 # Explicit default model
-miniouto provider add OpenAI --api-key sk-... --default-model gpt-5.5
+miniouto provider add MiniMax --api-key sk-... --default-model MiniMax-M3.1-Flash
 
 # Same name already exists → yellow warning, overwrites in place
-# ! Provider anthropic already exists; overwriting.
+# ! Provider kimi already exists; overwriting.
 ```
 
 ### Adding a custom provider
@@ -398,7 +399,7 @@ A Textual-based interactive UI. Key bindings:
 
 The chips in the bottom panel (two left/right-anchored pairs, `outo`/`style` then `subagent`/`session`):
 
-- **outo** — click → the provider settings popup: three rows, `Provider` / `Model` / `Reasoning`, each opening its own picker. The `Provider` row lists registered providers plus two sentinels (`+ add from catalog…`, `+ add custom…`); `Model` fetches the catalog list for a catalog provider and falls back to a free-text id for a hand-added endpoint; `Reasoning` lists the levels lma reports for the resolved model. **Picking a Provider or a Model resets Reasoning** to that model's default — an effort level belongs to a model — and Reasoning is one more click away.
+- **outo** — click → the provider settings popup: three rows, `Provider` / `Model` / `Reasoning`, each opening its own picker. The `Provider` row lists registered providers plus two sentinels (`+ add from catalog…`, `+ add custom…`); `Model` fetches the provider's catalog-owned model list and falls back to a free-text id for a hand-added endpoint; `Reasoning` lists the levels modelslist reports for the resolved model. **Picking a Provider or a Model resets Reasoning** to that model's default — an effort level belongs to a model — and Reasoning is one more click away.
 - **subagent** — the same popup, editing the `subagent_provider` / `subagent_model` / `subagent_reasoning` trio; empty still reads `same as outo`, which is what a delegated run inherits.
 - **style** — click → list of installed styles.
 - **session** — click → the session picker, grouped by the session's creation directory, plus `+ new session…`.

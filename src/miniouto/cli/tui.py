@@ -60,16 +60,15 @@ from textual.widgets import (
 from .. import __version__, paths_runtime
 from ..core import context as context_api
 from ..core import inbox, runtime, summary
-from ..core import lma as catalog_api
+from ..core import modelslist as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import STREAM_THINKING, LoopEvent
 from ..core.providers import (
     SUPPORTED_FORMATS,
     CatalogDialect,
-    add_provider_from_lma,
+    add_provider_from_catalog,
     catalog_compatibility,
     resolve_catalog_dialect,
-    sdk_to_format,
 )
 from ..core.runtime import LoopCancelledError, default_provider_config
 from ..storage import paths, session_config
@@ -77,7 +76,7 @@ from ..storage import providers as provider_store
 from ..storage import sessions as session_store
 from ..storage import settings as settings_store
 from ..storage import styles as style_store
-from ..storage.providers import SOURCE_CUSTOM, SOURCE_LMA
+from ..storage.providers import SOURCE_CUSTOM, is_catalog_source
 from ..tools import ascii_art
 from .chat import handoff_marker
 
@@ -202,7 +201,7 @@ def _record(name: str) -> provider_store.Provider | None:
 
 
 def _default_reasoning(model: str, provider_name: str) -> str | None:
-    """lma's auto reasoning default for a model, or None (no options / lookup failed)."""
+    """modelslist's auto reasoning default for a model, or None (no options / lookup failed)."""
 
     reasoning_api = _get_reasoning_api()
     if reasoning_api is None or not model:
@@ -216,7 +215,7 @@ def _default_reasoning(model: str, provider_name: str) -> str | None:
 def _reasoning_choices(model: str, provider_name: str) -> list[str] | None:
     """The effort levels a model offers, or None when it has no reasoning.
 
-    A lma transport failure is indistinguishable from "no reasoning options"
+    A modelslist transport failure is indistinguishable from "no reasoning options"
     here, exactly as it is in `resolve_reasoning_passthrough`: refusing to
     send reasoning is never the safe default, so the caller degrades to
     "leave whatever is configured alone".
@@ -236,7 +235,7 @@ def _model_defaults(provider_name: str, model: str = "") -> tuple[str, str]:
 
     The record's own `default_model` / `reasoning_effort` win — they ARE that
     provider's configured defaults, and rewriting them here would clobber a
-    preference another process set for the same provider. lma's auto default
+    preference another process set for the same provider. modelslist's auto default
     fills the reasoning gap; both empty means "this model offers no reasoning".
     """
 
@@ -331,7 +330,7 @@ def _reasoning_target(
 def _caps_value(record: provider_store.Provider) -> str:
     """A provider record's caps as one cell: `context / output`, `-` when unset.
 
-    Unset is the interesting state, not an error: it means "follow lma", and
+    Unset is the interesting state, not an error: it means "follow modelslist", and
     for the output side that lands on the 16K floor.
     """
 
@@ -1096,12 +1095,12 @@ class ProviderSettingsPopup(ModalScreen[None]):
 
     Provider and Model both reset Reasoning: an effort level belongs to a
     model, so picking either lands on that model's default (the provider
-    record's own preference, else lma's auto default). Reasoning is one more
+    record's own preference, else modelslist's auto default). Reasoning is one more
     click away whenever that default is not what the user wants.
 
     A fourth row, `Caps`, exists only while the trio runs on a CUSTOM
     provider. A catalog provider instead gets `Compatibility`, which selects
-    one of lma's supported/likely dialects and its exact base URL. Both are
+    one of modelslist's supported/likely dialects and its exact base URL. Both are
     endpoint properties: unlike the trio rows they write the provider RECORD
     alone, globally, never an individual session pin.
     """
@@ -1314,15 +1313,15 @@ class ProviderSettingsPopup(ModalScreen[None]):
     async def _model_flow(self, provider: str, current: str) -> None:
         """The model picker, with a free-text fallback for an unknown provider.
 
-        A hand-added endpoint need not exist in the lma catalog at all, so
+        A hand-added endpoint need not exist in the modelslist catalog at all, so
         "no models" is answered by asking for the id rather than by a dead end.
         """
 
         options: list[str] = []
         try:
             models = await asyncio.to_thread(catalog_api.list_models, provider)
-            # lma returns oldest-first; reverse so the newest models sit on top.
-            options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in reversed(models)]
+            # Preserve modelslist's curated/provider-native order.
+            options = [f"{m.get('id', '?')} — {m.get('name', '')}" for m in models]
         except Exception as exc:
             self._report(f"model list unavailable ({exc}); type the model id instead")
         if options:
@@ -1388,7 +1387,7 @@ class ProviderSettingsPopup(ModalScreen[None]):
 
         provider, _ = _reasoning_target(self._target, _effective_config(self._session))
         record = _record(provider)
-        if record is None or record.source != SOURCE_LMA:
+        if record is None or not is_catalog_source(record.source):
             return None
         return record
 
@@ -1400,11 +1399,14 @@ class ProviderSettingsPopup(ModalScreen[None]):
         self.app.run_worker(self._compatibility_flow(record.name), exclusive=False)
 
     async def _compatibility_flow(self, provider_name: str) -> None:
-        """Refresh lma's dialects, then persist the chosen format and URL."""
+        """Refresh modelslist formats, then persist the chosen format and URL."""
 
+        current = self._compatibility_record()
+        if current is None:
+            return
         try:
             catalog_provider = await asyncio.to_thread(
-                catalog_api.find_provider_by_slug, provider_name
+                catalog_api.find_provider_by_slug, provider_name, current.base_url
             )
         except Exception as exc:
             self._report(f"compatibility lookup failed: {exc}")
@@ -1413,57 +1415,32 @@ class ProviderSettingsPopup(ModalScreen[None]):
             self._report("No catalog metadata found for this provider.")
             return
         options = catalog_compatibility(catalog_provider)
-        current = self._compatibility_record()
-        if current is None:
-            return
-        current_dialect = current.catalog_dialect
-        saved_label = ""
-        native_format, native_url = sdk_to_format(
-            catalog_provider.get("sdk"), catalog_provider.get("api")
-        )
-        native_label = (
-            f"native SDK ({native_format}) — {native_url or 'SDK default URL'}"
-            if native_format is not None
-            else ""
-        )
-        choices: list[str] = []
-        if current_dialect:
-            current_option = next(
-                (option for option in options if option.dialect == current_dialect),
-                None,
-            )
-            if (
-                current_option is not None
-                and current.api_format == current_option.api_format
-                and current.base_url == current_option.base_url
-            ):
-                saved_label = self._compatibility_label(current_option)
-            else:
-                # Keep a dialect whose URL/version disappeared from current
-                # lma results selectable: confirmation must not silently move
-                # the provider to a different endpoint.
-                saved_label = (
-                    f"{current_dialect} (saved) — {current.base_url or 'SDK default URL'}"
-                )
-            choices.append(saved_label)
-            choices.extend(
-                self._compatibility_label(option)
+        current_option = next(
+            (
+                option
                 for option in options
-                if self._compatibility_label(option) != saved_label
-            )
-        else:
-            saved_label = native_label or (
-                f"native SDK ({current.api_format}) — "
-                f"{current.base_url or 'SDK default URL'}"
-            )
-            choices.append(saved_label)
-            if native_label:
-                choices.append(native_label)
-            choices.extend(self._compatibility_label(option) for option in options)
-        if native_label and current_dialect:
-            choices.append(native_label)
-        if not choices:
-            self._report("No compatibility mapping is available for this provider.")
+                if option.dialect == current.catalog_dialect
+                and option.api_format == current.api_format
+                and option.base_url == current.base_url
+            ),
+            None,
+        )
+        # Keep an old catalog dialect or hand-edited endpoint selectable without
+        # silently rewriting it merely because the popup was opened.
+        saved_label = (
+            self._compatibility_label(current_option)
+            if current_option is not None
+            else f"{current.catalog_dialect or current.api_format} (saved) — "
+            f"{current.base_url or 'SDK default URL'}"
+        )
+        choices = [saved_label]
+        choices.extend(
+            self._compatibility_label(option)
+            for option in options
+            if self._compatibility_label(option) != saved_label
+        )
+        if len(choices) == 1 and current_option is not None:
+            self._report("No other compatibility mapping is available for this provider.")
             return
         picked = await self.app.push_screen_wait(
             SelectionModal(
@@ -1471,59 +1448,41 @@ class ProviderSettingsPopup(ModalScreen[None]):
                 choices,
                 current=saved_label,
                 allow_none=False,
-                # Dialect labels carry a full endpoint URL; the stock 60-cell
-                # picker would clip exactly the information this choice needs.
                 dialog_width=min(100, self.app.screen.size.width),
             )
         )
-        if not picked:
+        if not picked or picked == saved_label:
             return
         latest = self._compatibility_record()
         if latest is None or latest.name != provider_name:
             return
-        if picked == saved_label:
+        option = next(
+            (option for option in options if self._compatibility_label(option) == picked),
+            None,
+        )
+        if option is None:
             return
-        if picked == native_label:
-            provider_store.upsert(
-                replace(
-                    latest,
-                    api_format=native_format,
-                    base_url=native_url or "",
-                    catalog_dialect="",
-                )
+        provider_store.upsert(
+            replace(
+                latest,
+                api_format=option.api_format,
+                base_url=option.base_url,
+                catalog_dialect=option.dialect,
             )
-        else:
-            option = next(
-                (
-                    option
-                    for option in options
-                    if self._compatibility_label(option) == picked
-                ),
-                None,
-            )
-            if option is None:
-                return
-            provider_store.upsert(
-                replace(
-                    latest,
-                    api_format=option.api_format,
-                    base_url=option.base_url,
-                    catalog_dialect=option.dialect,
-                )
-            )
+        )
         self.query_one("#provider-settings-status", Label).update("")
         self.refresh_rows()
 
     @staticmethod
     def _compatibility_label(option: CatalogDialect) -> str:
-        return f"{option.dialect} ({option.confidence}) — {option.base_url}"
+        return f"{option.dialect} — {option.base_url}"
 
     def _caps_record(self) -> provider_store.Provider | None:
         """The record the `Caps` row edits, or None when there is nothing to edit.
 
         Caps belong to the endpoint, so the record is whichever provider the
         trio runs on — an inheriting subagent trio runs on outo's — and only a
-        hand-added one carries them; a catalog provider's caps come from lma.
+        hand-added one carries them; a catalog provider's caps come from modelslist.
         """
 
         provider, _ = _reasoning_target(self._target, _effective_config(self._session))
@@ -1536,7 +1495,7 @@ class ProviderSettingsPopup(ModalScreen[None]):
         """Ask for the two caps in turn, then write them to the provider record.
 
         Two prompts, like the custom-add wizard. Empty clears that cap back to
-        "follow lma"; a non-numeric answer is refused, stored value untouched.
+        "follow modelslist"; a non-numeric answer is refused, stored value untouched.
         """
 
         record = self._caps_record()
@@ -1559,7 +1518,7 @@ class ProviderSettingsPopup(ModalScreen[None]):
                 TextInputModal(
                     f"Max context window — {record.name}",
                     initial=str(record.max_context_window or ""),
-                    placeholder="e.g. 128000 · empty to follow lma",
+                    placeholder="e.g. 128000 · empty to follow modelslist",
                     hint="Enter to continue · Esc to cancel",
                 ),
                 on_close,
@@ -1582,7 +1541,7 @@ class ProviderSettingsPopup(ModalScreen[None]):
                     )
                 )
                 # The override itself re-reads the record every call, but the
-                # lma FALLBACK it hands back to is cached for the life of the
+                # modelslist FALLBACK it hands back to is cached for the life of the
                 # process — drop it or this TUI serves pre-edit caps until exit.
                 context_api.clear_model_cache()
                 self.query_one("#provider-settings-status", Label).update("")
@@ -1592,7 +1551,7 @@ class ProviderSettingsPopup(ModalScreen[None]):
                 TextInputModal(
                     f"Max output tokens — {record.name}",
                     initial=str(record.max_output_tokens or ""),
-                    placeholder="e.g. 16384 · empty to follow lma",
+                    placeholder="e.g. 16384 · empty to follow modelslist",
                     hint="Enter to save · Esc to cancel",
                 ),
                 on_close,
@@ -3174,11 +3133,8 @@ class ChatTUI(App):
 
         name_to_provider: dict[str, dict[str, Any]] = {}
         for p in all_providers:
-            fmt, _ = sdk_to_format(p.get("sdk"), p.get("api"))
-            selected = resolve_catalog_dialect(
-                p.get("sdk"), p.get("api"), p.get("dialects")
-            )
-            if fmt or selected is not None:
+            selected = resolve_catalog_dialect(p)
+            if selected is not None:
                 name_to_provider[p["name"]] = p
         if not name_to_provider:
             self._spinner_status("No catalog providers have a supported api_format.")
@@ -3195,7 +3151,7 @@ class ChatTUI(App):
             return
 
         catalog_p = name_to_provider[picked_name]
-        our_name = catalog_api.slugify(picked_name)
+        our_name = str(catalog_p["slug"])
         if provider_store.get(our_name) is not None:
             choice = await self.push_screen_wait(
                 SelectionModal(
@@ -3258,25 +3214,11 @@ class ChatTUI(App):
                     reasoning_effort = picked
 
         try:
-            provider = add_provider_from_lma(
-                name=our_name,
+            provider = add_provider_from_catalog(
+                catalog_p,
                 api_key=api_key.strip(),
-                sdk=catalog_p.get("sdk"),
-                api=catalog_p.get("api"),
                 default_model=default_model,
                 reasoning_effort=reasoning_effort,
-                dialects=catalog_p.get("dialects"),
-            )
-        except TypeError:
-            # Parallel `reasoning_effort` kwarg hasn't landed yet; build
-            # without it and persist the value via upsert afterward.
-            provider = add_provider_from_lma(
-                name=our_name,
-                api_key=api_key.strip(),
-                sdk=catalog_p.get("sdk"),
-                api=catalog_p.get("api"),
-                default_model=default_model,
-                dialects=catalog_p.get("dialects"),
             )
         except ValueError as exc:
             self._spinner_status(f"add failed: {exc}")

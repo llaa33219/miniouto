@@ -8,7 +8,7 @@ Two jobs, both of which must happen *before* any test runs:
    The assignment is module-level and comes first -- ``conftest.py`` is imported
    before any test module, so nothing under ``miniouto`` can have resolved
    ``ROOT`` yet.
-2. Reset the module-level caches between tests, so one test's lma/model lookups
+2. Reset the module-level caches between tests, so one test's modelslist/model lookups
    or coreouto provider registrations never leak into the next. The repetition
    watchdog's counters and stream buffers are module state too, so they reset
    here as well.
@@ -52,10 +52,10 @@ def _clear_model_cache(context: Any) -> None:
 def _isolate_module_state() -> None:
     """Reset every module-level cache before each test."""
 
-    from miniouto.core import context, lma, providers, repetition
+    from miniouto.core import context, modelslist, providers, repetition
 
     _clear_model_cache(context)
-    lma.clear_cache()
+    modelslist.clear_cache()
     providers.clear_coreouto_state()
     # The watchdog's counters AND its per-actor stream buffers: a test that
     # fed deltas must not leave a half-counted phrase behind for the next.

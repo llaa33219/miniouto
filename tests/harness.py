@@ -9,8 +9,8 @@ harness does exactly that and stops at one boundary: the provider.
 Nothing here touches the network:
 
 - the provider is a `coreouto` provider double, so no SDK client is built;
-- the lma model lookups are answered from the installed provider's stored
-  caps (`max_context_window` / `max_output_tokens`), with `lma.get_model`
+- the modelslist model lookups are answered from the installed provider's stored
+  caps (`max_context_window` / `max_output_tokens`), with `modelslist.get_model`
   stubbed to "no data" for the reasoning resolver;
 - every timing is event-gated (a `threading.Event` the test owns) or a
   bounded poll — never a fixed sleep.
@@ -34,7 +34,7 @@ import pytest
 
 from miniouto.core import chat as chat_mod
 from miniouto.core import inbox
-from miniouto.core import lma as lma_module
+from miniouto.core import modelslist as modelslist_module
 from miniouto.core import runtime as rt
 from miniouto.core.error_rules import default_error_handling
 from miniouto.core.events import LoopEvent
@@ -179,9 +179,9 @@ class ScriptedProvider:
 
 
 def _provider(model: str) -> provider_store.Provider:
-    # Both cap overrides are set so `core.context` never asks lma for the
+    # Both cap overrides are set so `core.context` never asks modelslist for the
     # window or the output cap; the reasoning resolver gets `{}` from the
-    # stubbed `lma.get_model`.
+    # stubbed `modelslist.get_model`.
     return provider_store.Provider(
         name=PROVIDER_NAME,
         api_format="openai",
@@ -215,7 +215,7 @@ def install(
     settings_store.save(
         settings_store.Settings(provider=PROVIDER_NAME, style=STYLE_NAME, session=session)
     )
-    monkeypatch.setattr(lma_module, "get_model", lambda *args, **kwargs: {})
+    monkeypatch.setattr(modelslist_module, "get_model", lambda *args, **kwargs: {})
     monkeypatch.setattr(
         rt,
         "build_coreouto_provider",

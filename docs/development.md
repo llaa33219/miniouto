@@ -87,7 +87,7 @@ miniouto/
 | `rich` | 13.7.0 | Terminal output, tables, markdown |
 | `textual` | 0.80.0 | TUI framework |
 | `pydantic` | 2.0 | Data models |
-| `httpx` | 0.27.0 | HTTP client (lma REST client + style repo fetcher) |
+| `httpx` | 0.27.0 | HTTP client (modelslist REST client + style repo fetcher) |
 | `tomli-w` | 1.0.0 | TOML serializer |
 | `py-Vwayland` | 0.1.0 | Bundled virtual-display compositor behind the Computer tool |
 
@@ -136,7 +136,7 @@ Where to start reading, in rough order of usefulness as orientation:
 5. `tests/test_styles.py` — `parse_style` edge cases (missing `<outo>`, nested tags, legacy `<subagent>`, duplicate names, zero-role styles).
 6. `tests/test_no_call_subagent.py` — guards the deleted in-process delegation tool; keep it passing.
 
-`respx` is useful for mocking `httpx` calls to `lma.blp.sh` and the style repo fetchers if you extend the suite.
+`respx` is useful for mocking `httpx` calls to `modelslist.blp.sh` and the style repo fetchers if you extend the suite.
 
 ## Build
 
@@ -268,8 +268,9 @@ See `docs/tools.md` § "Adding a new tool".
 
 1. Add the format string to `core/providers.py:SUPPORTED_FORMATS`.
 2. Add an `_instantiate` branch with the right `coreouto` provider class import + constructor call.
-3. Update the `cli/provider.py:FORMAT_HELP` text.
-4. Document in `docs/cli.md` and `docs/core.md`.
+3. If modelslist can advertise it, add its `formats[].format` id to `DIALECT_TO_FORMAT` so the catalog wizard can select it (`typesafe` stays absent — it is not an LLM wire protocol).
+4. Update the `cli/provider.py:FORMAT_HELP` text.
+5. Document in `docs/cli.md`, `docs/core.md` and `docs/modelslist.md`.
 
 ### "Change the storage root"
 

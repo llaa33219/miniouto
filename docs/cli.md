@@ -17,7 +17,7 @@ miniouto [--version]
    ├─ status                     → show current configuration
    ├─ chat <prompt> [options]    → one-shot chat turn (also the delegation door)
    ├─ provider
-   │    ├─ providers                          → list all catalog (lma) providers
+   │    ├─ providers                          → list the modelslist catalog index
    │    ├─ models <provider-name>             → list models for a catalog provider
    │    ├─ add <provider-name> --api-key …    → add a provider from the catalog
    │    ├─ custom add  --name --format --base-url --api-key --default-model
@@ -45,7 +45,7 @@ miniouto [--version]
         └─ show [PATH] [--plain] [--cols N] [--head N]
 ```
 
-> **Naming note:** the catalog commands (`providers`, `models`, `add`) source their data from `https://lma.blp.sh` (the "lma" service). The codebase and UI call these **"catalog"** providers (see `cli/provider.py` importing `core.lma as catalog_api` and the `+ add from catalog…` TUI sentinel), but the underlying `Provider.source` field value remains the literal string `"lma"` (`SOURCE_LMA = "lma"`).
+> **Naming note:** the catalog commands (`providers`, `models`, `add`) source their data from `https://modelslist.blp.sh` (see `cli/provider.py` importing `core.modelslist as catalog_api`, and the `+ add from catalog…` TUI sentinel). Newly added providers are stored with `source="modelslist"` (`SOURCE_MODELSLIST`). The legacy `SOURCE_LMA = "lma"` value still exists — it is only ever **read**, so an old `providers.toml` keeps catalog behavior; no `lma.blp.sh` request is made. See `docs/modelslist.md`.
 
 ## Root callback behavior
 
@@ -117,9 +117,9 @@ Each `StatusChip` is a focusable widget. Click it (or focus it with `Tab` and pr
 | `style` | `SelectionModal` — list of installed styles | writes `settings.style` |
 | `session` | `SelectionModal` with `sections=` — grouped by the session's creation directory, plus `+ new session…` | writes the session **pin** (`self._pinned_session`), which is what `_dispatch` and the inbox poll route on |
 
-**Every provider/model/reasoning edit goes through `_persist_trio`, which writes BOTH halves** (`docs/storage.md` § `session-config/`): the session pin at `session-config/<pinned session>.toml`, so the edit survives a later default change, and the global default, so other processes and the next session follow the most recently changed choice. For the **outo** trio the global half is `settings.provider` + the provider record's `default_model` / `reasoning_effort` (`dataclasses.replace` + `provider_store.upsert`); `settings.model` is never written. For the **subagent** trio it is the three `settings.subagent_*` keys. **Provider and Model both reset Reasoning** — an effort level belongs to a model, so either pick lands on that model's default (the provider record's own preference, else lma's auto default); Reasoning is one more click away when that is not what you want. An empty value clears the pin key and hands it back to the global default.
+**Every provider/model/reasoning edit goes through `_persist_trio`, which writes BOTH halves** (`docs/storage.md` § `session-config/`): the session pin at `session-config/<pinned session>.toml`, so the edit survives a later default change, and the global default, so other processes and the next session follow the most recently changed choice. For the **outo** trio the global half is `settings.provider` + the provider record's `default_model` / `reasoning_effort` (`dataclasses.replace` + `provider_store.upsert`); `settings.model` is never written. For the **subagent** trio it is the three `settings.subagent_*` keys. **Provider and Model both reset Reasoning** — an effort level belongs to a model, so either pick lands on that model's default (the provider record's own preference, else modelslist's auto default); Reasoning is one more click away when that is not what you want. An empty value clears the pin key and hands it back to the global default.
 
-The catalog `Compatibility` row shows the saved lma dialect (or `native SDK` for a legacy record). Its picker lists supported/likely dialects and their exact base URLs, plus a `native SDK` restore option and the saved choice when the current catalog no longer reports it; selecting one persists `catalog_dialect`, `api_format`, and `base_url` on the provider record. Like `Caps`, this is provider-global, not part of the session trio. An inheriting subagent popup edits the effective outo provider.
+The catalog `Compatibility` row shows the saved modelslist format id (or `native SDK` for a legacy record). Its picker lists every hostable format with its exact base URL, plus the saved choice when the current catalog no longer reports it; selecting one persists `catalog_dialect`, `api_format`, and `base_url` on the provider record. Like `Caps`, this is provider-global, not part of the session trio. An inheriting subagent popup edits the effective outo provider.
 
 There is **no standalone provider or model editor any more** — the popup's rows replaced both, and so did the one that edited an existing provider's `max_context_window` / `max_output_tokens`. Those caps are set when the provider is added (the `+ add custom…` wizard asks for them) or by hand in `providers.toml`.
 
@@ -129,7 +129,7 @@ The "Pick session" modal is the one place that uses `SelectionModal`'s opt-in `s
 
 The popup's `Provider` row accepts two sentinels (rendered as `extra_options` rows at the bottom of the list):
 
-- `+ add from catalog…` — runs `_catalog_add_flow`: fetches `https://lma.blp.sh/provider`, filters to entries whose SDK or detected dialect maps to a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="lma"` and the first model returned by lma as `default_model`. See `core/lma.py` and `core/providers.py:sdk_to_format`.
+- `+ add from catalog…` — runs `_catalog_add_flow`: fetches the modelslist root index, filters to entries whose `formats` yields a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="modelslist"` (named after the catalog `slug`) and the first model of its catalog-owned list as `default_model`; when the model has reasoning options it also offers a picker and stores the result as `reasoning_effort`. See `core/modelslist.py` and `core/providers.py:DIALECT_TO_FORMAT`.
 - `+ add custom…` — runs `_open_custom_add_wizard`: a five-step wizard (name → api_format → base_url → api_key → default_model), saving with `source="custom"`.
 
 Modal results are persisted through `_persist_trio` (provider/model/reasoning — see above) or `storage.settings.update(...)` (style), and the chip row re-renders. The active Textual theme is persisted to `settings.theme` and restored on launch.
@@ -397,7 +397,7 @@ An override that names a **different** provider invalidates that session's pinne
 
 ### Subagent provider/model resolution
 
-The provider/model a **delegated run** uses with `--use-subagent-provider` resolves through `runtime._resolve_subagent`, pin-first against **this run's own** session: provider: `--pm` > the session pin's `subagent_provider` > `settings.subagent_provider` > inherit outo's; model: `--pm` > the pin's `subagent_model` > `settings.subagent_model` > the subagent provider's `default_model` > inherit outo's (only reachable when no subagent provider is set). Reasoning: the pin's `subagent_reasoning` > `settings.subagent_reasoning` > the subagent provider's `reasoning_effort` > lma's default. Without the flag the trio is inert and the run uses outo's provider, model and reasoning. The `{subagent_pm}` style token renders this same resolution as a literal `--pm` value, which is what bundled styles emit. `miniouto subagent set/clear` manages the **global half** of that trio; a TUI edit to the `subagent` chip writes both halves (see `docs/usage.md`). See `docs/core.md` § `resolve_runtime_from_settings`.
+The provider/model a **delegated run** uses with `--use-subagent-provider` resolves through `runtime._resolve_subagent`, pin-first against **this run's own** session: provider: `--pm` > the session pin's `subagent_provider` > `settings.subagent_provider` > inherit outo's; model: `--pm` > the pin's `subagent_model` > `settings.subagent_model` > the subagent provider's `default_model` > inherit outo's (only reachable when no subagent provider is set). Reasoning: the pin's `subagent_reasoning` > `settings.subagent_reasoning` > the subagent provider's `reasoning_effort` > modelslist's default. Without the flag the trio is inert and the run uses outo's provider, model and reasoning. The `{subagent_pm}` style token renders this same resolution as a literal `--pm` value, which is what bundled styles emit. `miniouto subagent set/clear` manages the **global half** of that trio; a TUI edit to the `subagent` chip writes both halves (see `docs/usage.md`). See `docs/core.md` § `resolve_runtime_from_settings`.
 
 ### Delegation: the post-step
 
@@ -495,24 +495,24 @@ The provider command has three groups: **catalog** browse/add (`providers`, `mod
 
 ### `provider providers`
 
-Calls `GET https://lma.blp.sh/provider`. Prints a rich `Table` titled `Catalog providers (N)` with columns `Name | SDK | API URL | miniouto format | Detected compatibility | Selected base URL | Addable?`. Detected dialects are labelled `(supported)` or `(likely)`; `typesafe-systemone` is omitted. The selected format/URL comes from `resolve_catalog_dialect`, falling back to `sdk_to_format`. The "Addable?" column is `✓` when either resolver returns a format. Empty result → yellow "No providers returned by the catalog." (exit 0). Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
+Calls `core.modelslist.list_providers()` (`GET https://modelslist.blp.sh/`). Prints a rich `Table` titled `Catalog providers (N)` with columns `Name | Slug | miniouto format | Selected base URL | Available compatibility | Addable?`. The selected format/URL comes from `resolve_catalog_dialect` — the first `formats` entry whose `format` maps through `DIALECT_TO_FORMAT`; `typesafe` is not an LLM wire protocol and is omitted. The "Addable?" column is `✓` when a hostable format exists (`✗` otherwise). N is whatever the curated index holds (17 when last observed) — never treat it as a fixed count. Empty result → yellow "No providers returned by the catalog." (exit 0). Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
 
 ### `provider models <provider-name>`
 
-Positional argument; lma does case-/whitespace-insensitive fuzzy match. Calls `GET https://lma.blp.sh/model-list?provider-name=<name>`. Prints a `Table` titled `Catalog models for '<name>' (N)` with columns `ID | Name`. Empty result → yellow "No models returned for `<name>`." + exit 1. Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
+Positional argument; modelslist lookup is case-/whitespace-/punctuation-insensitive (`_normalize` strips spaces, `-`, `_`, `.`) and falls through slug → name → saved-endpoint match → fuzzy substring (the endpoint step outranks the fuzzy one, so a stored record is never redirected by a name that merely resembles another provider). Fetches the provider's `modelLists` entry with `source == "modelslist"` and reads its `data` array. Prints a `Table` titled `Catalog models for '<name>' (N)` with columns `ID | Name`. Empty result → yellow "No models returned for `<name>`." + exit 1. Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
 
 ### `provider add <provider-name> --api-key <key> [--default-model <id>] [--reasoning <v>]`
 
-Catalog add. Positional `provider_name` (fuzzy-matched via `core.lma.find_provider`), required `--api-key`, optional `--default-model` (default `""`), optional `--reasoning` (default `None`).
+Catalog add. Positional `provider_name` (resolved via `core.modelslist.find_provider`), required `--api-key`, optional `--default-model` (default `""`), optional `--reasoning` (default `None`).
 
 - If `find_provider` returns `None`: red `✗ No catalog provider matched <name>. Run 'miniouto provider providers' to see the catalog.` + exit 1.
-- Calls `core.providers.add_provider_from_lma(...)` to build a `Provider` with `source="lma"`.
-- If `--default-model` is empty, re-fetches the provider's model list and uses the first model id (re-invokes `add_provider_from_lma` with that id).
-- `--reasoning` is stored verbatim as `Provider.reasoning_effort`; when omitted, it is auto-filled from `core.reasoning.default_reasoning_choice(default_model, provider_name)` (best-effort, silent when lma has no data).
+- Calls `core.providers.add_provider_from_catalog(...)` to build a `Provider` named after the catalog `slug`, with `source="modelslist"`, the first hostable format's `api_format`/`base_url`, and that format id in `catalog_dialect`.
+- If `--default-model` is empty, re-fetches the provider's model list and uses the first model id (re-invokes `add_provider_from_catalog` with that id).
+- `--reasoning` is stored verbatim as `Provider.reasoning_effort`; when omitted, it is auto-filled from `core.reasoning.default_reasoning_choice(default_model, provider_name)` (best-effort, silent when modelslist has no data).
 - If the provider already exists: yellow `! Provider <name> already exists; overwriting.`
 - On success: `✓ Added provider <name> (<api_format>, default-model=<model or ->, reasoning=<value or ->).`
 
-If `sdk_to_format` cannot map the SDK (raises `ValueError`): red `✗ {exc}` + exit 1.
+If the provider has no hostable format or no usable `slug` (`add_provider_from_catalog` raises `ValueError`): red `✗ {exc}` + exit 1.
 
 ### `provider custom add`
 
@@ -540,7 +540,7 @@ Pretty-prints a `rich.table.Table` titled `Providers` with columns:
 
 | Name | Type | Format | Compatibility | Base URL | Default Model | Reasoning | Default |
 
-The `Compatibility` column shows the saved catalog dialect, `sdk` for a legacy catalog record, or `manual` for a custom provider. The `Type` column renders `custom` or `catalog` based on `provider.source` (`SOURCE_CUSTOM` → "custom", `SOURCE_LMA` → "catalog"). The `Reasoning` column shows the provider's stored `reasoning_effort` (or `-`). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
+The `Compatibility` column shows the saved `catalog_dialect`, `catalog` for a catalog source with no saved dialect, or `manual` for a custom provider. The `Type` column renders `custom` or `catalog` via `is_catalog_source` (`SOURCE_CUSTOM` → "custom"; `SOURCE_MODELSLIST` and the legacy `SOURCE_LMA` → "catalog"). The `Reasoning` column shows the provider's stored `reasoning_effort` (or `-`). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
 
 If no providers are configured, prints yellow "No providers configured. Run `miniouto provider add <name>` or `miniouto provider custom add`."
 
@@ -639,9 +639,9 @@ Resets all three settings keys (`subagent_provider`, `subagent_model`, `subagent
 
 ---
 
-## Catalog (lma) endpoint caching
+## Catalog endpoint caching
 
-The catalog commands (`provider providers`, `provider models`, `provider add`) and the TUI catalog flows all hit `https://lma.blp.sh` via `core/lma.py`. Responses are cached for 10 minutes (matching lma's server TTL); the cache lives in `core.lma._CACHE` and can be cleared with `core.lma.clear_cache()` (used by tests). See `docs/lma.md` for the full endpoint reference and `sdk_to_format` mapping table.
+The catalog commands (`provider providers`, `provider models`, `provider add`) and the TUI catalog flows all hit `https://modelslist.blp.sh` via `core/modelslist.py`. The root index and each provider's model list are cached for `CACHE_TTL_SECONDS = 300` (5 minutes) in `core.modelslist._CACHE`, keyed `"providers"` and `f"models:{_normalize(provider)}"`; a cached empty list is meaningful, a transport failure is never cached. `core.modelslist.clear_cache()` drops everything (used by tests). See `docs/modelslist.md` for the endpoint reference, the `data` envelope and the `DIALECT_TO_FORMAT` table.
 
 ---
 
@@ -653,7 +653,7 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 | Unhandled exception in `chat_cmd` / `run_chat` | `run_chat._dump_failure_diagnostics` prints `✗ {ExceptionType}: {msg}` + last ≤5 tool calls + traceback to stderr, then re-raises; Typer prints the traceback | 1 |
 | `provider custom add` with unknown `--format` | `✗ Unknown format <fmt>. Supported: …` + `typer.Exit(1)` | 1 |
 | `provider add` for an unknown catalog provider name | `✗ No catalog provider matched <name>. Run 'miniouto provider providers' to see the catalog.` + exit 1 | 1 |
-| `provider add` for an unmappable SDK | `✗ {exc}` (ValueError from `add_provider_from_lma`) + exit 1 | 1 |
+| `provider add` for a provider with no hostable format | `✗ {exc}` (ValueError from `add_provider_from_catalog`) + exit 1 | 1 |
 | `provider add` overwriting an existing provider | yellow `! Provider <name> already exists; overwriting.` | 0 |
 | `provider providers` / `provider models` network failure | `✗ Failed to reach catalog: {exc}` + exit 1 | 1 |
 | `provider models` empty result | yellow "No models returned for `<name>`." + exit 1 | 1 |
@@ -693,13 +693,13 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 ## Module dependency graph (CLI layer only)
 
 ```
-cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.lma, core.providers
+cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.modelslist, core.providers
                   ├─→ cli/style.py    ─→ storage.paths, storage.settings, storage.styles
                   ├─→ cli/skill.py    ─→ storage.skills
                   ├─→ cli/subagent.py ─→ storage.providers, storage.settings
                   ├─→ cli/message.py  ─→ core.inbox, storage.settings
                   ├─→ cli/computer.py ─→ storage.paths, tools.ascii_art
-                   ├─→ cli/tui.py      ─→ core.{chat,events,inbox,lma}, core.providers, storage.{paths,providers,settings,styles,sessions}
+                   ├─→ cli/tui.py      ─→ core.{chat,events,inbox,modelslist}, core.providers, storage.{paths,providers,settings,styles,sessions}
                    └─→ cli/chat.py     ─→ core.{chat,events,inbox,spawn_state,runtime}, storage.{paths,settings,styles}
 ```
 

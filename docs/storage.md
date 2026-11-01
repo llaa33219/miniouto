@@ -85,7 +85,7 @@ SESSION_CONFIG_DIR  = ROOT / "session-config"
 [openai]
 name = "openai"
 api_format = "openai"          # one of: openai, openai-response, anthropic, google
-source = "custom"              # "custom" (manual) or "lma" (added from the catalog)
+source = "custom"              # "custom" (manual), "modelslist" (added from the catalog), or legacy "lma"
 base_url = "https://api.openai.com/v1"   # empty values are omitted on write; defaulted on read
 api_key = "sk-..."
 default_model = "gpt-5.5"      # used when neither chat --pm nor the session pin names a model
@@ -93,15 +93,15 @@ default_model = "gpt-5.5"      # used when neither chat --pm nor the session pin
 [anthropic]
 name = "anthropic"
 api_format = "anthropic"
-source = "lma"                 # added via `provider add Anthropic …`
-catalog_dialect = "anthropic-messages"  # selected lma dialect; omitted for legacy/custom records
-base_url = "https://api.anthropic.com"  # exact URL reported for that dialect
+source = "modelslist"          # added via `provider add Anthropic …`
+catalog_dialect = "anthropic"  # selected modelslist format id; omitted for legacy/custom records
+base_url = "https://api.anthropic.com"  # that format's exact baseUrl, verbatim
 default_model = "claude-opus-4.5"
 
 # Optional per-provider model-cap overrides (set when the provider is added,
 # via the TUI `+ add custom…` wizard, or by hand here). When present they win
-# over anything lma reports for the
-# default_model — useful for custom providers lma has never heard of.
+# over anything modelslist reports for the
+# default_model — useful for hand-added endpoints the catalog does not list.
 # Both are omitted on write when unset.
 max_context_window = 128000
 max_output_tokens = 8000
@@ -113,7 +113,7 @@ Notes on the on-disk format:
 - Empty-string fields (`base_url=""`, `api_key=""`) are **omitted on write** by `Provider.to_dict()` (which filters `None`/`{}`/`""`). `from_dict()` restores them to defaults on read, so round-trips cleanly.
 - `name` is redundantly stored inside the table body (it is also the table key); `from_dict(name, body)` ignores the body's `name` for the field but does not put it in `extra`.
 - `source` is always written (its default `"custom"` is non-empty so survives the filter).
-- `catalog_dialect` records the lma wire-dialect choice. Changing Compatibility in the TUI rewrites it together with `api_format` and that dialect's `base_url`; these endpoint fields are provider-global, not session-pinned. Empty/missing preserves legacy catalog and custom records.
+- `catalog_dialect` records the selected modelslist format id (`openai`, `openai-responses`, `anthropic`, `google`). Changing Compatibility in the TUI rewrites it together with `api_format` and that format's `base_url`; these endpoint fields are provider-global, not session-pinned. Empty/missing preserves legacy catalog and custom records.
 - `extra` (default `{}`) is omitted on write and reconstituted as unknown keys on read.
 
 ### `settings.toml`
@@ -403,9 +403,10 @@ The `<outo>` tag is required (or the whole document is treated as the outo promp
 Module-level constants:
 
 ```python
-SOURCE_CUSTOM = "custom"                       # manual provider (provider custom add)
-SOURCE_LMA    = "lma"                          # catalog provider (provider add)
-VALID_SOURCES = (SOURCE_CUSTOM, SOURCE_LMA)
+SOURCE_CUSTOM     = "custom"      # manual provider (provider custom add)
+SOURCE_LMA        = "lma"         # LEGACY catalog records; read-only, no lma requests are made
+SOURCE_MODELSLIST = "modelslist"  # catalog provider (provider add)
+VALID_SOURCES     = (SOURCE_CUSTOM, SOURCE_LMA, SOURCE_MODELSLIST)
 ```
 
 ```python
@@ -416,16 +417,16 @@ class Provider:
     base_url: str = ""
     api_key: str = ""
     default_model: str = ""
-    source: str = SOURCE_CUSTOM     # one of SOURCE_CUSTOM | SOURCE_LMA
-    catalog_dialect: str = ""       # selected lma dialect; empty = native/custom
+    source: str = SOURCE_CUSTOM     # one of SOURCE_CUSTOM | SOURCE_LMA | SOURCE_MODELSLIST
+    catalog_dialect: str = ""       # selected modelslist format id; empty = native/custom
     max_context_window: int | None = None   # TUI-only override of default_model's context window
     max_output_tokens: int | None = None    # TUI-only override of default_model's max output tokens
     extra: dict[str, Any] = field(default_factory=dict)
 ```
 
-`source` selects which TUI model picker is used: `SOURCE_LMA` → catalog model list (`_catalog_model_picker_flow`); `SOURCE_CUSTOM` → free-text editor (`_open_custom_model_editor`). See `docs/lma.md`. Invalid `source` values on load are coerced back to `SOURCE_CUSTOM`.
+`is_catalog_source(source)` is true for `SOURCE_MODELSLIST` and the legacy `SOURCE_LMA`; it decides whether the TUI shows the catalog `Compatibility` row (and, for `SOURCE_CUSTOM`, the `Caps` row instead). The popup's `Model` row is the same flow for every source — it tries the catalog model list and falls back to a free-text id. See `docs/modelslist.md`. Invalid `source` values on load are coerced back to `SOURCE_CUSTOM`.
 
-`max_context_window` / `max_output_tokens` are written only by the TUI custom-model editor and read only by `core/context.py`. When set, they win over anything lma reports for the model. Both default to `None` (omitted on write). Non-positive or garbage values loaded from disk are coerced back to `None` by `_coerce_positive_int`. See `docs/lma.md` for the full precedence ladder.
+`max_context_window` / `max_output_tokens` are written only by the TUI custom-model editor and read only by `core/context.py`. When set, they win over anything modelslist reports for the model. Both default to `None` (omitted on write). Non-positive or garbage values loaded from disk are coerced back to `None` by `_coerce_positive_int`. See `docs/modelslist.md` for the full precedence ladder.
 
 | Function | Returns | Notes |
 |---|---|---|

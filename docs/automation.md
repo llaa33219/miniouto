@@ -12,7 +12,7 @@ A reference for setting up and driving miniouto in non-interactive environments 
 - [8. Auto-registering skills](#8-auto-registering-skills)
 - [9. Session automation](#9-session-automation)
 - [10. Non-interactive automation patterns (CI / Docker / cron)](#10-non-interactive-automation-patterns-ci--docker--cron)
-- [11. lma cache control](#11-lma-cache-control)
+- [11. Catalog (modelslist) cache control](#11-catalog-modelslist-cache-control)
 
 ---
 
@@ -538,7 +538,7 @@ api_format = "anthropic"
 base_url = ""                  # empty → use the provider SDK's default endpoint
 api_key = "sk-ant-..."         # empty → read from env at call time
 default_model = "claude-sonnet-4"
-source = "lma"                 # "lma" (catalog) or "custom"
+source = "custom"              # hand-written → custom
 
 [my-local-vllm]
 api_format = "openai"
@@ -557,6 +557,8 @@ source = "custom"
 
 Required field: `api_format` (one of `openai`, `openai-response`, `anthropic`, `google`). The rest are optional and default to `""` or `"custom"`.
 
+> **`source` on a hand-written record is `"custom"`.** `source = "modelslist"` is written only by `provider add` / the TUI `+ add from catalog…` wizard, which also fill `catalog_dialect` and a catalog-verified `base_url` from modelslist's `formats[]`. Setting it by hand would falsely mark the record as catalog-backed (it shows as `catalog` in `provider list` and gets the TUI `Compatibility` row) without the metadata that makes that meaningful. `"lma"` is legacy read-only — never write it. Use Method B/C below when you want a catalog record.
+
 Set the active provider separately in `settings.toml`:
 
 ```toml
@@ -572,12 +574,12 @@ session = "default"
 
 ### Method B — CLI commands (`provider add` / `provider custom add`)
 
-Invoke the CLI from a script. Catalog add auto-fills base_url and format from lma:
+Invoke the CLI from a script. Catalog add auto-fills base_url and format from modelslist:
 
 ```bash
-# From the catalog (lma lookup auto-infers base_url and format)
-miniouto provider add Anthropic --api-key "$ANTHROPIC_API_KEY"
-miniouto provider add OpenAI --api-key "$OPENAI_API_KEY" --default-model gpt-5.5
+# From the catalog (modelslist lookup auto-infers base_url and format)
+miniouto provider add Kimi --api-key "$MOONSHOT_API_KEY"
+miniouto provider add DeepSeek --api-key "$DEEPSEEK_API_KEY" --default-model deepseek-v4-pro
 
 # Manual config
 miniouto provider custom add \
@@ -598,15 +600,17 @@ miniouto provider default anthropic
 ```python
 from miniouto.storage import providers as provider_store
 from miniouto.storage import settings as settings_store
-from miniouto.core.providers import add_provider_from_lma
+from miniouto.core.modelslist import find_provider
+from miniouto.core.providers import add_provider_from_catalog
 
-# Build from catalog metadata (includes sdk→format mapping)
-p = add_provider_from_lma(
-    name="anthropic",
-    api_key="sk-ant-...",
-    sdk="anthropic",
-    api=None,
-    default_model="claude-sonnet-4",
+# Build from catalog metadata (format + exact baseUrl come from formats[])
+catalog = find_provider("deepseek")
+if catalog is None:                      # unreachable catalog / no match
+    raise SystemExit("provider not in the modelslist catalog")
+p = add_provider_from_catalog(
+    catalog,
+    api_key="sk-...",
+    default_model="deepseek-v4-pro",
 )
 provider_store.upsert(p)
 
@@ -1001,26 +1005,27 @@ def batch_process(items: list[str]) -> list[str]:
 
 ---
 
-## 11. lma cache control
+## 11. Catalog (modelslist) cache control
 
-The catalog commands (`provider providers`, `provider models`, `provider add`) and context-window calculation (`get_max_output_tokens`) call `https://lma.blp.sh` via `core/lma.py`. Responses are cached in `core/lma.py:_CACHE` for 10 minutes (matching lma's server-side TTL).
+The catalog commands (`provider providers`, `provider models`, `provider add`) and context-window calculation (`get_max_output_tokens`) call `https://modelslist.blp.sh` via `core/modelslist.py`. The root provider index and each provider's catalog-owned model list are cached in `core/modelslist.py:_CACHE` for 300 seconds.
 
 ### Cache characteristics
 
-- **TTL**: `CACHE_TTL_SECONDS = 600` (10 minutes)
-- **Keys**: `"providers"`, `f"models:{provider.lower()}"`, `f"model:{provider.lower()}:{model.lower()}"`
-- **A cached `None` is meaningful**: when lma returns 404, the fact that "this model/provider is not in lma" is cached for 10 minutes to prevent redundant requests.
-- **Transport errors are not cached**: a transient `httpx.HTTPError` propagates without calling `_cache_set`, so a momentary network blip doesn't pollute the cache for 10 minutes.
+- **TTL**: `CACHE_TTL_SECONDS = 300` (5 minutes)
+- **Keys**: `"providers"`, `f"models:{_normalize(provider)}"` (lowercased with spaces, `-`, `_`, `.` stripped, so `Z.AI` == `z-ai` == `zai`)
+- **A cached empty list is meaningful**: it records "the catalog has no model list for this provider" (a 404, a provider with no `modelLists[source=modelslist]` entry, or an unknown name), so it is not re-requested until the entry expires. Model lookups themselves are served from those cached lists — there is no per-model cache key.
+- **Transport errors are not cached**: a transient `httpx.HTTPError` (anything but a 404 on a list URL) propagates without calling `_cache_set`, so a momentary network blip doesn't pollute the cache for five minutes.
+- **Only the catalog-owned list is fetched**: the `modelLists` entries with `source == "official"` are never requested.
 
 ### Cache invalidation
 
 There is **no CLI command** to clear the cache. It's only possible from Python:
 
 ```python
-from miniouto.core import lma
-lma.clear_cache()    # empties the entire _CACHE dict
+from miniouto.core import modelslist
+modelslist.clear_cache()    # empties the entire _CACHE dict
 ```
 
-In CI / batch jobs that need fresh catalog data, simply start a new process (the cache is in-memory only, not on disk). To force-refresh within a single Python process, call `lma.clear_cache()` then re-query.
+In CI / batch jobs that need fresh catalog data, simply start a new process (the cache is in-memory only, not on disk). To force-refresh within a single Python process, call `modelslist.clear_cache()` then re-query.
 
-> If catalog command results look frozen for 10 minutes, it's the cache. For fresh data, run in a new process or call `lma.clear_cache()`.
+> If catalog command results look frozen for 5 minutes, it's the cache. For fresh data, run in a new process or call `modelslist.clear_cache()`.

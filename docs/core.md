@@ -2,20 +2,20 @@
 
 The `core/` subpackage is where the agent loop is wired together. It is a thin orchestration layer on top of `coreouto` — it doesn't implement an agent loop itself, just translates miniouto's CLI/storage model into coreouto's primitives.
 
-`src/miniouto/core/__init__.py` re-exports `chat`, `events`, `lma`, `providers`, `runtime` (but **not** `context`, which is an implementation detail of `runtime.build_runtime`).
+`src/miniouto/core/__init__.py` re-exports `chat`, `events`, `modelslist`, `providers`, `runtime` (but **not** `context`, which is an implementation detail of `runtime.build_runtime`).
 
 ## Files
 
 | File | LOC | Purpose |
 |---|---|---|
 | `chat.py` | ~320 | Per-turn chat runner, history persistence, failure diagnostics, sink dispatchers |
-| `context.py` | ~230 | Context-window monitoring (lma `/model` caps, invariant-4 floors), the explicit summary trigger |
+| `context.py` | ~230 | Context-window monitoring (modelslist caps, invariant-4 floors), the explicit summary trigger |
 | `error_rules.py` | ~190 | Per-format `ErrorRule` lists for coreouto >= 0.10 provider-level `error_handling` |
 | `events.py` | ~115 | `LoopEvent`, `EventSink` protocol, `NullSink`, `ConsoleEventSink` (CLI rendering) |
 | `inbox.py` | ~185 | Cross-process message inbox: `ALARM_HEADER`, `insert` / `drain` / `pending_count` / `prune`, `InboxMessage` |
-| `lma.py` | ~140 | `lma.blp.sh` REST client: list_providers, list_models, get_model, find_provider, slugify |
-| `providers.py` | ~135 | Maps `Provider` records → coreouto provider classes; clears global state; maps lma SDKs to coreouto formats |
-| `reasoning.py` | ~200 | Resolves reasoning choices into provider-native request kwargs from lma `reasoning_options`; UI picker helpers |
+| `modelslist.py` | ~260 | `modelslist.blp.sh` REST client: list_providers, list_models, get_model, find_provider / find_provider_by_slug, slugify, clear_cache |
+| `providers.py` | ~225 | Maps `Provider` records → coreouto provider classes; clears global state; maps modelslist `formats` to coreouto formats; builds catalog providers |
+| `reasoning.py` | ~230 | Resolves reasoning choices into provider-native request kwargs from modelslist `reasoning_options`; UI picker helpers |
 | `runtime.py` | ~400 | `RuntimeConfig`, `build_runtime` (incl. role mode), inbox alarm hook, watchdogs, history repair |
 | `spawn_state.py` | ~130 | File-based liveness markers for detached `chat --bg` runs (`SpawnMarker`, pid-aware `pending_spawns`) |
 | `summary.py` | ~330 | The explicit summarization contract: the two pinned messages, `SUMMARY_FORMAT_SPEC`, `Handoff` state, the run-contract slot |
@@ -134,7 +134,7 @@ Raised when an LLM tool call arrives with non-dict or `None` arguments. This pre
 The main entry point. `sink=None` defaults to `NullSink()`; either way the sink is wrapped in a `_RecordingSink` that captures every `LoopEvent` (for the session's turn record) before delegating. Steps:
 
 1. Resolves a `RuntimeConfig` from settings + overrides.
-2. Computes `provider_config` — `max_tokens` defaults to `get_max_output_tokens(runtime.model, runtime.provider_name)` so providers with low hard caps (Anthropic's 1024) don't truncate long tool calls (e.g. heredoc file writes). The `provider_name` argument scopes the lma lookup so we don't accept the first cross-provider match.
+2. Computes `provider_config` — `max_tokens` defaults to `get_max_output_tokens(runtime.model, runtime.provider_name)` so providers with low hard caps (Anthropic's 1024) don't truncate long tool calls (e.g. heredoc file writes). The `provider_name` argument scopes the modelslist lookup so we don't accept the first cross-provider match.
 3. Builds the sink dispatchers (`_make_tool_call_dispatcher`, `_make_tool_result_dispatcher`, `_make_response_dispatcher`, `_make_thinking_dispatcher`, `_make_stream_dispatcher` ×2, `_make_iteration_dispatcher`, `_make_provider_error_dispatcher`, `_make_alarm_dispatcher`) plus the `on_iteration` / `on_history_repair` / `on_messages_removed` persistence bridges, and calls `build_runtime(..., on_inbox_messages=_make_alarm_dispatcher(sink))` to get a `co.Agent`.
 4. Loads prior history if `continue_session=True` via `_load_coreouto_history` — session `history` dicts are validated back into `co.Message` objects; invalid entries degrade to plain text (media block lists are flattened via `_flatten_media_blocks`) but **keep `tool_call_id`/`name` for tool messages** so tool_use/tool_result pairing survives even unknown schema drift (without the id the provider 400s the whole request on resume).
 5. Clears `_tool_trace`, runs the turn as `asyncio.run(_run_with_watchdog(agent, opts.prompt, core_msgs, sink=sink, cancel_event=opts.cancel_event, on_removed=sink.remove_events))` inside try/except — see the watchdog subsection below. There is no subagent observer to install and no level to pass: one process supervises one `"outo"`. The whole prepared run is wrapped by `run_chat` in a `try/except` that calls `providers.clear_coreouto_state()` before re-raising: hooks are global and close over this turn's sink and persister, so a turn dying during resolve/build (a provider deleted mid-session, a malformed style) must not leave the previous turn's hooks registered against the new state.
@@ -258,25 +258,25 @@ Per-tool one-liner:
 - `CONTEXT_SUMMARY_TRIGGER_PCT = 80` — the measured context usage (%) at which the model is **asked** to summarize. Deliberately late: the remaining window is still enough to write the summary documents and hand off, which is the only thing left that needs context.
 - `SUMMARY_SOURCE = "context"` — the `source` stamped on the injected request, so a receiver can tell a context trigger apart from a delegated run's completion alarm.
 - `DEFAULT_MAX_OUTPUT_TOKENS = 16384` — hard floor. Rationale: Anthropic defaults to 1024 if you don't set it explicitly, silently truncating long tool-call outputs (e.g. file writes).
-- There is no ceiling. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
+- There is no ceiling. The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against a legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; modelslist reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
 ### `_fetch_model_caps(model, provider_name=None) -> dict[str, int]`
 
-Calls `lma.get_model(model, provider_name)`. Reads `info["context_window"]` and `info["max_output_tokens"]` from the dict that `lma.get_model` returns (lma already unwraps the `models` array server-side). On any exception (network, JSON, etc.) it returns an empty dict **without caching it** (fail-soft, never raises) — caching that empty dict would pin the key to "no caps" (compaction off, 16K floor) for the life of the process off a single network blip. A successful answer IS memoized in the module-level `_MODEL_CACHE`, including a genuinely empty result ("lma answered, no info for this key"). That cache has **no TTL** (unlike `lma._CACHE`'s 10 minutes); `clear_model_cache()` drops it.
+Calls `modelslist.get_model(model, provider_name)`. Reads `info["context_window"]` and `info["max_output_tokens"]` from the dict `get_model` returns — the adapter has already mapped modelslist's `context_length` → `context_window` and `top_provider.max_completion_tokens` → `max_output_tokens`. On any exception (network, JSON, etc.) it returns an empty dict **without caching it** (fail-soft, never raises) — caching that empty dict would pin the key to "no caps" (compaction off, 16K floor) for the life of the process off a single network blip. A successful answer IS memoized in the module-level `_MODEL_CACHE`, including a genuinely empty result ("modelslist answered, no info for this key"). That cache has **no TTL** (unlike `modelslist._CACHE`'s 300 seconds); `clear_model_cache()` drops it.
 
 ### `get_context_window(model, provider_name=None) -> int | None`
 
-Returns the model's context window in tokens, or `None` if unknown. Passing `provider_name` scopes the lma lookup (recommended — otherwise lma returns matches across every provider and we only see the first).
+Returns the model's context window in tokens, or `None` if unknown. Passing `provider_name` scopes the modelslist lookup (recommended — otherwise `get_model` walks every provider slug and returns the first id match, which may be another provider's model with different caps).
 
 ### `get_max_output_tokens(model, provider_name=None) -> int`
 
 Resolution order (highest wins):
 1. Per-provider `max_output_tokens` override (set via the TUI custom-model editor; read fresh each call by `_provider_caps_override`).
-2. `caps["maxOutputTokens"]` (from lma).
+2. `caps["maxOutputTokens"]` (from modelslist's `top_provider.max_completion_tokens`).
 3. `caps["contextWindow"]` (fallback proxy).
 4. `DEFAULT_MAX_OUTPUT_TOKENS` (16K hard floor).
 
-No ceiling clamp. See `docs/lma.md` for rationale.
+No ceiling clamp. See `docs/modelslist.md` for the caps rationale.
 
 ### `make_context_monitor(*, model, session, provider_name=None) -> Callable | None`
 
@@ -389,13 +389,30 @@ SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")
 
 Whitelist of `Provider.api_format` values. Validated by `cli/provider.py:add_custom` and by `_instantiate`.
 
-### `sdk_to_format(sdk, api) -> (api_format, base_url)`
+### `DIALECT_TO_FORMAT` / `CatalogDialect`
 
-Maps an lma provider's `sdk`/`api` pair to a `(api_format, base_url)` tuple. Returns `(None, None)` when the SDK cannot be hosted by any supported coreouto builtin (e.g. `amazon-bedrock`, `bedrock`, anything else without an `api` URL). Unknown SDKs with a non-null `api` URL fall back to `("openai", api)` — the universal gateway shape. This remains the legacy/no-dialect fallback. `catalog_compatibility()` parses lma's hostable supported/likely dialects, and `resolve_catalog_dialect()` picks confirmed over tentative, then native-SDK-matching within that confidence group, returning the dialect's exact URL. See `docs/lma.md` for both mapping tables.
+```python
+DIALECT_TO_FORMAT = {
+    "openai": "openai",
+    "openai-responses": "openai-response",
+    "anthropic": "anthropic",
+    "google": "google",
+}
+```
 
-### `add_provider_from_lma(name, api_key, sdk, api, default_model="", reasoning_effort=None, dialects=None) -> Provider`
+Maps a modelslist `formats[].format` id onto a coreouto `api_format`. `typesafe` is deliberately absent — it is not an LLM wire protocol coreouto can host. `CatalogDialect(dialect, api_format, base_url, confidence="supported")` is the frozen record of one hostable endpoint.
 
-Builds a `storage.providers.Provider` from lma metadata + a user-supplied API key, with `source="lma"` set. `reasoning_effort` is stored verbatim on the Provider (see step 11 of `build_runtime`). A selected dialect supplies `api_format`, `base_url`, and `catalog_dialect`; absent dialect data retains `sdk_to_format`. Raises `ValueError` only when neither path yields a host. Used by `cli/provider.py:add_cmd` (catalog add) and `cli/tui.py:_catalog_add_flow`.
+### `catalog_compatibility(catalog_provider) -> list[CatalogDialect]`
+
+Reads the provider's `formats` array and returns one `CatalogDialect` per hostable entry, **in the catalog's advertised priority order**, skipping unmapped formats, non-string/empty `baseUrl` values and duplicate dialects.
+
+### `resolve_catalog_dialect(catalog_provider) -> CatalogDialect | None`
+
+Returns the first entry of `catalog_compatibility` — modelslist's own order decides, miniouto does not second-guess it — or `None` when nothing is hostable. There is no `supported`/`likely` confidence tier any more; `confidence` is always `"supported"`.
+
+### `add_provider_from_catalog(catalog_provider, *, api_key, default_model="", reasoning_effort=None) -> Provider`
+
+Builds a `storage.providers.Provider` from modelslist metadata + a user-supplied API key: `name` is the catalog `slug`, `source=SOURCE_MODELSLIST` (`"modelslist"`), and the selected format supplies `api_format`, `base_url` (verbatim) and `catalog_dialect`. `reasoning_effort` is stored verbatim (see step 11 of `build_runtime`). Raises `ValueError` when the provider has no hostable format or no usable `slug`. Used by `cli/provider.py:add_cmd` (catalog add) and `cli/tui.py:_catalog_add_flow`.
 
 ### `build_coreouto_provider(provider: Provider) -> None`
 
@@ -590,9 +607,9 @@ The heart of miniouto. Steps:
     - **Watchdog trackers** (`_register_watchdog_trackers`, always) — `activity_tracker_hook` on `AFTER_LLM_CALL`/`AFTER_TOOL_CALL`/`ON_ITERATION`/`ON_PROVIDER_ERROR`/`ON_STREAM_TEXT`/`ON_STREAM_THINKING`, all five `loop_progress_hook` entries, and a `BEFORE_LLM_CALL` live-messages capture stored under the literal key `"outo"`. Clears `_LIVE_MESSAGES` and calls `repetition.reset()` — repetition counters are scoped to one turn, exactly like the live lists. States are exposed via `watchdog_states()` for `supervised_run`.
 8. **Finalize the config** — `co.get_agent_preset("outo").to_config()`, merge in caller's `provider_config` and the resolved `provider_passthrough`, instantiate `co.Agent(outo_config)`. Returns the agent.
 
-> **Reasoning resolution** (done above the clear, listed here for the precedence rules) — `core.reasoning.resolve_reasoning_passthrough(api_format, model, provider_name, choice)` turns the resolved reasoning choice plus lma's per-model `reasoning_options` into provider-native request kwargs, merged into `provider_passthrough` for both outo and subagent. This is what makes providers return thinking blocks at all (the `ON_THINKING` display path is dead without it). It must go through `provider_passthrough`, not `provider_config`: miniouto registers providers under user-chosen names, and coreouto's `normalize_provider_config` passes config through **untranslated** for unknown provider names — a canonical `reasoning_effort` key would reach the SDK raw and `TypeError`. Precedence (highest wins) for outo: `chat --pm '…:REASONING'` > the session pin's `reasoning` (`session-config/<session>.toml`) > `Provider.reasoning_effort` (stored per provider) > lma's default for the model's option type (effort → `"medium"` or the middle non-`"none"` value; toggle/budget → `"on"`) > off (no kwargs when lma has no reasoning data — no blind defaults). For the **subagent**, the choice inserts one extra tier: the `--pm` reasoning suffix (applies to both) > `RuntimeConfig.subagent_reasoning` (the pin's `subagent_reasoning`, else the persisted `settings.subagent_reasoning` via `miniouto subagent set --reasoning`) > the subagent provider's `reasoning_effort` > lma default. `"none"`/`"off"` always disables. Only two request shapes are ever emitted — an effort value and anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes (`enabled` + `budget_tokens`) are deliberately NOT emitted: many providers reject budget parameters, so lma `budget_tokens` models are driven as a plain toggle and legacy digit choices degrade to `"on"`. Mapping:
+> **Reasoning resolution** (done above the clear, listed here for the precedence rules) — `core.reasoning.resolve_reasoning_passthrough(api_format, model, provider_name, choice)` turns the resolved reasoning choice plus modelslist's per-model `reasoning_options` into provider-native request kwargs, merged into `provider_passthrough` for both outo and subagent. This is what makes providers return thinking blocks at all (the `ON_THINKING` display path is dead without it). It must go through `provider_passthrough`, not `provider_config`: miniouto registers providers under user-chosen names, and coreouto's `normalize_provider_config` passes config through **untranslated** for unknown provider names — a canonical `reasoning_effort` key would reach the SDK raw and `TypeError`. Precedence (highest wins) for outo: `chat --pm '…:REASONING'` > the session pin's `reasoning` (`session-config/<session>.toml`) > `Provider.reasoning_effort` (stored per provider) > modelslist's default for the model's option type (effort → `default_effort` when it is a valid non-`"none"` ladder value, else `"medium"`, else the middle non-`"none"` value; toggle/budget → `"on"`; `reasoning.default_enabled: false` → none) > off (no kwargs when modelslist has no reasoning data — no blind defaults). For the **subagent**, the choice inserts one extra tier: the `--pm` reasoning suffix (applies to both) > `RuntimeConfig.subagent_reasoning` (the pin's `subagent_reasoning`, else the persisted `settings.subagent_reasoning` via `miniouto subagent set --reasoning`) > the subagent provider's `reasoning_effort` > modelslist default. `"none"`/`"off"` always disables. Only two request shapes are ever emitted — an effort value and anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes (`enabled` + `budget_tokens`) are deliberately NOT emitted: many providers reject budget parameters, so modelslist `budget_tokens` models are driven as a plain toggle and legacy digit choices degrade to `"on"`. A stored `"on"`/digit against an effort ladder degrades to the ladder's default instead of sending `effort="on"`. Mapping:
 
-    | api_format | lma option type | passthrough |
+    | api_format | modelslist option type | passthrough |
     |---|---|---|
     | `anthropic` | toggle / budget_tokens | on → `{"thinking": {"type": "adaptive"}}`; off → `{}` |
     | `anthropic` | effort | `{"thinking": {"type": "adaptive"}, "output_config": {"effort": v}}` (`"none"` → `{}`) |
@@ -602,7 +619,7 @@ The heart of miniouto. Steps:
     | `openai` | toggle / budget_tokens | on → `{"thinking": {"type": "enabled"}}` |
     | `google` | any | `{}` — **unsupported**: coreouto builds `GenerateContentConfig` itself from only system_instruction + tools and extra kwargs land on `generate_content(**kwargs)` top-level, so a `thinking_config` key would TypeError |
 
-    With an explicit choice but **no** lma data, the choice is applied per-format best-effort (`"on"`/digits → the toggle mapping; otherwise the effort mapping). `core/reasoning.py` also exports `reasoning_choices(model, provider_name)` and `default_reasoning_choice(model, provider_name)` for UI pickers (both fail soft to `None` on lma errors).
+    With an explicit choice but **no** modelslist data, the choice is applied per-format best-effort (`"on"`/digits → the toggle mapping; otherwise the effort mapping). `core/reasoning.py` also exports `reasoning_choices(model, provider_name)` and `default_reasoning_choice(model, provider_name)` for UI pickers (both fail soft to `None` on modelslist errors).
 
 ### Hook helpers
 
@@ -648,8 +665,8 @@ Returns a `RuntimeConfig` with `subagent_provider`/`subagent_model`/`subagent_re
 
 | Source | Target | Purpose | Failure mode |
 |---|---|---|---|
-| `core/lma.py` | `https://lma.blp.sh/{provider,model-list,model}` (GET, 15s timeout, `httpx`) | Discover providers, list models, fetch context + max-output caps | `list_*` / `get_model` propagate `httpx.HTTPError`; `find_provider` swallows and returns `None`; 10-minute in-process cache (`_CACHE`) |
-| `core/context.py` | (via `core.lma.get_model`) | Fetch `context_window` + `max_output_tokens` for a model | Caught; a **transport failure is returned uncached** (the empty dict is never stored), so one blip can't pin a model to "no caps" for the process; a successful-but-empty answer IS cached. `_MODEL_CACHE` has no TTL; `clear_model_cache()` mirrors `lma.clear_cache()` |
+| `core/modelslist.py` | `https://modelslist.blp.sh/` (root index) + the provider's `modelLists[source=modelslist].url` (GET, 15s timeout, `httpx`) | Discover providers, list models, derive context + max-output + reasoning metadata | `list_providers` / `list_models` / `get_model` propagate `httpx.HTTPError` (a 404 on a list URL → `[]`); `find_provider` swallows and returns `None`; 300-second in-process cache (`_CACHE`) |
+| `core/context.py` | (via `core.modelslist.get_model`) | Fetch `context_window` + `max_output_tokens` for a model | Caught; a **transport failure is returned uncached** (the empty dict is never stored), so one blip can't pin a model to "no caps" for the process; a successful-but-empty answer IS cached. `_MODEL_CACHE` has no TTL; `clear_model_cache()` mirrors `modelslist.clear_cache()` |
 | `core/providers.py` | `co.register_provider`, `co.clear_*` | coreouto global registry I/O | None caught |
 | `core/runtime.py` | `tool_registry.register_all`, `co.register_agent_preset`, `co.register_tool`, `co.register_hook` | coreouto global registry I/O | None caught |
 | `core/inbox.py` | `INBOX_DIR/<session>/<ts>-<6hex>.json` | Cross-process message hand-off: one atomically-renamed file per pending message | Insert validates (kind/text/meta) and raises `ValueError`; `drain` never raises — corrupt files are renamed `.bad` |

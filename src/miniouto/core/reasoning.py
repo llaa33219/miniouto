@@ -1,7 +1,7 @@
-"""Resolve reasoning/thinking request kwargs from lma model metadata.
+"""Resolve reasoning/thinking request kwargs from modelslist model metadata.
 
 The resolver turns a single user-facing choice string ("off"/"on"/an
-effort level) plus lma's per-model `reasoning_options` into
+effort level) plus modelslist's per-model `reasoning_options` into
 provider-native request kwargs, merged into `provider_passthrough` by
 `core/runtime.py`. It must go through passthrough, not `provider_config`:
 miniouto registers providers under user-chosen names and coreouto's
@@ -13,7 +13,7 @@ Only two request shapes are ever emitted: an effort value
 (`output_config.effort` / `reasoning.effort` / `reasoning_effort`) and
 anthropic's `thinking: {"type": "adaptive"}`. Token-budget shapes
 (`enabled` + `budget_tokens`) are deliberately NOT emitted — many
-providers reject budget parameters. lma `budget_tokens` models are
+providers reject budget parameters. modelslist `budget_tokens` models are
 driven as a plain toggle instead; legacy digit choices degrade to "on".
 
 Google is deliberately unsupported: coreouto builds
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import lma
+from . import modelslist
 
 _OFF_VALUES = ("none", "off")
 
@@ -42,8 +42,9 @@ def resolve_reasoning_passthrough(
 
     `choice` is the resolved explicit value (caller computes CLI flag >
     `Provider.reasoning_effort`; None = auto). "none"/"off" always
-    disables. Auto uses lma's default: effort → "medium" (or the middle
-    non-"none" value), toggle/budget → "on". When lma has no reasoning
+    disables. Auto honors modelslist's default_enabled/default_effort, then
+    uses "medium" (or the middle non-"none" value) for effort and "on" for
+    toggle/budget. When modelslist has no reasoning
     data for the model: no choice → {} (no blind defaults); a choice →
     per-format best-effort mapping (trust the user).
     """
@@ -59,7 +60,7 @@ def resolve_reasoning_passthrough(
     if api_format == "google":
         return {}
     try:
-        info = lma.get_model(model, provider_name)
+        info = modelslist.get_model(model, provider_name)
     except Exception:
         # Transport failure must not disable reasoning; treat as no data.
         info = None
@@ -72,7 +73,7 @@ def resolve_reasoning_passthrough(
     if otype == "budget_tokens":
         otype = "toggle"
     if choice is None:
-        value = _auto_value(otype, opt)
+        value = _auto_value(otype, opt, info)
         if value is None:
             return {}
     else:
@@ -94,7 +95,8 @@ def reasoning_choices(model: str, provider_name: str | None) -> list[str] | None
     toggle/budget → ["off", "on"].
     """
 
-    opt = _try_first_option(model, provider_name)
+    info = _try_model_info(model, provider_name)
+    opt = _first_reasoning_option(info)
     if opt is None:
         return None
     otype = opt.get("type")
@@ -111,30 +113,39 @@ def reasoning_choices(model: str, provider_name: str | None) -> list[str] | None
 def default_reasoning_choice(model: str, provider_name: str | None) -> str | None:
     """The auto default as a storable string, or None when no reasoning options.
 
-    effort → "medium" if in values else middle non-"none" value;
-    toggle/budget → "on".
+    modelslist's valid default_effort wins; effort otherwise uses "medium"
+    if present, else the middle non-"none" value. toggle/budget → "on".
+    default_enabled=False means no implicit reasoning override.
     """
 
-    opt = _try_first_option(model, provider_name)
+    info = _try_model_info(model, provider_name)
+    opt = _first_reasoning_option(info)
     if opt is None:
         return None
     otype = opt.get("type")
+    metadata = info.get("reasoning")
+    if isinstance(metadata, dict) and metadata.get("default_enabled") is False:
+        return None
     if otype == "effort":
-        return _default_effort(opt.get("values") or [])
+        default = metadata.get("default_effort") if isinstance(metadata, dict) else None
+        values = opt.get("values") or []
+        if isinstance(default, str) and default.lower() != "none" and default in values:
+            return default
+        return _default_effort(values)
     if otype in ("toggle", "budget_tokens"):
         return "on"
     return None
 
 
-def _try_first_option(model: str, provider_name: str | None) -> dict[str, Any] | None:
+def _try_model_info(model: str, provider_name: str | None) -> dict[str, Any] | None:
     try:
-        return _first_reasoning_option(lma.get_model(model, provider_name))
+        return modelslist.get_model(model, provider_name)
     except Exception:
         return None
 
 
 def _first_reasoning_option(info: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Pick the richest entry from lma's `reasoning_options` list.
+    """Pick the richest entry from modelslist's `reasoning_options` list.
 
     The list can carry MULTIPLE descriptors — e.g. kimi-k3 returns
     `[{"type": "toggle"}, {"type": "effort", "values": [...]}]`. Reading
@@ -155,9 +166,16 @@ def _first_reasoning_option(info: dict[str, Any] | None) -> dict[str, Any] | Non
     return None
 
 
-def _auto_value(otype: Any, opt: dict[str, Any]) -> str | None:
+def _auto_value(otype: Any, opt: dict[str, Any], info: dict[str, Any]) -> str | None:
+    metadata = info.get("reasoning")
+    if isinstance(metadata, dict) and metadata.get("default_enabled") is False:
+        return None
     if otype == "effort":
-        return _default_effort(opt.get("values") or [])
+        default = metadata.get("default_effort") if isinstance(metadata, dict) else None
+        values = opt.get("values") or []
+        if isinstance(default, str) and default.lower() != "none" and default in values:
+            return default
+        return _default_effort(values)
     if otype == "toggle":
         return "on"
     return None
@@ -207,7 +225,7 @@ def _map_effort(api_format: str, value: str) -> dict[str, Any]:
 
 
 def _best_effort(api_format: str, choice: str) -> dict[str, Any]:
-    """Map an explicit choice with no lma data (trust the user)."""
+    """Map an explicit choice with no modelslist data (trust the user)."""
 
     v = choice.strip()
     if v.isdigit() or v.lower() == "on":

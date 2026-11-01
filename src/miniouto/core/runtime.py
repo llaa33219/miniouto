@@ -720,7 +720,7 @@ def build_runtime(
     only; the messages are still delivered to the model.
     `reasoning` overrides reasoning for this call (effort level / "on" /
     token budget / "none"). None = auto: the provider's stored
-    `reasoning_effort` wins if set, otherwise lma's per-model default.
+    `reasoning_effort` wins if set, otherwise modelslist's per-model default.
     Resolved by `core.reasoning.resolve_reasoning_passthrough` into
     provider-native kwargs merged into `provider_passthrough` — this is
     what makes providers return thinking blocks at all.
@@ -743,7 +743,7 @@ def build_runtime(
     # wipes coreouto's global provider/preset/tool/hook registries, so a
     # multi-second network fetch or file read inside the clear+register
     # window leaves them empty for as long as it takes. Style file I/O and
-    # both lma lookups therefore resolve first; only dict/registry
+    # both modelslist lookups therefore resolve first; only dict/registry
     # operations follow the clear.
     provider = provider_store.get(runtime.provider_name)
     if provider is None:
@@ -787,7 +787,7 @@ def build_runtime(
 
     # Thinking display (ON_THINKING → CLI/TUI) only works when the model is
     # asked to reason — providers never emit thinking blocks unrequested.
-    # The resolver consults lma's per-model reasoning_options; an explicit
+    # The resolver consults modelslist's per-model reasoning_options; an explicit
     # `reasoning` choice wins over the session pin (runtime.reasoning),
     # which in turn wins over the provider's stored reasoning_effort.
     outo_choice = reasoning if reasoning is not None else (runtime.reasoning or provider.reasoning_effort)
@@ -798,7 +798,7 @@ def build_runtime(
         outo_choice,
     )
 
-    # The context monitor resolves the window size once (lma, unless a
+    # The context monitor resolves the window size once (modelslist, unless a
     # provider override supplies it) — above the clear, hooked below.
     context_monitor = make_context_monitor(
         model=runtime.model,

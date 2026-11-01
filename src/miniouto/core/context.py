@@ -2,7 +2,7 @@
 
 Two duties, deliberately kept apart:
 
-* **Caps** — the lma-backed lookups (`get_max_output_tokens`,
+* **Caps** — the modelslist-backed lookups (`get_max_output_tokens`,
   `get_context_window`) that pin the output floor and the window size. This
   is invariant 4's machinery and is unchanged.
 * **The summary trigger** — this harness never summarizes *implicitly*: no
@@ -26,7 +26,7 @@ from collections.abc import Callable
 from typing import Any
 
 from . import inbox
-from . import lma as lma_api
+from . import modelslist as modelslist_api
 from .summary import build_summary_request, summary_dir_for
 
 # The measured context usage (percent of the window) at which the model is
@@ -52,17 +52,17 @@ _CHARS_PER_TOKEN = 4
 DEFAULT_MAX_OUTPUT_TOKENS = 16384
 
 # Cache: (model, provider) → {contextWindow, maxOutputTokens}. A cached
-# `{}` is meaningful — it means "lma answered, and had no info for this
+# `{}` is meaningful — it means "modelslist answered, and had no info for this
 # key" — and we should not re-hit it every turn. A *failed* fetch is NOT
 # cached: caching the `{}` a transport error produced would pin the key
 # to "no caps" for the life of the process (compaction off, 16K floor
-# applied) off a single network blip. Same rule as lma's own `_CACHE`
+# applied) off a single network blip. Same rule as modelslist's own `_CACHE`
 # (see AGENTS.md invariant 13).
 _MODEL_CACHE: dict[tuple[str, str], dict[str, int]] = {}
 
 
 def clear_model_cache() -> None:
-    """Drop every cached model-cap lookup (mirror of `lma.clear_cache()`)."""
+    """Drop every cached model-cap lookup (mirror of `modelslist.clear_cache()`)."""
     _MODEL_CACHE.clear()
 
 
@@ -73,10 +73,10 @@ def _fetch_model_caps(model: str, provider_name: str | None = None) -> dict[str,
         return cached
     result: dict[str, int] = {}
     try:
-        info = lma_api.get_model(model, provider_name)
+        info = modelslist_api.get_model(model, provider_name)
     except Exception:
         # Uncached fallback: the caller gets the 16K floor and no context
-        # window for this call, and the next call retries lma.
+        # window for this call, and the next call retries modelslist.
         return {}
     if info:
         cw = info.get("context_window")
@@ -123,8 +123,8 @@ def get_max_output_tokens(model: str, provider_name: str | None = None) -> int:
     Order of preference:
     1. The per-provider `max_output_tokens` override set in the TUI
        custom-model editor.
-    2. lma's `max_output_tokens` for the (model, provider) pair.
-    3. lma's `context_window` (most APIs cap output at the context
+    2. modelslist's `max_output_tokens` for the (model, provider) pair.
+    3. modelslist's `context_window` (most APIs cap output at the context
        window; if a separate cap isn't published, this is a proxy).
     4. `DEFAULT_MAX_OUTPUT_TOKENS` (16K) — a hard floor because some
        providers (Anthropic) default to 1024 otherwise, which silently

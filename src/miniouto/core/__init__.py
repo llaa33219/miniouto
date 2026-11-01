@@ -1,13 +1,11 @@
-from . import chat, inbox, lma, providers, runtime
+from . import chat, inbox, modelslist, providers, runtime
 
-__all__ = ["chat", "inbox", "lma", "providers", "runtime"]
+__all__ = ["chat", "inbox", "modelslist", "providers", "runtime"]
 
 
 def __getattr__(name):
-    if name == "lma":
-        from . import lma
+    if name == "modelslist":
+        from . import modelslist
 
-        return lma
+        return modelslist
     raise AttributeError(name)
-
-

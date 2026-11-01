@@ -35,7 +35,7 @@ src/miniouto/
 │   ├── context.py
 │   ├── events.py            # LoopEvent, EventSink protocol, NullSink, ConsoleEventSink
 │   ├── inbox.py              # cross-process message inbox (one file per message)
-│   ├── lma.py
+│   ├── modelslist.py
 │   ├── providers.py
 │   ├── repetition.py         # repetition watchdog (phrase / tool loops)
 │   ├── runtime.py
@@ -66,7 +66,7 @@ src/miniouto/
                              │ runtime, │           │ settings,    │
                              │ providers,           │ sessions,    │
                              │ context, │           │ styles,      │
-                             │ lma      │           │ skills,      │
+                             │modelslist│           │ skills,      │
                              └────┬─────┘           │ toml_io      │
                                   │                 └──────┬───────┘
                                   ▼                        │
@@ -93,7 +93,7 @@ src/miniouto/
 | Layer | Touches the filesystem? | Touches coreouto? | Touches the network? |
 |---|---|---|---|
 | `cli/` | No (delegates to storage) | No (delegates to core) | No |
-| `core/` | No (delegates to storage) | Yes | Yes (`lma` REST client in `context.py` + `lma.py`) |
+| `core/` | No (delegates to storage) | Yes | Yes (`modelslist` REST client in `context.py` + `modelslist.py`) |
 | `storage/` | Yes — its primary job | No | Yes (`add_from_repo` for `style add`) |
 | `tools/` | Yes (each tool mutates files) | No (only `tools/registry.py` does) | No |
 | `default_style/` | No (read-only packaged assets) | No | No |
@@ -155,7 +155,7 @@ cli/__init__.py:app (Typer)
    │     └─► core.inbox.insert(alarm_session, alarm)   ← delivered next turn
    ├─ miniouto message insert/list/clear ─► core.inbox + storage.settings
    ├─ miniouto computer show [PATH]     ─► tools.ascii_art.parse_art (renders a .art capture)
-   ├─ miniouto provider providers/models/add ──► core.lma + storage.providers + settings.update
+   ├─ miniouto provider providers/models/add ──► core.modelslist + storage.providers + settings.update
   ├── miniouto provider custom add            ──► storage.providers + settings.update
   ├── miniouto provider [list|remove|default] ──► storage.providers.* + settings.update
   ├── miniouto style    [list|set|add|update|show] ──► storage.styles.* + settings.update
@@ -190,10 +190,10 @@ The system prompt **is** the `<outo>` section of the active style (or the whole-
 A role run (`chat --role <tag>`) is that tag's body through the same expansion call — assembled by the same `build_runtime`, so there is no second assembly path to drift.
 
 ### 4. Context-window safety
-`core/context.py` enforces a **16K-token output floor** by calling `https://lma.blp.sh/model?model-name=...&provider-name=...` (via `core.lma.get_model`):
+`core/context.py` enforces a **16K-token output floor** from modelslist model metadata (`top_provider.max_completion_tokens`, then `context_length`) via `core.modelslist.get_model`:
 
 - **Floor:** `DEFAULT_MAX_OUTPUT_TOKENS = 16384`. Without this, Anthropic's default of 1024 silently truncates long tool calls (e.g. heredoc file writes).
-- **No ceiling.** The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against the legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; lma reports accurate per-request non-streaming caps so the clamp is no longer needed.
+- **No ceiling.** The previous `MAX_OUTPUT_TOKENS_CEILING = 16384` was a defense against a legacy `lcw-api.blp.sh/context-window` endpoint reporting inflated theoretical streaming caps; modelslist reports accurate per-request non-streaming caps so the clamp is no longer needed.
 
 ### 5. Delegation is a Bash command — `miniouto chat --role` — in its own process
 There is **no** `call_subagent` tool and **no** separate spawn command. Delegation happens because the model runs the same `chat` command the user runs, through `Bash`:
@@ -249,7 +249,7 @@ The queue is a **directory of files, not a deque** (invariant 20): one message =
 
 | Entity | Defined in | Purpose |
 |---|---|---|
-| **Provider** | `storage/providers.py` | LLM API connection: `name`, `api_format` (openai/openai-response/anthropic/google), `base_url`, `api_key`, `default_model`, `source` (`SOURCE_CUSTOM`/`SOURCE_LMA`), `extra` |
+| **Provider** | `storage/providers.py` | LLM API connection: `name`, `api_format` (openai/openai-response/anthropic/google), `base_url`, `api_key`, `default_model`, `source` (`SOURCE_CUSTOM`/`SOURCE_MODELSLIST`, plus legacy `SOURCE_LMA`), `extra` |
 | **Settings** | `storage/settings.py` | The **global default**: `provider`, `model` (legacy, read-only), `style`, `session`, `theme`, `subagent_provider`/`subagent_model`/`subagent_reasoning` |
 | **ProviderConfig** | `storage/session_config.py` | One session's **pin** at `session-config/<session>.toml`: the same six provider keys, `""` = follow the default. Frozen at the session's first resolution, seeded copy-if-absent into every freshly minted session — the layer that lets several processes run on different providers at once |
 | **Style** | `storage/styles.py` | Markdown system prompt, parsed into an outo body and zero or more role bodies via `parse_style` (top-level tag-as-name) |
@@ -306,7 +306,7 @@ ChatOptions (CLI flags)
 | `rich` | `>=13.7.0` | Terminal output, tables, markdown |
 | `textual` | `>=0.80.0` | TUI framework |
 | `pydantic` | `>=2.0` | Data models (used by coreouto) |
-| `httpx` | `>=0.27.0` | HTTP client (`lma` REST client + style repo fetcher) |
+| `httpx` | `>=0.27.0` | HTTP client (modelslist REST client + style repo fetcher) |
 | `tomli-w` | `>=1.0.0` | TOML serializer (paired with stdlib `tomllib`) |
 
 `coreouto` is the only non-trivial runtime dependency; everything else is a thin UI/storage layer.

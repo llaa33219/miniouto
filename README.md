@@ -39,9 +39,9 @@ miniouto provider custom add \
   --base-url https://api.openai.com/v1 \
   --default-model gpt-5.5            # optional; used when neither chat --pm nor the session pin names a model
 
-# Or browse the lma (llm-model-api) catalog and add from there:
-miniouto provider providers          # see all 144 catalog providers
-miniouto provider add Anthropic --api-key sk-ant-...   # adds it with the first catalog model
+# Or browse the modelslist catalog and add from there:
+miniouto provider providers          # see the curated catalog index
+miniouto provider add Kimi --api-key sk-...            # adds it with the first catalog model
 
 miniouto provider default openai
 miniouto style set default
@@ -100,7 +100,7 @@ That middle tier is the point: **each session keeps the settings it started with
 
 In the TUI, both provider chips open the same popup: three rows, `Provider` / `Model` / `Reasoning`, each with its own picker. Picking a provider or a model resets Reasoning to that model's default (an effort level belongs to a model), and every change writes **both** the session pin and the global default.
 
-The **subagent** (a delegated run that asks for the subagent profile — `--use-subagent-provider`, or the `--pm` value the `{subagent_pm}` token renders) can run on a different provider/model, and resolves the same way, pin-first against its own session: `--pm` > the pin's `subagent_provider` > `settings.subagent_provider` (via `miniouto subagent set`) > inherit outo's provider; and `--pm` > the pin's `subagent_model` > `settings.subagent_model` > the subagent provider's `default_model` > inherit outo's model (only reachable when no subagent provider is set). A model-only setting (no subagent provider) is also valid — the run then uses outo's provider with that model. Reasoning resolves as: the `--pm` suffix > the pin's `subagent_reasoning` > `settings.subagent_reasoning` > the subagent provider's `reasoning_effort` > lma's default.
+The **subagent** (a delegated run that asks for the subagent profile — `--use-subagent-provider`, or the `--pm` value the `{subagent_pm}` token renders) can run on a different provider/model, and resolves the same way, pin-first against its own session: `--pm` > the pin's `subagent_provider` > `settings.subagent_provider` (via `miniouto subagent set`) > inherit outo's provider; and `--pm` > the pin's `subagent_model` > `settings.subagent_model` > the subagent provider's `default_model` > inherit outo's model (only reachable when no subagent provider is set). A model-only setting (no subagent provider) is also valid — the run then uses outo's provider with that model. Reasoning resolves as: the `--pm` suffix > the pin's `subagent_reasoning` > `settings.subagent_reasoning` > the subagent provider's `reasoning_effort` > the modelslist default.
 
 ## Commands
 
@@ -111,7 +111,7 @@ The **subagent** (a delegated run that asks for the subagent profile — `--use-
 | `miniouto status` | Show current configuration |
 | `miniouto message insert/list/clear` | Insert into or inspect a session inbox (`--session <s>`) |
 | `miniouto computer show` | Render a captured `.art` screen dump |
-| `miniouto provider providers/models/add` | Browse the lma catalog and add providers from it |
+| `miniouto provider providers/models/add` | Browse the modelslist catalog and add providers from it |
 | `miniouto provider custom add` | Add a custom provider by hand (api_format, base_url, api_key, default_model) |
 | `miniouto provider list/remove/default` | Manage saved providers |
 | `miniouto style list/set/add/update/show` | Manage style documents (`update` re-seeds bundled + re-fetches all repo styles) |

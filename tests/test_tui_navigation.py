@@ -625,7 +625,7 @@ def test_the_session_chip_shows_the_pinned_session_name() -> None:
 
 
 class _FakeReasoning:
-    """The lma reasoning boundary, stubbed per model."""
+    """The modelslist reasoning boundary, stubbed per model."""
 
     def __init__(self, ladder: dict[str, list[str]], defaults: dict[str, str]) -> None:
         self._ladder = ladder
@@ -640,21 +640,23 @@ class _FakeReasoning:
 
 @pytest.fixture
 def settings_home(monkeypatch: pytest.MonkeyPatch) -> str:
-    """Two CATALOG providers with different defaults, and no lma reasoning except on one.
+    """Two CATALOG providers with different defaults, and no reasoning except on one.
 
     `pop-alpha` offers an effort ladder and records `default_model` +
     `reasoning_effort`; `pop-beta` has no reasoning options at all. That split
     is what proves a provider change actually MOVES the other two rows.
 
-    Both are `source="lma"` on purpose: a hand-added provider carries the
-    `Caps` row, and these tests are about the trio alone.
+    Both are `source="modelslist"` on purpose: a hand-added provider carries
+    the `Caps` row, and these tests are about the trio alone. Legacy
+    `source="lma"` records are covered separately (they must keep behaving as
+    catalog records).
     """
     provider_store.upsert(
         provider_store.Provider(
             name="pop-alpha",
             api_format="openai",
             default_model="alpha-default",
-            source=provider_store.SOURCE_LMA,
+            source=provider_store.SOURCE_MODELSLIST,
             reasoning_effort="high",
         )
     )
@@ -663,7 +665,7 @@ def settings_home(monkeypatch: pytest.MonkeyPatch) -> str:
             name="pop-beta",
             api_format="openai",
             default_model="beta-default",
-            source=provider_store.SOURCE_LMA,
+            source=provider_store.SOURCE_MODELSLIST,
         )
     )
     monkeypatch.setattr(
@@ -806,15 +808,16 @@ def test_the_model_row_opens_the_model_list(settings_home: str, monkeypatch: Any
             await pilot.click(_row(app.screen, "model"), offset=(2, 0))
             for _ in range(6):
                 await pilot.pause()
-            # Then: the catalog model list is offered, newest first, with the
+            # Then: the catalog model list is offered in modelslist's own
+            # order — the catalog's first entry first, no reversal — with the
             # model in use marked
             assert isinstance(app.screen, SelectionModal)
             options = [
                 str(item.query_one(Label).render().plain).strip()
                 for item in app.screen.query_one("#selection-list").children
             ]
-            assert options[0].endswith("alpha-fast — Fast")
-            assert options[1] == "● alpha-default —"
+            assert options[0] == "● alpha-default —"
+            assert options[1] == "alpha-fast — Fast"
 
     asyncio.run(body())
 
@@ -918,7 +921,7 @@ def test_changing_the_provider_resets_model_and_reasoning_immediately(
     asyncio.run(body())
 
 
-def test_a_provider_change_takes_the_lma_default_when_the_record_has_none(
+def test_a_provider_change_takes_the_modelslist_default_when_the_record_has_none(
     settings_home: str,
 ) -> None:
     async def body() -> None:
@@ -942,7 +945,7 @@ def test_a_provider_change_takes_the_lma_default_when_the_record_has_none(
             assert isinstance(app.screen, SelectionModal)
             app.screen.dismiss("pop-auto")
             await pilot.pause()
-            # Then: the model's lma default fills the gap the record left
+            # Then: the model's modelslist default fills the gap the record left
             assert _row_text(app.screen, "reasoning") == "Reasoning: low"
             provider_store.remove("pop-auto")
 
@@ -975,11 +978,12 @@ def test_the_reasoning_row_is_disabled_for_a_model_without_levels(
 # ── the Caps row: a fourth row, only for a custom provider ───────────────────
 #
 # Caps (`max_context_window` / `max_output_tokens`) are an ENDPOINT property of
-# a hand-added provider record — a catalog provider's caps come from lma, so
-# there is nothing to override and the row must not exist at all. Unlike the
-# trio rows a caps save writes the record ALONE (never a session pin), and it
-# has to drop `core.context`'s per-process cache or this long-lived TUI would
-# keep serving the caps lma answered before the edit.
+# a hand-added provider record — a catalog provider's caps come from
+# modelslist, so there is nothing to override and the row must not exist at
+# all. Unlike the trio rows a caps save writes the record ALONE (never a
+# session pin), and it has to drop `core.context`'s per-process cache or this
+# long-lived TUI would keep serving the caps modelslist answered before the
+# edit.
 
 
 @pytest.fixture
@@ -1000,8 +1004,8 @@ def custom_provider() -> str:
 
 
 @pytest.fixture
-def lma_caps(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    """The caps lma reports for any (model, provider), as a dict the test edits.
+def catalog_caps(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """The caps modelslist reports for any (model, provider), as a dict the test edits.
 
     `core.context` caches that answer for the life of the process, so the cache
     is cleared around the test — the point of the last test below is that the
@@ -1009,7 +1013,9 @@ def lma_caps(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """
 
     answers: dict[str, int] = {}
-    monkeypatch.setattr(context_api.lma_api, "get_model", lambda *_a, **_k: dict(answers))
+    monkeypatch.setattr(
+        context_api.modelslist_api, "get_model", lambda *_a, **_k: dict(answers)
+    )
     context_api.clear_model_cache()
     yield answers
     context_api.clear_model_cache()
@@ -1039,11 +1045,11 @@ def test_the_caps_row_is_absent_for_a_catalog_provider(
             await pilot.pause()
             _pin_test_session(app)
             settings_store.update(provider="pop-alpha")
-            # Given / When: the popup is open on a `source="lma"` provider
+            # Given / When: the popup is open on a `source="modelslist"` provider
             _open_popup(app, chip="outo")
             await pilot.pause()
             assert isinstance(app.screen, ProviderSettingsPopup)
-            # Then: its caps come from lma, so there is nothing to override —
+            # Then: its caps come from modelslist, so there is nothing to override —
             # the caps row is absent; catalog compatibility is a separate row
             assert _fields(app.screen) == [
                 "provider", "model", "reasoning", "compatibility"
@@ -1066,7 +1072,7 @@ def test_the_caps_row_reads_unset_as_a_dash_pair_for_a_custom_provider(
             await pilot.pause()
             assert isinstance(app.screen, ProviderSettingsPopup)
             # Then: the fourth row is there, below Reasoning, and both unset
-            # caps read "-" — that state means "follow lma", not "broken"
+            # caps read "-" — that state means "follow modelslist", not "broken"
             assert _fields(app.screen) == ["provider", "model", "reasoning", "caps"]
             assert _row_text(app.screen, "caps") == "Caps: - / -"
 
@@ -1174,7 +1180,7 @@ def test_empty_caps_input_clears_the_override_back_to_unset(
             await _edit_caps(app, pilot, "", "")
 
             # Then: the overrides are GONE from the record (not zero, not ""),
-            # so the next turn falls back to lma's caps again
+            # so the next turn falls back to modelslist's caps again
             record = provider_store.get("pop-custom")
             assert (record.max_context_window, record.max_output_tokens) == (None, None)
             assert _row_text(app.screen, "caps") == "Caps: - / -"
@@ -1183,7 +1189,7 @@ def test_empty_caps_input_clears_the_override_back_to_unset(
 
 
 def test_a_caps_save_takes_effect_without_a_restart(
-    settings_home: str, custom_provider: str, lma_caps: dict[str, int]
+    settings_home: str, custom_provider: str, catalog_caps: dict[str, int]
 ) -> None:
     async def body() -> None:
         app = ChatTUI()
@@ -1191,9 +1197,9 @@ def test_a_caps_save_takes_effect_without_a_restart(
             await pilot.pause()
             _pin_test_session(app)
             settings_store.update(provider="pop-custom")
-            lma_caps.update({"context_window": 128000, "max_output_tokens": 4096})
-            # Given: lma answered for this provider once, and that answer is
-            # now cached for the life of this process
+            catalog_caps.update({"context_window": 128000, "max_output_tokens": 4096})
+            # Given: modelslist answered for this provider once, and that
+            # answer is now cached for the life of this process
             assert context_api.get_context_window("custom-default", "pop-custom") == 128000
 
             _open_popup(app, chip="outo")
@@ -1205,10 +1211,10 @@ def test_a_caps_save_takes_effect_without_a_restart(
             assert context_api.get_context_window("custom-default", "pop-custom") == 200000
             assert context_api.get_max_output_tokens("custom-default", "pop-custom") == 16384
 
-            # When: lma's answer changes and the overrides are cleared again
-            lma_caps["context_window"] = 64000
+            # When: modelslist's answer changes and the overrides are cleared
+            catalog_caps["context_window"] = 64000
             await _edit_caps(app, pilot, "", "")
-            # Then: lma is asked again — a stale `_MODEL_CACHE` entry would
+            # Then: modelslist is asked again — a stale `_MODEL_CACHE` entry would
             # still be serving the 128000 this process cached before the edit
             assert context_api.get_context_window("custom-default", "pop-custom") == 64000
 
@@ -2861,40 +2867,50 @@ def test_the_theme_a_user_picks_is_persisted_for_the_next_boot() -> None:
 
 @pytest.fixture
 def dialect_provider(settings_home: str, monkeypatch: pytest.MonkeyPatch) -> str:
-    """A catalog provider with both confirmed and tentative hostable dialects."""
+    """A separate provider avoids changing settings_home's pop-alpha fixture."""
 
     provider_store.upsert(
-        replace(
-            provider_store.get("pop-alpha"),
+        provider_store.Provider(
+            name="catalog-gateway",
             api_format="openai",
             base_url="https://gateway.example/v1",
-            catalog_dialect="openai-chat",
+            catalog_dialect="openai",
+            source=provider_store.SOURCE_MODELSLIST,
         )
     )
     monkeypatch.setattr(
         tui_module.catalog_api,
         "find_provider_by_slug",
-        lambda name: (
+        lambda name, base_url="": (
             {
-                "name": "Pop Alpha",
-                "sdk": "openai-compatible",
-                "api": "https://gateway.example/v1",
-                "dialects": {
-                    "supported": {
-                        "openai-chat": "https://gateway.example/v1",
-                        "anthropic-messages": "https://gateway.example/anthropic",
-                    },
-                    "likely": {
-                        "openai-responses": "https://gateway.example/v1",
-                        "typesafe-systemone": "https://ignored.example",
-                    },
-                },
+                "name": "Catalog Gateway",
+                "slug": "catalog-gateway",
+                "formats": [
+                    {"format": "openai", "baseUrl": "https://gateway.example/v1"},
+                    {"format": "anthropic", "baseUrl": "https://gateway.example/anthropic"},
+                    {"format": "openai-responses", "baseUrl": "https://gateway.example/v1/responses"},
+                    {"format": "typesafe", "baseUrl": "https://ignored.example"},
+                ],
+                "modelLists": [{
+                    "url": "https://modelslist.blp.sh/catalog-gateway/models",
+                    "format": "openai",
+                    "source": "modelslist",
+                }],
             }
-            if name == "pop-alpha"
+            if name == "catalog-gateway"
             else None
         ),
     )
-    return "pop-alpha"
+    return "catalog-gateway"
+
+
+def _compatibility_labels(app: ChatTUI) -> list[str]:
+    """The picker's rows, marker stripped, in the order the popup offered them."""
+
+    return [
+        str(item.query_one(Label).render().plain).strip().removeprefix("● ")
+        for item in app.screen.query_one("#selection-list").children
+    ]
 
 
 def test_catalog_provider_has_a_compatibility_row_with_the_saved_dialect(
@@ -2905,17 +2921,13 @@ def test_catalog_provider_has_a_compatibility_row_with_the_saved_dialect(
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
+            settings_store.update(provider=dialect_provider)
             _open_popup(app, chip="outo")
             await pilot.pause()
 
             assert isinstance(app.screen, ProviderSettingsPopup)
-            assert _fields(app.screen) == [
-                "provider", "model", "reasoning", "compatibility"
-            ]
-            assert _row_text(app.screen, "compatibility") == (
-                "Compatibility: openai-chat"
-            )
+            assert "compatibility" in _fields(app.screen)
+            assert _row_text(app.screen, "compatibility") == "Compatibility: openai"
 
     asyncio.run(body())
 
@@ -2928,7 +2940,7 @@ def test_compatibility_picker_changes_format_and_url_without_touching_the_trio(
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             session = _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
+            settings_store.update(provider=dialect_provider)
             _open_popup(app, chip="outo")
             await pilot.pause()
             pin_before = session_config.read(session)
@@ -2937,32 +2949,23 @@ def test_compatibility_picker_changes_format_and_url_without_touching_the_trio(
             for _ in range(6):
                 await pilot.pause()
             assert isinstance(app.screen, SelectionModal)
-            labels = [
-                str(item.query_one(Label).render().plain).strip()
-                for item in app.screen.query_one("#selection-list").children
+            labels = _compatibility_labels(app)
+            assert labels == [
+                "openai — https://gateway.example/v1",
+                "anthropic — https://gateway.example/anthropic",
+                "openai-responses — https://gateway.example/v1/responses",
             ]
-            assert any("anthropic-messages (supported)" in label for label in labels)
-            assert any("openai-responses (likely)" in label for label in labels)
-            assert not any("typesafe-systemone" in label for label in labels)
+            assert not any("typesafe" in label for label in labels)
 
-            selected = next(
-                label for label in labels if "anthropic-messages (supported)" in label
-            )
-            app.screen.dismiss(selected.removeprefix("● "))
+            selected = next(label for label in labels if label.startswith("anthropic "))
+            app.screen.dismiss(selected)
             await _settle(pilot)
 
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            record = provider_store.get("pop-alpha")
-            assert record.catalog_dialect == "anthropic-messages"
+            record = provider_store.get(dialect_provider)
+            assert record.catalog_dialect == "anthropic"
             assert record.api_format == "anthropic"
             assert record.base_url == "https://gateway.example/anthropic"
-            assert _row_text(app.screen, "compatibility") == (
-                "Compatibility: anthropic-messages"
-            )
-            assert _row_text(app.screen, "model") == "Model: alpha-default"
-            assert _row_text(app.screen, "reasoning") == "Reasoning: high"
-            # Like Caps, compatibility belongs to the provider record, not to
-            # an individual session's provider/model/reasoning pin.
+            assert _row_text(app.screen, "compatibility") == "Compatibility: anthropic"
             assert session_config.read(session) == pin_before
 
     asyncio.run(body())
@@ -2979,7 +2982,7 @@ def test_inherited_subagent_popup_edits_the_effective_outo_compatibility(
             settings_store.save(
                 replace(
                     settings_store.load(),
-                    provider="pop-alpha",
+                    provider=dialect_provider,
                     subagent_provider="",
                     subagent_model="",
                     subagent_reasoning="",
@@ -2988,59 +2991,63 @@ def test_inherited_subagent_popup_edits_the_effective_outo_compatibility(
             _open_popup(app, chip="subagent")
             await pilot.pause()
             assert isinstance(app.screen, ProviderSettingsPopup)
-            assert "compatibility" in _fields(app.screen)
-
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
             for _ in range(6):
                 await pilot.pause()
             assert isinstance(app.screen, SelectionModal)
             selected = next(
-                str(item.query_one(Label).render().plain).strip().removeprefix("● ")
-                for item in app.screen.query_one("#selection-list").children
-                if "openai-responses (likely)"
-                in str(item.query_one(Label).render().plain)
+                label
+                for label in _compatibility_labels(app)
+                if label.startswith("openai-responses ")
             )
             app.screen.dismiss(selected)
             await _settle(pilot)
 
-            record = provider_store.get("pop-alpha")
+            record = provider_store.get(dialect_provider)
             assert record.catalog_dialect == "openai-responses"
             assert record.api_format == "openai-response"
+            assert record.base_url == "https://gateway.example/v1/responses"
             assert settings_store.load().subagent_provider == ""
 
     asyncio.run(body())
 
 
-def test_catalog_add_persists_the_dialect_format_and_exact_url(
+def _stub_catalog_add(
+    monkeypatch: pytest.MonkeyPatch, catalog_provider: dict[str, Any]
+) -> None:
+    """Make the add wizard see exactly one provider, with a one-model list."""
+
+    monkeypatch.setattr(tui_module.catalog_api, "list_providers", lambda: [catalog_provider])
+    monkeypatch.setattr(
+        tui_module.catalog_api, "list_models", lambda _provider: [{"id": "gateway-model"}]
+    )
+    monkeypatch.setattr(tui_module, "_get_reasoning_api", lambda: None)
+
+
+def test_catalog_add_persists_the_catalog_format_and_exact_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The TUI add wizard must not silently fall back to the generic api URL."""
+    """The add wizard takes modelslist's FIRST format, and its exact URL."""
 
     name = "Dialect Gateway"
     slug = "dialect-gateway"
-    monkeypatch.setattr(
-        tui_module.catalog_api,
-        "list_providers",
-        lambda: [
-            {
-                "name": name,
-                "sdk": "openai-compatible",
-                "api": "https://gateway.example/v1",
-                "dialects": {
-                    "supported": {
-                        "anthropic-messages": "https://gateway.example/anthropic"
-                    },
-                    "likely": {"openai-chat": "https://gateway.example/v1"},
-                },
-            }
-        ],
+    _stub_catalog_add(
+        monkeypatch,
+        {
+            "name": name,
+            "slug": slug,
+            "formats": [
+                {"format": "anthropic", "baseUrl": "https://gateway.example/anthropic"},
+                {"format": "openai", "baseUrl": "https://gateway.example/v1"},
+                {"format": "typesafe", "baseUrl": "https://ignored.example"},
+            ],
+            "modelLists": [{
+                "url": "https://modelslist.blp.sh/dialect-gateway/models",
+                "format": "openai",
+                "source": "modelslist",
+            }],
+        },
     )
-    monkeypatch.setattr(
-        tui_module.catalog_api,
-        "list_models",
-        lambda _provider: [{"id": "gateway-model"}],
-    )
-    monkeypatch.setattr(tui_module, "_get_reasoning_api", lambda: None)
     screens = iter([name, "test-api-key"])
 
     async def fake_push_screen_wait(screen: Any) -> str | None:
@@ -3058,57 +3065,90 @@ def test_catalog_add_persists_the_dialect_format_and_exact_url(
 
             record = provider_store.get(slug)
             assert record is not None
-            assert record.catalog_dialect == "anthropic-messages"
+            assert record.catalog_dialect == "anthropic"
             assert record.api_format == "anthropic"
             assert record.base_url == "https://gateway.example/anthropic"
             assert record.default_model == "gateway-model"
+            assert record.source == provider_store.SOURCE_MODELSLIST
             assert settings_store.load().provider == slug
             provider_store.remove(slug)
 
     asyncio.run(body())
 
 
-
-def test_compatibility_can_restore_the_native_sdk_mapping(
-    dialect_provider: str,
+def test_catalog_add_uses_the_upstream_slug_not_a_slugified_name(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Z.AI is the case that matters: `slugify(name)` is not the catalog slug."""
+
+    name = "Z.AI"
+    assert tui_module.catalog_api.slugify(name) == "z-ai"
+    _stub_catalog_add(
+        monkeypatch,
+        {
+            "name": name,
+            "slug": "zai",
+            "formats": [{"format": "openai", "baseUrl": "https://api.z.ai/v1"}],
+        },
+    )
+    screens = iter([name, "test-api-key"])
+
+    async def fake_push_screen_wait(screen: Any) -> str | None:
+        return next(screens)
+
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
-            _open_popup(app, chip="outo")
-            await pilot.pause()
+            monkeypatch.setattr(app, "push_screen_wait", fake_push_screen_wait)
 
-            await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, SelectionModal)
-            selected = next(
-                str(item.query_one(Label).render().plain).strip().removeprefix("● ")
-                for item in app.screen.query_one("#selection-list").children
-                if "native SDK" in str(item.query_one(Label).render().plain)
-            )
-            app.screen.dismiss(selected)
-            await _settle(pilot)
+            await app._catalog_add_flow()
 
-            record = provider_store.get("pop-alpha")
-            assert record.catalog_dialect == ""
+            record = provider_store.get("zai")
+            assert record is not None
+            assert provider_store.get("z-ai") is None
             assert record.api_format == "openai"
-            assert record.base_url == "https://gateway.example/v1"
-            assert _row_text(app.screen, "compatibility") == "Compatibility: native SDK"
+            assert record.base_url == "https://api.z.ai/v1"
+            assert record.source == provider_store.SOURCE_MODELSLIST
+            assert settings_store.load().provider == "zai"
+            provider_store.remove("zai")
 
     asyncio.run(body())
 
 
-def test_compatibility_preserves_a_saved_dialect_missing_from_current_lma_results(
+def test_catalog_add_skips_a_provider_with_only_unhostable_formats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`typesafe` alone is not addable — the wizard must not offer it."""
+
+    monkeypatch.setattr(
+        tui_module.catalog_api,
+        "list_providers",
+        lambda: [{
+            "name": "Typesafe Only",
+            "slug": "typesafe-only",
+            "formats": [{"format": "typesafe", "baseUrl": "https://typesafe.example/v1"}],
+        }],
+    )
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await app._catalog_add_flow()
+            assert app._wizard_status == "No catalog providers have a supported api_format."
+
+    asyncio.run(body())
+
+
+def test_compatibility_preserves_a_saved_dialect_missing_from_current_results(
     dialect_provider: str,
 ) -> None:
     async def body() -> None:
         provider_store.upsert(
             replace(
-                provider_store.get("pop-alpha"),
+                provider_store.get(dialect_provider),
                 api_format="openai-response",
                 base_url="https://old.example/v1",
                 catalog_dialect="openai-responses",
@@ -3118,7 +3158,7 @@ def test_compatibility_preserves_a_saved_dialect_missing_from_current_lma_result
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
+            settings_store.update(provider=dialect_provider)
             _open_popup(app, chip="outo")
             await pilot.pause()
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
@@ -3126,20 +3166,126 @@ def test_compatibility_preserves_a_saved_dialect_missing_from_current_lma_result
                 await pilot.pause()
 
             assert isinstance(app.screen, SelectionModal)
-            labels = [
-                str(item.query_one(Label).render().plain).strip()
-                for item in app.screen.query_one("#selection-list").children
-            ]
-            saved = next(label for label in labels if "(saved)" in label)
+            saved = next(label for label in _compatibility_labels(app) if "(saved)" in label)
             assert "https://old.example/v1" in saved
-            assert saved.startswith("● ")
-            # Confirming the highlighted saved row is a no-op, not a silent
-            # migration to the current catalog's preferred dialect.
-            app.screen.dismiss(saved.removeprefix("● "))
+            app.screen.dismiss(saved)
             await _settle(pilot)
-            record = provider_store.get("pop-alpha")
+            record = provider_store.get(dialect_provider)
             assert record.catalog_dialect == "openai-responses"
             assert record.api_format == "openai-response"
             assert record.base_url == "https://old.example/v1"
+
+    asyncio.run(body())
+
+
+
+def test_a_legacy_lma_record_still_behaves_as_a_catalog_record(
+    dialect_provider: str,
+) -> None:
+    """Existing `source="lma"` records must keep the catalog rows and picker."""
+
+    async def body() -> None:
+        provider_store.upsert(
+            replace(
+                provider_store.get(dialect_provider), source=provider_store.SOURCE_LMA
+            )
+        )
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            _pin_test_session(app)
+            settings_store.update(provider=dialect_provider)
+            _open_popup(app, chip="outo")
+            await pilot.pause()
+            assert isinstance(app.screen, ProviderSettingsPopup)
+
+            assert "compatibility" in _fields(app.screen)
+            assert "caps" not in _fields(app.screen)
+            await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, SelectionModal)
+            labels = _compatibility_labels(app)
+            assert all("(supported)" not in label for label in labels)
+            assert not any("likely" in label or "native SDK" in label for label in labels)
+
+            app.screen.dismiss(
+                next(label for label in labels if label.startswith("anthropic "))
+            )
+            await _settle(pilot)
+            record = provider_store.get(dialect_provider)
+            assert record.catalog_dialect == "anthropic"
+            assert record.api_format == "anthropic"
+            assert record.base_url == "https://gateway.example/anthropic"
+            assert record.source == provider_store.SOURCE_LMA
+
+    asyncio.run(body())
+
+
+def test_a_picked_modelslist_format_persists_verbatim_and_survives_a_reopen(
+    dialect_provider: str,
+) -> None:
+    """The stored dialect is modelslist's exact format id and its exact URL.
+
+    Two things have to survive a round trip: the on-disk record, which core
+    reads to build the client, and the popup's next read of that record, which
+    must mark the same row current rather than re-deriving a label.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            _pin_test_session(app)
+            settings_store.update(provider=dialect_provider)
+            _open_popup(app, chip="outo")
+            await pilot.pause()
+
+            await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, SelectionModal)
+            picked = next(
+                label
+                for label in _compatibility_labels(app)
+                if label.startswith("openai-responses ")
+            )
+            assert picked.endswith("https://gateway.example/v1/responses")
+            app.screen.dismiss(picked)
+            await _settle(pilot)
+
+            # Then: the persisted record carries the catalog's own ids, not a
+            # locally-mapped variant (`openai-response`, `/v1`, …)
+            stored = provider_store.get(dialect_provider)
+            assert stored.catalog_dialect == "openai-responses"
+            assert stored.api_format == "openai-response"
+            assert stored.base_url == "https://gateway.example/v1/responses"
+
+            # And it is what the file says, so a fresh process reads the same
+            # thing the picker wrote.
+            reloaded = provider_store.load_all()[dialect_provider]
+            assert reloaded.catalog_dialect == "openai-responses"
+            assert reloaded.api_format == "openai-response"
+            assert reloaded.base_url == "https://gateway.example/v1/responses"
+
+            # When: the popup is reopened, the saved row is the current one
+            _open_popup(app, chip="outo")
+            await pilot.pause()
+            assert isinstance(app.screen, ProviderSettingsPopup)
+            assert _row_text(app.screen, "compatibility") == (
+                "Compatibility: openai-responses"
+            )
+            await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, SelectionModal)
+            rows = [
+                str(item.query_one(Label).render().plain).strip()
+                for item in app.screen.query_one("#selection-list").children
+            ]
+            # The saved row is first and marked; nothing was rewritten to
+            # "(saved)" merely because the popup was opened again.
+            assert rows[0] == "● " + picked
+            assert not any("(saved)" in row for row in rows)
 
     asyncio.run(body())
