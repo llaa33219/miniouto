@@ -129,7 +129,7 @@ def test_screen_result_carries_path_preview_and_more_rows_line(one_screen) -> No
     result = computer("screen")
 
     # Then: the result names the file, labels the new mode and previews rows
-    assert "Screen art captured (1280x720 -> 100x28 chars, subcell truecolor)." in result
+    assert "1280x720 -> 100x28 chars, subcell truecolor" in result
     assert "Saved to: " in result
     # And: the preview is capped by the row budget, and the rows it left out are
     # named — the art itself is far taller than one tool result can carry

@@ -120,7 +120,8 @@ Notes on the on-disk format:
 
 ```toml
 provider = "openai"     # global DEFAULT provider name (must match a top-level table in providers.toml)
-model    = ""           # optional; legacy, read-only (the TUI never writes it; reads at the bottom of the default chain)
+model    = ""           # the outo model — written WITH provider/reasoning as one pair; empty = the provider record's default_model
+reasoning = ""          # the outo reasoning effort — same pair; empty = the provider record's reasoning_effort
 style    = "default"    # default style (must exist in ~/.miniouto/style/)
 session  = "default"    # active session name; written by PLAIN `miniouto chat` (`_is_plain_run`: no --role/--alarm-session/--return/--bg) and by TUI user actions (first dispatch, session picker, "new session"). Delegated runs never write it, including across hand-offs; their explicit `ChatOptions.session` selects routing without touching this global fallback.
 theme    = "miniouto"   # TUI theme name. `miniouto` is the harness's own dark theme (registered in cli/tui.py); any other REGISTERED name — a stock Textual theme, e.g. `gruvbox` — replaces it, and the TUI writes back whatever is picked at runtime (Ctrl+P → Theme). An unregistered name falls back to `miniouto` rather than failing the launch.
@@ -129,7 +130,11 @@ subagent_model    = ""  # optional; subagent model override (empty = subagent pr
 subagent_reasoning = "" # optional; subagent reasoning-effort override (empty = subagent provider's reasoning_effort, else auto)
 ```
 
-All eight keys are optional. Missing keys fall back to: empty string for `provider`/`model`/`subagent_provider`/`subagent_model`/`subagent_reasoning`, `"default"` for `style`/`session`, and `"miniouto"` for `theme`.
+All nine keys are optional. Missing keys fall back to: empty string for `provider`/`model`/`reasoning`/`subagent_provider`/`subagent_model`/`subagent_reasoning`, `"default"` for `style`/`session`, and `"miniouto"` for `theme`.
+
+`provider` / `model` / `reasoning` are ONE paired choice: the TUI writes all three together, and `settings.update(provider=...)` swaps the model (and the effort) with the provider, so the pair can never name two different providers at once. The provider RECORD's `default_model` / `reasoning_effort` answer where nothing else names a model — they describe the ENDPOINT, while these three describe the INSTALLATION.
+
+**A named provider always carries a model.** `settings.save` completes a provider whose model is missing from that provider's own record, so the file never holds "provider but no model" — the state every reader would otherwise have to guess about. Only a provider that JUST CHANGED is completed: clearing the model on its own keeps its documented meaning ("hand that key back to the default"). The same rule applies to the `subagent_*` trio and to the session pin below.
 
 This file is the **global default** half of the resolution chain — what a session with no pin, and the next fresh session, resolve. The per-session half is `session-config/<session>.toml` below; `core/runtime.py:default_provider_config` computes this half, which storage never imports.
 
@@ -151,6 +156,7 @@ Semantics (`storage/session_config.py`):
 
 - **Resolution order, per key:** the explicit per-call override (`chat --pm`) > **this session's pin** > the global default (`settings.toml` + the resolved provider record's `default_model` / `reasoning_effort`). See `docs/core.md` § `resolve_runtime_from_settings`.
 - **A stored value is CONCRETE; `""` means "follow the global default at read time."** The pin is a set of overrides *on* the default, not a replacement for it: `set_fields(session, model="")` hands that one key back without touching the others. `as_dict()` drops empty keys on write, so an unset key is simply absent from the file.
+- **A named provider always carries a model.** `set_fields` completes a provider whose model is missing from that provider's own record, so the pin never holds "provider but no model" — the state every reader would otherwise have to guess about. Only a provider that JUST CHANGED is completed; clearing the model on its own keeps its documented meaning ("hand that key back to the default").
 - **Freeze at first use.** `effective(session, default=…)` materializes the pin: a session with no file gets the current global default written as its pin and that value returned. A model switch made by the TUI in another process can never redirect a session that is already running.
 - **Seeding is copy-if-absent.** `seed_from(new, source)` copies a source session's pin into a freshly minted one — a delegated run's `chat-`/`spawn-` name, a summary hand-off's `cont-*` name, the TUI's "new session". A session that already carries a pin keeps it, and a source with no pin seeds nothing (the new session freezes the default itself).
 - Writes are atomic (tmp + `os.replace`), and a **corrupt pin is treated as absent**, not raised over — the session simply follows the default again (the same tolerance `sessions.load` applies).
@@ -443,7 +449,8 @@ class Provider:
 @dataclass
 class Settings:
     provider: str = ""
-    model: str = ""           # legacy; read at the bottom of the default chain, never written by the TUI
+    model: str = ""           # the outo model — written WITH provider/reasoning as one pair
+    reasoning: str = ""       # the outo reasoning effort — same pair
     style: str = "default"
     session: str = "default"
     theme: str = "miniouto"    # TUI theme name (cli/tui.py:MINIOUTO_THEME)
@@ -485,7 +492,7 @@ class ProviderConfig:            # six keys; "" = follow the global default at r
 | `path_for(session)` | `Path` | `SESSION_CONFIG_DIR / f"{session}.toml"` |
 | `read(session)` | `ProviderConfig \| None` | `None` when there is no pin — or when the file is corrupt (treated as absent, never raised over) |
 | `effective(session, *, default=callable)` | `ProviderConfig` | the stored pin as-is; with no pin, **writes** `default()` as the pin and returns it (freeze at first use) |
-| `set_fields(session, **fields)` | `ProviderConfig` | merge; `""` clears that one key; keys outside `FIELDS` are ignored |
+| `set_fields(session, **fields)` | `ProviderConfig` | merge; `""` clears that one key; keys outside `FIELDS` are ignored; a provider named without a model is completed from that provider's own record |
 | `seed_from(new, source)` | `None` | copy-if-absent; a no-op when the names match or either side has no pin |
 | `clear(session)` | `None` | unlink; the session follows the global default again |
 | `ProviderConfig.as_dict()` | `dict` | drops empty keys (the on-disk shape) |

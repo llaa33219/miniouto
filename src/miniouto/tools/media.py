@@ -13,6 +13,18 @@ provider: a 200 MB video would blow the request budget (and most providers
 reject it well before that). When a file exceeds the cap, the tool raises
 `MediaViewError` with a redirect to Bash-based alternatives (ffmpeg/sox to
 downsample, or splitting the media into chunks).
+
+MULTIMODAL CAPABILITY IS THE PROVIDER'S, NOT THE FILE'S. Whether a loaded
+image/video/audio can be handed to the model depends on the CURRENT
+provider's `api_format` (see `tools/registry.py`): the OpenAI Chat
+Completions wire format cannot carry a multimodal tool result AT ALL, the
+Responses API carries images but not video/audio, and Anthropic / Google
+carry all three. When the active provider cannot carry the payload, the
+tool must NOT raise — a raise ends the TURN (the model never gets to
+recover), while the correct behaviour is an ordinary tool result that says
+"this provider cannot carry this payload" and lets the model continue.
+The capability matrix lives in `tools/multimodal.py`; this module stays
+pure stdlib and format-agnostic.
 """
 
 from __future__ import annotations

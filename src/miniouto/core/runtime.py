@@ -1210,7 +1210,40 @@ def _effective_subagent_pm(session: str) -> str:
         or pinned.provider
         or default.provider
     )
-    model = pinned.subagent_model or default.subagent_model or pinned.model or default.model
+    # The MODEL comes from the SUBAGENT's own sources, in order:
+    #
+    #   1. the session pin's `subagent_model`;
+    #   2. the global `settings.subagent_model`;
+    #   3. the SUBAGENT PROVIDER's own record `default_model` — the
+    #      endpoint's default for the provider the subagent actually
+    #      runs on;
+    #   4. outo's trio, only when the subagent inherits outo's provider
+    #      too ("same as outo").
+    #
+    # Step 3 is what keeps an outo edit away from the subagent. Falling
+    # back to outo's model for a subagent on ANOTHER provider meant the
+    # subagent ran the wrong provider's model AND followed every outo
+    # model change — the delegation command's `--pm` changed with it,
+    # and every delegated run restarted on a new model (issue: an outo
+    # edit resetting the subagent).
+    model = pinned.subagent_model or default.subagent_model
+    if not model:
+        outo_provider = pinned.provider or default.provider
+        if not provider or provider == outo_provider:
+            # SAME AS OUTO: the subagent runs on outo's provider, so it
+            # takes outo's model. The provider and the model are one
+            # choice there.
+            model = pinned.model or default.model
+        else:
+            # The subagent names a provider of its OWN: it takes THAT
+            # provider's endpoint default and nothing else. It must not
+            # inherit outo's model — that belongs to a different
+            # endpoint, and inheriting it is what made an outo edit move
+            # the subagent (issue: an outo edit resetting the subagent).
+            sub_record = provider_store.get(provider)
+            model = sub_record.default_model if sub_record else ""
+    # The REASONING follows the same shape, and inherits outo's effort
+    # when the subagent names none of its own.
     reasoning = (
         pinned.subagent_reasoning
         or default.subagent_reasoning
@@ -1253,10 +1286,20 @@ def default_provider_config() -> session_config.ProviderConfig:
 
     s = settings_store.load()
     provider = provider_store.get(s.provider) if s.provider else None
+    # `settings.model` / `settings.reasoning` are outo's OWN pick, and
+    # they are written TOGETHER with `settings.provider` — one paired
+    # choice. A provider switch therefore replaces the model too, so the
+    # stored model always belongs to the stored provider and needs no
+    # ownership check here.
+    #
+    # The provider record's `default_model` / `reasoning_effort` are the
+    # ENDPOINT's defaults, and they answer when nothing else names a
+    # model. Keeping the two apart is what stops an outo edit from
+    # dragging a subagent on the same provider along with it.
     return session_config.ProviderConfig(
         provider=s.provider,
         model=s.model or (provider.default_model if provider else ""),
-        reasoning=(provider.reasoning_effort or "") if provider else "",
+        reasoning=s.reasoning or ((provider.reasoning_effort or "") if provider else ""),
         subagent_provider=s.subagent_provider,
         subagent_model=s.subagent_model,
         subagent_reasoning=s.subagent_reasoning,
@@ -1390,7 +1433,18 @@ def _resolve_subagent(
         overrides.subagent_provider or pinned.subagent_provider or s.subagent_provider or None
     )
     subagent_model = overrides.subagent_model or pinned.subagent_model or s.subagent_model or None
+    if (
+        overrides.subagent_provider
+        and not overrides.subagent_model
+        and subagent_provider == overrides.subagent_provider
+    ):
+        # The override names a provider but no model: the pair must not
+        # keep the model that belonged to the provider being replaced.
+        subagent_model = None
     if subagent_provider is None:
+        # No subagent provider: the run inherits outo's provider AND model.
+        # The model stays None here on purpose — the caller (`build_runtime`)
+        # falls back to outo's model, which is the meaning of "same as outo".
         return None, subagent_model
 
     sub_provider = provider_store.get(subagent_provider)
@@ -1401,7 +1455,12 @@ def _resolve_subagent(
             "or pick a different one via `miniouto subagent set --provider`."
         )
 
-    if subagent_model is None and sub_provider.default_model:
+    if subagent_model is None:
+        # The subagent named a provider but no model: it takes THAT
+        # provider's endpoint default. Never outo's model — that belongs
+        # to a different endpoint, and inheriting it is what reset the
+        # subagent on every outo model edit (issue: an outo edit resetting
+        # the subagent).
         subagent_model = sub_provider.default_model
     if subagent_model is None:
         raise RuntimeError(

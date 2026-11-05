@@ -615,6 +615,11 @@ def _render_screen_art(
         "source": f"{width}x{height}",
         "grid": f"{cols}x{rows}",
         "cell": f"{round(width / (2 * cols))}x{round(height / (4 * rows))}",
+        # The per-axis pixel size of one art cell, so the result can state
+        # how a cell maps back to screen pixels. The art packs 2 pixels
+        # across and 4 down per cell (see `render_subcell`).
+        "cell_x": max(1, round(width / (2 * cols))),
+        "cell_y": max(1, round(height / (4 * rows))),
         "mode": MODE_COLOR_SUBCELL if color else MODE_PLAIN,
     }
     return _art_result(meta, body, path), build_art(meta, body), path
@@ -700,11 +705,29 @@ def _write_png_best_effort(png_bytes: bytes, sid: str) -> Path | None:
 
 
 def _art_result(meta: dict[str, str], body: str, path: Path) -> str:
+    """The `screen` action's tool result: a TEXT RENDER of the screen.
+
+    This is NOT a picture of the screen — it is a coarse text rendering
+    (Unicode sub-cell art) of the same pixels a `screenshot` would return.
+    The distinction matters: a model that reads the block characters as
+    if they were the screen will misjudge what is on it, so the result
+    says plainly what it is and what it is NOT.
+
+    It also carries NO clickable coordinates: the art is a lossy
+    re-rendering at a different resolution, so a cell in it is not a
+    pixel of the screen. The coordinate mapping is stated instead, so a
+    model that must click can convert an art cell back to screen pixels
+    (and is told that clicking from art is an approximation, while a
+    `screenshot` gives exact coordinates).
+    """
+
     header = (
-        f"Screen art captured ({meta['source']} -> {meta['grid']} chars, "
-        f"{_ART_MODE_LABELS[meta['mode']]}).\n"
+        f"TEXT RENDER of the screen (not a screenshot): {meta['source']} "
+        f"-> {meta['grid']} chars, {_ART_MODE_LABELS[meta['mode']]}.\n"
+        f"Each cell is {meta['cell_x']}x{meta['cell_y']} screen pixels.\n"
+        "Coarse: use it to SEE what is on screen, not to read fine text; "
+        "prefer a `screenshot` for exact click coordinates.\n"
         f"Saved to: {path}\n"
-        "Click coordinates still come from the screenshot action.\n"
     )
     lines = body.split("\n")
     preview, shown = _fit_preview(lines, len(header) + _RESULT_OVERHEAD)

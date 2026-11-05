@@ -153,8 +153,53 @@ def set_fields(session: str, **fields: str) -> ProviderConfig:
     current = read(session) or EMPTY
     updates = {k: v for k, v in fields.items() if k in FIELDS}
     merged = replace(current, **{k: str(v or "") for k, v in updates.items()})
-    _save(session, merged)
+    _save(session, _whole_trio(merged, current))
     return merged
+
+
+def _whole_trio(config: ProviderConfig, filled: ProviderConfig) -> ProviderConfig:
+    """A config whose provider trios are WHOLE.
+
+    A provider always carries a model: a trio is either fully configured
+    or it falls back to the default. A pin that names a provider but no
+    model would leave every reader guessing which model that provider
+    means, and a later write of the model alone would silently pair the
+    two halves of two different providers.
+
+    The model is filled from the provider's own record — the endpoint's
+    default — so the completed pair is always runnable.
+
+    ONLY A PROVIDER THAT JUST CHANGED is completed. Clearing a model on
+    its own keeps its documented meaning ("hand that key back to the
+    default"), so `filled` — the config BEFORE this write — is what says
+    whether the provider is the one just named.
+    """
+
+    provider, model = config.provider, config.model
+    if provider and not model and filled.provider != provider:
+        model = _provider_default_model(provider)
+    sub_provider, sub_model = config.subagent_provider, config.subagent_model
+    if sub_provider and not sub_model and filled.subagent_provider != sub_provider:
+        sub_model = _provider_default_model(sub_provider)
+    if (provider, model, sub_provider, sub_model) == (
+        config.provider,
+        config.model,
+        config.subagent_provider,
+        config.subagent_model,
+    ):
+        return config
+    return replace(config, model=model, subagent_model=sub_model)
+
+
+def _provider_default_model(name: str) -> str:
+    """The provider record's `default_model` — a late import, not a cycle."""
+
+    if not name:
+        return ""
+    from . import providers as provider_store
+
+    record = provider_store.get(name)
+    return record.default_model if record else ""
 
 
 def seed_from(new_session: str, source_session: str) -> None:

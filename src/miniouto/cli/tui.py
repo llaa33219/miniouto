@@ -256,7 +256,50 @@ def _effective_config(session: str) -> session_config.ProviderConfig:
     edit made in another process shows up here immediately.
     """
 
-    return session_config.read(session) or default_provider_config()
+    return _merged_config(session)
+
+
+def _merged_config(session: str) -> session_config.ProviderConfig:
+    """The session's config, with the SUBAGENT trio filled from the default.
+
+    The pin is a set of overrides ON the default (storage/session_config),
+    not a replacement for it: an empty key means "follow the global
+    default". Reading the pin ALONE therefore hides the subagent trio
+    the global default carries — the chip would show "same as outo"
+    while the subagent is in fact configured (the display/config
+    mismatch reported). Merging that ONE trio gives the chips and the
+    popup the SAME resolution the runtime applies, without freezing a
+    pin just to look at it.
+
+    The OUTO trio is left as the pin has it: filling it from the default
+    would show the DEFAULT's reasoning effort beside the PIN's model —
+    a display the runtime never produces.
+    """
+
+    pinned = session_config.read(session)
+    if pinned is None:
+        return default_provider_config()
+    default = default_provider_config()
+    # ONLY the SUBAGENT trio is merged with the default.
+    #
+    # The OUTO trio is left as the pin has it: a pin that names a
+    # provider says so, and an empty outo key is displayed as "-" (or
+    # resolved by `_trio_display`). Filling it from the default here
+    # would show the DEFAULT's reasoning effort beside the PIN's model
+    # — a display the runtime never produces.
+    #
+    # The SUBAGENT trio is different: a pin that names only outo's trio
+    # leaves the subagent keys empty, and those empty keys mean "whatever
+    # the subagent default says" — the global `subagent_*` values the
+    # user configured. Reading the pin ALONE therefore showed "same as
+    # outo" while the subagent was in fact configured (the reported
+    # display/config mismatch).
+    return replace(
+        pinned,
+        subagent_provider=pinned.subagent_provider or default.subagent_provider,
+        subagent_model=pinned.subagent_model or default.subagent_model,
+        subagent_reasoning=pinned.subagent_reasoning or default.subagent_reasoning,
+    )
 
 
 @dataclass(frozen=True)
@@ -353,11 +396,30 @@ def _persist_trio(
     two processes editing different sessions never silently redirect each
     other while a fresh session still picks up the newest choice.
 
-    outo keeps invariant 12's shape (the active model lives on the provider
-    record, `settings.model` is never written); the subagent trio writes the
-    three `subagent_*` settings, where empty means "same as outo". An empty
-    value CLEARS the pin key, handing it back to the global default — the
-    documented `session_config` semantics, not a reset to nothing.
+    The outo trio writes `settings.provider` + `settings.model` +
+    `settings.reasoning` — ONE paired choice, always all three, so the
+    global default is exactly what the user last picked (issue: the last
+    change not becoming the default).
+
+    The provider RECORD's `default_model` follows the pick too — it is
+    the ENDPOINT's default, and it is what a fresh install and every
+    other process resolve, so the last change must become the default
+    there as well. Its `reasoning_effort` is left alone: a subagent on
+    the same provider resolves its effort from that record, and
+    rewriting it is what dragged the subagent along with every outo
+    reasoning change.
+
+    A subagent that INHERITS outo keeps the MODEL it was already running
+    on: the inheritance is frozen into this session's pin when outo's
+    trio changes, so an outo edit cannot drag the subagent to a
+    different model (issue: an outo edit resetting the subagent). The
+    reasoning effort still inherits outo's — that is what the subagent
+    trio's empty values mean.
+
+    The subagent trio writes the three `subagent_*` settings, where empty
+    means "same as outo". An empty value CLEARS the pin key, handing it
+    back to the global default — the documented `session_config`
+    semantics, not a reset to nothing.
     """
 
     provider_key, model_key, reasoning_key = target.fields
@@ -376,12 +438,53 @@ def _persist_trio(
             )
         )
         return
-    settings_store.update(provider=provider)
+    # The outo trio is ONE paired choice — provider, model, reasoning —
+    # and it lives in the SETTINGS. The settings keys describe the
+    # INSTALLATION ("what outo runs here"); the provider record's
+    # `default_model` describes the ENDPOINT ("what this endpoint
+    # serves by default"). Keeping the two apart is what stops an outo
+    # edit from dragging a subagent along: a subagent resolves its model
+    # from its OWN key, never from outo's (see
+    # `runtime._effective_subagent_pm`).
+    #
+    # Written through `save` (not `update`, which SKIPS empty strings):
+    # an empty model or reasoning must CLEAR the stored value, not leave
+    # the previous one behind.
+    settings_store.save(
+        replace(
+            settings_store.load(),
+            provider=provider,
+            model=model,
+            reasoning=reasoning,
+        )
+    )
+    # NOTHING to do for the subagent here. "SAME AS OUTO" is a LIVE
+    # link: the subagent's provider, model and reasoning follow outo's
+    # whenever outo changes (that is what the empty values mean). A
+    # subagent that names its OWN settings is independent and is not
+    # touched — an outo edit can never reach it.
+    #
+    # The one thing an outo edit must not disturb is the SUBAGENT's own
+    # configuration, and nothing here writes it: the outo branch below
+    # touches `settings.provider` / `model` / `reasoning` only.
+
+    # The record's `default_model` follows the outo pick — it is what a
+    # fresh install and every other process resolve, so the last change
+    # IS the new default (issue: the last change not becoming the
+    # default).
+    #
+    # Its `reasoning_effort` does NOT: a subagent on this same provider
+    # resolves its effort from that record, so rewriting it here is what
+    # dragged the subagent along with every outo reasoning change
+    # (issue: an outo edit resetting the subagent). The record keeps the
+    # preference it was configured with; outo's own choice lives in
+    # `settings.reasoning`.
+    #
+    # Written AFTER the snapshot above, so the snapshot sees the model
+    # the subagent is running on — not the one this edit installs.
     record = _record(provider)
     if record is not None:
-        provider_store.upsert(
-            _with_reasoning_effort(replace(record, default_model=model), reasoning or None)
-        )
+        provider_store.upsert(replace(record, default_model=model))
 
 
 # Braille spinner frames. The status line reads e.g. "⠧ Bash…" and the
@@ -1271,10 +1374,10 @@ class ProviderSettingsPopup(ModalScreen[None]):
         self.query_one("#provider-settings-status", Label).update(message)
 
     def _pick_provider(self) -> None:
+        # The picker opens EVEN when no provider is configured: the "add"
+        # entries below are the only way to create the first one, so an
+        # empty list must not short-circuit into a dead-end message.
         options = sorted(provider_store.load_all())
-        if not options:
-            self._report("No providers configured. Add one first.")
-            return
 
         def on_close(result: str | None) -> None:
             if not result:
@@ -1291,7 +1394,7 @@ class ProviderSettingsPopup(ModalScreen[None]):
 
         self.app.push_screen(
             SelectionModal(
-                "Select provider",
+                "Select provider" if options else "No providers yet — add one",
                 options,
                 current=self._values()[0],
                 allow_none=False,
@@ -4031,7 +4134,11 @@ class ChatTUI(App):
             opts = ChatOptions(
                 prompt=prompt,
                 session=self._pinned_session(),
-                model=s.model or None,
+                # NO model override: the session's PIN already carries the
+                # trio this popup wrote (`_persist_trio` writes both). An
+                # override here would outrank the pin and let a global
+                # `settings.model` from another process redirect a live
+                # conversation — the exact thing the pin exists to stop.
                 continue_session=True,
                 cancel_event=self._cancel_event,
             )

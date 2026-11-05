@@ -37,6 +37,22 @@ STYLE = (
 
 
 @pytest.fixture(autouse=True)
+def _restore_global_settings() -> Iterator[None]:
+    """Restore the GLOBAL settings after each test.
+
+    These tests write the whole settings file (`settings_store.save`) to
+    put a session under a specific provider/trio. Without restoring it,
+    the last write leaks into the next test file — and a leaked
+    `subagent_provider` makes a TUI test that expects "same as outo"
+    read a leftover provider instead.
+    """
+
+    saved = settings_store.load()
+    yield
+    settings_store.save(saved)
+
+
+@pytest.fixture(autouse=True)
 def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         context, "get_max_output_tokens", lambda model, provider_name=None: 4_096

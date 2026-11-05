@@ -41,6 +41,21 @@ def _isolated() -> Iterator[None]:
         session_config.clear(name)
 
 
+@pytest.fixture(autouse=True)
+def _restore_global_settings() -> Iterator[None]:
+    """Restore the GLOBAL settings after each test.
+
+    One test writes the whole settings file to pin a global default.
+    Without restoring it, the last write leaks into the next test file
+    — and a leaked provider/model makes a TUI test read a provider the
+    test never set up.
+    """
+
+    saved = settings_store.load()
+    yield
+    settings_store.save(saved)
+
+
 def _install(name: str, default_model: str) -> None:
     provider_store.upsert(
         provider_store.Provider(

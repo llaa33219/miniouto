@@ -13,6 +13,7 @@ from typing import Any
 import coreouto as co
 
 from ..storage.providers import SOURCE_MODELSLIST, Provider
+from ..tools import multimodal
 from .error_rules import default_error_handling
 
 SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")
@@ -121,6 +122,13 @@ def build_coreouto_provider(provider: Provider) -> None:
 
     api_key = provider.api_key or None
     instance = _instantiate(fmt, api_key, provider.base_url)
+    # A provider that refuses a multimodal tool result (openai's chat
+    # completions carries no image blocks; openai-response carries no
+    # video/audio) raises from `format_tool_result` — which coreouto calls
+    # OUTSIDE the tool-call wrapper, so the exception would end the whole
+    # turn. The wrapper turns that refusal into a text tool result, so the
+    # model is told instead of the run dying.
+    multimodal.wrap_provider(instance)
 
     co.register_provider(provider.name, instance)
 

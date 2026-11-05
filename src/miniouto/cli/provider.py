@@ -248,6 +248,9 @@ def default(name: str) -> None:
     if provider_store.get(name) is None:
         console.print(f"[red]✗[/red] Provider [bold]{name}[/bold] is not configured.")
         raise typer.Exit(code=1)
+    # `update(provider=...)` switches the provider AND the model it runs
+    # as one pair — a stale model from the provider being left behind
+    # would fail the next call with a model that provider never heard of.
     settings_store.update(provider=name)
     console.print(f"[green]✓[/green] Default provider is now [bold]{name}[/bold].")
 

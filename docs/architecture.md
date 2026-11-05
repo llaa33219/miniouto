@@ -250,7 +250,7 @@ The queue is a **directory of files, not a deque** (invariant 20): one message =
 | Entity | Defined in | Purpose |
 |---|---|---|
 | **Provider** | `storage/providers.py` | LLM API connection: `name`, `api_format` (openai/openai-response/anthropic/google), `base_url`, `api_key`, `default_model`, `source` (`SOURCE_CUSTOM`/`SOURCE_MODELSLIST`, plus legacy `SOURCE_LMA`), `extra` |
-| **Settings** | `storage/settings.py` | The **global default**: `provider`, `model` (legacy, read-only), `style`, `session`, `theme`, `subagent_provider`/`subagent_model`/`subagent_reasoning` |
+| **Settings** | `storage/settings.py` | The **global default**: `provider`, `model`, `reasoning` (the outo trio, one paired choice — `update(provider=...)` swaps the model with the provider), `style`, `session`, `theme`, `subagent_provider`/`subagent_model`/`subagent_reasoning` |
 | **ProviderConfig** | `storage/session_config.py` | One session's **pin** at `session-config/<session>.toml`: the same six provider keys, `""` = follow the default. Frozen at the session's first resolution, seeded copy-if-absent into every freshly minted session — the layer that lets several processes run on different providers at once |
 | **Style** | `storage/styles.py` | Markdown system prompt, parsed into an outo body and zero or more role bodies via `parse_style` (top-level tag-as-name) |
 | **InboxMessage** | `core/inbox.py` | One cross-process message: `(id, kind, text, ts, source, meta)`; `id` is the filename stem |
