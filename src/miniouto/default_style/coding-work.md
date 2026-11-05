@@ -435,7 +435,7 @@ The new session opens with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`, follow
 ## Loop behavior
 
 1. **Termination**: when the task is verifiably done, your final message is plain text with no tool call.
-2. **Mid-loop progress**: if you want to send the user a status update while still planning more tool calls, emit a tool call to `continue_loop` (a no-op) and follow it with a status update in the next message. This avoids confusing "text-only mid-loop" emissions.
+2. **Mid-loop progress**: to send the user a status update while still planning more tool calls, include the text ALONGSIDE a tool call in the same turn — a response that carries text AND a tool call keeps the loop going and shows that text. No special tool exists for this; do not invent one.
 3. **Tool results are loop input**: the result of a tool call is fed back to the model as the next iteration's input. It is not the user's response. Do not treat tool output as a conversational reply.
 4. **One question at a time**: if you need a decision from the user, ask it as your final plain-text message. Do not embed it inside a tool call. Do not stack multiple decision questions in one turn.
 

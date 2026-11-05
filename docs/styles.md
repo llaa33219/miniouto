@@ -129,10 +129,10 @@ There are deliberately **no** Write/Edit/Delete tools — file work goes through
 Every style should also include a **Loop behavior** section with three rules:
 
 1. **Termination**: when you've finished, your final message is plain text with no tool call.
-2. **`continue_loop`**: to send a progress update to the user while still planning more tool calls, emit a tool call to `continue_loop` (a no-op tool shipped by some styles). This avoids "text-only mid-loop" messages that the model sometimes improvises.
+2. **Mid-loop progress**: to send a progress update to the user while still planning more tool calls, include the text ALONGSIDE a tool call in the same turn — a response carrying text AND a tool call keeps the loop going and shows that text. No special tool exists for this; do not invent one.
 3. **Tool results are loop input**: the result of a tool call is fed back to the model as the next iteration's input — it is **not** the user's response.
 
-The `continue_loop` tool is referenced in styles but not actually wired into the tool registry by default. If you want the model to use it, register a no-op `continue_loop` tool in `tools/registry.py` and add it to `core/runtime.BASE_TOOLS`.
+This mirrors coreouto's termination policy exactly: text + no tool call = final answer; text + tool call = keep going. An earlier draft referenced a `continue_loop` tool that was never registered; the model then invented calls that never executed. That reference has been removed from every style, the docs, and `runtime._fallback_style`.
 
 ---
 
@@ -161,7 +161,7 @@ The five bundled templates live in `src/miniouto/default_style/`. They are seede
 The original "outo" prompt. Short, opinionated, deliberately sparse. Used when no style is set, or when `miniouto style set default` is run.
 
 Key points:
-- 7 outo operating principles: be brief, lead with the answer, finish with text + no tool call (or use `continue_loop`), treat tool results as loop input, match delegation scope to task size, never invent outputs, match the user's language, pass paths correctly when delegating.
+- 7 outo operating principles: be brief, lead with the answer, finish with text + no tool call (progress updates are text ALONGSIDE a tool call), treat tool results as loop input, match delegation scope to task size, never invent outputs, match the user's language, pass paths correctly when delegating.
 - A single legacy `<subagent>` block (named `"subagent"`, selected with `--role subagent`): 10 principles — treat the brief as the whole spec (no clarifying questions), be terse, prefer targeted `sed`/Python edits over full-file rewrites, read first, return useful extracted output (not full dumps), plan + execute + synthesize for multi-step work, spawn a nested run only when the subtask deserves its own context, finish with text + no tool call, tool results are loop input, match brief language, surface errors verbatim.
 
 ### `coding.md`: expert coding agent, minimal
@@ -427,5 +427,5 @@ Just `cp ~/.miniouto/style/<name>.md some/path.md`. The file is fully self-conta
 
 ## Known issues
 
-1. **`continue_loop` tool is referenced but not registered.** All bundled styles mention it as the way to "send progress to the user while still planning more tool calls." The coreouto integration would need a no-op tool registered in `tools/registry.py` and added to `core/runtime.BASE_TOOLS`. Models currently improvise (often emitting a tool-shaped message with no actual call), which can confuse some coreouto versions.
+1. **There is no `continue_loop` tool, by design.** coreouto's termination policy already covers progress updates: text AND a tool call keeps the loop going, text with NO tool call ends it. An earlier draft referenced a `continue_loop` tool that was never registered, which made the model invent calls that never executed — that reference has been removed everywhere (styles, docs, `_fallback_style`).
 2. **A style with no named tags can still delegate.** `Bash` — and therefore a delegated `miniouto chat --role <tag>` run — is always registered, so an outo-only style has a working delegation surface; it just has **no roles to select**, and `--role <tag>` against it fails before the turn with `Available roles: (none)`. Add a top-level `<name>` body for each role you want `--role` to be able to pick.

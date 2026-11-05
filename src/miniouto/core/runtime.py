@@ -1257,19 +1257,25 @@ def _effective_subagent_pm(session: str) -> str:
 
 
 def _fallback_style(name: str) -> str:
+    # coreouto's termination policy: a response with TEXT + no tool call is
+    # the final answer; a response with text ALONGSIDE a tool call keeps the
+    # loop going and shows that text as progress. So progress updates are
+    # just "say something while calling a tool" — no special tool exists,
+    # and telling the model to call one would make it invent a call that
+    # never gets executed.
     if name == "subagent":
         return (
             "You are subagent. Execute the brief directly using your tools. "
             "To finish, respond with text and no tool call — that text becomes "
-            "the final answer returned to the parent. Use the `continue_loop` "
-            "tool if you need to send text to the parent while still planning "
-            "more tool calls."
+            "the final answer returned to the parent. To share progress while "
+            "still working, include the text alongside a tool call in the same "
+            "turn."
         )
     return (
         f"You are {name}. To finish, respond with text and no tool call — "
-        "that text becomes the final answer returned to the user. Use the "
-        "`continue_loop` tool if you need to share progress while still "
-        "planning more tool calls."
+        "that text becomes the final answer returned to the user. To share "
+        "progress while still working, include the text alongside a tool call "
+        "in the same turn."
     )
 
 

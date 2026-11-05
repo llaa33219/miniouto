@@ -213,7 +213,7 @@ Provider/model/reasoning resolution order (first match wins, per key — see [`R
 
 1. `--pm` (this call only)
 2. this session's pin, `session-config/<session>.toml` — frozen at the session's first resolution
-3. the global default: `settings.provider` + the provider record's `default_model` / `reasoning_effort`
+3. the global default: the paired `settings.provider` / `settings.model` / `settings.reasoning`, with the resolved provider record's `default_model` / `reasoning_effort` answering where nothing else names a model
 4. error — no provider configured / no model can be inferred
 
 Pin a long-running session so a model switch in another process can't move it, and start a fresh one on something else with `--pm`.
