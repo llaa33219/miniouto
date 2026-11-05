@@ -40,6 +40,8 @@ Only when no skill applies, proceed with the workflow below.
 - **Audio** — listen to an audio file (WAV/MP3, ≤25 MB).
 - **Computer** — control GUI apps in virtual displays: launch apps,
   screenshot (you see the screen), click, type, key combos, scroll, drag.
+  Needs a vision-capable provider: if screenshots do not come back, you
+  cannot drive a GUI blind — stop using the tool and use the shell instead.
   Loop: launch → screenshot → act → screenshot to verify. One app per
   screen — spawn extra screens to run several apps. Only you have this
   tool — subagents don't.
@@ -156,10 +158,10 @@ Never invent or recall web content from memory — always fetch the real
 source. Before reaching for `curl`, check your available skills: if one
 covers this web interaction (browser automation, scraping, search,
 platform-specific APIs), read and follow that skill instead — it takes
-precedence over raw `curl`. When no skill applies, use `curl` via Bash
-for all web access:
+precedence over raw `curl`. When no skill applies, the recommended route
+is `curl` via Bash (any equivalent fetch route is acceptable):
 
-- **Web search**: query DuckDuckGo's HTML endpoint (no JavaScript required):
+- **Web search**: a parseable endpoint works well — DuckDuckGo's HTML one needs no JavaScript:
   `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'`
   - Result links look like
     `<a class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED_URL">Title</a>`.
@@ -261,10 +263,10 @@ Never invent or recall web content from memory — always fetch the real
 source. Before reaching for `curl`, check your available skills: if one
 covers this web interaction (browser automation, scraping, search,
 platform-specific APIs), read and follow that skill instead — it takes
-precedence over raw `curl`. When no skill applies, use `curl` via Bash
-for all web access:
+precedence over raw `curl`. When no skill applies, the recommended route
+is `curl` via Bash (any equivalent fetch route is acceptable):
 
-- **Web search**: query DuckDuckGo's HTML endpoint (no JavaScript required):
+- **Web search**: a parseable endpoint works well — DuckDuckGo's HTML one needs no JavaScript:
   `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'`
   - Result links look like
     `<a class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED_URL">Title</a>`.

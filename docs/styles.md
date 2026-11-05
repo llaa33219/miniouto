@@ -144,11 +144,11 @@ The five bundled templates live in `src/miniouto/default_style/`. They are seede
 
 | File | Size | Persona | Orchestrator? |
 |---|---|---|---|
-| `default.md` | ~4 KB | "**outo**" — minimal, sparse | No (deliberately) |
-| `coding.md` | ~1.6 KB | "**outo**" — expert coding agent, minimal ruleset | Light (delegation for non-trivial work) |
-| `coding-pro.md` | ~32 KB | "**pro**" — senior staff engineer orchestrator | **Aggressive** (with a delegate-vs-DIY decision framework) |
-| `coding-work.md` | ~38 KB | "**coding-work**" — pragmatic senior engineer orchestrator | **Aggressive but proportionate** (one subagent per slice, one reviewer when warranted) |
-| `coding-ultra.md` | ~81 KB | "**ultra**" — relentless MAX-mode execution orchestrator | **Aggressive** (layered subagent fan-out, best-of-N editors, multi-focus review) |
+| `default.md` | ~15 KB | "**outo**" — minimal, sparse | No (deliberately) |
+| `coding.md` | ~4.7 KB | "**outo**" — expert coding agent, minimal ruleset | Light (delegation for non-trivial work) |
+| `coding-pro.md` | ~38 KB | "**pro**" — senior staff engineer orchestrator | **Aggressive** (with a delegate-vs-DIY decision framework) |
+| `coding-work.md` | ~49 KB | "**coding-work**" — pragmatic senior engineer orchestrator | **Aggressive but proportionate** (one subagent per slice, one reviewer when warranted) |
+| `coding-ultra.md` | ~90 KB | "**ultra**" — relentless MAX-mode execution orchestrator | **Aggressive** (layered subagent fan-out, best-of-N editors, multi-focus review) |
 
 `coding-pro.md`, `coding-work.md`, and `coding-ultra.md` include explicit guidance on when and how to delegate, taught entirely as **Bash recipes** (`miniouto chat "<brief>" --style {style} --role <tag> --pm {subagent_pm} [--bg --alarm-session {this_session}] --return` — the tokens expand per run, see [Dynamic tokens](#dynamic-tokens)); `default.md` and `coding.md` compress the same mechanic to one or two lines.
 
@@ -184,51 +184,36 @@ only the load-bearing rules. Both halves are a short ruleset:
 ### `coding-pro.md`: senior staff engineer orchestrator
 
 A senior staff engineer orchestrator. Persona: "**pro**, a senior staff engineer"
-that is "a teammate, not a tutor." It requires the following behaviors:
+that is "a teammate, not a tutor" — "you do the work, you show the evidence, you
+do not narrate." Its signature is **explicit**: it names the destination before
+starting, the files before touching them, and the command that proves it before
+claiming it. It asks **once, cleanly, up front**, then carries the work to the
+end without asking again.
 
-- **Startup step — read AGENTS.md before anything else**: on every turn, check
-  for an `AGENTS.md` / `AGENT.md` / `CLAUDE.md` / `CURSOR.md` / `.cursorrules`
-  / `GEMINI.md` (repo root, `./.agents/`, `./.docs/`, or nested copies), read
-  them in the same response, and treat their content as **overriding** the
-  style when in conflict (project rules win). Immediately after, scan the
-  skills list and follow any matching skill (see below).
-- **12 core operating principles**: lead with the answer, match depth to the
-  task, delegate by default, parallelize independent work **as a single
-  batched tool call**, verify with real evidence, surgical minimal changes,
-  read before editing, preserve user work, no fabrication, match the user's
-  language, stop and ask on material decisions, loop until done or
-  hard-blocked.
-- **PARALLEL TOOL CALLS — the actual mechanics**: a dedicated section teaching
-  the exact parallelism mechanic — when delegating N independent subagents,
-  issue ALL N `miniouto chat … --bg` commands **in one Bash call / one
-  assistant response** (not one per turn, not serialized), with worked
-  wrong/right patterns and a self-check ("count the delegation commands; fewer
-  than N means you serialized"). Includes when you *cannot*
-  batch (true data dependencies sequence across turns) and a mirror rule for
-  each named subagent's body (batch independent reads/commands of its own).
-- **Delegate-vs-DIY decision framework**: a signal table (one quick read → do
-  it yourself; multi-file/multi-step/investigative → a delegated `chat --role` run; two or
-  more independent subtasks → one batched parallel batch), with an explicit
-  ban on stringing together many small direct actions to avoid delegation.
-- **Five-stage execution loop**: EXPLORE → PLAN → EXECUTE → VERIFY → LOOP,
-  with a project onboarding sweep for first contact.
-- **Plan-file lifecycle**: work that needs a plan goes to
-  `./.miniouto/plans/<name>.md`, plus optional `CHECKPOINTS.md` and
-  `DECISIONS.md` companions (mirrors Karpathy's PLAN / EXPERIMENTS / NOTES
-  pattern).
-- **6-section delegation brief**: every spawn brief must carry TASK, EXPECTED OUTCOME, REQUIRED TOOLS, MUST DO, MUST NOT DO, CONTEXT — a spawned run starts with no conversation history, so the brief is its entire spec.
-- **Definition of done**: an explicit checklist (build/lint/typecheck/test
-  exit 0, minimal diff, plan file updated, subagent claims confirmed by
-  reading changed files, parallel batches actually emitted as N tool_use
-  blocks in one response, skills list actually scanned).
-- **Status update format**: Checkpoint / Verified / Changed / Remaining /
-  Blocked — vague updates like "working on it" are forbidden.
-- **Hard blocks**: no sudo or system-level changes (must hand the command to
-  the user), no mass or destructive operations without authorization, no
-  fabrication, no silent scope expansion, no commit/push/publish without
-  explicit instruction, no silent destruction of user work.
-- **Match the response to the request**: a deliverable-type table — "explain" → answer; "look into" → findings report then **stop** (an investigation is not implementation authorization, and authorization does not carry across turns); "what do you think" → judgment; "implement/fix" → shipped work.
-- **Execution know-how**: destination / constraints / stopping-condition triad named before acting; delegated searches never duplicated (stop when sources converge); verification exercises the real surface (invoke the CLI, `curl` the endpoint, drive the TUI — build/lint/typecheck are necessary, not sufficient); hypothesis-driven debugging with a `thinker` consult after two failed fixes; one objective per brief (an "and also" in TASK = split it); final reports state residual risk.
+The prompt is an ordered stack; each section answers one question:
+
+1. **Environment** — `{cwd}` and `{skills}`.
+2. **Project rules come first — AGENTS.md**: on every turn, check for an
+   instruction file (repo root, `./.agents/`, `./docs/`, nested copies), read
+   it in the same response, and treat it as **overriding** the style when in
+   conflict. First contact runs one batched sweep (layout, state, real
+   build/lint/test commands, instructions, conventions, verification surface);
+   later turns refresh only what may have changed.
+3. **Skills — mandatory first check**: scan the skill listing, follow a
+   matching skill, name it in any brief that covers the same domain.
+4. **Operating rules** (12): lead with the answer, read before editing,
+   surgical changes, verify with real evidence, never fabricate, preserve
+   user work, match the user's language, depth scales with the task, ask
+   once clearly, loop until done or truly blocked, one objective per unit
+   of work, convergence not repetition.
+5. **Match the deliverable to the request** — "explain" → answer;
+   "look into" → findings report then **stop** (an investigation is not
+   implementation authorization, and authorization does not carry across
+   turns); "what do you think" → judgment; "implement/fix" → shipped work;
+   "refactor" → proposal first when the blast radius is unclear.
+6. **Size the work before you start** — S/M/L tiers, each with its procedure.
+7. **The confirm gate** — a proposal (destination, changes, verification,
+   risk) and ONE question; after a go-ahead, no re-asking.
 - **Subagent roster (top-level tags)**: file-picker / thinker / editor / reviewer / validator — each a named tag in the file, loaded as that subagent's own system prompt.
 - Like `coding-ultra.md` (and unlike `default.md`/`coding.md`), `coding-pro.md`
   has **no Web access section** — it relies on the skill catalog and plain
@@ -236,67 +221,33 @@ that is "a teammate, not a tutor." It requires the following behaviors:
 
 ### `coding-work.md`: pragmatic senior engineer orchestrator
 
-A pragmatic senior-software-engineer orchestrator (~38 KB) positioned between
-`coding-pro.md` and `coding-ultra.md`: the autonomy of the heaviest execution
-styles (never stop early, never ask permission mid-loop, decide soft blocks
-yourself, three-strike rule) with **proportionate machinery** — the work is
-**distributed by its scale**: what the orchestrator can read, understand, and
-execute within a modest number of calls is done end-to-end itself (batched
-parallel reads, direct edits, no subagent ceremony on small work);
-large-scale understanding (unfamiliar codebase too broad to survey directly)
-goes to parallel context subagents; large or multi-site changes go to one
-focused editor subagent per independent slice — parallel spawns for
-genuinely independent sites — with one reviewer when the change warrants it.
-No documentation empire, no worktrees for everyday patches, no best-of-N
-editor tournaments. Persona: "**coding-work**, a pragmatic senior software
-engineer" that "ships, then tells the user what it shipped and the evidence."
-It requires the following behaviors:
+A pragmatic senior-software-engineer orchestrator positioned between
+`coding-pro.md` and `coding-ultra.md`. Persona: "**coding-work**, a pragmatic
+senior software engineer" that "ships, then tells the user what it shipped and
+the evidence." It is not a ceremonial agent and not a nervous one: **the
+machinery and the verbosity both scale with the work** — over-procedure on small
+work is as much a failure as under-procedure on large work.
 
-- **Startup step — read AGENTS.md before anything else**: same sweep as
-  `coding-pro.md` (repo root, `./.agents/`, `./.docs/`, nested copies;
-  re-check mtime on later turns), then scan the skills list.
-- **Autonomy protocol (load-bearing)**: eight rules — never stop early, never
-  ask permission mid-loop, decide soft blocks yourself (naming, library
-  choice, API shape — pick the defensible default, log it in the plan),
-  never report partial success as success, never give up on a failure
-  (re-brief and respawn a failed subagent once, then take the slice over),
-  three-strike rule, never fabricate progress, never expand scope. Defines
-  the only four **true hard blocks** (missing credentials, unauthorized
-  destructive action, contradictory instructions, unreachable verification
-  surface) — everything else is decided autonomously.
-- **PARALLEL TOOL CALLS mechanics, two flavors**: Flavor 1 — batch your own
-  independent reads/commands as N tool_use blocks in one response (the
-  small-task case); Flavor 2 — several `miniouto chat … --bg` commands issued
-  together for large splittable work (parallel context searches with
-  different angles on a broad codebase, or one editor per independent site
-  of a multi-site change). Ceremony on small work is the named
-  anti-pattern; the self-check counts tool_use blocks after each batch.
-- **Scale-based decision framework**: "read it, understand it, do it
-  directly within a modest number of calls → do it yourself" is the first
-  row; large-scale understanding, non-trivial execution, multi-site
-  modification, and independent checking each map to their delegation
-  action. The closing rule runs both directions — subagent ceremony on
-  small work and hand-grinding oversized work are the same failure.
-- **Five-phase workflow**: EXPLORE (direct batched-read exploration — the
-  onboarding sweep runs as ONE batched block of read-only commands by the
-  orchestrator itself; parallel context subagents when the tree is
-  genuinely too broad to survey) → PLAN (`./.miniouto/plans/<name>.md` with
-  soft-block decisions logged) → EXECUTE (read-and-do work goes direct;
-  otherwise one `editor` subagent per slice — a multi-site change is one
-  editor per independent site, emitted as one parallel batch, never
-  overlapping edit ownership) → REVIEW (one `reviewer` subagent with a
-  **single** focus area for risky changes — auth, money, concurrency,
-  public API, migrations; self-review for routine ones) → VERIFY (real
-  commands, read the diff yourself, loop).
+The prompt is an ordered stack; each section answers one question:
+
+- **Environment** — `{cwd}` and `{skills}` (with explicit root order:
+  `./skills/` → `./.agents/skills/` → `~/.agents/skills/`).
+- **Project rules come first — AGENTS.md**: same sweep as `coding-pro.md`
+  (repo root, `./.agents/`, `./docs/`, nested copies; re-check mtime on
+  later turns), then scan the skills list. First contact runs one batched
+  sweep; later turns refresh only what may have changed.
+- **Skills — first check**: same rule as `coding-pro.md`, with the explicit
+  root order for duplicate skill names (project-local beats global).
+- **The size ladder**: T0 (trivial) → T1 (small) → T2 (medium) → T3 (large).
+  Each rung sets the machinery AND the length of the reply — T0 gets one
+  command and one line back; T3 gets a full report. The two failure modes
+  are named: T3 ceremony on a T0 task, and a T3 task shipped in a T0
+  paragraph.
+- **Ask or decide?**: ask only when readings produce **different
+  deliverables**, no convention settles it, and it is **not easily
+  reversible**; decide everything else (naming, formatting, library choice,
+  API shape, test placement, equivalent implementations) and log it.
 - **Subagent roster (top-level tags)**: file-picker / code-searcher / directory-lister / researcher / thinker / editor / reviewer / validator — each a named tag in the file. Role-specific behavior is encoded in each tag's body: a file-picker does not edit; an editor does not review its own work; a validator does not change code to make a check pass.
-- **6-section delegation brief** at the top of every brief (the role name is selected via `name=`, not as a `[ROLE: …]` tag inside the brief text), plus a subagent retry protocol (one respawn with a sharper brief, then take the slice over).
-- **Status update format, definition of done, hard blocks, loop behavior**:
-  the same discipline as `coding-pro.md` (Checkpoint / Verified / Changed /
-  Remaining / Blocked; nothing is "done" until the real commands pass; no
-  sudo, no mass delete, no fabrication, no silent scope expansion, no
-  unprompted commit/push/publish).
-- **Match the response to the request**: a deliverable-type table — "explain" → answer; "look into" → findings report then **stop** (an investigation is not implementation authorization, and authorization does not carry across turns); "what do you think" → judgment; "implement/fix" → shipped work.
-- **Execution know-how**: destination / constraints / stopping-condition triad named before acting; delegated searches never duplicated (stop when sources converge); verification exercises the real surface (invoke the CLI, `curl` the endpoint, drive the TUI — build/lint/typecheck are necessary, not sufficient); hypothesis-driven debugging with a `thinker` consult after two failed fixes; one objective per brief (an "and also" in TASK = split it); final reports state residual risk.
 - Like `coding-pro.md` and `coding-ultra.md`, it has **no Web access
   section** — its researcher role covers external lookups via the skill
   catalog and Bash `curl` judgment.
