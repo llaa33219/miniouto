@@ -59,7 +59,7 @@ from textual.widgets import (
 
 from .. import __version__, paths_runtime
 from ..core import context as context_api
-from ..core import inbox, runtime, summary
+from ..core import inbox, runtime, summary, update_check
 from ..core import modelslist as catalog_api
 from ..core.chat import ChatOptions, run_chat
 from ..core.events import STREAM_THINKING, LoopEvent
@@ -2966,6 +2966,7 @@ class ChatTUI(App):
         self._activity = _SPINNER_DEFAULT_TEXT
         self._wizard_status: str | None = None
         self._wizard_working = False
+        self._update_notice: str | None = None
         # Last: assigning the reactive runs `watch_theme`, which reads
         # `_logo_shown` and republishes the name to settings.
         self.theme = self._boot_theme()
@@ -3038,6 +3039,16 @@ class ChatTUI(App):
         if self._input is not None:
             self._input.focus()
         self.set_interval(_INBOX_POLL_INTERVAL, self._deliver_pending_messages)
+        self.run_worker(self._check_for_updates(), exclusive=False)
+
+    async def _check_for_updates(self) -> None:
+        """Check PyPI without delaying startup or interrupting a chat worker."""
+
+        latest = await asyncio.to_thread(update_check.latest_pypi_version)
+        notice = update_check.update_notice(update_check.current_version(), latest)
+        if notice is not None:
+            self._update_notice = notice
+            self._post_system(notice)
 
     def _pin_session(self, name: str) -> None:
         """Adopt `name` as this conversation's session and publish it.
@@ -3128,6 +3139,8 @@ class ChatTUI(App):
         )
         self._log.mount(Static(""))
         self._log.mount(Static(Text(f"miniouto v{__version__} — Ready. Press Ctrl+P for commands.", style="dim")))
+        if self._update_notice is not None:
+            self._post_system(self._update_notice)
         self._logo_shown = True
 
     def watch_theme(self) -> None:

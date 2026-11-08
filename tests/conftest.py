@@ -49,10 +49,18 @@ def _clear_model_cache(context: Any) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_module_state() -> None:
+def _isolate_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset every module-level cache before each test."""
 
+    from miniouto.cli.tui import ChatTUI
     from miniouto.core import context, modelslist, providers, repetition
+
+    # Booting ChatTUI starts a real update worker. Update tests opt back into
+    # the real coroutine with a fake response; other tests never touch PyPI.
+    async def skip_update_check(self: ChatTUI) -> None:
+        return None
+
+    monkeypatch.setattr(ChatTUI, "_check_for_updates", skip_update_check)
 
     _clear_model_cache(context)
     modelslist.clear_cache()

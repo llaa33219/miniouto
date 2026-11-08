@@ -73,6 +73,10 @@ Layout (top to bottom):
   4. help-hint row
 - `Footer`
 
+### Update check
+
+At startup the TUI checks `https://pypi.org/pypi/miniouto/json` in a background worker, so the first frame and chat input are not delayed by the network. It compares PyPI's advertised version with the installed `miniouto` distribution's version. Only a strictly newer version produces a warning row with the current and latest versions and the upgrade command (`uv tool upgrade miniouto`). An equal or older installed version produces no warning. The request has a 3-second timeout; an unavailable server, HTTP error, or malformed response is ignored without interrupting the TUI.
+
 ### Chat log rows
 
 The chat log is a `VerticalScroll` of row widgets (migrated from `RichLog` so rows can be clickable and live-updating). All row widgets derive from **`RowStatic`**, which gives every row identical drag selection: Textual's native path (theme `$screen-selection-*` colors — and nothing at all for Markdown, whose `RichVisual` ignores selection) is suppressed, and `render_line` paints the selected span itself with plain **reverse video (fg/bg inversion)**, character-accurate (CJK-safe) and clipped at the text end. `Ctrl+Shift+C` copies the extraction (`get_selection`, padding stripped).

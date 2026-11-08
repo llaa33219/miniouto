@@ -87,7 +87,8 @@ miniouto/
 | `rich` | 13.7.0 | Terminal output, tables, markdown |
 | `textual` | 0.80.0 | TUI framework |
 | `pydantic` | 2.0 | Data models |
-| `httpx` | 0.27.0 | HTTP client (modelslist REST client + style repo fetcher) |
+| `httpx` | 0.27.0 | HTTP client (modelslist REST client + style repo fetcher + TUI update check) |
+| `packaging` | 23.0 | PEP 440 version comparison for the TUI update check |
 | `tomli-w` | 1.0.0 | TOML serializer |
 | `py-Vwayland` | 0.1.0 | Bundled virtual-display compositor behind the Computer tool |
 
