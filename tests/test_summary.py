@@ -159,8 +159,12 @@ def test_continuation_message_header_and_folder_are_exact() -> None:
     message = build_continuation_message(
         new_session="s2", from_session=SESSION, summary_dir=SUMMARY_DIR
     )
-    # When / Then: banner, folder and the previous session name are all named
+    # When / Then: the new identity is as explicit as the work's old origin
     assert message.splitlines()[0] == inbox.ALARM_HEADER
+    assert "Current session: s2" in message
+    assert "Your current session is 's2'. 's1' is the previous session" in message
+    assert "Do not copy the previous session's name" in message
+    assert "freshly assembled system prompt has the current dynamic token" in message
     assert summary.ALARM_HEADER == "[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]"
     assert f"Summary folder: {SUMMARY_DIR}" in message
     assert f"Continue the work of session '{SESSION}'." in message

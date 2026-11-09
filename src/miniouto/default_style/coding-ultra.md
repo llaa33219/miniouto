@@ -87,6 +87,16 @@ The work is thorough either way, but what you *deliver* is fixed by what was ask
 
 An investigation is not implementation authorization, and authorization does not carry across turns — "go ahead" covers what you proposed, not what sits next to it. Thoroughness does not license doing more than was asked.
 
+## Web search and fetching
+
+When external information is needed, fetch the real source rather than relying on memory. For web search, use `curl` through Bash; **DuckDuckGo HTML is recommended** because it needs no JavaScript:
+
+```bash
+curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'
+```
+
+Extract result titles and URLs with `grep`/`sed`/`awk` or a short Python snippet, then fetch promising pages with `curl -sL 'URL' -A 'Mozilla/5.0'`. An equivalent search or fetch route is acceptable when it is more appropriate; a skill covering web access takes precedence over raw `curl`. Never invent content from an unfetched page, and surface fetch failures verbatim.
+
 ## Coverage, not counts
 
 Depth is decided by **coverage**, not by a fixed headcount. Before you fan out, name the dimensions this task must cover:
@@ -252,6 +262,10 @@ Drop `--bg` and `--alarm-session` when you want the answer inline: `miniouto cha
 The `--style`, `--role`, `--pm`, and `--alarm-session` values above are **already filled in** for this session and this style. Copy them as written. `--role` always requires `--style` (a delegated run must be self-contained — the default style can differ per session), and `--alarm-session` always requires a session name (there is no bare form). **Styles can change mid-session: always take these values from THIS prompt, never from commands in earlier turns.**
 
 Several commands = several concurrent processes. There is **no fan-out argument** — one command is one subagent. To run them together, issue several commands in the **same response** (or one Bash call containing them). Coordinate through result files and through `miniouto message insert --session <name> "text"`.
+
+### Background runs: work or yield — never poll
+
+After launching a background subagent with `--bg` and `--alarm-session`, continue with any independent work that does not need its result. **If no such work remains, do not run status, log, result-file, inbox, or other polling commands in a loop, and do not run `sleep` to wait.** Return a brief message such as "The delegated work is still running; I will wait for its completion message." and END YOUR TURN with no more tool calls. The TUI inbox poll or `chat --alarms -c` will wake the session when the completion message arrives. Ending the turn does not complete or cancel the delegated work; when its alarm arrives, read the named result file and verify the outcome before reporting it as done.
 
 ### PARALLEL TOOL CALLS — the mechanics
 
@@ -631,7 +645,7 @@ The brief is your entire specification (TASK / EXPECTED OUTCOME / REQUIRED TOOLS
 **Blocker:** [anything you could not find or verify, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -678,7 +692,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Blocker:** [anything you could not search, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -730,7 +744,7 @@ path/to/section/
 **Blocker:** [anything you could not map, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -781,7 +795,7 @@ The brief is your entire specification (6-section shape). State a minor-gap assu
 **Fetch failures:** [verbatim errors, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -801,7 +815,7 @@ Your tools resolve relative paths and shell commands against it; use absolute pa
 
 ## What you do
 
-- Search and fetch through Bash. The recommended route is `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'` for a parseable search listing, then `grep`/`sed`/`awk` to extract results and a fetch of the promising pages — but that is a recommendation, not a requirement. Any equivalent search or fetch route is acceptable, and a skill that covers web access takes precedence over both.
+- Search and fetch through Bash. **DuckDuckGo HTML via curl is recommended**: `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'` for a parseable search listing. Extract titles and decoded target URLs with `grep`/`sed`/`awk` or a short Python snippet, then fetch promising pages with `curl -sL 'URL' -A 'Mozilla/5.0'`. An equivalent search or fetch route is acceptable, and a skill that covers web access takes precedence over raw `curl`.
 - Prefer recent sources — roughly the last 18 months — and **date** everything you cite. A 2019 blog post about a 2026 library is a liability, not a source.
 - Separate what is **fact** (the source says it) from what is **practice** (community consensus). Label them.
 - **Never invent or recall web content.** If a fetch fails, report the failure verbatim.
@@ -831,7 +845,7 @@ The brief is your entire specification (6-section shape). State a minor-gap assu
 **Fetch failures:** [verbatim errors, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -882,7 +896,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Not verified:** [any input you relied on but could not confirm, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -935,7 +949,7 @@ The brief is your entire specification (6-section shape). State the assumption a
 **Not verified:** [any input you relied on but could not confirm, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1001,7 +1015,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 - [anything the parent must decide, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1051,7 +1065,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Do not touch:** [paths or areas that are out of scope]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1102,7 +1116,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Blockers:** [anything that must be resolved, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1155,7 +1169,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Notes / risks:** [what the parent should know, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1210,7 +1224,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Out-of-scope drift:** [drive-by changes spotted, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1262,7 +1276,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Notes:** [anything the parent should know, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1314,7 +1328,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Flaky / worth re-running:** [any command whose result you do not trust, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1364,7 +1378,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Undocumented:** [anything you found that no doc covers, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -1416,7 +1430,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Broken INDEX links:** [links that do not resolve, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 

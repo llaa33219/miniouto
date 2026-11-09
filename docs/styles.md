@@ -215,9 +215,8 @@ The prompt is an ordered stack; each section answers one question:
 7. **The confirm gate** — a proposal (destination, changes, verification,
    risk) and ONE question; after a go-ahead, no re-asking.
 - **Subagent roster (top-level tags)**: file-picker / thinker / editor / reviewer / validator — each a named tag in the file, loaded as that subagent's own system prompt.
-- Like `coding-ultra.md` (and unlike `default.md`/`coding.md`), `coding-pro.md`
-  has **no Web access section** — it relies on the skill catalog and plain
-  `curl` judgment.
+- **Web search and fetching**: `curl` with DuckDuckGo HTML is recommended;
+  a matching web-access skill still takes precedence.
 
 ### `coding-work.md`: pragmatic senior engineer orchestrator
 
@@ -248,9 +247,8 @@ The prompt is an ordered stack; each section answers one question:
   reversible**; decide everything else (naming, formatting, library choice,
   API shape, test placement, equivalent implementations) and log it.
 - **Subagent roster (top-level tags)**: file-picker / code-searcher / directory-lister / researcher / thinker / editor / reviewer / validator — each a named tag in the file. Role-specific behavior is encoded in each tag's body: a file-picker does not edit; an editor does not review its own work; a validator does not change code to make a check pass.
-- Like `coding-pro.md` and `coding-ultra.md`, it has **no Web access
-  section** — its researcher role covers external lookups via the skill
-  catalog and Bash `curl` judgment.
+- **Web search and fetching**: `curl` with DuckDuckGo HTML is recommended;
+  the researcher role carries the same executable search recipe.
 
 ### `coding-ultra.md`: MAX-mode execution orchestrator
 
@@ -315,9 +313,8 @@ are decided autonomously). It requires the following behaviors:
   unprompted commit/push/publish, no silent destruction of user work).
 - **The deliverable follows the request type**: zero-excuse execution targets the *requested* deliverable — investigations complete as findings reports (Layer 9), and authorization does not carry across turns.
 - **Execution know-how**: convergence as the layer-advance signal (never re-run a search a searcher returned); Layer 7 exercises the real surface; hypothesis-driven debugging with a `deep-thinker` consult after two failed fixes; one objective per brief.
-- Like `coding-pro.md`, `coding-ultra.md` has **no Web access section** — its
-  researcher-docs / researcher-web roles rely on the skill catalog and Bash
-  `curl` judgment.
+- **Web search and fetching**: `curl` with DuckDuckGo HTML is recommended;
+  researcher-web carries the same executable search recipe.
 
 ---
 
@@ -368,7 +365,11 @@ The larger templates (`default.md`, `coding-pro.md`, `coding-work.md`, `coding-u
 
 ### Web access guidance in bundled styles
 
-The `default.md` template includes a full **Web access (search & fetch)** section in its `<outo>` half and in its single legacy `<subagent>` half (`coding-pro.md`, `coding-work.md`, and `coding-ultra.md` do not; `coding.md` compresses it to one rule). It is **skill-first**: the agent must check whether an available skill covers the web interaction (browser automation, scraping, search, platform-specific APIs) and follow that skill when one applies. Only when no skill applies does it fall back to `curl` via Bash — searching the web via DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) — no JavaScript, parseable with `grep`/`sed`/`awk`. If you author a custom style and want the agent to fetch real pages instead of guessing content, copy this section from `default.md`.
+Every bundled orchestrator except `coding.md` recommends `curl` via Bash with DuckDuckGo's HTML endpoint (`https://html.duckduckgo.com/html/?q=...`) for web search — no JavaScript, parseable with `grep`/`sed`/`awk`. `default.md` includes the full **Web access (search & fetch)** recipe in its `<outo>` half and in its single legacy `<subagent>` half; `coding-pro.md`, `coding-work.md`, and `coding-ultra.md` include a concise orchestrator-level section, with the executable curl recipe also present in the web researcher roles of the latter two. Web access remains **skill-first**: a matching skill (browser automation, scraping, search, platform-specific APIs) takes precedence over raw `curl`. `coding.md` is deliberately unchanged by this guidance. Never guess content from an unfetched page; surface fetch failures.
+
+### Background waiting guidance in bundled styles
+
+The same four orchestrators distinguish independent work from waiting. After a `--bg` delegation with `--alarm-session`, do independent work while it is useful. When none remains, say you will wait for the completion message and **end the turn**, rather than polling status files, logs, the inbox, or the result file (or using `sleep`). A TUI inbox poll or `chat --alarms -c` wakes the session; then read the named result and verify it. Nested role prompts have the same exception to their ordinary final-message contract. `coding.md` is unchanged.
 
 ### Export / share a style
 

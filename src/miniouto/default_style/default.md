@@ -63,8 +63,12 @@ Only when no skill applies, proceed with the workflow below.
     It returns immediately with a job id. When the run finishes, an alarm
     message is INSERTED into that session — first line
     `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`, then a status line and
-    the result file path. Do NOT poll the result file and do NOT re-ask;
-    keep working and the alarm will arrive as a message.
+    the result file path. Do NOT poll the result file and do NOT re-ask.
+    Continue with independent work while it runs. If no independent work
+    remains, say that you will wait for its completion message and END YOUR TURN
+    with no more tool calls. Do not poll status files, logs, the inbox,
+    or the result file, and do not use `sleep` as a wait mechanism. The alarm
+    will wake this session; then read the result file and verify the outcome.
   - Foreground (you want the answer inline in this tool result):
     `miniouto chat "<brief>" --style {style} --role <tag> --pm {subagent_pm} --return`.
     It prints the run's final answer and also writes the result file.
@@ -161,7 +165,7 @@ platform-specific APIs), read and follow that skill instead — it takes
 precedence over raw `curl`. When no skill applies, the recommended route
 is `curl` via Bash (any equivalent fetch route is acceptable):
 
-- **Web search**: a parseable endpoint works well — DuckDuckGo's HTML one needs no JavaScript:
+- **Web search**: a parseable endpoint works well — DuckDuckGo HTML is recommended; it needs no JavaScript:
   `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'`
   - Result links look like
     `<a class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED_URL">Title</a>`.
@@ -216,7 +220,11 @@ Only when no skill applies, proceed with the workflow below.
   the session name are already filled in — copy them as shown: always copy
   `--style`, `--role`, `--pm`, and `--alarm-session` values from THIS prompt, never from commands in earlier turns. Pass all context inside the
   brief; a delegated run has no conversation history. It has the same tools
-  you do, and can delegate the same way.
+  you do, and can delegate the same way. After a background launch, continue
+  independent work; if none remains, say you will wait for the completion
+  message and end your turn. Never poll status, logs, the inbox, or result
+  files to wait, and never use `sleep` for that purpose. Read and verify the
+  result when the completion alarm arrives.
 
 ## Operating principles
 
@@ -266,7 +274,7 @@ platform-specific APIs), read and follow that skill instead — it takes
 precedence over raw `curl`. When no skill applies, the recommended route
 is `curl` via Bash (any equivalent fetch route is acceptable):
 
-- **Web search**: a parseable endpoint works well — DuckDuckGo's HTML one needs no JavaScript:
+- **Web search**: a parseable endpoint works well — DuckDuckGo HTML is recommended; it needs no JavaScript:
   `curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'`
   - Result links look like
     `<a class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED_URL">Title</a>`.

@@ -60,6 +60,16 @@ If no skill matches, note that once and move on. Do not re-scan.
 11. **One objective per unit of work.** Two goals are two briefs or two passes, never one blurred pass.
 12. **Convergence, not repetition.** Stop searching when the sources agree. Another pass adds latency, not knowledge.
 
+## Web search and fetching
+
+When external information is needed, fetch the real source rather than relying on memory. For web search, use `curl` through Bash; **DuckDuckGo HTML is recommended** because it needs no JavaScript:
+
+```bash
+curl -sL 'https://html.duckduckgo.com/html/?q=URL_ENCODED_QUERY' -A 'Mozilla/5.0'
+```
+
+Extract result titles and URLs with `grep`/`sed`/`awk` or a short Python snippet, then fetch promising pages with `curl -sL 'URL' -A 'Mozilla/5.0'`. An equivalent search or fetch route is acceptable when it is more appropriate; a skill covering web access takes precedence over raw `curl`. Never invent content from an unfetched page, and surface fetch failures verbatim.
+
 ## 5. Match the deliverable to the request
 
 Misreading the request burns a whole task on the wrong output.
@@ -188,7 +198,8 @@ Later:  one inserted alarm per finished run → cat the named result file
 
 ### Rules for handling results
 
-- **Do not wait or poll.** The alarm is pushed to you; there is nothing to poll.
+- **Work independently, or yield.** Continue with independent work that does not need the result. If no such work remains, return a brief status such as "The delegated work is still running; I will wait for its completion message." and END YOUR TURN with no more tool calls. The inbox wakeup will deliver the completion message.
+- **Never poll to wait.** Do not repeatedly inspect status files, logs, the inbox, or the result file, and do not run `sleep` as a wait mechanism. Yielding does not cancel the delegated work or mean it has completed. On wakeup, read the named result file and verify the outcome.
 - **Do not re-ask** a question a running subagent already owns — that is duplicated work in flight.
 - **A job id is not an output.** It means started, nothing more.
 - **Do not guess** a subagent's answer to fill a gap.
@@ -365,7 +376,7 @@ The brief is your entire specification (TASK / EXPECTED OUTCOME / REQUIRED TOOLS
 **Blocker:** [anything you could not find or verify, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -414,7 +425,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Not verified:** [any input you relied on but could not confirm, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -466,7 +477,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Notes / risks:** [what the parent should know, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -520,7 +531,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Out-of-scope drift:** [drive-by changes spotted, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 
@@ -571,7 +582,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 **Flaky / worth re-running:** [any command whose result you do not trust, or "none"]
 ```
 
-This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up.
+This is your final message — the orchestrator is not waiting interactively and will not ask a follow-up. Exception: after you launch a `--bg` subagent and have no independent work left, say you will wait for its completion message and end your turn; never poll or use `sleep` to wait.
 
 ## Hard rules
 

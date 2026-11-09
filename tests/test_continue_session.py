@@ -11,6 +11,8 @@ import pytest
 
 import harness
 import miniouto.tools.continue_session as tool_mod
+from miniouto.cli import chat as chat_cli
+from miniouto.cli.tui import ChatInput, ChatTUI
 from miniouto.core import chat as chat_mod
 from miniouto.core import inbox, summary
 from miniouto.core.summary import Handoff
@@ -271,3 +273,139 @@ def test_a_turn_that_hands_off_stops_before_another_llm_call_and_finishes_done(
     assert handoff is not None
     assert handoff.from_session == summary_folder.name
     assert handoff.new_session in answer
+
+
+def test_the_continuation_names_the_new_session_as_the_command_routing_identity(
+    summary_folder: Path,
+) -> None:
+    # Given: a run handing work from an old session into a new cont-* session
+    summary.set_run_contract(session="handoff-old")
+    continue_session(str(summary_folder))
+    handoff = summary.pending_handoff()
+    assert handoff is not None
+
+    # When: the new session reads its opening message
+    message = _delivered(handoff).text
+
+    # Then: it cannot mistake the previous session named by the work contract
+    # for the destination of a NEW --alarm-session / --session command
+    assert f"Current session: {handoff.new_session}" in message
+    assert f"Your current session is '{handoff.new_session}'" in message
+    assert "Continue the work of session 'handoff-old'." in message
+    assert "'handoff-old' is the previous session" in message
+    assert "Do not copy the previous session's name" in message
+
+
+def test_the_continuation_reexpands_this_session_with_the_new_session_name(
+    monkeypatch: pytest.MonkeyPatch, summary_folder: Path
+) -> None:
+    """A hand-off must change the prompt, not only the transcript destination."""
+
+    session = "handoff-token-old"
+
+    async def handler(request: harness.Request) -> co.LLMResponse:
+        if len(request.messages) == 2:
+            return _tool_call_response(
+                "call-1", "continue_session", summary_dir=str(summary_folder)
+            )
+        return co.LLMResponse(content="continued", tool_calls=[], raw=None)
+
+    monkeypatch.setattr(tool_mod, "_mint_session", lambda: "cont-token-new")
+    style = f"<outo>{harness.OUTO_TOKEN} --alarm-session {{this_session}}</outo>"
+    provider = harness.install(monkeypatch, handler, session=session, style=style)
+    summary.set_run_contract(session=session, style=harness.STYLE_NAME)
+    chat_cli.run_turn_chain(
+        chat_mod.ChatOptions(prompt="summarize", session=session), quiet=True
+    )
+
+    handoff = summary.pending_handoff()
+    assert handoff is None
+    systems = [
+        next(m.content for m in request.messages if m.role == "system")
+        for request in provider.requests
+    ]
+    assert [text.rsplit(" ", 1)[-1] for text in systems] == [
+        session, "cont-token-new", "cont-token-new"
+    ]
+    continuation = provider.requests[1].user_texts()[0]
+    assert "Current session: cont-token-new" in continuation
+    assert "Your current session is 'cont-token-new'" in continuation
+
+
+def test_a_tui_continuation_also_reexpands_this_session(
+    monkeypatch: pytest.MonkeyPatch, summary_folder: Path
+) -> None:
+    import asyncio
+
+    async def body() -> None:
+        async def handler(request: harness.Request) -> co.LLMResponse:
+            if request.index == 0:
+                return _tool_call_response(
+                    "call-1", "continue_session", summary_dir=str(summary_folder)
+                )
+            return co.LLMResponse(content="continued", tool_calls=[], raw=None)
+
+        monkeypatch.setattr(tool_mod, "_mint_session", lambda: "cont-token-tui")
+        style = f"<outo>{harness.OUTO_TOKEN} --alarm-session {{this_session}}</outo>"
+        provider = harness.install(
+            monkeypatch, handler, session="tui-token-old", style=style
+        )
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.on_chat_input_submitted(ChatInput.Submitted("summarize"))
+            for _ in range(60):
+                await pilot.pause()
+                if len(provider.requests) == 2:
+                    break
+            systems = [
+                next(m.content for m in request.messages if m.role == "system")
+                for request in provider.requests
+            ]
+            assert len(systems) == 2
+            assert systems[1].endswith("cont-token-tui")
+
+    asyncio.run(body())
+
+
+def test_a_delegated_continuation_reexpands_its_role_prompt(
+    monkeypatch: pytest.MonkeyPatch, summary_folder: Path
+) -> None:
+    """Role mode follows the same hand-off, not the caller's old session."""
+
+    async def handler(request: harness.Request) -> co.LLMResponse:
+        if request.index == 0:
+            return _tool_call_response(
+                "call-1", "continue_session", summary_dir=str(summary_folder)
+            )
+        return co.LLMResponse(content="continued", tool_calls=[], raw=None)
+
+    monkeypatch.setattr(tool_mod, "_mint_session", lambda: "cont-token-role")
+    style = (
+        f"<outo>{harness.OUTO_TOKEN}</outo>\n"
+        f"<editor>{harness.PERSONA_TOKEN} --alarm-session {{this_session}}</editor>"
+    )
+    provider = harness.install(
+        monkeypatch, handler, session="role-token-old", style=style
+    )
+    state = chat_cli.ChainState(session="role-token-old")
+    chat_cli.run_turn_chain(
+        chat_mod.ChatOptions(
+            prompt="summarize",
+            session="role-token-old",
+            style=harness.STYLE_NAME,
+            role="editor",
+        ),
+        quiet=True,
+        state=state,
+        publish_session=False,
+    )
+
+    systems = [
+        next(m.content for m in request.messages if m.role == "system")
+        for request in provider.requests
+    ]
+    assert [text.rsplit(" ", 1)[-1] for text in systems] == [
+        "role-token-old", "cont-token-role"
+    ]
+    assert state.session == "cont-token-role"

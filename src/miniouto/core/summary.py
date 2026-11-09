@@ -200,11 +200,24 @@ def build_continuation_message(
         ALARM_HEADER,
         "New session opened from a summary — continue the previous work here.",
         "",
+        f"Current session: {new_session}",
         f"Summary folder: {summary_dir}",
         "",
         "WHAT TO DO",
         "1. Read every document in the folder (00-overview.md first).",
         f"2. Continue the work of session '{from_session}'.",
+        "",
+        "SESSION IDENTITY",
+        f"- Your current session is '{new_session}'. '{from_session}' is the "
+        "previous session, whose WORK you are continuing — it is not your "
+        "current session.",
+        "- Use the CURRENT session name in every newly issued command that "
+        "takes a session name, including `--alarm-session` and "
+        "`--session`. Do not copy the previous session's name from summary "
+        "documents or quoted historical commands.",
+        "- Your freshly assembled system prompt has the current dynamic token "
+        "values. Follow ITS delegation command values, never a command literal "
+        "in the summary or history.",
         "",
         "CAUTIONS",
         "- The summary is a record of past state — verify current code/state "
