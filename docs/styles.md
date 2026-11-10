@@ -122,7 +122,7 @@ Every style should include a **Tools available** section that lists the tools th
 | *(delegation is not a tool)* | There is **no** `call_subagent` tool — the word appears nowhere in the codebase. Delegation is a **Bash command**: `miniouto chat "<self-contained brief>" --style <style> --role <tag> --return` runs a nested run of the harness in its own process and prints its answer inline; add `--bg --alarm-session <session>` to fire and forget, in which case the answer arrives later as a user message starting with `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` naming a file under `~/.miniouto/subagent-results/`. One brief per command; several commands in one Bash call = several concurrent runs. `Bash` is always registered, so **the delegation surface is never conditional on this style's tags** — what a style controls is only which role bodies exist. |
 | `Computer(action="screen", chars=…, color=…)` | (outo runs only) Dump the current virtual screen as Unicode half-block art to `~/.miniouto/computer-screens/*.art` and return a short text preview — the text-only channel that works where `screenshot` cannot. Render it with `miniouto computer show`. |
 
-There are deliberately **no** Write/Edit/Delete tools — file work goes through Bash (see `docs/tools.md` § "Why Bash is the only file tool"). All bundled styles describe the tools with **identical behavior summaries** (so the model doesn't see inconsistent tool docs across styles). The summaries come from `tools/registry.py`'s `_<name>_description` strings.
+There are deliberately **no** Write/Edit/Delete tools — file work goes through Bash (see `docs/tools.md` § "Why Bash is the only file tool"). The four coding styles additionally require the [`rwe`](https://github.com/llaa33219/read-write-edit-tools) CLI for UTF-8 text reads, creates, and edits; it is invoked through Bash, not registered as a miniouto tool. Bash remains responsible for search, Git, tests/builds, unsupported transformations, and explicit-path deletion. Tool summaries come from `tools/registry.py`'s `_<name>_description` strings; style-specific CLI policy is documented in each style.
 
 ## The loop behavior section (required)
 
@@ -152,7 +152,13 @@ The five bundled templates live in `src/miniouto/default_style/`. They are seede
 
 `coding-pro.md`, `coding-work.md`, and `coding-ultra.md` include explicit guidance on when and how to delegate, taught entirely as **Bash recipes** (`miniouto chat "<brief>" --style {style} --role <tag> --pm {subagent_pm} [--bg --alarm-session {this_session}] --return` — the tokens expand per run, see [Dynamic tokens](#dynamic-tokens)); `default.md` and `coding.md` compress the same mechanic to one or two lines.
 
+**Background is the default delegation mode**: in these three styles, `--bg` together with `--alarm-session` and `--return` is the default and recommended form. Foreground delegation is reserved for when the agent intentionally needs an answer inline immediately and has no concurrent work. This applies to orchestrators and to nested delegation from every role prompt.
+
+**Background waiting is an explicit tool-free response**: `coding-pro.md`, `coding-work.md`, and `coding-ultra.md` now distinguish two branches after a `--bg` launch. If real work remains that needs no pending result, the agent continues with status text alongside a real tool call. If the next edit, brief, review, validation, or synthesis depends on a pending result, it sends the user a plain-text message naming the pending run and explicitly saying it will wait for its completion message, with **no tool call in that response**, and ends the turn. This waiting response is not a final task report and does not cancel the delegated processes. Status/log/inbox/result-file checks, `sleep`, placeholder calls, repeated searches, and manufactured busywork do not qualify as independent work. When an alarm arrives, the agent reads the named result and resumes whatever it unblocks; it waits again only if every remaining next step still depends on other results. Foreground delegation returns inline and never needs this waiting response. The same exception is embedded in every role prompt for nested background runs.
+
 **Note on which provider a delegated run uses**: bundled styles teach the recipe with `--pm {subagent_pm}`, so the command the model copies carries the subagent provider/model/reasoning **spelled out** — literal, idempotent, and not re-resolved against whatever the default says at the moment the command is typed. `--use-subagent-provider` remains available and does the same job by *resolving at call time*: it resolves the subagent trio **pin-first against the delegated run's own session** (`session-config/<session>.toml`, which it inherits copy-if-absent from the caller via `seed_from`), else the `settings.subagent_*` global default. Prefer `--pm` in a generated command; reach for `--use-subagent-provider` when the point is "whatever the subagent profile currently is".
+
+**Shared rwe policy**: `coding-pro.md`, `coding-work.md`, and `coding-ultra.md` contain a detailed `rwe` section with an existence check, user-level installation (`uv tool install read-write-edit-tools`, with `python3 -m pip install --user read-write-edit-tools` as fallback), command table, multiline workflow, and safety rules. They explain that addresses are 1-based hexadecimal, that all addresses in one edit refer to the original pre-edit snapshot, and that a fresh `rwe read` is required after each edit. They also cover the 1000-line read cap, create-only `write`, no parent-directory creation, quoted stdin heredocs, escaping header-shaped content, lack of line deletion/search/append, atomic validated edits, concurrent-writer limitations, and exit codes. File-reading roles use `rwe read` (or ephemeral `uvx` where installation is inappropriate); editor and documentation-writing roles carry the same install-and-use policy. `coding.md` deliberately compresses this to the three commands, hexadecimal/original-line rules, and an ephemeral `uvx` fallback instead of persistent installation.
 
 **Note on mechanics**: each bundled orchestrator style declares its roster as top-level named tags (one tag per role). The model delegates by running `miniouto chat "<brief>" --style <style> --role <tag>` through `Bash`, and that tag's body becomes the delegated run's system prompt — a per-role lean prompt in its own process. A mixed-role layer is just **several such commands issued together** (an editor, then a reviewer), each carrying exactly one brief; each run reports through its own completion alarm. See each style file for its actual roster.
 
@@ -170,16 +176,19 @@ A deliberately terse style (~1.6 KB) — an "expert coding agent" persona with
 only the load-bearing rules. Both halves are a short ruleset:
 
 - **Identity**: "expert coding agent. Be precise, minimal, and verified."
-- **Tools**: one line each — Bash as the ONLY file tool (with the
-  read/create/edit/delete command forms), media viewers, Computer,
-  and `miniouto chat "<brief>" --style <style> --role <tag>` with one
-  self-contained brief per command (several commands run as separate,
-  independent processes).
+The `default.md` orchestrator and the three detailed coding orchestrators distinguish independent work from waiting. After a `--bg` delegation with `--alarm-session`, do independent work while it is useful. When none remains, say you will wait for the completion message and **end the turn**, rather than polling status files, logs, the inbox, or the result file (or using `sleep`). A TUI inbox poll or `chat --alarms -c` wakes the session; then read the named result and verify it.
+
+For the three detailed coding styles, the strengthened contract above is explicit: the waiting assistant response is user-facing plain text with **no tool call**, names the pending run, and is not a final task report. Continue only with real work that needs no pending result; a dependent edit, brief, review, validation, or synthesis means stop and wait. Partial alarms resume only the work they unblock. Nested role prompts carry the same exception to their ordinary final-message contract. `coding.md` is unchanged.
+  files only), and `rwe edit` for UTF-8 text, with hexadecimal
+  original-line addresses and a fresh read after each edit. If `rwe` is
+  absent, coding uses `uvx --from read-write-edit-tools rwe ...` rather
+  than installing it. Bash handles search, commands, and deletion;
+  delegation remains `miniouto chat` through Bash.
 - **Seven rules** (outo half): follow matching skills; read before editing
   and follow project conventions; smallest change; verify with real
   commands and never fabricate; fetch web content instead of recalling it;
   ask before destructive/ambiguous moves; match the user's language.
-- **Six rules** (single legacy `<subagent>` block, named `"subagent"`): same core — brief is the whole spec, read first, Bash-only file work, verified reporting (files changed, commands + output, blockers), no unauthorized destructive actions, match the brief's language.
+- **Six rules** (single legacy `<subagent>` block, named `"subagent"`): same core — brief is the whole spec, read first, rwe-based text work with the same ephemeral `uvx` fallback, verified reporting (files changed, commands + output, blockers), no unauthorized destructive actions, match the brief's language.
 
 ### `coding-pro.md`: senior staff engineer orchestrator
 
@@ -242,10 +251,18 @@ The prompt is an ordered stack; each section answers one question:
   command and one line back; T3 gets a full report. The two failure modes
   are named: T3 ceremony on a T0 task, and a T3 task shipped in a T0
   paragraph.
-- **Ask or decide?**: ask only when readings produce **different
-  deliverables**, no convention settles it, and it is **not easily
-  reversible**; decide everything else (naming, formatting, library choice,
-  API shape, test placement, equivalent implementations) and log it.
+- **Calibrated clarification**: inspect the request, code, docs, and
+  conventions first; never ask automatically merely because wording is ambiguous.
+  Ask before acting only when unresolved interpretations have materially
+  different deliverables or serious consequences. Mid-task questions are
+  avoided unless progress is impossible or a serious unauthorized decision
+  would be required. Safe interpretation choices may instead get one
+  optional question after the completed-work report, stating what was done
+  and that the user may ignore it. An explicit no-question instruction also
+  suppresses that follow-up. Only extreme computer/data/privacy harm or a
+  truly unavoidable root-access emergency after exhaustive user-space
+  attempts can override it; stop before the action and ask only the
+  unavoidable question.
 - **Subagent roster (top-level tags)**: file-picker / code-searcher / directory-lister / researcher / thinker / editor / reviewer / validator — each a named tag in the file. Role-specific behavior is encoded in each tag's body: a file-picker does not edit; an editor does not review its own work; a validator does not change code to make a check pass.
 - **Web search and fetching**: `curl` with DuckDuckGo HTML is recommended;
   the researcher role carries the same executable search recipe.
@@ -261,12 +278,15 @@ are decided autonomously). It requires the following behaviors:
 - **Startup step**: same AGENTS.md-first read as `coding-pro.md`, **plus**
   `./.miniouto/docs/` — if that directory exists, read its `INDEX.md` and the
   docs relevant to the task before acting.
-- **Zero-excuse protocol** (load-bearing): never stop early, never ask
-  permission mid-loop, never ask low-stakes design questions (pick the most
-  defensible option, log it in the plan's DECISIONS section), never report
-  partial success as success, never give up on a verification or subagent
-  failure (re-brief and respawn), never fabricate progress, never expand
-  scope without a reason.
+- **Startup-only clarification and zero-excuse execution**: before work,
+  inspect evidence and ask at most one question only for consequential,
+  unresolved ambiguity. Minor/reversible ambiguity is decided and logged,
+  never asked. After work starts, do not ask permission, clarification,
+  design, or optional end-of-report questions. An explicit no-question
+  instruction also suppresses startup clarification. Only the same extreme
+  computer/data/privacy or unavoidable root-access emergencies may override
+  these rules, stopping before the action. Subagents report ambiguity to the
+  parent rather than questioning the user.
 - **MAX-mode operating principle**: spawn more subagents than you think you
   need — at least 3 file-picker subagents on the first context-gathering
   layer (plus searcher / glob / researchers), a second context pass with
