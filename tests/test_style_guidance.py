@@ -237,3 +237,83 @@ def test_roles_report_ambiguity_to_the_parent_instead_of_questioning_the_user(
         assert "the parent owns any user clarification" in spec.prompt, spec.name
         assert "Do not append optional questions to your report" in spec.prompt, spec.name
         assert "If the brief lacks a fact you need, ask" not in spec.prompt, spec.name
+
+
+def _rung(body: str, rung: str) -> str:
+    return next(line for line in body.splitlines() if line.startswith(f"| **{rung} "))
+
+
+def test_coding_work_delegates_from_t1_not_only_for_large_tasks() -> None:
+    body = _body("coding-work")
+
+    assert "Do it directly" in _rung(body, "T0")
+    t1 = _rung(body, "T1")
+    assert "at least one" in t1
+    assert "subagent" in t1
+    assert "Batch the reads → edit → run the local checks" not in t1
+    assert "delegate" in _rung(body, "T2").lower()
+    assert "delegate" in _rung(body, "T3").lower()
+    assert "pick the lower one and escalate only when reality demands it" not in body
+
+
+def test_coding_ultra_distinguishes_one_agent_from_multi_agent_work() -> None:
+    body = _body("coding-ultra")
+
+    assert "## Delegation is the default" in body
+    assert "one appropriate subagent" in body
+    assert "multiple subagents" in body
+    assert "trivial" in body.lower()
+    assert "Calling a task small or familiar" in body
+    assert "If the tree is small enough to survey with batched reads of your own" not in body
+
+
+def test_coding_ultra_simple_work_does_not_require_a_second_agent() -> None:
+    body = _body("coding-ultra")
+    challenge = body.split("### L5 — Challenge", 1)[1].split("### L6 — Validate", 1)[0]
+
+    assert "**One appropriate subagent is enough for a simple task:**" in body
+    assert "Do not add a reviewer just to reach two agents" in body
+    assert "one owning subagent and no separate review" in challenge
+    assert "the one `editor` may run the focused checks" in body
+    assert "Simple work gets proportionate verification — one verdict, one focused review" not in body
+    assert "T1: exactly one" not in _body("coding-work")
+
+
+def test_coding_ultra_delegates_validation_and_hard_task_review() -> None:
+    body = _body("coding-ultra")
+    validation = body.split("### L6 — Validate", 1)[1].split("### L7 — Falsify", 1)[0]
+    falsification = body.split("### L7 — Falsify", 1)[1].split("### L8 —", 1)[0]
+
+    assert "by default" in validation
+    assert "`validator`" in validation
+    assert "`commander`" in validation
+    assert "review" in falsification.lower()
+    assert "spec-checker" in falsification
+
+
+@pytest.mark.parametrize("style", ("coding-work", "coding-ultra"))
+def test_delegation_defaults_require_real_commands_not_hypothetical_roles(style: str) -> None:
+    body = _body(style)
+
+    assert "actually issuing" in body
+    assert "miniouto chat" in body
+    assert "without a subagent" in body
+    assert "exception" in body
+
+
+def test_classification_is_nature_based_not_size_based() -> None:
+    work = _body("coding-work")
+    ultra = _body("coding-ultra")
+
+    t0 = _rung(work, "T0")
+    assert "Mechanical, known-outcome edit" in t0
+    assert "no debugging loop" in t0
+    assert "already-known, obvious, local answer or edit" not in work
+    assert "A few files, one clear area, contained and reversible" not in work
+    assert "take the lower rung" not in work
+    assert "bug fix that needs debugging or functional testing is NOT T0" in work
+
+    assert "mechanical, known-outcome edit" in ultra
+    assert "bug fix that needs debugging or functional testing is NOT trivial" in ultra
+    assert "one-file bug fix needing debugging or functional testing" in ultra
+    assert "an already-known, obvious local answer or edit" not in ultra
