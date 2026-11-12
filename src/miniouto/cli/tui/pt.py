@@ -767,6 +767,23 @@ def _normalize_alignment(alignment: str) -> str:
 # ─── the terminal ───────────────────────────────────────────────────────────
 
 
+_CARET_SHAPE = "bar"
+_CARET_BLINKING = True
+"""How the hardware caret looks while the input band owns it.
+
+xnano's ``shape=None`` means "keep the user's own cursor shape", so a canvas
+that sets only ``position`` + ``is_visible`` emits no ``DECSCUSR`` at all — a
+pty probe found not one ``ESC[N q`` in a whole session of typing. A position
+with no shape is drawn in whatever the terminal happens to be set to, and on
+many terminals that is invisible, which the owner read as "there is no
+cursor". A blinking bar is what a text field shows, so the caret names it.
+
+Re-asserting the same value every frame is free: xnano puts a ``DECSCUSR`` on
+the wire only when the shape or the blink bit actually changed (30 assignments
+of ``'bar'`` produced exactly one ``ESC[5 q`` on a pty).
+"""
+
+
 class Frame:
     """The frame a draw callback receives: ``.area`` and ``.render_widget``."""
 
@@ -854,6 +871,8 @@ class Terminal:
         self._frame_marks = 0
         self._last_area: tuple[int, int] | None = None
         self._cursor_visible = False
+        self._cursor_cell: tuple[int, int] | None = None
+        """The cell last WRITTEN to xnano's cursor, so an unchanged tick writes nothing."""
         self._hooks: list[tuple[str, Callable[[Any], None]]] = []
         self._opened = False
 
@@ -1074,12 +1093,19 @@ class Terminal:
         """Hide the caret for the next frame."""
 
         self._cursor_visible = False
+        # Forgetting the cell is what makes the next `move_cursor` write again:
+        # hiding is the one transition where xnano's state moved out from under
+        # the memo, so a later move to the SAME cell must not be skipped.
+        self._cursor_cell = None
         self._set_cursor_visible(False)
 
     def show_cursor(self) -> None:
         """Show the caret again."""
 
         self._cursor_visible = True
+        # Showing after a hide has to write again, so the memo is cleared here
+        # exactly as `hide_cursor` clears it.
+        self._cursor_cell = None
         self._set_cursor_visible(True)
 
     def move_cursor(self, x: int, y: int) -> None:
@@ -1090,18 +1116,44 @@ class Terminal:
         ``ESC[row;colH`` written between frames is undone by the next one. The
         app hands the cell over and xnano keeps it there.
 
-        A caret needs a POSITION and visibility; the shape stays whatever the
-        user configured (a pty probe showed a position with ``shape=None`` is
-        drawn with the terminal's own block).
+        The caret also names its SHAPE. xnano's ``shape=None`` means "keep the
+        user's own shape", and a cursor with a position but no shape emits no
+        ``DECSCUSR`` at all — measured on a pty, not one ``ESC[N q`` in a whole
+        session of typing — so the caret was drawn in whatever the terminal was
+        set to. That is what the owner read as "no cursor": the position was
+        right (``?25h`` and the CUP both landed in the input band,
+        probe-verified); only the shape was left to the terminal. A blinking
+        bar is what a text field shows, and re-asserting it per frame is free
+        because xnano emits ``DECSCUSR`` only when the value changed.
+
+        A shape is used rather than ``cursor.follow``: follow ties the caret to
+        a placement and loses it when that placement is removed, while the app
+        recomputes the cell from the live layout every frame. Assigning
+        ``position`` also clears whatever follow xnano had (``Cursor.position``
+        sets ``_cursor_follow = None``), so our position is the one that wins.
         """
 
         canvas = self._canvas
         if canvas is None or getattr(canvas, "is_closed", False):
             return
+        # `_cursor_cell` remembers what was last WRITTEN, not merely where the
+        # caret is: assigning `position` on every tick makes xnano advance a
+        # frame each time (measured on a pty: 173 frames and 5.3% of a core over
+        # 3 idle seconds, against 0 frames for an untouched canvas). Writing
+        # only on a change keeps the caret where it is at no cost, and the
+        # first call after a blink/shape reset still lands because `None`
+        # never compares equal.
+        cell = (max(0, int(x)), max(0, int(y)))
+        if cell == self._cursor_cell:
+            self._cursor_visible = True
+            return
         with _suppressed():
             cursor = canvas.screen.cursor
-            cursor.position = (max(0, int(x)), max(0, int(y)))
+            cursor.position = cell
+            cursor.shape = _CARET_SHAPE
+            cursor.is_blinking = _CARET_BLINKING
             cursor.is_visible = True
+        self._cursor_cell = cell
         self._cursor_visible = True
 
     def _set_cursor_visible(self, visible: bool) -> None:

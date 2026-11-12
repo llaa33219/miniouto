@@ -1000,7 +1000,56 @@ def test_a_hook_on_a_headless_terminal_is_recorded_and_inert() -> None:
     assert len(terminal._hooks) == 1
 
 
-def test_move_cursor_drives_the_canvas_cursor_not_an_escape_sequence() -> None:
+def test_move_cursor_names_the_caret_shape() -> None:
+    """Regression: the caret was POSITIONED but never given a SHAPE.
+
+    xnano's ``shape=None`` means "keep the user's own shape", so a cursor that
+    set only ``position`` + ``is_visible`` emitted no ``DECSCUSR`` at all —
+    measured on a pty, not one ``ESC[N q`` in a whole session of typing. The
+    owner read the invisible caret as "there is no cursor". A blinking bar is
+    what a text field shows.
+    """
+    terminal = pt.Terminal(width=20, height=5)
+    terminal.draw(
+        lambda frame: frame.render_widget(
+            pt.Paragraph(pt.Text.from_string("row")), pt.Rect(0, 0, 20, 1)
+        )
+    )
+    terminal.move_cursor(4, 2)
+
+    cursor = terminal.canvas.screen.cursor
+    assert cursor.shape == "bar", cursor.shape
+    assert cursor.is_blinking is True
+    assert cursor.is_visible is True
+
+
+def test_move_cursor_does_not_rewrite_the_same_cell() -> None:
+    """Re-assigning ``position`` every tick makes xnano advance a frame each time.
+
+    Measured on a pty: an unchanged canvas whose cursor was re-assigned at 60 Hz
+    advanced 173 frames and burned 5.3% of a core over 3 idle seconds, against 0
+    frames for an untouched canvas. The memo is what keeps an idle tick free —
+    but it must never swallow a move that FOLLOWS a hide.
+    """
+
+    terminal = pt.Terminal(width=20, height=5)
+    terminal.move_cursor(4, 2)
+    cursor = terminal.canvas.screen.cursor
+
+    # Given: the position is already written, so a repeat costs no write.
+    terminal.move_cursor(4, 2)
+    assert terminal._cursor_cell == (4, 2)
+    assert terminal.cursor_visible is True
+
+    # When: the caret is hidden and then put back on the SAME cell
+    terminal.hide_cursor()
+    assert cursor.is_visible is False
+    terminal.move_cursor(4, 2)
+
+    # Then: the write is not skipped — a hidden caret has to come back
+    assert cursor.is_visible is True
+    assert cursor.shape == "bar"
+    assert terminal.cursor_visible is True
     """The caret has to be xnano's own.
 
     A canvas on the screen re-asserts its cursor on every frame it draws, so a

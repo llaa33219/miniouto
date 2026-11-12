@@ -1129,6 +1129,9 @@ class _FakeTerminal:
         self.cursor: list[str] = []
         self.hooks: dict[str, Any] = {}
         self.exit_after = 0
+        self.ticks = 0
+        # Loop iterations seen. The loop now draws only a DIRTY frame, so a
+        # test that wants N iterations can no longer count `frames`.
         self._on_exit: Any = None
         self._size_source: Any = None
 
@@ -1248,14 +1251,23 @@ def test_the_running_loop_polls_the_terminal_size_every_tick(
 
         monkeypatch.setattr(app_module, "terminal_size", size)
         monkeypatch.setattr(app_module, "_write_terminal", lambda _payload: None)
-        terminal.exit_after = 3
-        terminal._on_exit = app.exit
+        # The loop DRAWS only a dirty frame, so the exit trigger counts loop
+        # ITERATIONS (`tick`), not painted frames.
+        iterations: list[int] = []
+        real_tick = ChatTUI.tick
+
+        def counting_tick(self: ChatTUI, dt: float = 0.0) -> None:
+            real_tick(self, dt)
+            iterations.append(1)
+            if len(iterations) >= 3:
+                app.exit()
+
+        monkeypatch.setattr(ChatTUI, "tick", counting_tick)
         await app.run_async()
-        # Then: the loop polls the ioctl at least once per frame — the boot call
-        # is the only one the old code ever made. (The tick that sets `_running`
-        # False still polls before it re-tests the loop condition, so the counts
-        # match within one.)
-        assert len(polls) >= len(terminal.frames) >= 3, (polls, terminal.frames)
+        # Then: the loop polls the ioctl at least once per ITERATION — the boot
+        # call is the only one the old code ever made. (`frames` is no longer
+        # the iteration count: an idle tick paints nothing, by design.)
+        assert len(polls) >= len(iterations) >= 3, (polls, iterations)
 
     asyncio.run(body())
 
@@ -1286,6 +1298,78 @@ def test_a_size_change_reaches_compose_through_the_resize_path(
     asyncio.run(body())
 
 
+def test_an_idle_tick_paints_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression (owner: "screen stutter"): an idle tick did a full rebuild.
+
+    The loop called ``compose()`` + ``term.draw()`` every 1/60 s whether or not
+    anything had changed, while xnano's own frame loop drew too: measured on a
+    pty, that was 42% of one core at 60 fps for output the terminal already had,
+    and the two loops beat against each other. A tick with no state change must
+    therefore compose nothing and draw nothing.
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        terminal = _FakeTerminal((80, 24))
+        app = ChatTUI(terminal=terminal)
+        monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
+        monkeypatch.setattr(app_module, "_write_terminal", lambda _payload: None)
+        composed: list[tuple[int, int]] = []
+        real_compose = ChatTUI.compose
+
+        def counting(self: ChatTUI, width: int, height: int) -> Any:
+            composed.append((width, height))
+            return real_compose(self, width, height)
+
+        monkeypatch.setattr(ChatTUI, "compose", counting)
+        # The exit is driven from `tick`, not from a draw: this test is ABOUT
+        # draws not happening, so an exit keyed on frames painted would never
+        # fire. Six ticks is more than enough for the boot frame to settle.
+        ticks: list[int] = []
+        real_tick = ChatTUI.tick
+
+        def counting_tick(self: ChatTUI, dt: float = 0.0) -> None:
+            real_tick(self, dt)
+            ticks.append(1)
+            if len(ticks) >= 6:
+                app.exit()
+
+        monkeypatch.setattr(ChatTUI, "tick", counting_tick)
+        await app.run_async()
+
+        # Then: the loop ran, and it composed strictly fewer times than it
+        # ticked — the idle ticks did no work at all.
+        assert len(ticks) >= 6, ticks
+        assert len(composed) < len(ticks), (composed, ticks)
+
+    asyncio.run(body())
+
+
+def test_a_keystroke_dirties_the_next_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half: when state DOES change, the frame follows on the next tick.
+
+    A dirty flag that nothing sets would skip every repaint; the input hooks are
+    what set it, and they are the only thing that can (keys, mouse, paste and
+    resize all arrive through ``hop``).
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app._mark_clean()
+            assert app.is_dirty is False
+            # A keystroke, routed exactly as the real hook routes one.
+            app.inject_key(tui_module.Key("h"))
+            assert app.is_dirty is True
+            await pilot.pause()
+            # And: the settle painted it, so the flag is down again
+            assert app.is_dirty is False
+
+    asyncio.run(body())
+
+
 def test_a_resize_that_changed_nothing_does_no_extra_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1296,11 +1380,23 @@ def test_a_resize_that_changed_nothing_does_no_extra_work(
         app = ChatTUI(terminal=terminal)
         monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
         monkeypatch.setattr(app_module, "_write_terminal", lambda _payload: None)
-        terminal.exit_after = 2
-        terminal._on_exit = app.exit
+        # The loop DRAWS only a dirty frame, so the exit trigger counts loop
+        # ITERATIONS (`tick`), not painted frames.
+        iterations: list[int] = []
+        real_tick = ChatTUI.tick
+
+        def counting_tick(self: ChatTUI, dt: float = 0.0) -> None:
+            real_tick(self, dt)
+            iterations.append(1)
+            if len(iterations) >= 3:
+                app.exit()
+
+        monkeypatch.setattr(ChatTUI, "tick", counting_tick)
         await app.run_async()
-        # The poll runs every frame; an unchanged size costs nothing at all
-        assert len(terminal.frames) == 2, terminal.frames
+        # The poll runs every iteration; an unchanged size repaints NOTHING.
+        # (This is the regression guard for the idle work: a resize that did not
+        # move used to cost a full compose anyway.)
+        assert len(terminal.frames) <= 1, terminal.frames
 
     asyncio.run(body())
 
@@ -1330,10 +1426,23 @@ def test_the_loop_shows_the_caret_again_before_leaving(
         written: list[str] = []
         monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
         monkeypatch.setattr(app_module, "_write_terminal", written.append)
-        terminal.exit_after = 2
-        terminal._on_exit = app.exit
+        # The loop DRAWS only a dirty frame, so the exit trigger counts loop
+        # ITERATIONS (`tick`), not painted frames.
+        iterations: list[int] = []
+        real_tick = ChatTUI.tick
+
+        def counting_tick(self: ChatTUI, dt: float = 0.0) -> None:
+            real_tick(self, dt)
+            iterations.append(1)
+            if len(iterations) >= 3:
+                app.exit()
+
+        monkeypatch.setattr(ChatTUI, "tick", counting_tick)
         await app.run_async()
-        # Then: every frame hid it and the teardown showed it again
+        # Then: every PAINTED frame hid it (this loop paints one, because the
+        # stub hides the caret instead of placing it) and the teardown showed it
+        # again. `hide` is counted per painted frame, not per iteration: a tick
+        # that draws nothing must not touch the caret either.
         assert terminal.cursor.count("hide") == len(terminal.frames), terminal.cursor
         assert terminal.cursor[-1] == "show", terminal.cursor
         # And: the loop registered one hook per input kind BEFORE the canvas
@@ -1428,13 +1537,23 @@ def test_the_running_loop_never_writes_an_alt_screen_sequence(
         written: list[str] = []
         monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
         monkeypatch.setattr(app_module, "_write_terminal", written.append)
-        terminal.exit_after = 2
-        terminal._on_exit = app.exit
+        # The loop DRAWS only a dirty frame, so the exit trigger counts loop
+        # ITERATIONS (`tick`), not painted frames.
+        iterations: list[int] = []
+        real_tick = ChatTUI.tick
+
+        def counting_tick(self: ChatTUI, dt: float = 0.0) -> None:
+            real_tick(self, dt)
+            iterations.append(1)
+            if len(iterations) >= 3:
+                app.exit()
+
+        monkeypatch.setattr(ChatTUI, "tick", counting_tick)
         await app.run_async()
         # `Terminal.__enter__`/`__exit__` own the alt-screen pair; the loop owns
         # only the mouse/paste modes and the caret.
         assert not any("1049" in payload for payload in written), written
-        assert len(terminal.frames) >= 2, "the loop never ran"
+        assert len(iterations) >= 3, "the loop never ran"
 
     asyncio.run(body())
 
@@ -1635,12 +1754,20 @@ def test_the_registered_hooks_reach_the_same_handlers_the_pilot_uses(
                 _FakeContext(keyboard=_FakeKeyboard(_FakeKeyReading("a"), pasted="pasted"))
             )
 
-        def fire_then_stop() -> None:
-            fire()
-            app.exit()
+        # The hooks fire from inside a loop ITERATION, and the loop stops itself
+        # on the second one: this test needs the callbacks called the way
+        # xnano's input thread calls them, not a particular draw count.
+        iterations: list[int] = []
+        real_tick = ChatTUI.tick
 
-        terminal._on_exit = fire_then_stop
-        terminal.exit_after = 2
+        def tick_then_fire(self: ChatTUI, dt: float = 0.0) -> None:
+            real_tick(self, dt)
+            iterations.append(1)
+            fire()
+            if len(iterations) >= 2:
+                app.exit()
+
+        monkeypatch.setattr(ChatTUI, "tick", tick_then_fire)
         await app.run_async()
         # Then: the key reached `handle_key` with our own Key, Shift+Tab folded
         # into BackTab (the code the router tests), and the letters intact.
