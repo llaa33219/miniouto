@@ -354,8 +354,11 @@ def test_a_tui_continuation_also_reexpands_this_session(
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             app.on_chat_input_submitted(ChatInput.Submitted("summarize"))
-            for _ in range(60):
-                await pilot.pause()
+            # The turn driver runs on a worker THREAD, so pumping the app is not
+            # enough: each pause also has to give that thread real wall-clock
+            # time, or the request would be checked before it was ever made.
+            for _ in range(120):
+                await pilot.pause(0.01)
                 if len(provider.requests) == 2:
                     break
             systems = [

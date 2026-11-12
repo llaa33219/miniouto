@@ -9,14 +9,10 @@ files directly (never `load()`, which force-writes the bundled styles via
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 import pytest
-from textual.app import App
-from textual.widgets import Label, ListItem, ListView
 
-from miniouto.cli.tui import SelectionModal
 from miniouto.paths_runtime import INVOCATION_CWD
 from miniouto.storage import sessions as session_store
 from miniouto.storage.paths import SESSION_DIR
@@ -176,85 +172,3 @@ def test_save_omits_cwd_when_empty_and_includes_it_when_set() -> None:
     # Then: "cwd" is serialized
     raw = json.loads((SESSION_DIR / f"{name}.json").read_text(encoding="utf-8"))
     assert raw["cwd"] == str(INVOCATION_CWD)
-
-
-class _ModalApp(App[None]):
-    def __init__(self, modal: SelectionModal) -> None:
-        super().__init__()
-        self._modal = modal
-
-    def on_mount(self) -> None:
-        self.push_screen(self._modal)
-
-
-def _rows(modal: SelectionModal) -> list[tuple[str, str | None, bool]]:
-    """(label, mapped value, is-header) for each row, top to bottom."""
-
-    async def _run() -> list[tuple[str, str | None, bool]]:
-        async with _ModalApp(modal).run_test() as pilot:
-            out: list[tuple[str, str | None, bool]] = []
-            for item in pilot.app.screen.query_one("#selection-list", ListView).query(ListItem):
-                out.append(
-                    (
-                        str(item.query_one(Label).content),
-                        modal._row_values.get(item),
-                        "-header" in item.classes,
-                    )
-                )
-            return out
-
-    return asyncio.run(_run())
-
-
-def test_selection_modal_renders_section_headers_and_preselects_correctly() -> None:
-    # Given: a modal with two groups, the current value in the second group,
-    # and a trailing extra option
-    modal = SelectionModal(
-        "Select session",
-        [],
-        current="sess-b",
-        allow_none=False,
-        extra_options=[("__new__", "+ new session…")],
-        sections=[
-            ("This directory", [("sess-a", "sess-a")]),
-            ("Other directories", [("sess-b", "[proj] sess-b")]),
-        ],
-    )
-
-    # When: the modal is mounted
-    rows = _rows(modal)
-
-    # Then: headers are display-only rows (no mapped value), options are not
-    assert rows == [
-        ("This directory", None, True),
-        ("  sess-a", "sess-a", False),
-        ("Other directories", None, True),
-        ("● [proj] sess-b", "sess-b", False),
-        ("  + new session…", "__new__", False),
-    ]
-
-    # And the pre-select row index is the real option row, not the position
-    # of that option in the options list
-    assert modal._row_index_by_value == {"sess-a": 1, "sess-b": 3, "__new__": 4}
-
-
-def test_selection_modal_flat_rendering_is_unchanged_without_sections() -> None:
-    # Given: a modal with no sections (style/provider/model pickers)
-    modal = SelectionModal(
-        "Select style",
-        ["a", "b"],
-        current="b",
-        allow_none=False,
-        extra_options=[("__new__", "+ new")],
-    )
-
-    # When: it is mounted
-    rows = _rows(modal)
-
-    # Then: a flat list, no headers, marker on the current option
-    assert rows == [
-        ("  a", "a", False),
-        ("● b", "b", False),
-        ("  + new", "__new__", False),
-    ]
-    assert modal._row_index_by_value == {"a": 0, "b": 1, "__new__": 2}

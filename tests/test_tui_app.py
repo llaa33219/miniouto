@@ -1,0 +1,1736 @@
+"""App-level smoke tests: the composited frame, the dispatch path, the overlays.
+
+Everything here drives a REAL headless ``ChatTUI`` through ``run_test`` — the
+same boot, the same key router, the same composition the terminal gets — and
+asserts on what a user could see or on the state a user's action leaves behind.
+The old Textual pilot-smoke assertions (``tests/test_tui_navigation.py``,
+``test_alarm_display.py``, ``test_tui_indicators.py``) are the specification for
+the ones that existed; the rest lock the two real-terminal bugs the port hit:
+
+* **The frame was shifted up one row.** ``_paint_log`` wrote each row's lines at
+  a row-relative offset, so the logo landed on row 0 and erased the header. The
+  regression is asserted as "row 0 is the header, the panel is rows 28-31",
+  which is exactly what the pty baseline shows.
+* **The real loop never delivered a posted message.** ``Enter`` in the input
+  posted ``ChatInput.Submitted`` and nothing drained it, so submitting only
+  worked under ``pilot.pause``. The pump is exercised directly here, because the
+  terminal loop's framing (Terminal/reader thread) is not what was broken.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import threading
+from typing import Any
+
+import pytest
+from rich.cells import cell_len
+from rich.text import Text
+
+import tui_harness
+from miniouto.cli import tui as tui_module
+from miniouto.cli.tui import (
+    CHAT_MAX_WIDTH,
+    HELP_TEXT,
+    AnswerRow,
+    ChatTUI,
+    CommandPalette,
+    LoopEvent,
+    ProviderSettingsPopup,
+)
+from miniouto.cli.tui.input import Mouse
+from miniouto.cli.tui.nodes import Rect
+from miniouto.cli.tui.rows import RowStatic
+from miniouto.core import inbox, summary
+from miniouto.storage import sessions as session_store
+from miniouto.storage import settings as settings_store
+
+BOOT = tui_harness.BOOT_SIZE
+
+
+@pytest.fixture(autouse=True)
+def _restore_settings() -> Any:
+    """Put ``settings.toml`` back after every test in this module.
+
+    These tests deliberately write the theme and the active session — that IS
+    the behaviour under test — but the settings file is shared, so an unrestored
+    write would decide the boot theme (and the session) of every test that runs
+    afterwards. Owned by the module rather than by each test because it must
+    also cover the async bodies, which a plain ``try/finally`` inside one test
+    would silently skip on an assertion failure.
+    """
+
+    saved = settings_store.load()
+    yield
+    settings_store.save(saved)
+
+
+# ── 1. the boot frame ───────────────────────────────────────────────────────
+
+
+def test_the_boot_frame_starts_with_the_header_and_ends_with_the_panel() -> None:
+    """The whole-frame regression: header on row 0, panel on the last four rows."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            lines = tui_harness.composed(app, *BOOT)
+            # Then: row 0 is the HEADER, not the logo (the off-by-one wrote the
+            # logo's first line there and pushed the header out of the frame).
+            assert "miniouto v" in lines[0], f"row 0 is not the header: {lines[0]!r}"
+            assert "⭘" not in lines[0], f"the header icon is back: {lines[0]!r}"
+            assert "⠀" not in lines[0], "the logo overwrote the header row"
+            # And: the logo is the block directly under it, then the ready line.
+            assert "⠀" in lines[1], f"the logo does not start on row 1: {lines[1]!r}"
+            ready = [i for i, line in enumerate(lines) if "Ready. Press Ctrl+P" in line]
+            assert ready and 1 < ready[0] < BOOT[1], f"no ready line: {ready}"
+            # And: the panel keeps its four rows at the bottom of the frame —
+            # a blank spinner row, then the two chip rows, then the help hint.
+            panel_rows = lines[-4:]
+            assert panel_rows[0].strip() == "", f"the idle spinner row is not blank: {panel_rows}"
+            assert "outo:" in panel_rows[1], panel_rows
+            assert "subagent:" in panel_rows[2], panel_rows
+            assert HELP_TEXT in panel_rows[3], panel_rows
+            # And: no logo leaked into any of them
+            assert "⠀" not in "".join(panel_rows)
+
+    asyncio.run(body())
+
+
+def test_the_panel_occupies_the_last_four_rows_of_the_screen() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            _log, _input, panel, _x = app.layout(*BOOT)
+            # Then: the panel's region is the bottom band, and the composited
+            # screen agrees (that is the copy a terminal actually draws).
+            assert panel.y == BOOT[1] - 4, panel
+            assert panel.y + panel.height == BOOT[1], panel
+            assert tui_harness.painted_line(app, panel.y).strip() == "", "spinner row"
+            assert "outo:" in tui_harness.painted_line(app, panel.y + 1)
+            assert "subagent:" in tui_harness.painted_line(app, panel.y + 2)
+            assert HELP_TEXT in tui_harness.painted_line(app, panel.y + 3)
+            # The row above the panel is the input band; the panel owns the
+            # rows below it and nothing else writes down here.
+            assert "█" in tui_harness.painted_line(app, panel.y - 1)
+
+    asyncio.run(body())
+
+
+def test_the_boot_frame_shows_the_logo_the_chips_and_the_help_hint() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            screen = "\n".join(tui_harness.painted(app))
+            # Then: the ornament, the four chips and the key hint are all there.
+            assert "⠀" in screen, "no logo"
+            assert "Ready. Press Ctrl+P for commands." in screen
+            values = tui_harness.chip_values(app)
+            assert set(values) == {"outo", "style", "subagent", "session"}
+            for kind, text in values.items():
+                assert text in screen, f"the {kind} chip is not on screen: {text!r}"
+            assert HELP_TEXT in screen, "the help hint is missing"
+
+    asyncio.run(body())
+
+
+def test_every_chip_renders_its_value_whole_and_on_screen() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            for kind, chip in tui_harness.chip_rows(app).items():
+                # Then: a chip keeps a real, on-screen region — the display
+                # cannot reach a chip that sits past the right edge.
+                assert chip.region.width > 0, f"{kind} collapsed"
+                assert 0 <= chip.region.x < BOOT[0], f"{kind} starts off screen"
+                assert chip.region.x + chip.region.width <= BOOT[0] + 1, kind
+                # And: its painted text is the whole value, never elided.
+                painted = chip.render().plain
+                assert "…" not in painted
+                assert painted == tui_harness.chip_values(app)[kind]
+
+    asyncio.run(body())
+
+
+def test_an_image_lane_blanks_the_frame_rows_it_actually_occupies() -> None:
+    """The same off-by-one, on the image lane: ``top`` is a FRAME row.
+
+    ``GraphicsOverlay.add`` emits the pixels at the frame-absolute ``top``, so
+    the rect the render blanks has to be at that same coordinate. Subtracting
+    the log rect's ``y`` blanked the lane one row too high, which painted log
+    text over the picture and left a hole above it.
+    """
+
+    class Placement:
+        width_cells = 6
+        height_cells = 2
+
+        def emit_at(self, x: int, y: int) -> bytes:
+            return b""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            row = RowStatic(Text("x"))
+            lines = [[(" " * 100, None)] for _ in range(30)]
+            log_rect = Rect(0, 5, 100, 20)
+            app._overlay = type(app._overlay)()
+            row.image_placements = lambda: [(0, 2, Placement())]  # type: ignore[method-assign]
+            app._paint_images(row, 7, log_rect, lines, None)  # type: ignore[arg-type]
+            # Then: the overlay emits at the frame row …
+            assert app._overlay.clear_regions() == [(2, 7, 6, 2)]
+            # … and exactly those rows are blanked — not rect.y's offset.
+            assert lines[7][0][0].strip() == ""
+            assert lines[8][0][0].strip() == ""
+            assert lines[5][0][0].strip() == ""
+            assert lines[6][0][0].strip() == ""
+
+    asyncio.run(body())
+
+
+
+
+def test_a_real_screenshot_row_paints_its_pixels_through_the_overlay(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole lane, end to end: row → rect → blanked frame → emitted pixels.
+
+    ``ToolRow`` reserves the rect and hands over a placement; the app blanks
+    exactly those frame rows and registers the placement; after the frame the
+    overlay writes the protocol bytes through the transport it is given, and a
+    removed row's delete takes the same route. This is the wiring between the
+    three modules, which no single-module test covers: a mismatch in the FRAME row
+    (the port's off-by-one) shows up here as pixels painted on top of text.
+
+    The rect is read back from the overlay rather than computed here, because the
+    app re-lays the row out at the log's own width — the line indices a 60-column
+    build produces are not the ones a 100-column log does.
+    """
+
+    from miniouto.cli.tui import graphics
+    from test_tui_rows import THEME, WIDTH
+
+    image = pytest.importorskip("PIL.Image")
+    png = tmp_path / "shot.png"
+    image.new("RGB", (64, 36), (200, 30, 40)).save(png)
+    monkeypatch.setattr(graphics, "_GRAPHICS_MODE", graphics.GRAPHICS_MODE_TGP)
+    monkeypatch.setattr(
+        graphics, "_DETECTED", graphics._Capabilities(frozenset({"kitty"}), (10, 20))
+    )
+
+    row = tui_module.ToolRow("Computer screenshot", tool_name="Computer")
+    row.set_result(f"Screenshot of the virtual display.\nImage saved to: {png}")
+    row._toggle()
+    row.build_lines(WIDTH, THEME)
+
+    written: list[bytes] = []
+    graphics.set_writer(written.append)
+    try:
+
+        async def body() -> None:
+            app = ChatTUI()
+            # Tall enough that the whole image rect sits inside the log viewport,
+            # so the blanking below is the rect itself, not a clipped part of it.
+            async with app.run_test(size=(100, 90)) as pilot:
+                await pilot.pause()
+                frame: list[list[tuple[str, Any]]] = [
+                    [(" " * 100, None)] for _ in range(90)
+                ]
+                app._paint_images(row, 7, Rect(0, 5, 100, 80), frame, None)  # type: ignore[arg-type]
+                (x, top, width, height), = app._overlay.clear_regions()
+                # Then: the rect starts below the row's caption, and every one of
+                # its frame rows was blanked — the row above it was not touched.
+                assert width > 0 and height > 0
+                assert top > 7
+                for blank in range(height):
+                    assert frame[top + blank][0][0].strip() == ""
+                assert frame[top - 1][0][0].strip() == ""
+                # When: the frame is done and the overlay emits
+                app._overlay.emit_post_draw()
+                assert len(written) == 1
+                emitted = written[0]
+                # Then: the pixels go out with a CUP at that exact frame row/column …
+                assert f"\x1b[{top + 1};{x + 1}H".encode() in emitted
+                # … as an upload the first time, and a place-only copy afterwards
+                assert b"a=T" in emitted
+                app._overlay.emit_post_draw()
+                assert b"a=T" not in written[1]
+                assert b"a=p" in written[1]
+                # …and the row's removal deletes the image it uploaded, through
+                # the same writer the frames went to.
+                (placement, _px, _py), = app._overlay._placements
+                image_id = placement.image_id
+                assert image_id is not None
+                written.clear()
+                row.release_image()
+                assert [w for w in written if b"a=d,d=I" in w and f"i={image_id}".encode() in w]
+
+        asyncio.run(body())
+    finally:
+        graphics.set_writer(None)
+
+
+def test_the_text_lane_shows_the_art_and_never_touches_the_overlay(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GRAPHICS_MODE_TEXT is the unchanged `.art` lane: no rect, no pixels.
+
+    A non-graphics terminal must look exactly as it did before this lane existed,
+    which means the row takes the text path and the overlay stays empty.
+    """
+
+    from miniouto.cli.tui import graphics
+    from test_tui_rows import THEME, WIDTH, write_art
+
+    image = pytest.importorskip("PIL.Image")
+    png = tmp_path / "shot.png"
+    image.new("RGB", (64, 36), (200, 30, 40)).save(png)
+    art = write_art(tmp_path, rows=3)
+    monkeypatch.setattr(graphics, "_GRAPHICS_MODE", graphics.GRAPHICS_MODE_TEXT)
+
+    row = tui_module.ToolRow("Computer screenshot", tool_name="Computer")
+    row.set_result(f"shot\nImage saved to: {png}\nSaved to: {art}")
+    row._toggle()
+    row.build_lines(WIDTH, THEME)
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            frame = [[(" " * 100, None)] for _ in range(30)]
+            app._overlay = type(app._overlay)()
+            app._paint_images(row, 7, Rect(0, 5, 100, 20), frame, None)  # type: ignore[arg-type]
+            # Then: no pixel rect anywhere, and the `.art` render is in the row
+            assert app._overlay.clear_regions() == []
+            assert row.image_placements() == []
+            block = row._screen_art()
+            assert block is not None and str(art) in block.plain
+
+    asyncio.run(body())
+
+
+# ── 2. submit → dispatch ────────────────────────────────────────────────────
+
+
+def test_enter_dispatches_the_prompt_on_the_pinned_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns: list[dict[str, Any]] = []
+
+    async def body() -> None:
+        tui_harness.stub_run_chat(monkeypatch, turns)
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-submit-session")
+            # Given / When: a prompt typed into the input and submitted
+            app._input.text = "hello from the test"
+            await pilot.press("enter")
+            await tui_harness.settle(pilot, want=1, turns=turns)
+            # Then: it went to the turn driver, on THIS session, continuing it
+            assert turns[0]["prompt"] == "hello from the test", turns
+            assert turns[0]["session"] == "app-submit-session", turns
+            assert turns[0]["continue"] is True
+            # And: the input is empty and the prompt is a user row on screen
+            assert app._input.text == ""
+            rows = [r for r in app._log.rows if isinstance(r, RowStatic)]
+            assert rows and tui_harness.row_text(rows[-1]).lstrip().startswith(
+                "> hello from the test"
+            )
+
+    asyncio.run(body())
+
+
+def test_a_posted_submit_message_is_delivered_by_the_message_pump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real-terminal regression: ``post_message`` alone must dispatch.
+
+    The terminal loop used to drain the input QUEUE only, so a handler that
+    POSTED a message (Enter → ``ChatInput.Submitted``) had no effect outside a
+    ``pilot.pause`` drive. The pump is ``_drain_messages``; asserting on it is
+    what keeps the loop honest without owning a terminal in a test.
+    """
+
+    turns: list[dict[str, Any]] = []
+
+    async def body() -> None:
+        tui_harness.stub_run_chat(monkeypatch, turns)
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-pump-session")
+            app._input.text = "posted, not pumped"
+            # Given: the key is handled (it posts) but NOTHING pumps afterwards
+            app.inject_key(tui_module.Key("Enter"))
+            assert app._messages, "Enter posted no message at all"
+            assert not turns, "the dispatch ran without a pump"
+            # When: the loop's own pump step runs
+            app._drain_messages()
+            await tui_harness.settle(pilot, want=1, turns=turns)
+            # Then: the turn it was for actually started
+            assert turns[0]["prompt"] == "posted, not pumped"
+            assert app._input.text == ""
+
+    asyncio.run(body())
+
+
+def test_a_chip_click_posted_message_also_reaches_the_pump() -> None:
+    """A handler-posted message (a chip's ``ChipClicked``) dispatches the same way."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-chip-session")
+            chip = app.query_one("#chip-outo")
+            # When: the chip is activated the way a click does it, and pumped
+            chip.activate()
+            assert app._messages, "the chip posted no message"
+            app._drain_messages()
+            # Then: its editor opened
+            assert isinstance(app.screen, ProviderSettingsPopup)
+
+    asyncio.run(body())
+
+
+def test_a_real_click_on_a_chip_opens_its_editor() -> None:
+    """The click has to reach the chip: the panel's children carry SCREEN regions."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-click-session")
+            chip = app.query_one("#chip-outo")
+            # Given: the panel is painted, so the chip has its screen region
+            app.compose(*BOOT)
+            await pilot.click(chip, offset=(2, 0))
+            # Then: the click routed to the chip, not to the log behind it
+            assert isinstance(app.screen, ProviderSettingsPopup)
+
+    asyncio.run(body())
+
+
+# ── 3. esc-esc stops the turn ───────────────────────────────────────────────
+
+
+def test_escape_twice_sets_the_cancel_event() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-esc-session")
+            # Given: a turn is in flight, with the event the driver watches
+            app._busy = True
+            app._cancel_event = threading.Event()
+            # When: one Esc only WARNS
+            await pilot.press("escape")
+            assert app._esc_hint == "press esc again to stop", app._esc_hint
+            assert not app._cancel_event.is_set(), "one Esc stopped the turn"
+            # And: the second Esc inside the window stops it
+            await pilot.press("escape")
+            assert app._cancel_event.is_set(), "two Esc presses did not stop the turn"
+            assert app._esc_hint == "stopping after the current step…"
+
+    asyncio.run(body())
+
+
+def test_escape_does_nothing_when_no_turn_is_running() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            app._busy = False
+            await pilot.press("escape")
+            # Then: no hint, no cancel — an idle app ignores Esc entirely
+            assert app._esc_hint is None
+            assert app._cancel_event is None
+            assert app._last_escape == 0.0
+
+    asyncio.run(body())
+
+
+# ── 4. ctrl+l clears the log ────────────────────────────────────────────────
+
+
+def test_ctrl_l_clears_the_log_including_the_logo() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-clear-session")
+            app._post_system("something to clear")
+            await pilot.pause()
+            assert app._log.rows, "nothing was in the log to clear"
+            # When: Ctrl+L
+            await pilot.press("ctrl+l")
+            # Then: the log is empty, the logo is gone and the screen is blank
+            # below the header
+            assert app._log.rows == []
+            assert app._logo_shown is False
+            screen = tui_harness.painted(app)
+            assert "something to clear" not in "\n".join(screen)
+            assert "⠀" not in "\n".join(screen[:-4]), "the logo survived the clear"
+
+    asyncio.run(body())
+
+
+# ── 5. the command palette ──────────────────────────────────────────────────
+
+
+def test_ctrl_p_opens_the_palette_and_typing_filters_it() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            # Given / When: the palette opens over the base screen
+            await pilot.press("ctrl+p")
+            palette = app.screen
+            assert isinstance(palette, CommandPalette)
+            # Then: it lists this app's own commands first
+            titles = [str(c.title) for c in palette.commands]
+            assert titles[0] == "New session", titles
+            # No numeric prefixes and none of the three dropped commands
+            assert not any(title[:2].isdigit() for title in titles), titles
+            assert "Clear log" not in titles and "Maximize" not in titles
+            assert "Screenshot" not in titles, titles
+            # And: a query narrows it to the matching command
+            palette.set_query("theme")
+            assert [str(c.title) for c in palette.results] == ["Theme"]
+            await pilot.pause()
+
+    asyncio.run(body())
+
+
+def test_the_palette_runs_the_highlighted_command_and_closes() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-palette-session")
+            await pilot.press("ctrl+p")
+            palette = app.screen
+            palette.set_query("new session")
+            await pilot.press("enter")
+            # Then: `New session` ran (the logo is back, a session was
+            # minted) and the palette is gone
+            assert app.screen is not palette
+            assert app._logo_shown is True
+            assert app._pinned_session().startswith("tui-")
+
+    asyncio.run(body())
+
+
+def test_the_palette_mentions_and_escape_closes_it() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            await pilot.press("ctrl+p")
+            assert isinstance(app.screen, CommandPalette)
+            # Then: Esc returns to the base screen without running anything
+            await pilot.press("escape")
+            assert not isinstance(app.screen, CommandPalette)
+            assert app._logo_shown is True, "Esc ran a command"
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize(("query", "expected"), [("theme", "Theme"), ("style", "Pick style")])
+def test_palette_search_is_fuzzy_and_finds_the_command(query: str, expected: str) -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            await pilot.press("ctrl+p")
+            palette = app.screen
+            assert isinstance(palette, CommandPalette)
+            palette.set_query(query)
+            assert str(palette.results[0].title) == expected
+
+    asyncio.run(body())
+
+
+# ── 6. theme: boot, persist, fallback ──────────────────────────────────────
+
+
+def test_a_stored_theme_is_used_on_the_next_boot() -> None:
+    settings_store.update(theme="nord")
+    app = ChatTUI()
+    assert app.theme == "nord"
+    assert app.current_theme is app.get_theme("nord")
+
+
+def test_an_unregistered_stored_theme_falls_back_to_the_default() -> None:
+    settings_store.update(theme="not-a-registered-theme")
+    app = ChatTUI()
+    assert app.theme == tui_module.THEME_NAME
+    assert app.theme in app.available_themes
+
+
+def test_assigning_a_theme_persists_it_for_the_next_boot() -> None:
+    """Assignment IS the persistence — the old app spelled it a reactive."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            # Given / When: a theme is assigned (what the picker and a keybinding do)
+            app.theme = "gruvbox"
+            # Then: the choice is on disk, which is what the next boot reads …
+            assert settings_store.load().theme == "gruvbox"
+            # … and it is the theme actually in force now
+            assert app.current_theme.name == "gruvbox"
+            assert ChatTUI().theme == "gruvbox"
+
+    asyncio.run(body())
+
+
+def test_css_variables_carry_the_resolved_palette() -> None:
+    app = ChatTUI()
+    variables = app.get_css_variables()
+    # Then: the names the old CSS used all resolve, from the live theme
+    for name in ("text", "text-muted", "text-disabled", "text-answer", "boost"):
+        assert name in variables, name
+    assert variables["primary"] == app.current_theme.primary
+    assert variables["text"] == tui_module.auto_text(
+        app.current_theme, app.current_theme.background
+    )
+
+
+# ── 7. hand-off ────────────────────────────────────────────────────────────
+
+
+def test_a_handoff_mounts_the_marker_and_moves_the_session() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-handoff-from")
+            session_store.create("app-handoff-from")
+            session_store.create("app-handoff-to")
+            # Given: a hand-off is pending
+            summary.request_handoff(
+                "app-handoff-to",
+                from_session="app-handoff-from",
+                summary_dir="/tmp/summary",
+            )
+            # When: the app applies it
+            app._apply_handoff()
+            await pilot.pause()
+            # Then: the OLD conversation ends visibly…
+            texts = [tui_harness.row_text(r) for r in app._log.rows]
+            assert any("------summary → app-handoff-to------" in t for t in texts), texts
+            # …the pin moved…
+            assert app._pinned_session() == "app-handoff-to"
+            assert settings_store.load().session == "app-handoff-to"
+            # …and the marker is on the OLD session's disk too, as its own turn
+            data = session_store.load("app-handoff-from")
+            assert data.turns, "no turn written for the marker"
+            assert data.turns[-1].events[0]["kind"] == "handoff"
+
+    asyncio.run(body())
+
+
+# ── 8. the inbox poll ──────────────────────────────────────────────────────
+
+
+def test_an_idle_inbox_message_becomes_a_user_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    turns: list[dict[str, Any]] = []
+
+    async def body() -> None:
+        tui_harness.stub_run_chat(monkeypatch, turns)
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-inbox-session")
+            session_store.create("app-inbox-session")
+            # Given: a message landed in this session's inbox while idle
+            inbox.insert("app-inbox-session", "queued while you were away")
+            # When: the poll runs (the 1s timer calls exactly this)
+            app._deliver_pending_messages()
+            await tui_harness.settle(pilot, want=1, turns=turns)
+            # Then: it started a turn with that text as the prompt
+            assert turns[0]["prompt"] == "queued while you were away", turns
+            assert turns[0]["session"] == "app-inbox-session"
+            # And: the inbox is drained, so a second poll does not repeat it
+            assert inbox.pending_count("app-inbox-session") == 0
+            app._deliver_pending_messages()
+            await pilot.pause()
+            assert len(turns) == 1, turns
+
+    asyncio.run(body())
+
+
+def test_an_inbox_message_during_a_turn_is_left_to_the_hook() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-inbox-busy")
+            session_store.create("app-inbox-busy")
+            inbox.insert("app-inbox-busy", "arrived mid-turn")
+            # Given: a turn is in flight — the core's hook owns delivery then
+            app._busy = True
+            # When: the idle poll runs anyway
+            app._deliver_pending_messages()
+            # Then: it did NOT steal the message from the running turn
+            assert inbox.pending_count("app-inbox-busy") == 1
+            app._busy = False
+            inbox.drain("app-inbox-busy")
+
+    asyncio.run(body())
+
+
+# ── 9. the jump button ─────────────────────────────────────────────────────
+
+
+def test_the_jump_button_appears_when_scrolled_away_and_hides_at_the_tail() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-jump-session")
+            for index in range(60):
+                app._mount_row(RowStatic(Text(f"line {index}")))
+            app.compose(80, 24)
+            # Given: the log is longer than its viewport, pinned to the tail
+            assert app._log.max_scroll_y > 0
+            assert app._jump.display is False, "the button showed while at the tail"
+            # When: the user scrolls away from the tail
+            app._log.scroll_to(y=0)
+            app.compose(80, 24)
+            # Then: the button appears …
+            assert app._jump.display is True
+            button_line = tui_harness.painted_line(app, app._jump.region.y)
+            assert "- latest -" in button_line, button_line
+            # … and hides again once the tail is back
+            app._log.scroll_end(animate=False)
+            app.compose(80, 24)
+            assert app._jump.display is False
+
+    asyncio.run(body())
+
+
+def test_clicking_the_jump_button_returns_to_the_tail() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-jump-click")
+            for index in range(60):
+                app._mount_row(RowStatic(Text(f"line {index}")))
+            # A frame first: the viewport height is what bounds max_scroll_y.
+            app.compose(80, 24)
+            app._log.scroll_to(y=0)
+            app.compose(80, 24)
+            assert app._jump.display is True
+            # When: the button is clicked
+            await pilot.click(app.query_one("#jump-bottom"), offset=(1, 0))
+            app.compose(80, 24)
+            # Then: the log follows its tail again and the button is gone
+            assert app._log.scroll_y == app._log.max_scroll_y
+            assert app._jump.display is False
+
+    asyncio.run(body())
+
+
+# ── 10. the compat surface the ported tests rely on ────────────────────────
+
+
+def test_query_one_finds_the_mounted_widgets_and_the_chips() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            # Then: the ids the ported suites use all resolve, and a chip renders
+            for selector in ("#header", "#chat", "#input", "#bottom-panel", "#jump-bottom"):
+                assert app.query_one(selector) is not None, selector
+            chip = app.query_one("#chip-outo")
+            assert chip.render().plain.startswith("outo: ")
+            assert chip.region.width > 0
+            # And: query() by type walks the same tree
+            assert len(app.query(tui_module.StatusChip)) == 4
+            assert app.query("#chip-outo") == [chip]
+
+    asyncio.run(body())
+
+
+def test_a_modal_is_reached_through_the_screen_not_the_app() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-query-session")
+            app.on_status_chip_chip_clicked(
+                tui_module.StatusChip.ChipClicked(app.query_one("#chip-subagent"))
+            )
+            popup = app.screen
+            assert isinstance(popup, ProviderSettingsPopup)
+            # Then: the popup's nodes live in ITS tree, exactly as a pushed
+            # Textual screen did — app.query_one does not see them
+            assert popup.query_one("#provider-settings-title").render().plain
+            with pytest.raises(LookupError):
+                app.query_one("#provider-settings-title")
+
+    asyncio.run(body())
+
+
+def test_remove_children_unmounts_the_base_screen() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            assert app._base_screen.children
+            app.remove_children()
+            assert app._base_screen.children == []
+
+    asyncio.run(body())
+
+
+def test_the_app_exposes_the_ported_seams_through_the_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patching ``miniouto.cli.tui.<name>`` must reach the caller (item D)."""
+
+    import types
+
+    from miniouto.cli.tui import config as config_module
+
+    # Given: a package-level patch of the reasoning API seam
+    fake = types.SimpleNamespace(reasoning_choices=lambda model, prov: ["patched"])
+    monkeypatch.setattr(tui_module, "_get_reasoning_api", lambda: fake)
+    # Then: the trio helper that owns the call resolves THROUGH the package
+    assert config_module._reasoning_choices("m", "p") == ["patched"]
+
+    # And: run_chat resolves through the package too
+    def fake_run_chat(opts: Any, sink: Any = None) -> str:
+        return ""
+
+    monkeypatch.setattr(tui_module, "run_chat", fake_run_chat)
+    from miniouto.cli.tui import app as app_module
+
+    assert app_module._chat_runner() is fake_run_chat
+
+
+def test_every_module_alias_the_suites_patch_is_re_exported() -> None:
+    for name in (
+        "catalog_api",
+        "context_api",
+        "inbox",
+        "runtime",
+        "summary",
+        "update_check",
+        "session_config",
+        "provider_store",
+        "session_store",
+        "settings_store",
+        "style_store",
+        "paths",
+        "paths_runtime",
+        "ascii_art",
+        "handoff_marker",
+        "run_chat",
+        "ChatOptions",
+        "LoopCancelledError",
+        "default_provider_config",
+        "LoopEvent",
+        "STREAM_THINKING",
+        "SUPPORTED_FORMATS",
+        "CatalogDialect",
+        "add_provider_from_catalog",
+        "catalog_compatibility",
+        "resolve_catalog_dialect",
+        "SOURCE_CUSTOM",
+        "is_catalog_source",
+        "__version__",
+    ):
+        assert hasattr(tui_module, name), f"miniouto.cli.tui.{name} is missing"
+
+
+# ── 10. the live stream row must leave the log when the answer lands ───────
+
+
+def test_the_final_answer_replaces_the_streamed_row_instead_of_doubling_it() -> None:
+    """Regression (C1): every turn used to paint its answer TWICE.
+
+    `_RowWindow.remove` detached with `row.remove()`, and `Node.remove` only
+    splices `parent.children` — but the log paints `rows` (which IS `_mounted`).
+    So the live StreamRow stayed paintable next to the canonical AnswerRow: the
+    transcript grew a duplicate answer every single turn.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            # Given: a message streaming into a live row
+            app._apply_stream_text("The answer is ")
+            app._apply_stream_text("42.")
+            await pilot.pause()
+            # When: the canonical form arrives
+            app._finalize_stream()
+            app._mount_row(AnswerRow("The answer is 42."))
+            await pilot.pause()
+            painted = tui_harness.composed(app, 80, 24)
+            answers = [line for line in painted if "answer is 42" in line]
+            # Then: exactly ONE painted answer line, and the log holds one row
+            assert answers == ["The answer is 42."], painted
+            assert len(app._log._mounted) == 1
+            assert app._window.rows == list(app._log._mounted)
+
+    asyncio.run(body())
+
+
+def test_a_pruned_row_disappears_from_the_painted_frame() -> None:
+    """Regression (C1, invariant 18): a pruned row stayed on screen."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            app._add_event_row(
+                LoopEvent(actor="outo", kind="tool", text="Bash a1", tool_name="Bash", msg_ref="111")
+            )
+            app._add_event_row(
+                LoopEvent(actor="outo", kind="tool", text="Bash a2", tool_name="Bash", msg_ref="222")
+            )
+            await pilot.pause()
+            assert any("Bash a1" in line for line in tui_harness.composed(app, 80, 24))
+            # When: the first message is pruned
+            app._remove_event_rows(["111"])
+            await pilot.pause()
+            painted = tui_harness.composed(app, 80, 24)
+            # Then: its row left the FRAME, not just the window list
+            assert not any("Bash a1" in line for line in painted), painted
+            assert any("Bash a2" in line for line in painted), painted
+            assert app._log._mounted == app._window.rows
+
+    asyncio.run(body())
+
+
+def test_a_mid_turn_message_is_painted_once_after_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (C1 on the inbox path, invariants 16/20): shown TWICE.
+
+    `_queue_inbox_message` paints an optimistic row and `_deliver_pending_messages`
+    retires it before posting the real prompt. Retiring went through the window's
+    `row.remove()`, which did not detach from the log — so the optimistic row
+    stayed painted next to the prompt that replaced it.
+    """
+
+    turns: list[dict[str, Any]] = []
+
+    async def body() -> None:
+        tui_harness.stub_run_chat(monkeypatch, turns)
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-inbox-midturn")
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            # Given: the user typed while a turn was in flight
+            app._busy = True
+            app._queue_inbox_message("MIDTURN-TEXT")
+            await pilot.pause()
+            assert sum("MIDTURN-TEXT" in line for line in tui_harness.composed(app, *BOOT)) == 1
+            # When: the turn ends and the queued message becomes the next prompt
+            app._busy = False
+            app._deliver_pending_messages()
+            await tui_harness.settle(pilot, want=1, turns=turns)
+            painted = tui_harness.composed(app, *BOOT)
+            # Then: it is on screen exactly once, and so is the dispatch
+            assert sum("MIDTURN-TEXT" in line for line in painted) == 1, painted
+            assert turns[0]["prompt"] == "MIDTURN-TEXT", turns
+
+    asyncio.run(body())
+
+
+# ── 11. call_from_thread really hops threads ───────────────────────────────
+
+
+def test_call_from_thread_runs_the_callback_on_the_loop_thread() -> None:
+    """Regression (C2, invariant 10): the hop silently did nothing.
+
+    `call_from_thread` resolved the loop with `asyncio.get_running_loop()`, which
+    raises on the `asyncio.to_thread` worker the agent loop runs on — so the
+    except branch ran the callback INLINE on that worker, mutating UI state while
+    the loop thread was inside `compose()`. The headless harness runs everything
+    on one thread and could never see it, so this test uses a REAL worker.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            loop_thread = threading.get_ident()
+            seen: list[int] = []
+
+            def callback() -> None:
+                seen.append(threading.get_ident())
+
+            # When: the agent worker (not the loop) posts a UI callback
+            await asyncio.to_thread(app.call_from_thread, callback)
+            await pilot.pause()
+            # Then: it ran exactly once, and on the loop's own thread
+            assert len(seen) == 1
+            assert seen[0] == loop_thread
+
+    asyncio.run(body())
+
+
+def test_call_from_thread_runs_inline_when_no_loop_is_bound() -> None:
+    # A synchronous caller has no loop to hop to; the callback must still run
+    app = ChatTUI()
+    seen: list[str] = []
+    app.call_from_thread(lambda: seen.append("ran"))
+    assert seen == ["ran"]
+
+
+# ── 12. Shift+Tab (BackTab) cycles focus backward from the real parser ─────
+
+
+def test_backtab_from_the_real_parser_cycles_focus_backward() -> None:
+    """Regression (M3): CSI Z was ignored in the real terminal.
+
+    ``input.Key`` carries BackTab as its own ``code`` with ``shift`` set, but
+    ``handle_key`` only tested ``code == "Tab"``. The headless harness hid it
+    because ``nodes.compile_key`` rewrites shift+tab to ``Tab``+shift, so the
+    bytes a REAL terminal sends are fed through ``InputParser`` here.
+    """
+
+    async def body() -> None:
+        from miniouto.cli.tui.input import InputParser
+
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            app._set_focus(app._input)
+            # Given: the input holds focus
+            assert app._focused is app._input
+            # When: the terminal's Shift+Tab arrives as raw bytes
+            events = InputParser().feed(b"\x1b[Z")
+            assert [event.code for event in events] == ["BackTab"]
+            for event in events:
+                app._handle_event(event)
+            await pilot.pause()
+            # Then: focus moved BACKWARD to the last chip, not forward
+            order = app._focus_order()
+            assert app._focused is order[-1]
+            assert app._focused is not order[1]
+
+    asyncio.run(body())
+
+
+# ── 13. the wheel honours the modal on top (regression m8) ─────────────────
+
+
+def test_a_wheel_detent_does_not_scroll_the_log_behind_a_modal() -> None:
+    """Regression (m8): wheel reports bypassed the modal-ownership check.
+
+    Every other mouse report goes through `_route_mouse`, which hands a modal the
+    whole screen; the wheel called `scroll_wheel` directly, so a palette (or any
+    picker) sat still while the log scrolled behind it.
+    """
+
+    async def body() -> None:
+        from miniouto.cli.tui.input import Mouse
+
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            for index in range(200):
+                app._mount_row(RowStatic(f"row {index}"))
+            await pilot.pause()
+            app.action_command_palette()
+            await pilot.pause()
+            assert isinstance(app.screen, CommandPalette)
+            before = app._log.scroll_y
+            assert before > 0, "the log cannot scroll: the test is vacuous"
+            # When: the wheel turns UP with the palette open (one detent only:
+            # up+down would cancel out and pass even on the broken code)
+            app._handle_event(Mouse("wheel_up", 10, 5))
+            await pilot.pause()
+            # Then: the log behind the modal did not move
+            assert app._log.scroll_y == before
+
+    asyncio.run(body())
+
+
+def test_the_wheel_still_scrolls_the_log_when_no_modal_is_up() -> None:
+    async def body() -> None:
+        from miniouto.cli.tui.input import Mouse
+
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            for index in range(200):
+                app._mount_row(RowStatic(f"row {index}"))
+            await pilot.pause()
+            before = app._log.scroll_y
+            app._handle_event(Mouse("wheel_up", 10, 5))
+            await pilot.pause()
+            assert app._log.scroll_y == before - 3
+
+    asyncio.run(body())
+
+
+# ── 14. a terminal resize reaches the frame (regression M6) ────────────────
+
+
+class _FakeRect:
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+
+
+class _FakeFrame:
+    """Enough of a pyratatui ``Frame`` for ``ChatTUI.render`` (area + widgets)."""
+
+    def __init__(self, area: tuple[int, int]) -> None:
+        self.area = _FakeRect(*area)
+
+    def render_widget(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class _FakeTerminal:
+    """A ``pt.Terminal`` double: no alt screen, no cursor, no escape bytes.
+
+    ``hook`` records the input callbacks the loop registers, the way the real
+    shim does before it opens the canvas — the loop tests then drive them
+    directly, standing in for xnano's own input thread.
+    """
+
+    def __init__(self, size: tuple[int, int]) -> None:
+        self.size = size
+        self.frames: list[tuple[int, int]] = []
+        self.cursor: list[str] = []
+        self.hooks: dict[str, Any] = {}
+        self.exit_after = 0
+        self._on_exit: Any = None
+        self._size_source: Any = None
+
+    def __enter__(self) -> _FakeTerminal:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def hook(self, kind: str, callback: Any) -> None:
+        self.hooks[kind] = callback
+
+    def area(self) -> Any:
+        width, height = self.size
+        return _FakeRect(width, height)
+
+    def draw(self, render: Any) -> None:
+        if self._size_source is not None:  # a resize moves the real screen's area
+            self.size = self._size_source()
+        self.frames.append(self.size)
+        render(_FakeFrame(self.size))
+        if self._on_exit is not None and len(self.frames) >= self.exit_after:
+            self._on_exit()
+
+    def move_cursor(self, _x: int, _y: int) -> None:
+        self.cursor.append("move")
+
+    def hide_cursor(self) -> None:
+        self.cursor.append("hide")
+
+    def show_cursor(self) -> None:
+        self.cursor.append("show")
+
+
+class _FakeKeyReading:
+    """One xnano key reading, as ``context.keyboard`` exposes it."""
+
+    def __init__(self, key: str, *, kind: str = "press", modifiers: Any = (), text: Any = None):
+        self.key = key
+        self.kind = kind
+        self.modifiers = frozenset(modifiers)
+        self.text = text
+
+
+class _FakeKeyboard:
+    def __init__(self, reading: _FakeKeyReading, pasted: str | None = None) -> None:
+        self._reading = reading
+        self.pasted = pasted
+        self.key = reading.key
+        self.kind = reading.kind
+        self.modifiers = reading.modifiers
+        self.text = reading.text
+
+
+class _FakePoint:
+    """An xnano ``Point``: the cell a pointer reading reports."""
+
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+
+class _FakeMouseReading:
+    """One xnano pointer reading, as ``context.mouse`` exposes it."""
+
+    def __init__(self, kind: str | None, position: Any = None, button: Any = "left") -> None:
+        self.kind = kind
+        self.position = position
+        self.button = button
+        self.pointer = position
+        self.scroll = _FakeScroll(0)
+
+
+class _FakeScroll:
+    def __init__(self, y: int) -> None:
+        self.x = 0
+        self.y = y
+
+
+class _FakeContext:
+    """The three readings a hook callback touches: keyboard, mouse, size."""
+
+    def __init__(
+        self,
+        *,
+        keyboard: _FakeKeyboard | None = None,
+        mouse: _FakeMouseReading | None = None,
+        size: tuple[int, int] | None = None,
+    ) -> None:
+        self.keyboard = keyboard
+        self.mouse = mouse
+        self.size = _FakeRect(*size) if size is not None else None
+
+
+def test_the_running_loop_polls_the_terminal_size_every_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (M6): resize was dead — nothing ever built a `Resize`.
+
+    ``terminal_size()`` was called exactly once, at boot, and no ``Resize`` was
+    ever constructed anywhere in ``src/``. This drives the REAL ``run_async``
+    over a fake terminal (only the terminal, the reader thread and the ioctl are
+    doubled) and asserts the loop POLLS: without the poll there is no resize
+    path at all in a real terminal.
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        terminal = _FakeTerminal((80, 24))
+        app = ChatTUI(terminal=terminal)
+        polls: list[tuple[int, int]] = []
+
+        def size() -> tuple[int, int]:
+            polls.append((80, 24))
+            return (80, 24)
+
+        monkeypatch.setattr(app_module, "terminal_size", size)
+        monkeypatch.setattr(app_module, "_write_terminal", lambda _payload: None)
+        terminal.exit_after = 3
+        terminal._on_exit = app.exit
+        await app.run_async()
+        # Then: the loop polls the ioctl at least once per frame — the boot call
+        # is the only one the old code ever made. (The tick that sets `_running`
+        # False still polls before it re-tests the loop condition, so the counts
+        # match within one.)
+        assert len(polls) >= len(terminal.frames) >= 3, (polls, terminal.frames)
+
+    asyncio.run(body())
+
+
+def test_a_size_change_reaches_compose_through_the_resize_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resize path is LIVE: a changed geometry repaints at the new size."""
+
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            monkeypatch.setattr(app_module, "terminal_size", lambda: (100, 40))
+            # When: the ioctl reports a new size (what the loop does per tick)
+            app._sync_terminal_size()
+            # Then: the app's geometry moved and compose paints the new frame
+            assert (app.size.width, app.size.height) == (100, 40)
+            painted = tui_harness.composed(app, 100, 40)
+            assert len(painted) == 40
+            assert all(len(line) <= 100 for line in painted)
+            # And: the panel still occupies the last four rows of the NEW height
+            assert painted[-1].strip() != ""
+            assert "row" not in painted[0] or painted[0].strip() == painted[0].strip()
+
+    asyncio.run(body())
+
+
+def test_a_resize_that_changed_nothing_does_no_extra_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        terminal = _FakeTerminal((80, 24))
+        app = ChatTUI(terminal=terminal)
+        monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
+        monkeypatch.setattr(app_module, "_write_terminal", lambda _payload: None)
+        terminal.exit_after = 2
+        terminal._on_exit = app.exit
+        await app.run_async()
+        # The poll runs every frame; an unchanged size costs nothing at all
+        assert len(terminal.frames) == 2, terminal.frames
+
+    asyncio.run(body())
+
+
+def test_the_loop_shows_the_caret_again_before_leaving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (m9): the caret stayed hidden after exit.
+
+    ``_position_cursor`` hides the hardware caret on every frame with no caret to
+    place — the state a user is in whenever focus is on a chip or a modal is up —
+    and nothing ever undid it before the alt screen was left.
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        terminal = _FakeTerminal((80, 24))
+        app = ChatTUI(terminal=terminal)
+        # Given: the LAST frame of the loop leaves the caret hidden — that is
+        # `_position_cursor`'s None branch (focus off the input: tab a chip, or a
+        # modal owns the screen), and it is the state nothing used to undo.
+        def position(term: Any) -> None:
+            term.hide_cursor()
+
+        monkeypatch.setattr(app, "_position_cursor", position)
+        written: list[str] = []
+        monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
+        monkeypatch.setattr(app_module, "_write_terminal", written.append)
+        terminal.exit_after = 2
+        terminal._on_exit = app.exit
+        await app.run_async()
+        # Then: every frame hid it and the teardown showed it again
+        assert terminal.cursor.count("hide") == len(terminal.frames), terminal.cursor
+        assert terminal.cursor[-1] == "show", terminal.cursor
+        # And: the loop registered one hook per input kind BEFORE the canvas
+        # opened. That ordering is the contract: xnano decides which terminal
+        # settings (mouse/scroll/paste) to switch on from the hooks that exist
+        # at open time, and a hook added afterwards is attached and never runs.
+        assert set(terminal.hooks) == {"key", "mouse", "scroll", "paste", "resize"}
+        # And: the loop itself never touches the alt screen — the Terminal
+        # context owns that pair (?1049h on __enter__, ?1049l on __exit__).
+        assert not any("1049" in payload for payload in written)
+
+    asyncio.run(body())
+
+
+def test_run_tui_is_the_only_writer_of_the_alt_screen_leave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (m7): the leave sequence must have exactly ONE owner.
+
+    ``Terminal.__enter__`` emits ``?1049h`` — verified with a pty probe, which
+    printed exactly ``b'\\x1b[?1049h\\x1b[?1049l'`` for an empty session — so the
+    matching leave belongs to ``__exit__``. ``run_async`` used to write a second
+    one inside the context, which made the pair unbalanced AND restored the mouse
+    modes twice. `run_tui`'s ``finally`` is the single writer, and it covers the
+    paths where the context never opened (a failed boot, Ctrl-C before the loop).
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    written: list[str] = []
+    terminal = _FakeTerminal((80, 24))
+    app = ChatTUI(terminal=terminal)
+
+    async def no_frames(self: ChatTUI) -> None:
+        self.exit()  # the terminal handshake is `Terminal`'s, not ours to redo
+
+    monkeypatch.setattr(ChatTUI, "run_async", no_frames)
+    monkeypatch.setattr(app_module, "_write_terminal", written.append)
+    monkeypatch.setattr(tui_module, "detect_graphics_mode", lambda: "text")
+    # The double stands in for `pt.Terminal(real_screen=True)`; the keyword
+    # is accepted rather than ignored so the call shape is the real one.
+    monkeypatch.setattr(app_module.pt, "Terminal", lambda **_kw: terminal)
+    monkeypatch.setattr(tui_module, "ChatTUI", lambda *a, **k: app)
+
+    app_module.run_tui()
+    # Then: exactly one leave, from `run_tui`'s finally — the context never
+    # opened, so nothing else supplied one.
+    leaves = [payload for payload in written if "1049" in payload]
+    assert leaves == ["\x1b[?1049l"], written
+
+
+def test_run_tui_leaves_the_alt_screen_only_when_the_context_did_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of m7: a `Terminal` that DID open owns its own leave.
+
+    `Terminal.__exit__` emits the matching ``?1049l``, so `run_tui`'s finally must
+    stay silent — otherwise every normal exit sent the leave twice (measured with
+    a pty probe: two ``\\x1b[?1049l`` on the wire).
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    written: list[str] = []
+    app = ChatTUI(terminal=None)
+
+    async def entered(self: ChatTUI) -> None:
+        # Stand in for a session whose Terminal context DID open.
+        self._alt_screen_entered = True
+        self.exit()
+
+    monkeypatch.setattr(ChatTUI, "run_async", entered)
+    monkeypatch.setattr(app_module, "_write_terminal", written.append)
+    monkeypatch.setattr(tui_module, "detect_graphics_mode", lambda: "text")
+    monkeypatch.setattr(tui_module, "ChatTUI", lambda *a, **k: app)
+
+    app_module.run_tui()
+    # Then: no leave from here — `Terminal.__exit__` already sent one
+    assert [payload for payload in written if "1049" in payload] == [], written
+
+
+def test_the_running_loop_never_writes_an_alt_screen_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of m7, on the REAL loop: no `?1049` from `run_async`."""
+
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        terminal = _FakeTerminal((80, 24))
+        app = ChatTUI(terminal=terminal)
+        written: list[str] = []
+        monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
+        monkeypatch.setattr(app_module, "_write_terminal", written.append)
+        terminal.exit_after = 2
+        terminal._on_exit = app.exit
+        await app.run_async()
+        # `Terminal.__enter__`/`__exit__` own the alt-screen pair; the loop owns
+        # only the mouse/paste modes and the caret.
+        assert not any("1049" in payload for payload in written), written
+        assert len(terminal.frames) >= 2, "the loop never ran"
+
+    asyncio.run(body())
+
+
+# ── 12. the centred column at every width (I2) ─────────────────────────────
+
+
+@pytest.mark.parametrize(("width", "height"), [(40, 20), (80, 24), (120, 32), (200, 30), (250, 30)])
+def test_the_chat_column_stays_centred_and_inside_the_screen(width: int, height: int) -> None:
+    """The 150-cell cap must CENTRE the column, not pin it to the left edge.
+
+    Regression: `_paint_log`/`_paint_input` wrote each composed line at cell 0
+    instead of at the column's x, so on a 200-column terminal the log, the input
+    band and the chips all sat hard against the left edge while `layout()`
+    reported a centred column — the frame the user saw disagreed with the
+    geometry every click test asserts against.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, f"app-column-{width}")
+            app._post_system("COLUMN-MARK")
+            await pilot.pause()
+            lines = app.compose(width, height)
+            _log, input_rect, panel, column_x = app.layout(width, height)
+            assert column_x == max(0, (width - min(width, CHAT_MAX_WIDTH)) // 2)
+            # Every composed line is exactly the screen width: nothing overflows.
+            for index, line in enumerate(lines):
+                assert cell_len("".join(text for text, _ in line)) == width, index
+            # The log lands inside the column, not at the screen edge.
+            painted = ["".join(text for text, _ in line) for line in lines]
+            mark = next(line for line in painted if "COLUMN-MARK" in line)
+            assert mark.index("COLUMN-MARK") == column_x + 1, mark
+            # The input band's left rule sits at the column's x + margin + …
+            assert painted[input_rect.y].index("\u2588") == column_x + 2
+            # The panel's content starts at the column too (its bg spans the row).
+            assert painted[panel.y + 3].index("\u2039Tab\u203a") == column_x + 1
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("width", [40, 80, 200, 250])
+def test_a_long_line_wraps_inside_the_column_and_never_past_the_screen(width: int) -> None:
+    """Text wraps at the COLUMN width at any terminal size, chips stay whole."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(width, 24)) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, f"app-wrap-{width}")
+            app._post_system("x" * 400)
+            await pilot.pause()
+            lines = app.compose(width, 24)
+            log, _input, panel, column_x = app.layout(width, 24)
+            column = min(width, CHAT_MAX_WIDTH)
+            for index, line in enumerate(lines):
+                text = "".join(piece for piece, _ in line)
+                assert cell_len(text) == width, (index, text)
+            # Every log row's content stays inside the column.
+            for index in range(log.y, log.y + log.height):
+                text = "".join(piece for piece, _ in lines[index])
+                body_text = text[column_x : column_x + column]
+                assert len(body_text) == column
+            # The chips render their whole values: no ellipsis at any width.
+            for index in (panel.y + 1, panel.y + 2):
+                text = "".join(piece for piece, _ in lines[index])
+                assert "\u2026" not in text, text
+            chip = app._panel.get_chip("outo")
+            assert "outo:" in "".join(piece for piece, _ in lines[panel.y + 1])
+            assert chip.region.right <= width
+
+    asyncio.run(body())
+
+
+# ── 13. one theme background everywhere (I6) ───────────────────────────────
+
+
+@pytest.mark.parametrize("size", [(80, 24), (200, 30)])
+def test_every_frame_cell_carries_a_theme_background(size: tuple[int, int]) -> None:
+    """No cell may fall back to the TERMINAL's default background.
+
+    A ``pt.Style()`` with no ``bg`` leaves the cell to the terminal, whose
+    default is visibly not ``#0a0e14`` — the logo, the spinner row, the panel's
+    empty cells and the help row all read as a lighter band than the log. The
+    only intended exceptions are the ones the owner asked for: the header uses
+    ``$panel``, the input band ``$surface`` and the chip box ``$boost``.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, f"app-bg-{size[0]}")
+            await pilot.pause()
+            width, height = size
+            app.compose(width, height)
+            theme = app.current_theme
+            allowed = {
+                str(theme.color(theme.background)),
+                str(theme.color(theme.surface)),
+                str(theme.color(theme.panel)),
+                str(theme.color(theme.boost)),
+                str(theme.color(theme.primary)),  # the focused-chip / caret bar
+            }
+            cells = app.screen._compositor.cells
+            for y in range(height):
+                for x in range(width):
+                    background = str(cells[y][x].style.background)
+                    assert background in allowed, (
+                        f"({x},{y}) painted background {background}, "
+                        f"which is not one of the theme's surfaces"
+                    )
+
+    asyncio.run(body())
+
+
+def test_the_logo_the_panel_and_the_help_row_share_the_log_background() -> None:
+    """The owner's exact complaint: those four areas must be the SAME colour."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(120, 32)) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-bg-same")
+            await pilot.pause()
+            app.compose(120, 32)
+            theme = app.current_theme
+            background = str(theme.color(theme.background))
+            cells = app.screen._compositor.cells
+            _log, _input, panel, column_x = app.layout(120, 32)
+            samples = {
+                "logo": (column_x + 4, 2),
+                "spinner row": (column_x + 4, panel.y),
+                "panel empty cell": (column_x + 4, panel.y),
+                "help row": (column_x + 2, panel.y + 3),
+                "log blank": (column_x + 4, 20),
+            }
+            for label, (x, y) in samples.items():
+                assert str(cells[y][x].style.background) == background, (
+                    f"{label} at ({x},{y}) is {cells[y][x].style.background}, "
+                    f"not {background}"
+                )
+
+    asyncio.run(body())
+
+
+def test_the_registered_hooks_reach_the_same_handlers_the_pilot_uses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The xnano bridge, end to end over the REAL loop.
+
+    xnano owns stdin, so the app can no longer run its own reader: it registers
+    one hook per input kind and every one of them has to land on the handler the
+    headless ``Pilot`` already drives. This calls the registered callbacks the
+    way xnano would (with a context carrying the reading) and asserts the app
+    state each one is supposed to move.
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        terminal = _FakeTerminal((80, 24))
+        app = ChatTUI(terminal=terminal)
+        seen_key: list[Any] = []
+        seen_mouse: list[Any] = []
+        seen_paste: list[Any] = []
+        monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
+        monkeypatch.setattr(app_module, "_write_terminal", lambda _payload: None)
+        monkeypatch.setattr(app, "handle_key", lambda key: seen_key.append(key) or True)
+        monkeypatch.setattr(app, "_route_mouse", lambda mouse, chain=1: seen_mouse.append(mouse) or True)
+        monkeypatch.setattr(app, "inject_paste", lambda text: seen_paste.append(text) or True)
+        # Run two frames, and drive the hooks from inside the second one — that
+        # is where xnano's own input thread would fire them.
+        fired: list[bool] = []
+
+        def fire() -> None:
+            if fired:
+                return
+            fired.append(True)
+            terminal.hooks["key"](
+                _FakeContext(keyboard=_FakeKeyboard(_FakeKeyReading("h", text="h")))
+            )
+            terminal.hooks["key"](
+                _FakeContext(
+                    keyboard=_FakeKeyboard(
+                        _FakeKeyReading("tab", modifiers={"shift"}), pasted=None
+                    )
+                )
+            )
+            terminal.hooks["mouse"](
+                _FakeContext(
+                    mouse=_FakeMouseReading("press", _FakePoint(3, 4))
+                )
+            )
+            terminal.hooks["paste"](
+                _FakeContext(keyboard=_FakeKeyboard(_FakeKeyReading("a"), pasted="pasted"))
+            )
+
+        def fire_then_stop() -> None:
+            fire()
+            app.exit()
+
+        terminal._on_exit = fire_then_stop
+        terminal.exit_after = 2
+        await app.run_async()
+        # Then: the key reached `handle_key` with our own Key, Shift+Tab folded
+        # into BackTab (the code the router tests), and the letters intact.
+        codes = [(key.code, key.shift) for key in seen_key]
+        assert codes == [("h", False), ("BackTab", True)], codes
+        # And: the pointer report became OUR Mouse, with the cell it was at.
+        assert seen_mouse == [Mouse("down", 3, 4, button=0)], seen_mouse
+        # And: the bracketed paste reached the focused node's handler.
+        assert seen_paste == ["pasted"], seen_paste
+
+    asyncio.run(body())
+
+
+# ── 15. the boot probe must not poison xnano's input reader ────────────────
+
+
+def test_the_graphics_probe_runs_in_a_child_so_the_tty_is_never_left_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the in-process probe broke Enter on a real terminal.
+
+    Asking the terminal what it can draw means reading the answer off stdin,
+    which turns the tty into cbreak. Measured on a pty, the probe this build uses
+    puts the modes back but leaves xnano's input reader convinced the tty is
+    still raw — every key it then delivered arrived with the kernel canonical
+    again, so ``\\r`` came through as ``Ctrl+J`` and Enter was dead while every
+    escape-sequence test passed. The probe therefore runs in a FORKED child,
+    whose tty modes die with it.
+
+    This asserts the isolation contract, not the terminal: the parent's own
+    process must never be the one that called the probe.
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    parent = os.getpid()
+
+    def probe() -> str:
+        # The answer carries the pid that produced it, so the PARENT can see
+        # which process actually ran the probe (a closure list would not: the
+        # child mutates its own copy of memory and dies with it).
+        return f"sixel:{os.getpid()}"
+
+    # When: the probe runs through the isolation helper
+    answer = app_module._probe_in_child(probe)
+
+    # Then: it answered, and the pid it reported is NOT this process
+    assert answer is not None and answer.startswith("sixel:"), answer
+    assert int(answer.split(":", 1)[1]) != parent, "the probe ran in the parent"
+
+
+def test_the_isolated_probe_answers_none_when_the_child_says_nothing() -> None:
+    """A silent child is not an error: the caller falls back to the module."""
+
+    from miniouto.cli.tui import app as app_module
+
+    # A child that exits without writing: the read sees EOF and returns None.
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    try:
+        assert app_module._read_probe_answer(read_fd) is None
+    finally:
+        os.close(read_fd)
+
+
+def test_the_isolated_probe_ignores_an_untagged_answer() -> None:
+    """Only the child's own marker counts — stdout noise must not be read as one."""
+
+    from miniouto.cli.tui import app as app_module
+
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"garbage without the marker\n")
+    os.close(write_fd)
+    try:
+        assert app_module._read_probe_answer(read_fd) is None
+    finally:
+        os.close(read_fd)
+
+
+def test_the_isolated_probe_publishes_the_mode_so_the_render_path_sees_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child's answer must reach ``graphics`` — that is what the app reads."""
+
+    from miniouto.cli.tui import app as app_module
+
+    monkeypatch.setattr(app_module.graphics_module, "_GRAPHICS_MODE", None)
+    monkeypatch.setattr(app_module, "_probe_in_child", lambda _probe: "sixel")
+    monkeypatch.setattr(
+        app_module.graphics_module, "graphics_mode", lambda: "sixel"
+    )
+    assert app_module._detect_graphics_mode() == "sixel"
+    assert app_module.graphics_module._GRAPHICS_MODE == "sixel"

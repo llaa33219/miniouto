@@ -49,7 +49,7 @@ In other words, a single `miniouto status` creates the entire `~/.miniouto/` str
 │   └── coding-ultra.md
 ├── style_repos.toml       ← created on first `style add` (absent initially)
 ├── sessions/              ← empty directory
-└── logs/                  ← empty directory (currently unused, reserved)
+└── logs/                  ← failure-<session>.log: diagnostics of failed turns
 ```
 
 ### Bundled-style force-refresh mechanism
@@ -441,7 +441,7 @@ An empty `--alarms` wakeup is the one case with **no** finish marker: it prints 
 
 > The spinner and loop events go to stdout via rich console, but in non-verbose modes `ConsoleEventSink(quiet=True)` suppresses all of them. So `--answer-only` / `--with-session` leave only the answer and (optionally) the session marker on stdout.
 
-> Failure diagnostics (`✗ {ExceptionType}`, last tool calls, traceback) always go to **stderr** (`core/chat.py:_dump_failure_diagnostics`, `_fail_console = Console(stderr=True)`). They never pollute stdout parsing.
+> Failure diagnostics (`✗ {ExceptionType}`, last tool calls, traceback) are appended to `~/.miniouto/logs/failure-<session>.log` on every failed turn, **and** printed to **stderr** (`core/chat.py:_dump_failure_diagnostics`) — except under the TUI, which sets `ChatOptions.quiet_diagnostics` so its alternate screen is never painted over. They never pollute stdout parsing.
 
 ### Exit codes
 

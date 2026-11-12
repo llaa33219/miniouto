@@ -28,7 +28,7 @@ Every file in `src/miniouto/`:
 src/miniouto/
 ├── __init__.py              # __version__ only
 ├── paths_runtime.py         # INVOCATION_CWD (captured cwd at import)
-├── cli/                     # Typer commands + Textual TUI  → see cli.md
+├── cli/                     # Typer commands + xnano TUI  → see cli.md
 │   ├── __init__.py          # app, console, _root callback, status command
 │   ├── chat.py              # chat_cmd + run_turn_chain (ONE turn + summary hand-off transitions; --alarms wakeup) + the delegation post-step (--bg detach)
 │   ├── message.py           # message insert/list/clear (the CLI side of core/inbox.py)
@@ -37,7 +37,8 @@ src/miniouto/
 │   ├── style.py             # style list/set/add/update/show
 │   ├── skill.py             # skill list/show
 │   ├── subagent.py          # subagent show/set/clear (what `chat --use-subagent-provider` reads)
-│   └── tui.py               # ChatTUI, run_tui(), model/provider pickers, catalog/custom add wizards
+│   └── tui/                 # the xnano TUI package: app (ChatTUI, run_tui), pt (the compat shim),
+│                            # input, render, theme, graphics, rows, widgets, modals, config, nodes
 ├── core/                    # Chat loop + runtime assembly   → see core.md
 │   ├── __init__.py          # re-exports chat, events, modelslist, providers, runtime
 │   ├── chat.py              # ChatOptions, run_chat, ToolCallArgsError, diagnostics, sink dispatchers
@@ -75,7 +76,7 @@ src/miniouto/
 │   ├── coding-pro.md        # senior staff engineer orchestrator
 │   ├── coding-work.md        # pragmatic senior engineer orchestrator
 │   └── coding-ultra.md      # MAX-mode execution orchestrator
-├── tui/                     # EMPTY placeholder (TUI lives in cli/tui.py)
+├── tui/                     # EMPTY placeholder (the TUI lives in the cli/tui/ package)
 └── utils/                   # EMPTY placeholder
 ```
 

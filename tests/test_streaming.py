@@ -655,7 +655,7 @@ def test_a_message_boundary_event_flushes_the_buffered_stream_tail() -> None:
             assert app._stream_text_row is not None
             clock.t += 0.001
             await from_worker(lambda: sink.emit_stream_delta("text", " TAIL"))
-            assert "TAIL" not in app._stream_text_row.content
+            assert "TAIL" not in app._stream_text_row.text
 
             # When: the message completes and the loop moves on (tool call,
             # next iteration) — each a message boundary
@@ -677,7 +677,7 @@ def test_a_message_boundary_event_flushes_the_buffered_stream_tail() -> None:
             # Then: each message's row holds exactly its own text — the tail
             # closed message 1's row instead of prepending message 2's.
             rows = [r for r in app._window.rows if isinstance(r, StreamRow)]
-            contents = [str(r.content) for r in rows]
+            contents = [r.text for r in rows]
             assert contents == ["msg1 body. TAIL", "msg2 body."]
 
     asyncio.run(body())

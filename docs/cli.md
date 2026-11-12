@@ -53,7 +53,7 @@ miniouto [--version]
 
 1. Calls `storage.paths.ensure_dirs()` to guarantee `~/.miniouto/` and its `style/`, `sessions/`, `logs/` subdirs exist (also force-refreshes bundled styles — see `storage/paths.py`).
 2. If `--version` was passed: prints `miniouto {__version__}` and exits 0.
-3. If no subcommand was invoked (`ctx.invoked_subcommand is None`): calls `tui.run_tui()` which launches the Textual TUI.
+3. If no subcommand was invoked (`ctx.invoked_subcommand is None`): calls `tui.run_tui()` which launches the xnano TUI.
 
 The root app is configured with `no_args_is_help=False` and `invoke_without_command=True` so that `miniouto` alone runs the TUI without printing help text.
 
@@ -61,17 +61,24 @@ The root app is configured with `no_args_is_help=False` and `invoke_without_comm
 
 ## `miniouto` (no args) — TUI mode
 
-Delegates to `cli/tui.py:run_tui()`, which constructs a `ChatTUI` (Textual `App`) and calls `.run()`.
+Delegates to `cli/tui/app.py:run_tui()`, which detects the terminal's graphics mode (invariant 15), constructs a `ChatTUI` and runs it on an asyncio loop until the user quits.
+
+The substrate is **`xnano`** (a retained-mode canvas) with an immediate-mode frame builder on top, reached through a pyratatui-shaped compat shim. `cli/tui/pt.py` re-implements the exact `pt` surface the package uses (`Color`/`Style`/`Span`/`Line`/`Text`/`Paragraph`/`Rect`/`TextState`/`Terminal`) on `xnano` + `xnano-core`, so every call site reads `from . import pt` and nothing else about the layers changed. Each ~60 Hz tick composes a whole frame of styled lines and paints it one row at a time through `Terminal.draw` — each row is `canvas.write(..., height=1)` and the placement it returns is REUSED when the same cell/width is painted again, so only the text is replaced and xnano's diff can emit nothing when nothing changed; the canvas itself — the alt screen, the blit loop, the diff — is xnano's.
+
+**Input belongs to xnano, not to us.** `pt.Terminal(real_screen=True)` registers one hook per kind (`key`/`mouse`/`scroll`/`paste`/`resize`) *before* the canvas opens — xnano decides which terminal settings to turn on from the hooks that exist at open time, and a hook attached afterwards never runs — and each hook translates its xnano reading into our own `Key`/`Mouse`/`Paste`/`Resize` and hops it onto the asyncio loop thread, so every handler still runs where it always ran. The `InputReader`/`InputParser` pair in `cli/tui/input.py` is retired on the real terminal (it would block on a descriptor xnano owns) but is **not** deleted: the event dataclasses and the headless `Pilot` still use it. Two `canvas.open()` flags are load-bearing, both measured on a pty: `keyboard="disambiguated"` (the default reports a bare CR as `Ctrl+J`, so Enter never reached the router and submit was dead) and `capture=False` (xnano's default replaces fd 1 with a pipe, which kills the OSC title/clipboard lanes *and* the `TIOCGWINSZ` resize poll with `Inappropriate ioctl for device`). `interrupt=False` keeps `Ctrl+C` as the app's own key event rather than letting xnano stop the canvas. The lone-ESC `flush_timeout` is gone too — xnano disambiguates a bare Escape itself.
+
+The package still owns its cell-correct word wrap (`rich.cells.cell_len`, never the shim's `Span.width()`, which answers CELLS precisely so it never mis-wraps CJK — the old pyratatui `width()` counted characters), and its headless twin: `ChatTUI(terminal=None)` driven by `nodes.py:run_test` / `Pilot` / `Compositor`, which is what the behavioural suite runs against. `pt.Terminal`'s headless mode owns an offscreen `xnano.new()` canvas and exposes `output_text()` / `output_lines()` / `output_ansi()` for assertions; both modes share the whole painting path, so the frame the tests read is the frame a terminal shows.
 
 Layout (top to bottom):
-- `Header(show_clock=False)`
-- `Vertical(VerticalScroll(id="chat"), ChatInput(id="input"))`
+- `Header` — a full-width bar: the centred `title — sub` string (no icon)
+- log (the windowed chat transcript) + `ChatInput` (a 1..N-row multiline editor), both inside the centred `CHAT_MAX_WIDTH` column
 - `BottomPanel` (height 4) with four rows:
-  1. spinner row (a Textual-`Timer`-driven braille spinner shown while a chat turn is in flight)
-  2. chip row with **three** clickable `StatusChip`s — `model`, `provider`, `style`
-  3. session row — a plain `Static` label showing the active session name (not clickable)
+  1. spinner row (a braille spinner, one ticker at ~12.5 fps, shown while a chat turn is in flight)
+  2. chip row A — `outo` on the left, `style` on the right
+  3. chip row B — `subagent` on the left, `session` on the right
   4. help-hint row
-- `Footer`
+
+There is **no** Footer key bar — it was dropped deliberately, so every action lives on a key (see "Keybindings") or in the command palette. The header's background and the panel's background span the terminal; both stop their *content* at the chat column so the chips line up with the log and input. A modal renders itself over a dimmed copy of the frame below it.
 
 ### Update check
 
@@ -79,15 +86,15 @@ At startup the TUI checks `https://pypi.org/pypi/miniouto/json` in a background 
 
 ### Chat log rows
 
-The chat log is a `VerticalScroll` of row widgets (migrated from `RichLog` so rows can be clickable and live-updating). All row widgets derive from **`RowStatic`**, which gives every row identical drag selection: Textual's native path (theme `$screen-selection-*` colors — and nothing at all for Markdown, whose `RichVisual` ignores selection) is suppressed, and `render_line` paints the selected span itself with plain **reverse video (fg/bg inversion)**, character-accurate (CJK-safe) and clipped at the text end. `Ctrl+Shift+C` copies the extraction (`get_selection`, padding stripped).
+The chat log is a list of **row objects**, not widgets: the frame builder is immediate-mode, so a row owns only STATE (its text, its collapsed flag, its attached result, its image) and is essentially a function of `(state, width, theme)` → styled lines. `RowStatic` is the base every row derives from: it builds the pre-wrapped lines the app paints (heights are therefore EXACT, which is what the scroll window and the mouse hit-testing need), caches them per width, and paints drag selection itself with plain **reverse video (fg/bg inversion)** — Textual's `$screen-selection-*` path is gone, and Markdown was never painted by it anyway — character-accurate (CJK-safe, via `cell_len`) and clipped at the text end. `Ctrl+Shift+C` copies the extraction, padding stripped.
 
-| Row widget | Shows |
+| Row object | Shows |
 |---|---|
-| `Static` | user prompts (`> ` in accent), blank spacers, `[system]` lines in warning color |
-| `AnswerRow` | the final answer as `Markdown` — behavior inherited from `RowStatic`; exists as a distinct class because Markdown goes through `RichVisual` (no native selection painting) |
+| `EventRow` (plain) | user prompts (`> ` in accent), blank spacers, `[system]` lines in warning color |
+| `AnswerRow` | the final answer as Markdown (`render_markdown`), painted on the `text_answer` layer — the top of the text hierarchy, which is why it is its own class rather than a flag on `RowStatic` |
 | `ThinkingRow` | reasoning/thinking — **collapsed by default** (`▶ thinking`), a plain click anywhere on the row or `Enter` to expand the full text (`▼ thinking` + content), clicking again to re-collapse. A drag that selects text never toggles it, and a double-click selects no whole row. While reasoning is still streaming, the header carries a `●` marker; the completed message's whole text then replaces the streamed fragments in place. Same translucent border + muted styling as `EventRow` |
-| `StreamRow` | the **live** assistant text while the model is still generating it: mounted on the first text delta of a message and updated in place for each subsequent one (one widget per message, not per token). Replaced by the canonical `AnswerRow` when the turn's final answer arrives, or kept as the record of an intermediate message whose whole text is otherwise suppressed |
-| `EventRow` | any other intermediate loop output — tool calls, iteration/token progress, provider errors — rendered with a **translucent left border (`$primary 40%`) and muted gray text** (provider errors use `$error`). No `actor:` prefixes |
+| `StreamRow` | the **live** assistant text while the model is still generating it: created on the first text delta of a message and updated in place for each subsequent flush (one row per message, not per token). Replaced by the canonical `AnswerRow` when the turn's final answer arrives, or kept as the record of an intermediate message whose whole text is otherwise suppressed |
+| `ToolRow` | a tool call — a collapsible box carrying a `▶`/`▼` glyph, the call preview, and (once expanded, after the call finished) its attached result, including the `.art` render of a Computer capture and, on a graphics terminal, the PNG placed as an overlay (invariant 15) |
 
 There is **no** `SubagentRow` / `SubagentDetailScreen`: a spawned run is a separate process with its own event stream, so there is no per-actor row stream to drill into. What a spawned run contributes to this transcript is its **completion alarm** (a user-style row — see "Messages" below).
 
@@ -99,20 +106,20 @@ While the provider is streaming, the TUI renders text and reasoning **as it arri
 
 Deltas are **display-only**: they are never written to the session file (`_RecordingSink` forwards them to the wrapped sink without recording), so a reloaded session is byte-identical to a pre-streaming one. Nor are they fed to the repetition watchdog — that stays on whole-message boundaries to avoid counting each phrase twice.
 
-Finalization avoids showing the same text twice: the live `StreamRow` is removed and the Markdown `AnswerRow` mounted in its place for the final answer, the whole-text `thinking` event finalizes the live `ThinkingRow` in place, and the stashed `response` row is suppressed whenever deltas already showed that message (a non-streaming turn renders exactly as before).
+Finalization avoids showing the same text twice: the live `StreamRow` is dropped and the Markdown `AnswerRow` takes its place for the final answer, the whole-text `thinking` event finalizes the live `ThinkingRow` in place, and the stashed `response` row is suppressed whenever deltas already showed that message (a non-streaming turn renders exactly as before).
 
 ### Messages (the inbox), width cap, and scrolling
 
 - **Mid-turn insertion.** Typing while a turn is running does not poke the live message list: it goes to `inbox.insert(session, text, kind="user", source="tui")`. One code path then serves human interjections, spawn alarms, and `chat --alarms` wakeups. The row renders optimistically, and when the drain later produces the matching loop event `ChatTUI._claim_inbox_event` matches `detail="inbox:<id>"` and drops the duplicate.
 - **Idle delivery.** No registry callback pushes messages any more (a detached process may write at any moment), so the TUI polls the inbox every `_INBOX_POLL_INTERVAL` (1 s) and at the tail of `_dispatch`: anything drained starts a turn whose prompt **is** the joined message text, recorded as that turn's `user` so display, replay, and model perception are the same string by construction.
 - **Single consumer.** One session belongs to one live process; a second process bound to the same session would steal each other's messages (see `docs/core.md` § `core/inbox.py`). Before a TUI has chosen a session, it polls a unique `tui-pending-<hex>` queue, never the shared `default` or another process's published session.
-- **Summary hand-off.** If a turn ends because the model called `continue_session`, `ChatTUI._apply_handoff` mounts the `------summary → <new>------` + `summary: <dir>` marker as a system row in the **old** conversation, persists it there for replay (`_persist_handoff_marker`), re-pins the new `cont-*` session, and lets the 1 s inbox poll auto-deliver the continuation message — so the transition needs no user action. The old conversation keeps its history: a hand-off is a session change, never a history edit.
+- **Summary hand-off.** If a turn ends because the model called `continue_session`, `ChatTUI._apply_handoff` appends the `------summary → <new>------` + `summary: <dir>` marker as a system row in the **old** conversation, persists it there for replay (`_persist_handoff_marker`), re-pins the new `cont-*` session, and lets the 1 s inbox poll auto-deliver the continuation message — so the transition needs no user action. The old conversation keeps its history: a hand-off is a session change, never a history edit.
 - **Width cap.** The log column is centered and capped at `CHAT_MAX_WIDTH = 150` cells (theme variable `$chat-max-width`), so wide terminals do not stretch the transcript. The header chips sit in two left/right-anchored pairs inside that column (`outo` / `style`, then `subagent` / `session`) and render their values whole — two chips a row is what keeps every value short enough not to truncate, so every picker stays clickable at any terminal width.
-- **Scrolling.** `PgUp` / `PgDn` / `Home` / `End` are priority bindings overridden with `animate=False`, so they act **instantly** even though the input is a `TextArea` that otherwise owns them for caret movement. A jump-to-bottom button sits under the log.
+- **Scrolling.** `PgUp` / `PgDn` / `Home` / `End` act **instantly**: the TUI takes them at the app level before the input sees them (they would otherwise move the caret), and no scroll is ever animated — animating through a long transcript's heights would lose the target. The wheel scrolls `WHEEL_LINES = 3` rows per detent. A windowed log (`_RowWindow`: a trailing window of rows is painted, older chunks load as the view nears the top, far-above rows evict) keeps a long session's per-frame cost flat, and a jump-to-bottom button sits under the log whenever the view is scrolled up.
 
 ### Clickable chips
 
-Each `StatusChip` is a focusable widget. Click it (or focus it with `Tab` and press `Enter`) to open a modal:
+Each `StatusChip` is a focusable node. Click it (or focus it with `Tab` and press `Enter`) to open a modal:
 
 | Chip | Modal | Notes |
 |---|---|---|
@@ -137,24 +144,24 @@ The popup's `Provider` row accepts two sentinels (rendered as `extra_options` ro
 - `+ add from catalog…` — runs `_catalog_add_flow`: fetches the modelslist root index, filters to entries whose `formats` yields a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="modelslist"` (named after the catalog `slug`) and the first model of its catalog-owned list as `default_model`; when the model has reasoning options it also offers a picker and stores the result as `reasoning_effort`. See `core/modelslist.py` and `core/providers.py:DIALECT_TO_FORMAT`.
 - `+ add custom…` — runs `_open_custom_add_wizard`: a five-step wizard (name → api_format → base_url → api_key → default_model), saving with `source="custom"`.
 
-Modal results are persisted through `_persist_trio` (provider/model/reasoning — see above) or `storage.settings.update(...)` (style), and the chip row re-renders. The active Textual theme is persisted to `settings.theme` and restored on launch.
+Modal results are persisted through `_persist_trio` (provider/model/reasoning — see above) or `storage.settings.update(...)` (style), and the chips repaint on the next frame. The active theme is persisted to `settings.theme` and restored on launch.
 
 ### Theme
 
-`ChatTUI` registers the harness's own dark theme, `MINIOUTO_THEME` (name `miniouto`, `cli/tui.py`), and boots on it. The palette is comfort-tuned for long sessions: the floor is lifted off near-black (background `#0a0e14`, ~2× the old `#05070a`'s relative luminance, and still darker than Textual's stock dark `#121212`), the surfaces step `#0f141b` → `#151b24` → `#1d2530`, and the ceiling comes down from the old 13.28:1 glare — but not all the way to one undifferentiated gray, because the agent's **final answer must still be the brightest thing on screen**. The text therefore forms an explicit **three-layer hierarchy** (plus the disabled ramp):
+`ChatTUI` ships the harness's own dark theme, `MINIOUTO_THEME` (name `miniouto`, `cli/tui/theme.py`), and boots on it. Because the port paints the canvas directly (`pt.Color` → `xnano` styles), a theme is a frozen `TuiTheme` dataclass of plain `#rrggbb` strings — there are no CSS `$variables` to resolve at paint time. The palette is comfort-tuned for long sessions: the floor is lifted off near-black (background `#0a0e14`, ~2× the old `#05070a`'s relative luminance, and still darker than the stock dark `#121212`), the surfaces step `#0f141b` → `#151b24` → `#1d2530`, and the ceiling comes down from the old 13.28:1 glare — but not all the way to one undifferentiated gray, because the agent's **final answer must still be the brightest thing on screen**. The text therefore forms an explicit **three-layer hierarchy** (plus the disabled ramp):
 
-| Layer | Variable | Hex | On `$background` | Painted on |
+| Layer | Field | Hex | On `background` | Painted on |
 | --- | --- | --- | --- | --- |
-| answer | `$text-answer` | `#c5d0d8` | **12.33:1** | the final-answer row only (`AnswerRow`) |
-| body | `$foreground` | `#a9bac5` | **9.69:1** | everything else in the transcript |
-| muted | `$text-muted` | `#7b8490` | **5.11:1** | event, tool and thinking rows |
-| disabled | `$text-disabled` | `#434a52` | 2.16:1 | disabled controls (WCAG-exempt) |
+| answer | `text_answer` | `#c5d0d8` | **12.33:1** | the final-answer row only (`AnswerRow`) |
+| body | `foreground` | `#a9bac5` | **9.69:1** | everything else in the transcript |
+| muted | `text_muted` | `#7b8490` | **5.11:1** | event, tool and thinking rows |
+| disabled | `text_disabled` | `#434a52` | 2.16:1 | disabled controls (WCAG-exempt) |
 
-The answer layer is the only near-white in the palette, so the hierarchy reads at a glance: answer > body > muted. `$foreground` also got its chroma back — `#a9bac5` is 3.4× the saturation of the `#a8b0b1` it replaces (S≈0.19 vs S≈0.06), which is what "too gray" was; it carries the theme's blue family without going clinical. Muted and disabled are unchanged. The four semantic colors are one notch down (secondary `#8f86d8`, success `#52bd8a`, warning `#c99a4e`, error `#d16f7e`) and each clears 4.5:1 on all four surfaces, and the owner-pinned `#2fc2ff` accent — carried by **both** `$primary` and `$accent`, so the logo, the focus rules, block cursors and the tool-row toggle glyph are all the same cyan — is left exactly as it was; it reads calmer for free (9.87:1 → 9.47:1) because the background underneath it is lighter.
+The answer layer is the only near-white in the palette, so the hierarchy reads at a glance: answer > body > muted. `foreground` also got its chroma back — `#a9bac5` is 3.4× the saturation of the `#a8b0b1` it replaces (S≈0.19 vs S≈0.06), which is what "too gray" was; it carries the theme's blue family without going clinical. Muted and disabled are unchanged. The four semantic colors are one notch down (secondary `#8f86d8`, success `#52bd8a`, warning `#c99a4e`, error `#d16f7e`) and each clears 4.5:1 on all four surfaces, and the owner-pinned `#2fc2ff` accent — carried by **both** `primary` and `accent`, so the logo, the focus rules, block cursors and the tool-row toggle glyph are all the same cyan — is left exactly as it was; it reads calmer for free (9.87:1 → 9.47:1) because the background underneath it is lighter.
 
-Four fields travel in the theme's `variables` dict rather than as `Theme` fields, because Textual's `ColorSystem` does not derive them here: `boost` (Textual **drops** the `boost` field whenever `panel` is set explicitly, which would leave `$boost` transparent and take the chips, selection lists and `TextArea`/`Markdown` backgrounds with it) and the `text-answer` / `text-muted` / `text-disabled` ramp. `get_theme_variable_defaults()` still supplies the app's own `$chat-max-width`. `AnswerRow` applies `$text-answer` through a single `color` rule: its content is a **Rich** `Markdown` renderable — one `RichVisual` with no DOM children — so a descendant selector would never match. `$text` is deliberately left at Textual's `auto 87%` default: it does not paint the transcript (the declared `foreground` does), and it is what resolves to near-black ink on the picker's selected row, which sits on a solid `#2fc2ff` bar — pinning `$text` to the solid foreground was measured and drops that row to 1.08:1.
+`boost`, `text_muted`, `text_disabled` and `text_answer` are real `TuiTheme` fields, not derived at paint time: Textual used to compute them (`boost` from `panel`, the ramp as `foreground` composited at 60% / 38% over the background), and `theme.py` reproduces that same arithmetic so the ported palettes look byte-identical to the Textual ones they replace — `panel` when a theme omits it is `surface` lerped 10% toward `primary`, `foreground` when omitted is the background's inverse, `boost` steps 8% toward white (or black on a light theme), and the ramp is alpha compositing rather than a darkening curve (reading "60%" the other way inverts the ladder). `AnswerRow` paints `text_answer` because its content is the Markdown answer; the near-black ink on the picker's solid-cyan selection bar comes from `render.auto_text` (the port of Textual's `auto 87%` — pinning it to the solid `foreground` drops that row to 1.08:1), while the transcript body paints the declared `foreground`. `get_css_variables()` still exposes the resolved palette under the old CSS names (that is what the theme tests read), and `$chat-max-width` is reported there from `CHAT_MAX_WIDTH` even though no CSS consumes it.
 
-`settings.theme` overrides the default at launch (`ChatTUI._boot_theme`); a name no build registers falls back to `miniouto` rather than failing the launch, since `App.theme`'s validator rejects unknown names outright. `Ctrl+P` → Theme changes it at runtime and `watch_theme` writes the choice back.
+`settings.theme` overrides the default at launch (`ChatTUI._boot_theme`); a name no build registers falls back to `miniouto` rather than failing the launch. `Ctrl+P` → Theme changes it at runtime and `watch_theme` writes the choice back to `settings.theme`. The picker order is `miniouto` first, then the stock themes re-derived as `TuiTheme`s (`textual-dark`, `textual-light`, `nord`, `gruvbox`, `catppuccin-*`, `dracula`, `tokyo-night`, `monokai`, `flexoki`, `solarized-*`, `atom-one-*`).
 
 ### Model resolution order
 
@@ -165,14 +172,14 @@ Four fields travel in the theme's `variables` dict rather than as `Theme` fields
 
 In the TUI, every row shows the **configured** value when there is one, else what it resolves to (the provider record's own default), else `-`.
 
-Keybindings:
-- App-level (registered on `ChatTUI`): `Ctrl+L` — clear log; `Ctrl+C` — quit; `Esc Esc` (two presses within 2.0 s while the agent is busy) — force-stop the running turn. The stop is cooperative: a `threading.Event` is passed via `ChatOptions.cancel_event`, and the loop's cancel-guard hook raises `LoopCancelledError` at the next hook boundary (before the next LLM call / tool execution) — additionally, the stall watchdog's 5 s poll watches the same event and hard-cancels the turn task, so an in-flight LLM call IS interrupted promptly, and an in-flight **Bash** process IS killed (`tools/bash.py` polls the same event — Bash's 1-hour hard cap, `BASH_TIMEOUT_SECONDS`, is far too slow to serve as the stop mechanism). The TUI shows `[stopped by user (esc esc)]`; a single `Esc` while busy shows a persistent "press esc again to stop" hint in the spinner line (it survives spinner ticks for the full 2.0 s window; after a successful double-press, "stopping after the current step…" persists until the turn ends).
-- `Ctrl+P` — open the Textual system command palette (customized via `get_system_commands`) — new session, pick session, change model/provider/style/theme, clear log. The splash text on boot explicitly says "Press Ctrl+P for commands."
-- Widget-level (inside modals / chips): `Tab` / `Shift+Tab` — cycle focus; `Enter` — confirm; `Esc` — cancel.
+Keybindings (one app-level router in `ChatTUI._handle_key`: global keys first, then the modal on top, then the focused node):
+- App-level: `Ctrl+L` — clear log; `Ctrl+C` — quit; `Ctrl+Shift+C` — copy the selection; `Ctrl+P` — open (or dismiss) the command palette; `Esc Esc` (two presses within 2.0 s while the agent is busy) — force-stop the running turn. The stop is cooperative: a `threading.Event` is passed via `ChatOptions.cancel_event`, and the loop's cancel-guard hook raises `LoopCancelledError` at the next hook boundary (before the next LLM call / tool execution) — additionally, the stall watchdog's 5 s poll watches the same event and hard-cancels the turn task, so an in-flight LLM call IS interrupted promptly, and an in-flight **Bash** process IS killed (`tools/bash.py` polls the same event — Bash's 1-hour hard cap, `BASH_TIMEOUT_SECONDS`, is far too slow to serve as the stop mechanism). The TUI shows `[stopped by user (esc esc)]`; a single `Esc` while busy shows a persistent "press esc again to stop" hint in the spinner line (it survives spinner ticks for the full 2.0 s window; after a successful double-press, "stopping after the current step…" persists until the turn ends).
+- `Ctrl+P` — the command palette: a centred dialog (`modals.py:CommandPalette` + `default_system_commands`, behind `get_system_commands`) with a search input and a list — new session, pick session, configure outo, configure subagent, pick style, theme, keys, quit. No numeric prefixes (`00`, `01`, … were Textual's alphabetical-sort workaround) and no clear-log / maximize / screenshot entries; `clear log` is still on `Ctrl+L`. The splash text on boot says "Press Ctrl+P for commands."
+- Node-level (inside modals / chips / the input): `Tab` / `Shift+Tab` — cycle focus; `Enter` — confirm; `Esc` — cancel.
 
-Submission flow: each submitted prompt is dispatched via `self.run_worker(..., exclusive=True)` to `_dispatch(prompt)`, which calls `core.chat.run_chat(opts, sink)` inside `asyncio.to_thread` so the Textual event loop stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output is mounted as row widgets (see "Chat log rows" above); errors/system messages render as `[…]` (e.g. `[error: {exc}]`) in theme warning.
+Submission flow: each submitted prompt is dispatched by `self.run_worker(self._dispatch(prompt), exclusive=True)`, which calls `core.chat.run_chat(opts, sink)` inside `asyncio.to_thread` so the asyncio loop (and the ~60 Hz draw) stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output becomes row objects (see "Chat log rows" above), composed into the next frame; errors/system messages render as `[…]` (e.g. `[error: {exc}]`) in theme warning.
 
-`cli/tui.py:tui_summary() -> dict` is a programmatic snapshot helper (currently unused by the runtime) that returns `{provider, model, style, session, styles_available}`.
+`cli/tui/app.py:tui_summary() -> dict` is a programmatic snapshot helper (currently unused by the runtime) that returns `{provider, model, style, session, styles_available}`.
 
 ---
 
@@ -348,7 +355,7 @@ Validation happens **first, ahead of every resolution**: `--answer-only` + `--wi
    - else: generate a fresh `chat-{YYYYMMDD-HHMMSS}-{6hex}` name.
 2. Calls `settings.update(session=session_name)` — **only for a plain run** (`_is_plain_run`: not `--bg`, not `--bg-child`, no `--role`, no `--alarm-session`, no `--return`). A delegated run is a guest: it mints its own `chat-`/`spawn-` name and writes its transcript there, but never repoints the active session (otherwise the caller's conversation — and the TUI, which reads the active session — would jump onto the subagent's file). Plain `miniouto chat` still persists the active session, with or without `--name`. Every turn instead passes `ChatOptions.session` through `ChatOverrides.session` into `runtime.session`, so it drains its own inbox and expands `{this_session}` to its own name — never the caller's — without temporarily rewriting the shared active-session setting. A delegated `--continue` run must provide `--name SESSION` (it cannot inherit the caller's active session).
 3. Emits the `------{session_name}------` marker to stdout unless `--answer-only` was passed, then builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts, sink=ConsoleEventSink(quiet=answer_only or with_session))`. **Session persistence is unconditional** — `run_chat` builds its `_TurnPersister` before any branch on delegation, so every run (plain outo, a delegated `--role` run, and `--answer-only`/`-a`) writes its session file; `-a` suppresses stdout only, and the file on disk is identical either way.
-4. On exception: `run_chat` itself calls `_dump_failure_diagnostics` (prints `✗ {ExceptionType}: {msg}` + the last ≤5 tool calls + a full traceback to **stderr**) and **re-raises**. Typer prints the traceback and exits 1. A *delegated* run catches it instead — see the post-step below.
+4. On exception: `run_chat` itself calls `_dump_failure_diagnostics` (appends `✗ {ExceptionType}: {msg}` + the last ≤5 tool calls + a full traceback to `logs/failure-<session>.log`, and prints the same to **stderr** — the CLI leaves `quiet_diagnostics` False, so this output is unchanged) and **re-raises**. Typer prints the traceback and exits 1. A *delegated* run catches it instead — see the post-step below.
 5. On success: `ConsoleEventSink` writes the reply as plain stdout; in verbose mode it is preceded by a `------finish------` marker and loop events (tool calls, intermediate responses) rendered in `orange3`. In quiet mode only the raw answer (and the session marker, for `--with-session`) reaches stdout.
 
 
@@ -655,7 +662,7 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 | Scenario | Behavior | Exit code |
 |---|---|---|
 | Successful command | stdout output, no error | 0 |
-| Unhandled exception in `chat_cmd` / `run_chat` | `run_chat._dump_failure_diagnostics` prints `✗ {ExceptionType}: {msg}` + last ≤5 tool calls + traceback to stderr, then re-raises; Typer prints the traceback | 1 |
+| Unhandled exception in `chat_cmd` / `run_chat` | `run_chat._dump_failure_diagnostics` appends `✗ {ExceptionType}: {msg}` + last ≤5 tool calls + traceback to `logs/failure-<session>.log` and prints the same to stderr, then re-raises; Typer prints the traceback | 1 |
 | `provider custom add` with unknown `--format` | `✗ Unknown format <fmt>. Supported: …` + `typer.Exit(1)` | 1 |
 | `provider add` for an unknown catalog provider name | `✗ No catalog provider matched <name>. Run 'miniouto provider providers' to see the catalog.` + exit 1 | 1 |
 | `provider add` for a provider with no hostable format | `✗ {exc}` (ValueError from `add_provider_from_catalog`) + exit 1 | 1 |
@@ -708,4 +715,4 @@ cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.pr
                    └─→ cli/chat.py     ─→ core.{chat,events,inbox,spawn_state,runtime}, storage.{paths,settings,styles}
 ```
 
-External libs the CLI directly imports: `typer`, `rich.console`, `rich.table`, `rich.markdown`, `textual.app`, `textual.containers`, `textual.binding`, `textual.reactive`, `textual.widgets` (`RichLog`, `Input`, `ListView`, `ListItem`, `Label`, `Static`, `TextArea`), `textual.message`, `textual.screen`, `textual.timer`, `rich.text`, `asyncio`, `dataclasses.replace`.
+External libs the CLI directly imports: `typer`, `rich.console`, `rich.table`, `rich.markdown`, `rich.text`, `rich.cells`, `rich.style`, `xnano` (+ `xnano.styles` — the canvas, styles and the placement API), `xnano_core` (`cell_grid_to_ansi`, the graphics lane's grid → ANSI writer) and `xnano_image` (`TerminalImage`, `TerminalGraphics`, `cell_grid_size` — imported lazily inside the graphics lane), `asyncio`, `threading`, `dataclasses.replace`. Note `rich` is not optional: the TUI measures with `rich.cells.cell_len`, and `render.py` (`style_from_rich`/`text_to_lines`) is the Rich → `pt` bridge — the port keeps its own bridge rather than xnano's `from_rich`.

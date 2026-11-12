@@ -4,7 +4,7 @@
 
 `miniouto` is a **thin orchestration layer** on top of the [`coreouto`](https://github.com/llaa33219/coreouto) agent library. It provides:
 
-1. A CLI (`miniouto`) and an optional Textual TUI for interactive use.
+1. A CLI (`miniouto`) and an optional `xnano`-backed TUI for interactive use.
 2. File-driven configuration (TOML for providers/settings, Markdown for styles, JSON for sessions).
 3. Bundled agent "style" templates (three personas: a minimal default and two orchestrators).
 4. A minimal tool surface (Bash + Image/Video/Audio media viewers, plus `Computer` when the platform supports it) and **delegation as a Bash command** — `miniouto chat "<brief>" --style <style> --role <tag>`, run by the model through `Bash`.
@@ -28,7 +28,7 @@ From `README.md`:
 src/miniouto/
 ├── __init__.py              # __version__ = "0.1.1"
 ├── paths_runtime.py         # INVOCATION_CWD: Path  (captured cwd at import)
-├── cli/                     # Typer commands + Textual TUI
+├── cli/                     # Typer commands + xnano TUI (cli/tui/ package)
 ├── core/                    # Chat loop + runtime assembly + event sinks
 │   ├── __init__.py
 │   ├── chat.py
@@ -43,19 +43,19 @@ src/miniouto/
 ├── storage/                 # Filesystem persistence (the only layer that touches disk, besides tools/)
 ├── tools/                   # Bash + media + Computer + .art codec (pure stdlib + async)
 ├── default_style/           # Bundled .md prompts (seeded into ~/.miniouto/style/ on first run)
-├── tui/                     # EMPTY placeholder — TUI code lives in cli/tui.py
+├── tui/                     # EMPTY placeholder — TUI code lives in cli/tui/ (a package)
 └── utils/                   # EMPTY placeholder
 ```
 
-> **Note on empty dirs:** `tui/` and `utils/` are 0-byte placeholders. The TUI is in `cli/tui.py`. There is no `utils/` package — utilities live in `core/`, `storage/`, and `tools/`. Do not add modules to `tui/` or `utils/` without first deciding whether the contents should be moved into the proper package.
+> **Note on empty dirs:** `tui/` and `utils/` are 0-byte placeholders. The TUI is the `cli/tui/` package. There is no `utils/` package — utilities live in `core/`, `storage/`, and `tools/`. Do not add modules to `tui/` or `utils/` without first deciding whether the contents should be moved into the proper package.
 
 ## Dependency graph
 
 ```
                             ┌──────────────────────────────────────┐
-                            │   cli/  (Typer app + Textual TUI)    │
+                            │   cli/  (Typer app + xnano TUI)      │
                             │   __init__, chat, provider, style,   │
-                            │   skill, tui                         │
+                            │   skill, tui/                        │
                             └──────┬───────────────────────┬───────┘
                                    │                       │
                                    ▼                       ▼
@@ -107,7 +107,7 @@ user input
   │
   ▼
 cli/__init__.py:app (Typer)
-  │ ── no subcommand ──► tui.run_tui() (Textual ChatTUI)
+  │ ── no subcommand ──► tui.run_tui() (xnano ChatTUI)
   │                          │
   │                          ▼
   │                      core.chat.run_chat(opts, sink)
@@ -222,7 +222,7 @@ Delegation is cross-process, so there is no in-process identity to attribute: th
 There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (they were error-prone and the agent reached for Bash anyway). Do not reintroduce them without explicit discussion; to add any other tool, follow `docs/tools.md` § "Adding a new tool".
 
 ### 9. Async only where needed
-`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the Textual event loop.
+`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the asyncio event loop (the TUI's own loop, ~60 Hz draw).
 
 ### 10. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from two roots — the invocation directory's `./skills/<name>/SKILL.md` (project-local, FIRST) and `~/.agents/skills/<name>/SKILL.md` (the Anthropic-style convention) — NOT from `~/.miniouto/`. This is intentional: skills are a portable, project-shared concept, not a per-installation setting.
@@ -304,7 +304,9 @@ ChatOptions (CLI flags)
 | `coreouto[all]` | `>=0.11.3` | Agent loop, providers, tool registry, hooks (streaming hooks, contrib watchdog trackers, literal-typed schemas) |
 | `typer` | `>=0.12.0` | CLI framework |
 | `rich` | `>=13.7.0` | Terminal output, tables, markdown |
-| `textual` | `>=0.80.0` | TUI framework |
+| `xnano[image]` | `==2.3.0` | The TUI substrate: a retained-mode canvas (`xnano.new()`, `canvas.write`) that owns the alt screen, the diff and stdin. Pinned exactly — the API churns between minor versions. No image support, which is why graphics are an escape-sequence overlay (invariant 15 in `AGENTS.md`) |
+| `xnano-core` | `==2.2.3` | Styles/colors, the `KeyEvent`/`MouseEvent` types the input bridge translates, and the cell grid the graphics lane emits |
+| `xnano-image` | `==0.2.0` | Kitty/Sixel encoding for Computer screenshots (`TerminalImage`, `TerminalGraphics`); a Rust extension with no Python dependencies |
 | `pydantic` | `>=2.0` | Data models (used by coreouto) |
 | `httpx` | `>=0.27.0` | HTTP client (modelslist REST client + style repo fetcher) |
 | `tomli-w` | `>=1.0.0` | TOML serializer (paired with stdlib `tomllib`) |

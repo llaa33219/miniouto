@@ -162,8 +162,9 @@ class Screenshot:
     shape the `screen` action emits.
 
     `png_path` is the raw PNG written next to the `.art` (also best effort):
-    the TUI's graphics-capable path renders THAT inline (Kitty TGP / Sixel
-    via textual-image) where `.art` is only the fallback.
+    the TUI's graphics-capable path places THAT on screen: Kitty TGP or Sixel
+    escape sequences emitted AFTER the frame, so ratatui's diff cannot paint
+    over the pixels (``cli/tui/graphics.py``). `.art` is only the fallback.
     """
 
     data: bytes

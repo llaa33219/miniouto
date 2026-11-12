@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 import traceback
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import coreouto as co
 from rich.console import Console
+from rich.text import Text
 
 from ..storage import sessions as session_store
+from ..storage.paths import LOG_DIR
 from ..storage.sessions import STATUS_DONE, STATUS_INTERRUPTED
 from . import inbox, providers, repetition, summary
 from .context import get_max_output_tokens
@@ -30,17 +35,22 @@ from .runtime import (
     supervised_run,
 )
 
-# Failure diagnostics still go straight to stderr so a sink-aware caller
-# (e.g. the TUI) doesn't have to opt in to error rendering.
+# Failure diagnostics go to a per-session file under `paths.LOG_DIR` ALWAYS,
+# and to stderr as well unless `ChatOptions.quiet_diagnostics` is set. The
+# TUI sets that flag because it owns the terminal's alternate screen: writing
+# a traceback to stderr there overwrites the frame the TUI is composing (the
+# in-TUI "[error: …]" row is the user-facing surface). A CLI run leaves the
+# flag False, so its stderr debugging output is unchanged.
 _fail_console = Console(stderr=True, soft_wrap=False, highlight=False)
 
 # Per-turn diagnostics: the last tool call observed (if any). When the
-# turn raises out of the supervised loop, we print these to stderr so the user can see
+# turn raises out of the supervised loop, we record these so the user can see
 # which tool was the proximate cause — most "'NoneType' object is not
 # iterable" / "list index out of range" / "tool not found" errors fire
 # on the *next* operation after a malformed tool call, and without this
 # trail the traceback alone often points into coreouto internals with
-# no clue about the offending input.
+# no clue about the offending input. `_dump_failure_diagnostics` is the only
+# reader, and it writes them to the failure log (and to stderr, CLI only).
 _tool_trace: list[dict[str, Any]] = []
 _tool_trace_lock = threading.Lock()
 
@@ -63,6 +73,12 @@ class ChatOptions:
     # Cooperative cancellation: once set, the loop raises LoopCancelledError
     # at the next hook boundary (before the next LLM call / tool execution).
     cancel_event: threading.Event | None = None
+    # Failure diagnostics (the error line, the last tool calls, the traceback)
+    # always go to a per-session file under `paths.LOG_DIR`. They ALSO go to
+    # stderr unless this is set, because a TUI owns the terminal's alternate
+    # screen and a stray stderr write would overwrite the frame it composes.
+    # The TUI sets this True; the CLI leaves it False.
+    quiet_diagnostics: bool = False
 
 
 # The one actor a process supervises. Delegation is cross-process now, so
@@ -444,7 +460,7 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
                 ).to_dict()
             )
             _finish_turn(session_name, None, opts, sink, status=STATUS_INTERRUPTED)
-            _dump_failure_diagnostics(exc, session_name)
+            _dump_failure_diagnostics(exc, session_name, quiet=opts.quiet_diagnostics)
             raise
         except Exception as exc:
             sink.end_working()
@@ -457,7 +473,7 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
                 ).to_dict()
             )
             _finish_turn(session_name, None, opts, sink, status=STATUS_INTERRUPTED)
-            _dump_failure_diagnostics(exc, session_name)
+            _dump_failure_diagnostics(exc, session_name, quiet=opts.quiet_diagnostics)
             raise
     finally:
         sink.end_working()
@@ -1059,25 +1075,30 @@ def _make_iteration_dispatcher(
     return on_iteration
 
 
-def _dump_failure_diagnostics(exc: BaseException, session_name: str) -> None:
-    """Print the last tool calls and a traceback to stderr.
+def _failure_diagnostic_lines(exc: BaseException) -> list[Text]:
+    """The failure report as rich `Text` lines — the CONTENT is unchanged.
 
-    Called when the turn raises out of the supervised loop. The goal is to
-    context to tell whether the failure is in miniouto (bad argument shape,
-    missing tool, hook bug) or in coreouto (provider quirk, model output
-    parsing) without having to re-run with a debugger attached.
+    ONE source for both sinks: the log file always receives it, stderr receives
+    it too unless a TUI owns the terminal. `Text` (not markup) because the
+    report is DATA — an error message containing `[/]` or an unclosed tag would
+    otherwise raise `MarkupError` from rich inside the failure path — and
+    because it keeps the diagnostics readable as plain text (`Text.plain`) for
+    the log.
     """
 
     with _tool_trace_lock:
         recent = list(_tool_trace)
 
-    _fail_console.print(
-        f"\n[red]✗ {type(exc).__name__}:[/red] {exc}",
-        highlight=False,
-    )
+    # The prefix is red and the exception text is not, exactly as before.
+    lines: list[Text] = [
+        Text(f"\n✗ {type(exc).__name__}:", style="red") + Text(f" {exc}")
+    ]
     if recent:
-        _fail_console.print(
-            f"[red]Last tool call before failure ({len(recent)} total this turn):[/red]"
+        lines.append(
+            Text(
+                f"Last tool call before failure ({len(recent)} total this turn):",
+                style="red",
+            )
         )
         for entry in recent[-5:]:
             name = entry.get("name")
@@ -1087,14 +1108,87 @@ def _dump_failure_diagnostics(exc: BaseException, session_name: str) -> None:
                 if name in _LOGGABLE_TOOL_NAMES
                 else repr(args)[:160]
             )
-            _fail_console.print(f"  - {name}: {arg_summary}")
+            lines.append(Text(f"  - {name}: {arg_summary}"))
     else:
-        _fail_console.print(
-            "[red]No tool call was observed before the failure — the error "
-            "fired during model setup, provider call, or response parsing.[/red]"
+        lines.append(
+            Text(
+                "No tool call was observed before the failure — the error "
+                "fired during model setup, provider call, or response parsing.",
+                style="red",
+            )
         )
-    _fail_console.print("[red]Traceback:[/red]")
-    _fail_console.print(traceback.format_exc(), highlight=False)
+    lines.append(Text("Traceback:", style="red"))
+    lines.append(Text(traceback.format_exc()))
+    return lines
+
+
+def failure_log_path(session_name: str) -> Path:
+    """Where `session_name`'s failure diagnostics are appended.
+
+    The name can come from a CLI flag, so it is squashed to a filename-safe
+    form: a name carrying `/` must never escape `LOG_DIR`.
+    """
+
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", session_name or "").strip("_")
+    return LOG_DIR / f"failure-{safe or 'session'}.log"
+
+
+def _append_failure_log(
+    lines: list[Text], exc: BaseException, session_name: str
+) -> Path | None:
+    """Append the report to `failure_log_path(session_name)`; never raise.
+
+    This runs on the failure path, so a full disk, a read-only home or a
+    deleted directory must not turn one error into two: an `OSError` yields
+    None (no log) and the turn re-raises exactly as it would have.
+    """
+
+    path = failure_log_path(session_name)
+    stamp = datetime.now().isoformat(timespec="seconds")
+    header = f"===== {stamp} · {type(exc).__name__} · {session_name} =====\n"
+    body = "\n".join(line.plain for line in lines)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(header)
+            handle.write(body)
+            handle.write("\n")
+    except OSError:
+        return None
+    return path
+
+
+def _dump_failure_diagnostics(
+    exc: BaseException, session_name: str, *, quiet: bool = False
+) -> None:
+    """Record the last tool calls and a traceback — log file always, stderr unless quiet.
+
+    Called when the turn raises out of the supervised loop. The goal is to give
+    enough context to tell whether the failure is in miniouto (bad argument
+    shape, missing tool, hook bug) or in coreouto (provider quirk, model output
+    parsing) without having to re-run with a debugger attached.
+
+    TWO SINKS, ONE CONTENT:
+
+    - `LOG_DIR/failure-<session>.log`, timestamped and appended — ALWAYS. A TUI
+      run keeps the same record a CLI run does, on disk instead of on screen.
+    - stderr — only when `quiet` is False. A TUI owns the terminal's alternate
+      screen, where a stray stderr write paints over the frame it composes (the
+      TUI already shows its own `[error: …]` row); the CLI keeps the stderr
+      debugging output it always had.
+
+    `markup=False` because the report is DATA: a message containing `[/]` or an
+    unclosed tag would otherwise raise `MarkupError` from rich — inside the
+    failure path, turning one error into two.
+    """
+
+    lines = _failure_diagnostic_lines(exc)
+
+    if not quiet:
+        for line in lines:
+            _fail_console.print(line, markup=False, highlight=False)
+
+    _append_failure_log(lines, exc, session_name)
 
 
 def _load_coreouto_history(session: str, continue_session: bool) -> list[co.Message] | None:

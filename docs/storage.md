@@ -34,7 +34,7 @@ All paths are rooted at `~/.miniouto/` and can be overridden via the `MINIOUTO_H
 │       (+ matching .png siblings for screenshots)  # newest 100 files kept (MAX_CAPTURE_FILES), oldest pruned per write
 │                                         # (action="screen"; action="screenshot" writes the
 │                                         # same art best-effort as a sibling of its capture)
-└── logs/                         # reserved (currently unused by code)
+├── logs/                         # failure-<session>.log (failed-turn diagnostics)
 ```
 
 Skills live **outside** `~/.miniouto/`, in two default roots: the invocation directory's `./skills/<name>/SKILL.md` (project-local, first) and `~/.agents/skills/<name>/SKILL.md` (the Anthropic convention). `storage.skills.list_skills(None)` reads both in that order; `list_skills(directory)` reads a named root — that is how a style's `{skills:<dir>…}` token lists project-local or Claude-style skill directories; only the default root is the harness-wide convention. See `docs/skills.md`.
@@ -124,7 +124,7 @@ model    = ""           # the outo model — written WITH provider/reasoning as 
 reasoning = ""          # the outo reasoning effort — same pair; empty = the provider record's reasoning_effort
 style    = "default"    # default style (must exist in ~/.miniouto/style/)
 session  = "default"    # active session name; written by PLAIN `miniouto chat` (`_is_plain_run`: no --role/--alarm-session/--return/--bg) and by TUI user actions (first dispatch, session picker, "new session"). Delegated runs never write it, including across hand-offs; their explicit `ChatOptions.session` selects routing without touching this global fallback.
-theme    = "miniouto"   # TUI theme name. `miniouto` is the harness's own dark theme (registered in cli/tui.py); any other REGISTERED name — a stock Textual theme, e.g. `gruvbox` — replaces it, and the TUI writes back whatever is picked at runtime (Ctrl+P → Theme). An unregistered name falls back to `miniouto` rather than failing the launch.
+theme    = "miniouto"   # TUI theme name. `miniouto` is the harness's own dark theme (`cli/tui/theme.py:MINIOUTO_THEME`); any other REGISTERED name — the ported stock themes, e.g. `gruvbox` — replaces it, and the TUI writes back whatever is picked at runtime (Ctrl+P → Theme). An unregistered name falls back to `miniouto` rather than failing the launch.
 subagent_provider = ""  # optional; subagent provider override (empty = inherit outo's provider)
 subagent_model    = ""  # optional; subagent model override (empty = subagent provider's default_model, else inherit outo's model)
 subagent_reasoning = "" # optional; subagent reasoning-effort override (empty = subagent provider's reasoning_effort, else auto)
@@ -398,7 +398,7 @@ The `<outo>` tag is required (or the whole document is treated as the outo promp
 | `STYLE_REPOS_FILE` | `Path` | `ROOT/style_repos.toml` (repo URLs recorded by `style add`) |
 | `SESSION_DIR` | `Path` | `ROOT/sessions` |
 | `SUBAGENT_RESULTS_DIR` | `Path` | `ROOT/subagent-results` — where a finished delegated `chat` run writes its answer file |
-| `LOG_DIR` | `Path` | `ROOT/logs` (reserved) |
+| `LOG_DIR` | `Path` | `ROOT/logs` — one `failure-<session>.log` per session with a failed turn |
 | `INBOX_DIR` | `Path` | `ROOT/inbox` — per-session cross-process message directories |
 | `SPAWN_LOG_DIR` | `Path` | `ROOT/spawn-logs` — one `<id>.json` marker + `<id>.log` per detached `chat --bg` run |
 | `COMPUTER_SCREENS_DIR` | `Path` | `ROOT/computer-screens` — `.art` captures written by the Computer tool's `screen` action |

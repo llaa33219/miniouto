@@ -84,7 +84,7 @@ build_runtime(runtime, *, style_overrides, provider_config,
 
 ## `core/events.py`
 
-The sink layer — a tiny abstraction so the chat loop can emit progress/trace events without coupling to either the CLI (`rich.Console`) or the TUI (Textual widgets). Introduced when the TUI was added so `run_chat` could drive both surfaces from the same code path.
+The sink layer — a tiny abstraction so the chat loop can emit progress/trace events without coupling to either the CLI (`rich.Console`) or the TUI (its own `TUIEventSink`, which turns events into painted rows). Introduced when the TUI was added so `run_chat` could drive both surfaces from the same code path.
 
 - **`LoopEvent`** — dataclass with `actor: str` (always `"outo"` — plus `"provider"` / `"watchdog"` for synthetic events), `kind: str`, `text: str`, optional `tool_name`, optional `subagent_id` / `subagent_name` (**spawn bookkeeping, not actor identity** — they are copied off the drained inbox message's `meta`, and are `None` for `kind="user"` messages), optional `detail` (extra payload not shown by the CLI — the full untruncated Bash command on `kind="tool"`, and `inbox:<id>` on drained inbox messages), optional `msg_ref` (`str(id(message))` of the live coreouto `Message` the event came from — the prune key for invariant 18). Kinds: `"tool"` / `"tool_result"` / `"response"` / `"thinking"` / `"context"` / `"error"` / `"wakeup"` / `"alarm"` / `"user"` / `"subagent_start"` / `"subagent_end"` (the last two survive only for old session files). `to_dict()`/`from_dict()` provide the sparse JSON form stored in session turns (optional fields are only serialized when truthy, so older session files load unchanged).
 - **`EventSink`** — `Protocol`: `begin_working()`, `update_activity(text)`, `end_working()`, `emit_loop_event(event)`, `emit_final_answer(content, session_name)`, `emit_stream_delta(kind, text)`, `remove_events(msg_refs)`. `emit_stream_delta` is **transient and display-only** (`kind` is `"text"` or `"thinking"` — the `StreamKind` literal): deltas are incremental fragments of a message the model is still generating, never records. All four implementers must define it — hooks are global and there is no `__getattr__` delegation, so a missing method raises `AttributeError` on the first delta. `NullSink` and `ConsoleEventSink` are no-ops (the CLI renders whole messages only, keeping its output byte-identical), `_RecordingSink` forwards without recording, `TUIEventSink` coalesces into a live row. `remove_events(msg_refs)` is the display-prune entry point: it drops every recorded event carrying one of those `msg_ref`s, forwards to the wrapped sink (the TUI removes matching rows, the console prints a dim `[removed N corrupted messages from the record]` note), and is called **only** by the two removal sources (history repair + `sanitize_history`) — never by the summary hand-off, which changes sessions rather than editing history.
@@ -98,9 +98,9 @@ The sink layer — a tiny abstraction so the chat loop can emit progress/trace e
 ### Module-level state
 
 - `_tool_trace: list[dict]` + `_tool_trace_lock: threading.Lock` — last 5 tool calls observed this turn, used by failure diagnostics. Locked because tool handlers may run concurrently.
-- `_LOGGABLE_TOOL_NAMES = ("Bash", "Image", "Video", "Audio", "Computer")` — the live tool set, one entry per tool registered by `tools/registry.py`, so every tool call a turn can make gets a readable `_short_arg_summary` in failure output instead of a raw `repr(args)`. Delegation is deliberately absent: it rides on `Bash` (`miniouto chat … --role <tag>`), and a delegated run's completion comes back as an inbox alarm message, not as a tool call.
+- `_LOGGABLE_TOOL_NAMES = ("Bash", "Image", "Video", "Audio", "Computer", "continue_session")` — the live tool set, one entry per tool registered by `tools/registry.py`, so every tool call a turn can make gets a readable `_short_arg_summary` in failure output instead of a raw `repr(args)`.
 - `pending_responses` / `pending_thinking` / `turn_refs` — buffers created in `_run_chat_prepared` (see the dispatchers below). Since every actor is `outo`, each is keyed by `""`. `turn_refs` is the `str(id(assistant_message))` published by `ON_ITERATION` and read by the two tool dispatchers, which is why a call row and its result row always share one `msg_ref`.
-- `_fail_console = rich.Console(stderr=True, soft_wrap=False, highlight=False)` — for diagnostic output (failure trace + traceback to stderr).
+- `_fail_console = rich.Console(stderr=True, soft_wrap=False, highlight=False)` — the stderr sink for failure diagnostics (written only when `ChatOptions.quiet_diagnostics` is False; the log file under `LOG_DIR` is written either way).
 - Imports `EventSink, LoopEvent, NullSink` from `.events`.
 
 ### `ChatOptions`
@@ -121,6 +121,7 @@ class ChatOptions:
     reasoning: str | None = None
     continue_session: bool = False
     cancel_event: threading.Event | None = None
+    quiet_diagnostics: bool = False  # TUI: log file only, no stderr dump
 ```
 
 Mirrors the CLI flags for `miniouto chat`. The CLI is responsible for translating `--name` → `session`, `--continue` → `continue_session`, etc. `role` is set **only** by `cli/chat.py` from `--role`, never by the TUI — see "Role mode" under `core/runtime.py`.
@@ -228,13 +229,26 @@ Builds the `on_iteration(*, iteration, messages, response, **kwargs)` closure. `
 
 Builds the `on_provider_error(*, status_code, error_message, reaction, reaction_message, **kwargs)` closure wired into coreouto's `ON_PROVIDER_ERROR` hook. Emits a `LoopEvent(actor="provider", kind="error", text="HTTP {code} → {reaction}: {message}")` for every rule-matched provider error, and switches the spinner activity to `"provider retry"` for retry reactions. This is the only surface for rule-matched errors — they no longer raise out of the turn (see `core/error_rules.py` below), so without this hook a retry storm or a 401 would be invisible.
 
-### `_dump_failure_diagnostics(exc, session_name)`
+### `_dump_failure_diagnostics(exc, session_name, *, quiet=False)`
 
-On exception, prints to **stderr** via `_fail_console`:
-- `✗ {type(exc).__name__}: {exc}` in red.
+Two sinks, one content. `_failure_diagnostic_lines(exc)` builds the report as
+`rich.text.Text` lines (so an error message containing markup is never parsed);
+`_append_failure_log` writes it to `LOG_DIR/failure-<session>.log` — timestamped,
+appended, and **always**, whether or not a TUI is up. `quiet` (the TUI's
+`ChatOptions.quiet_diagnostics`) suppresses only the second sink, `_fail_console`
+on stderr, because a TUI owns the terminal's alternate screen and a traceback
+written there paints over the frame it composes.
+
+The report itself is unchanged:
+- `✗ {type(exc).__name__}: {exc}` with a red prefix.
 - A "Last tool call before failure" header followed by the last 5 traced tool calls (or a "No tool call observed" notice).
 - For known tools, a one-line summary via `_short_arg_summary`; otherwise `repr(args)[:160]`.
 - A full traceback via `traceback.format_exc()`.
+
+`_append_failure_log` is best-effort: an `OSError` (read-only home, missing
+directory) yields `None` instead of raising, so the failure path never turns one
+error into two. A session name is squashed to `[A-Za-z0-9._-]` before it becomes
+a filename, so a name carrying `/` cannot escape `LOG_DIR`.
 
 Then re-raises so the caller (`chat_cmd` or the TUI worker) can handle or propagate.
 
@@ -673,7 +687,7 @@ Returns a `RuntimeConfig` with `subagent_provider`/`subagent_model`/`subagent_re
 | `core/chat.py` | `session_store.begin_turn/update_turn_events/update_history/prune_turn_events/finish_turn`, `session_store.load` | JSON session persistence (schema v2, incremental) | Load is tolerant (never raises); write failures swallowed (`_TurnPersister`, `_finish_turn`) |
 | `core/spawn_state.py` | `SPAWN_LOG_DIR/<id>.json` | Liveness marker for a detached `--bg` run, read by a monitor (nothing in `chat` waits on it) | Written atomically; `read_marker` never raises (missing/corrupt → `None`) |
 | `core/chat.py` | `_run_with_watchdog` → `agent.call(prompt, history=...)` | LLM call (network to configured provider) | Caught locally for diagnostics, re-raised |
-| `core/chat.py` | `_fail_console.print(...)` | Human-readable diagnostic lines to stderr | None — best-effort |
+| `core/chat.py` | `LOG_DIR/failure-<session>.log` (always) + `_fail_console.print(...)` (unless `quiet_diagnostics`) | Human-readable failure diagnostics: error line, last ≤5 tool calls, traceback | Log append is best-effort (`OSError` swallowed); stderr write is skipped for a TUI |
 
 No file I/O directly inside `core/` — all disk access is delegated to `storage/` (providers, settings, sessions, styles, skills) and `tools/registry.py`.
 

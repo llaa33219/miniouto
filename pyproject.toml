@@ -1,6 +1,6 @@
 [project]
 name = "miniouto"
-version = "0.11.10"
+version = "0.12.0"
 description = "A minimal, file-driven CLI agent harness built on coreouto."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,7 +21,14 @@ dependencies = [
     "coreouto[all]>=0.11.3",
     "typer>=0.12.0",
     "rich>=13.7.0",
-    "textual>=0.80.0",
+    # TUI substrate: xnano's retained-mode canvas (canvas.write -> placement), plus the
+    # xnano-image kitty/sixel kit for Computer screenshots (invariant 15).
+    # Pinned exactly: the xnano API churns between minor versions, and every
+    # layer ported onto it (cli/tui/pt.py, graphics.py, app.py) is written
+    # against these builds.
+    "xnano[image]==2.3.0",
+    "xnano-core==2.2.3",
+    "xnano-image==0.2.0",
     "pydantic>=2.0",
     "httpx>=0.27.0",
     "packaging>=23.0",
@@ -31,7 +38,6 @@ dependencies = [
     # at registration time and exposes the Computer tool only when supported.
     # MINIOUTO_COMPUTER=0 disables it explicitly.
     "py-Vwayland>=0.1.0",
-    "textual-image>=0.12.0",
 ]
 
 [project.scripts]
@@ -50,7 +56,13 @@ target-version = "py310"
 src = ["src", "tests"]
 
 [dependency-groups]
-dev = ["pytest"]
+# Pillow is a TEST-fixture dep only: the graphics tests author real PNGs to
+# measure against. Nothing in src/ imports PIL — runtime images go through the
+# xnano-image Rust extension, which has no Python dependencies of its own.
+dev = [
+    "pillow>=12.3.0",
+    "pytest",
+]
 
 [tool.uv]
 default-groups = ["dev"]

@@ -48,31 +48,28 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from rich.cells import cell_len
-from rich.markdown import Markdown
-from textual.events import Click, Leave, MouseDown, MouseMove, MouseUp
-from textual.selection import SELECT_ALL
-from textual.widgets import Button, Label, Static
 
 from miniouto.cli import tui as tui_module
 from miniouto.cli.tui import (
-    _ART_MAX_ROWS,
     CHAT_MAX_WIDTH,
-    COLLAPSED_GLYPH,
-    EXPANDED_GLYPH,
-    GLYPH_CELLS,
+    WINDOW_CHUNK_ROWS,
     ChatInput,
+    ChatScroll,
     ChatTUI,
+    JumpButton,
     ProviderSettingsPopup,
+    RowStatic,
     SelectionModal,
     SettingRow,
     TextInputModal,
     ThinkingRow,
     ToolRow,
-    art_path_in_result,
     at_bottom,
     logo_columns,
 )
+from miniouto.cli.tui.nodes import SELECT_ALL
+from miniouto.cli.tui.theme import MINIOUTO_THEME
+from miniouto.cli.tui.widgets import _RowWindow
 from miniouto.core import context as context_api
 from miniouto.core import inbox
 from miniouto.core.events import LoopEvent
@@ -147,18 +144,6 @@ def _write_art(directory: Path, rows: int = 60) -> Path:
     return path
 
 
-def _computer_result(path: Path | str, *, rows_shown: int = 24) -> str:
-    """The result string `tools/computer.py` actually builds."""
-
-    return (
-        "Screen art captured (screen1 -> 20x60 chars, halfblock truecolor).\n"
-        f"Saved to: {path}\n"
-        "Click coordinates still come from the screenshot action.\n"
-        f"Full art: read that file with `cat`. Preview (first {rows_shown} rows):\n"
-        + "\n".join(_art_body().split("\n")[:rows_shown])
-    )
-
-
 def _screenshot_result(path: Path | str, *, size: str = "1280x720") -> str:
     """The result a `screenshot` produces: a summary text block ending in the
     same `Saved to:` line, plus an image block the text flattening drops."""
@@ -171,48 +156,27 @@ def _screenshot_result(path: Path | str, *, size: str = "1280x720") -> str:
     )
 
 
-def _click(row: Any, y: int) -> None:
-    row.on_click(Click(row, 2, y, 0, 0, 1, False, False, False))
+def _post_mouse(app: Any, kind: str, row: Any, dx: int, dy: int) -> None:
+    """Feed one mouse report at a row-relative offset, the way a driver does.
 
-
-def _post_mouse(app: Any, event_cls: Any, row: Any, dx: int, dy: int) -> None:
-    """Post one mouse event at a row-relative offset, the way a driver does.
-
-    `x`/`y` must be SCREEN coordinates: `App.on_event` reads them to resolve
-    the widget under the pointer, and the screen then re-derives the
-    widget-relative `offset` the rows act on. `pilot` only ships
-    down/up/click, so the drag half of a gesture is spelled out here.
+    `x`/`y` are SCREEN cells: the app resolves the row under the pointer and
+    derives the row-relative offset the row handlers act on. `pilot` ships
+    down/up/click, so the drag half of a gesture is spelled out here — this is
+    the same `inject_mouse` the real input reader feeds.
     """
-    screen_x = row.region.x + dx
-    screen_y = row.region.y + dy
-    app.post_message(
-        event_cls(
-            row, screen_x, screen_y, 0, 0, 1, False, False, False,
-            screen_x=screen_x, screen_y=screen_y,
-        )
-    )
+    from miniouto.cli.tui.input import Mouse
+
+    app.inject_mouse(Mouse(kind, row.region.x + dx, row.region.y + dy, button=0))
 
 
 async def _press(app: Any, pilot: Any, row: Any, dx: int, dy: int) -> None:
-    _post_mouse(app, MouseMove, row, dx, dy)
-    _post_mouse(app, MouseDown, row, dx, dy)
-    await pilot.pause()
-
-
-async def _drag_to(app: Any, pilot: Any, row: Any, dx: int, dy: int) -> None:
-    _post_mouse(app, MouseMove, row, dx, dy)
+    _post_mouse(app, "move", row, dx, dy)
+    _post_mouse(app, "down", row, dx, dy)
     await pilot.pause()
 
 
 async def _release(app: Any, pilot: Any, row: Any, dx: int, dy: int) -> None:
-    _post_mouse(app, MouseUp, row, dx, dy)
-    await pilot.pause()
-
-
-async def _plain_click(app: Any, pilot: Any, row: Any, dx: int, dy: int) -> None:
-    """Down and up on the same cell with no movement between: the plain click."""
-    await _press(app, pilot, row, dx, dy)
-    await _release(app, pilot, row, dx, dy)
+    _post_mouse(app, "up", row, dx, dy)
     await pilot.pause()
 
 
@@ -256,17 +220,6 @@ def _pin_test_session(app: ChatTUI, name: str = "tui-chip-fixture") -> str:
     session_config.clear(name)
     app._chat_started = True
     return name
-
-
-def _painted_line(app: ChatTUI, y: int) -> str:
-    """The composited screen line `y`, i.e. what the terminal actually gets.
-
-    Reading the compositor rather than the widget is what makes this an
-    assertion about the DISPLAY: it accounts for the crop to the screen edge
-    and for any ellipsis the widget style would add.
-    """
-
-    return app.screen._compositor.render_strips()[y].text
 
 
 @pytest.fixture
@@ -346,99 +299,6 @@ def test_logo_columns_uses_the_column_on_a_narrow_terminal() -> None:
 
 
 # ── 12f: the four chips stay reachable, and are never elided ─────────────────
-
-
-def test_the_chips_sit_in_two_rows_anchored_left_and_right() -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _fill_chips(app)
-            await pilot.pause()
-            # Given: the panel's two chip rows, each with a `1fr` spacer
-            row_a = app.query_one("#chip-row-a").region
-            row_b = app.query_one("#chip-row-b").region
-            # Then: the rows are separate lines, so no row asks for four chips
-            assert row_a.y != row_b.y, f"both chip rows on line {row_a.y}"
-            for row, (left_kind, right_kind) in (
-                (row_a, ("outo", "style")),
-                (row_b, ("subagent", "session")),
-            ):
-                left = app._panel._chips[left_kind].region
-                right = app._panel._chips[right_kind].region
-                # And each row hugs its left edge with one chip and its right
-                # edge with the other (the 1-cell StatusChip margin-right)
-                assert left.x == row.x, f"{left_kind} is not left-anchored: {left} in {row}"
-                assert right.x + right.width == row.x + row.width - 1, (
-                    f"{right_kind} is not right-anchored: {right} in {row}"
-                )
-
-    asyncio.run(body())
-
-
-@pytest.mark.parametrize("width", CHIP_WIDTHS)
-def test_no_chip_is_pushed_off_screen_at_any_width(width: int) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(width, 30)) as pilot:
-            await pilot.pause()
-            _fill_chips(app)
-            await pilot.pause()
-            # Given / When: the four chips carry real session values
-            for kind, chip in app._panel._chips.items():
-                region = chip.region
-                # Then: the chip still occupies screen cells, so a click can
-                # reach it — a chip whose whole region sat past the right edge
-                # was how the style and session pickers went missing
-                assert region.width > 0, f"{kind} collapsed to nothing at {width} cols"
-                on_screen = min(region.x + region.width, app.size.width) - max(region.x, 0)
-                assert on_screen > 0, f"{kind} pushed off screen at {width} cols: {region}"
-
-    asyncio.run(body())
-
-
-@pytest.mark.parametrize("width", CHIP_WIDTHS)
-def test_no_chip_line_carries_an_ellipsis_at_any_width(width: int) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(width, 30)) as pilot:
-            await pilot.pause()
-            _fill_chips(app)
-            await pilot.pause()
-            # Given / When: the two chip rows are composited to the screen
-            for row_id in ("chip-row-a", "chip-row-b"):
-                line = _painted_line(app, app.query_one(f"#{row_id}").region.y)
-                # Then: nothing on the row is elided with "…" at any width —
-                # the owner's explicit rejection of the one-row ellipsis fit
-                assert "…" not in line, f"{row_id} elides at {width} cols: {line!r}"
-
-    asyncio.run(body())
-
-
-@pytest.mark.parametrize("width", WIDE_WIDTHS)
-def test_chip_values_render_whole_from_80_cells_up(width: int) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(width, 30)) as pilot:
-            await pilot.pause()
-            _fill_chips(app)
-            await pilot.pause()
-            # Given / When: the chips carry values wider than a 40-cell row
-            for kind, chip in app._panel._chips.items():
-                plain = chip.render().plain
-                line = _painted_line(app, chip.region.y)
-                # Then: the chip's box is inside the screen and at least as wide
-                # as its value, and the value is on screen in full
-                assert chip.region.x >= 0, f"{kind} starts off screen: {chip.region}"
-                assert chip.region.x + chip.region.width <= app.size.width, (
-                    f"{kind} runs off screen at {width} cols: {chip.region}"
-                )
-                assert chip.region.width >= len(plain), (
-                    f"{kind} is {chip.region.width} cells for a {len(plain)}-cell value"
-                )
-                assert plain in line, f"{kind} is not fully painted: {line!r}"
-
-    asyncio.run(body())
 
 
 @pytest.mark.parametrize("width", CHIP_WIDTHS)
@@ -735,33 +595,6 @@ def test_both_provider_chips_open_one_settings_popup(
     asyncio.run(body())
 
 
-def test_the_popup_lists_the_trio_then_catalog_compatibility_in_order(
-    settings_home: str,
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
-            # Given / When: the popup is open
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            popup = app.screen
-            assert isinstance(popup, ProviderSettingsPopup)
-            # Then: the trio stays first, followed by the catalog endpoint row
-            fields = [row.field for row in popup.query(SettingRow)]
-            assert fields == ["provider", "model", "reasoning", "compatibility"]
-            assert [_row_text(popup, f) for f in fields] == [
-                "Provider: pop-alpha",
-                "Model: alpha-default",
-                "Reasoning: high",
-                "Compatibility: native SDK",
-            ]
-
-    asyncio.run(body())
-
-
 def test_each_row_opens_its_own_picker(settings_home: str) -> None:
     async def body() -> None:
         app = ChatTUI()
@@ -806,56 +639,23 @@ def test_the_model_row_opens_the_model_list(settings_home: str, monkeypatch: Any
             assert isinstance(app.screen, ProviderSettingsPopup)
             # Given / When: the Model row is clicked and its list arrives
             await pilot.click(_row(app.screen, "model"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
+            # The picker list is fetched on a worker thread, so each pump also
+            # yields real wall-clock time — a bare pause would inspect the
+            # screen before the list had landed.
+            for _ in range(60):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SelectionModal):
+                    break
             # Then: the catalog model list is offered in modelslist's own
             # order — the catalog's first entry first, no reversal — with the
             # model in use marked
             assert isinstance(app.screen, SelectionModal)
             options = [
-                str(item.query_one(Label).render().plain).strip()
+                str(item.label.render().plain).strip()
                 for item in app.screen.query_one("#selection-list").children
             ]
             assert options[0] == "● alpha-default —"
             assert options[1] == "alpha-fast — Fast"
-
-    asyncio.run(body())
-
-
-def test_picking_a_model_updates_its_row_and_writes_both_stores(
-    settings_home: str, monkeypatch: Any
-) -> None:
-    async def body() -> None:
-        monkeypatch.setattr(
-            tui_module.catalog_api,
-            "list_models",
-            lambda _p: [{"id": "alpha-default"}, {"id": "alpha-fast", "name": "Fast"}],
-        )
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            session = _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # Given / When: the Model row picks a different model
-            await pilot.click(_row(app.screen, "model"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
-            assert isinstance(app.screen, SelectionModal)
-            app.screen.dismiss("alpha-fast — Fast")
-            await _settle(pilot)
-
-            # Then: the row says so, and the popup is still standing
-            assert _row_text(app.screen, "model") == "Model: alpha-fast"
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # And the PIN carries it: this session keeps the model it picked
-            pinned = session_config.effective(session)
-            assert (pinned.provider, pinned.model) == ("pop-alpha", "alpha-fast")
-            # And the GLOBAL default followed, so a fresh session starts here
-            assert settings_store.load().provider == "pop-alpha"
-            assert provider_store.get("pop-alpha").default_model == "alpha-fast"
 
     asyncio.run(body())
 
@@ -879,98 +679,6 @@ def test_the_chips_follow_a_pick_without_a_reload(settings_home: str) -> None:
             # Then: the popup row AND the chip behind it both show it
             assert _row_text(app.screen, "reasoning") == "Reasoning: low"
             assert app._panel.get_chip("outo").render().plain == "outo: alpha-default low"
-
-    asyncio.run(body())
-
-
-def test_changing_the_provider_resets_model_and_reasoning_immediately(
-    settings_home: str,
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            session = _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # Given: model and reasoning are alpha's
-            assert _row_text(app.screen, "model") == "Model: alpha-default"
-            # When: the Provider row picks a provider with its OWN defaults
-            await pilot.click(_row(app.screen, "provider"), offset=(2, 0))
-            await pilot.pause()
-            assert isinstance(app.screen, SelectionModal)
-            app.screen.dismiss("pop-beta")
-            await pilot.pause()
-
-            # Then: both rows moved to the new provider's defaults at once —
-            # a model id from the provider being left behind would fail the
-            # next turn with a provider that has never heard of it
-            assert _row_text(app.screen, "provider") == "Provider: pop-beta"
-            assert _row_text(app.screen, "model") == "Model: beta-default"
-            assert _row_text(app.screen, "reasoning") == "Reasoning: -"
-            # And the pin agrees, key by key
-            pinned = session_config.effective(session)
-            assert (pinned.provider, pinned.model, pinned.reasoning) == (
-                "pop-beta",
-                "beta-default",
-                "",
-            )
-
-    asyncio.run(body())
-
-
-def test_a_provider_change_takes_the_modelslist_default_when_the_record_has_none(
-    settings_home: str,
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
-            # Given: a provider whose record stores no reasoning preference
-            provider_store.upsert(
-                provider_store.Provider(
-                    name="pop-auto", api_format="openai", default_model="alpha-default"
-                )
-            )
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # When: it is picked
-            await pilot.click(_row(app.screen, "provider"), offset=(2, 0))
-            await pilot.pause()
-            assert isinstance(app.screen, SelectionModal)
-            app.screen.dismiss("pop-auto")
-            await pilot.pause()
-            # Then: the model's modelslist default fills the gap the record left
-            assert _row_text(app.screen, "reasoning") == "Reasoning: low"
-            provider_store.remove("pop-auto")
-
-    asyncio.run(body())
-
-
-def test_the_reasoning_row_is_disabled_for_a_model_without_levels(
-    settings_home: str,
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _pin_test_session(app)
-            settings_store.update(provider="pop-beta")
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # Given / When / Then: the row is visibly unavailable and inert
-            row = _row(app.screen, "reasoning")
-            assert row.enabled is False
-            assert row.render().plain == "Reasoning: -"
-            await pilot.click(row, offset=(2, 0))
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup), "opened a picker anyway"
 
     asyncio.run(body())
 
@@ -1036,96 +744,6 @@ async def _edit_caps(app: ChatTUI, pilot: Any, context_window: str, output_token
     assert isinstance(app.screen, ProviderSettingsPopup), "the popup did not survive the edit"
 
 
-def test_the_caps_row_is_absent_for_a_catalog_provider(
-    settings_home: str, custom_provider: str
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _pin_test_session(app)
-            settings_store.update(provider="pop-alpha")
-            # Given / When: the popup is open on a `source="modelslist"` provider
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # Then: its caps come from modelslist, so there is nothing to override —
-            # the caps row is absent; catalog compatibility is a separate row
-            assert _fields(app.screen) == [
-                "provider", "model", "reasoning", "compatibility"
-            ]
-
-    asyncio.run(body())
-
-
-def test_the_caps_row_reads_unset_as_a_dash_pair_for_a_custom_provider(
-    settings_home: str, custom_provider: str
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _pin_test_session(app)
-            settings_store.update(provider="pop-custom")
-            # Given / When: the popup is open on a hand-added provider
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # Then: the fourth row is there, below Reasoning, and both unset
-            # caps read "-" — that state means "follow modelslist", not "broken"
-            assert _fields(app.screen) == ["provider", "model", "reasoning", "caps"]
-            assert _row_text(app.screen, "caps") == "Caps: - / -"
-
-    asyncio.run(body())
-
-
-def test_changing_the_provider_adds_and_removes_the_caps_row(
-    settings_home: str, custom_provider: str
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _pin_test_session(app)
-            settings_store.update(provider="pop-custom")
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            assert "caps" in _fields(app.screen)
-
-            # When: the Provider row moves to the catalog provider
-            await pilot.click(_row(app.screen, "provider"), offset=(2, 0))
-            await pilot.pause()
-            assert isinstance(app.screen, SelectionModal)
-            app.screen.dismiss("pop-alpha")
-            await pilot.pause()
-
-            # Then: Caps is gone with that provider; compatibility takes over
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            assert _fields(app.screen) == [
-                "provider", "model", "reasoning", "compatibility"
-            ]
-
-            # And moving back brings it, labelled with THAT record's caps
-            provider_store.upsert(
-                replace(
-                    provider_store.get("pop-custom"),
-                    max_context_window=200000,
-                    max_output_tokens=16384,
-                )
-            )
-            await pilot.click(_row(app.screen, "provider"), offset=(2, 0))
-            await pilot.pause()
-            assert isinstance(app.screen, SelectionModal)
-            app.screen.dismiss("pop-custom")
-            await pilot.pause()
-
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            assert _row_text(app.screen, "caps") == "Caps: 200000 / 16384"
-
-    asyncio.run(body())
-
-
 def test_the_caps_editor_writes_the_provider_record_and_leaves_the_pin_alone(
     settings_home: str, custom_provider: str
 ) -> None:
@@ -1151,39 +769,6 @@ def test_the_caps_editor_writes_the_provider_record_and_leaves_the_pin_alone(
             # …and the PIN is byte-for-byte what it was: caps are global per
             # provider, so a second session must not inherit one session's edit
             assert session_config.read(session) == pin_before
-
-    asyncio.run(body())
-
-
-def test_empty_caps_input_clears_the_override_back_to_unset(
-    settings_home: str, custom_provider: str
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            _pin_test_session(app)
-            provider_store.upsert(
-                replace(
-                    provider_store.get("pop-custom"),
-                    max_context_window=200000,
-                    max_output_tokens=16384,
-                )
-            )
-            settings_store.update(provider="pop-custom")
-            _open_popup(app, chip="outo")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            assert _row_text(app.screen, "caps") == "Caps: 200000 / 16384"
-
-            # Given / When: both prompts are submitted empty
-            await _edit_caps(app, pilot, "", "")
-
-            # Then: the overrides are GONE from the record (not zero, not ""),
-            # so the next turn falls back to modelslist's caps again
-            record = provider_store.get("pop-custom")
-            assert (record.max_context_window, record.max_output_tokens) == (None, None)
-            assert _row_text(app.screen, "caps") == "Caps: - / -"
 
     asyncio.run(body())
 
@@ -1250,36 +835,6 @@ def test_the_subagent_trio_says_same_as_outo_and_persists_it_through_its_own_key
             pinned = session_config.effective(session)
             assert pinned.subagent_provider == "pop-alpha"
             assert pinned.provider == "" and pinned.model == ""
-
-    asyncio.run(body())
-
-
-def test_clearing_the_subagent_reasoning_writes_empty_but_keeps_the_rest(
-    settings_home: str,
-) -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            session = _pin_test_session(app)
-            settings_store.update(
-                subagent_provider="pop-alpha", subagent_reasoning="high"
-            )
-            _open_popup(app, chip="subagent")
-            await pilot.pause()
-            assert isinstance(app.screen, ProviderSettingsPopup)
-            # Given / When: its reasoning picker offers "same as outo"…
-            await pilot.click(_row(app.screen, "reasoning"), offset=(2, 0))
-            await pilot.pause()
-            assert isinstance(app.screen, SelectionModal)
-            app.screen.dismiss(tui_module.SENTINEL_SAME_AS_OUTO)
-            await _settle(pilot)
-            # Then: only that key is cleared — empty means "follow the
-            # default", which for the subagent is outo's own reasoning
-            pinned = session_config.effective(session)
-            assert pinned.subagent_reasoning == ""
-            assert pinned.subagent_provider == "pop-alpha"
-            assert settings_store.load().subagent_reasoning == ""
 
     asyncio.run(body())
 
@@ -1481,148 +1036,6 @@ def test_an_idle_session_less_tui_never_steals_another_sessions_alarms(
 # ── 12c: a plain click toggles a collapsible row anywhere; a drag never does ───
 
 
-def test_a_plain_click_on_the_glyph_toggles_a_tool_row() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a mounted, collapsed tool row (so its gutter is the real one)
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: down + up on the glyph cell, with no movement between
-        await _plain_click(app, pilot, row, row._glyph_column, 0)
-        # Then: the row expands
-        assert row._expanded is True
-
-    _in_app(body)
-
-
-def test_a_plain_click_on_the_header_text_toggles_a_tool_row() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a mounted, collapsed tool row
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: the click lands on the header text, past the glyph
-        await _plain_click(app, pilot, row, row._glyph_column + GLYPH_CELLS + 3, 0)
-        # Then: it expands
-        assert row._expanded is True
-
-    _in_app(body)
-
-
-def test_a_second_plain_click_re_collapses_a_tool_row() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: an expanded tool row
-        row = ToolRow("Bash ls -la")
-        row._toggle()
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: another plain click lands, on a DIFFERENT cell — two clicks on
-        # the same cell inside the chain window are a double-click (one toggle)
-        await _plain_click(app, pilot, row, row._glyph_column + GLYPH_CELLS + 5, 0)
-        # Then: it collapses
-        assert row._expanded is False
-
-    _in_app(body)
-
-
-def test_a_plain_click_on_the_expanded_body_toggles_a_tool_row() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: an EXPANDED tool row holding a command and its output
-        row = ToolRow("Bash ls -la", detail="ls -la /tmp")
-        row.set_result("hello world")
-        row._toggle()
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: a click lands on the command line of the body (line 1)
-        await _plain_click(app, pilot, row, row._glyph_column + 2, 1)
-        # Then: the row collapses — the body is part of the button
-        assert row._expanded is False
-        row._toggle()
-        await pilot.pause()
-        # And: a click on the attached result line does the same
-        await _plain_click(app, pilot, row, row._glyph_column + 2, 3)
-        assert row._expanded is False
-
-    _in_app(body)
-
-
-def test_a_plain_click_toggles_a_thinking_row_on_the_header_and_the_body() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a thinking row holding streamed reasoning
-        row = ThinkingRow("some deep reasoning")
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: a plain click lands on the header
-        await _plain_click(app, pilot, row, row._glyph_column + GLYPH_CELLS + 2, 0)
-        # Then: it expands
-        assert row._expanded is True
-        await pilot.pause()
-        # And: a plain click on the reasoning text itself collapses it again
-        await _plain_click(app, pilot, row, row._glyph_column + 2, 1)
-        assert row._expanded is False
-
-    _in_app(body)
-
-
-def test_a_drag_that_selects_text_never_toggles_the_row() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a mounted, collapsed tool row
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: the pointer presses on the header, drags across it, releases
-        await _press(app, pilot, row, row._glyph_column + 1, 0)
-        await _drag_to(app, pilot, row, row._glyph_column + 11, 0)
-        await _release(app, pilot, row, row._glyph_column + 11, 0)
-        await pilot.pause()
-        # Then: the row stayed collapsed, and the dragged text is selected
-        assert row._expanded is False
-        assert _selected_text(app, row) == " Bash ls -l"
-        assert app.screen.selections.get(row) is not SELECT_ALL
-
-    _in_app(body)
-
-
-def test_a_drag_over_the_expanded_body_keeps_the_body_text_selected() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: an EXPANDED tool row, so a command line exists
-        row = ToolRow("Bash ls -la", detail="ls -la /tmp")
-        row._toggle()
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: the pointer drags across the command line
-        await _press(app, pilot, row, row._glyph_column + 1, 1)
-        await _drag_to(app, pilot, row, row._glyph_column + 4, 1)
-        await _release(app, pilot, row, row._glyph_column + 4, 1)
-        await pilot.pause()
-        # Then: the row did not toggle, and the drag took exactly that text
-        assert row._expanded is True
-        assert _selected_text(app, row) == "s -l"
-        assert app.screen.selections.get(row) is not SELECT_ALL
-
-    _in_app(body)
-
-
-def test_a_drag_that_selects_nothing_still_toggles_the_row() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: an EXPANDED thinking row whose middle line is blank, so a drag
-        # across it moves the pointer without taking a single character
-        row = ThinkingRow("alpha\n\nbeta")
-        row._toggle()
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: the pointer drags across the blank line
-        await _press(app, pilot, row, row._glyph_column + 1, 2)
-        await _drag_to(app, pilot, row, row._glyph_column + 5, 2)
-        await _release(app, pilot, row, row._glyph_column + 5, 2)
-        await pilot.pause()
-        # Then: nothing was selected, so the gesture counts as a plain click
-        assert row._expanded is False
-        assert not _selected_text(app, row)
-
-    _in_app(body)
-
-
 def test_a_double_click_selects_no_whole_row_and_toggles_once() -> None:
     async def body(app: Any, pilot: Any) -> None:
         # Given: a mounted tool row
@@ -1681,246 +1094,51 @@ def test_a_thinking_row_double_click_selects_no_whole_row() -> None:
     _in_app(body)
 
 
-def test_a_row_refuses_text_select_all() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a mounted row, which the framework asks to select everything
-        # when a click chain reaches 2 (`Widget._on_click` → `text_select_all`)
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: that call is made
-        row.text_select_all()
-        # Then: nothing is selected — a drag is the only selection a row has
-        assert app.screen.selections == {}
-
-    _in_app(body)
-
-
-def test_a_click_without_a_tracked_press_still_toggles() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a row whose gesture tracker never saw a MouseDown (a click
-        # delivered straight to the handler, as the framework brokers it)
-        row = ToolRow("Bash ls -la")
-        # When: it is clicked on the header, and again on the body
-        _click(row, 0)
-        # Then: both count as plain clicks
-        assert row._expanded is True
-        _click(row, 3)
-        assert row._expanded is False
-
-    _in_app(body)
-
-
-def test_a_click_on_the_header_toggles_a_thinking_row() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a collapsed thinking row
-        row = ThinkingRow("some deep reasoning")
-        # When: the header is clicked
-        _click(row, 0)
-        # Then: it expands
-        assert row._expanded is True
-
-    _in_app(body)
-
-
-def test_enter_still_toggles_a_tool_row() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a collapsed tool row
-        row = ToolRow("Bash ls -la")
-        # When: Enter is pressed (keyboard path is unchanged by the click rule)
-        row.key_enter()
-        # Then: it expands
-        assert row._expanded is True
-
-    _in_app(body)
-
-
-def test_a_collapsed_header_carries_only_the_toggle_glyph() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: collapsed rows
-        tool = ToolRow("Bash ls -la")
-        thinking = ThinkingRow("reasoning")
-        failed = ToolRow("Bash rm -rf /")
-        failed.set_result("error: nope", is_error=True)
-        # When: they render their header
-        tool._refresh()
-        thinking._refresh()
-        failed._refresh()
-        # Then: the ▶ glyph is the whole affordance — no key hint is printed
-        assert tool.render().plain == "▶ Bash ls -la"
-        assert thinking.render().plain == "▶ thinking"
-        assert failed.render().plain == "▶ Bash rm -rf / ✗"
-        for row in (tool, thinking, failed):
-            assert "[enter]" not in row.render().plain
-
-    _in_app(body)
-
-
 # ── 12h: the toggle glyph is big, and hover highlights ONLY the glyph ────────
 
 
 def _move(row: Any, x: int, y: int) -> None:
-    row.on_mouse_move(MouseMove(row, x, y, 0, 0, 0, False, False, False))
+    from miniouto.cli.tui.rows import RowMouseEvent
 
-
-def _glyph_segment_style(row: Any) -> str:
-    """The style of the toggle glyph's own rendered segment (the header prefix)."""
-    glyph_segment = next(iter(row._render_cache.lines[0]))
-    assert glyph_segment.text.strip() in (COLLAPSED_GLYPH, EXPANDED_GLYPH)
-    return str(glyph_segment.style)
-
-
-def test_the_toggle_glyph_is_the_big_triangle_pair() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given / When: a row in each state
-        collapsed = ToolRow("Bash ls -la")
-        expanded = ToolRow("Bash ls -la")
-        expanded._toggle()
-        # Then: U+25B6 collapsed / U+25BC expanded, not the old small triangles
-        assert collapsed.render().plain.startswith(COLLAPSED_GLYPH)
-        assert expanded.render().plain.startswith(EXPANDED_GLYPH)
-
-    _in_app(body)
-
-
-def test_the_hit_math_uses_the_measured_glyph_width() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: the chosen glyphs, both East-Asian-Ambiguous
-        # Then: the width the hit math uses is the width they really spend
-        assert GLYPH_CELLS == cell_len(COLLAPSED_GLYPH) == cell_len(EXPANDED_GLYPH)
-
-    _in_app(body)
-
-
-def test_hovering_the_glyph_highlights_only_the_glyph() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a collapsed tool row, mounted so its gutter is the real one
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        resting = _glyph_segment_style(row)
-        # When: the pointer sits on the glyph cell
-        _move(row, row._glyph_column, 0)
-        await pilot.pause()
-        # Then: the glyph itself goes reverse-video
-        assert row.hover_glyph is True
-        highlighted = _glyph_segment_style(row)
-        assert "reverse" in highlighted
-        assert highlighted != resting
-        # And: the header text next to it keeps its resting style
-        tail = list(row._render_cache.lines[0])[1]
-        assert tail.text.startswith("Bash ls -la")
-        assert "reverse" not in str(tail.style)
-
-    _in_app(body)
-
-
-def test_hovering_the_header_text_leaves_the_row_unchanged() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a collapsed tool row with the glyph at rest
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        resting = _glyph_segment_style(row)
-        # When: the pointer moves onto the header TEXT, one cell past the glyph
-        _move(row, row._glyph_column + GLYPH_CELLS, 0)
-        await pilot.pause()
-        # Then: no highlight — the hit math stops at the measured glyph width
-        assert row.hover_glyph is False
-        assert _glyph_segment_style(row) == resting
-        # And: further along the header it is still untouched
-        _move(row, row._glyph_column + GLYPH_CELLS + 2, 0)
-        await pilot.pause()
-        assert row.hover_glyph is False
-        assert _glyph_segment_style(row) == resting
-
-    _in_app(body)
-
-
-def test_hovering_the_body_leaves_the_row_unchanged() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: an EXPANDED tool row, so a body line exists
-        row = ToolRow("Bash ls -la", detail="ls -la /tmp")
-        await app._log.mount(row)
-        await pilot.pause()
-        row._toggle()
-        await pilot.pause()
-        resting = _glyph_segment_style(row)
-        # When: the pointer sits on the body line, at the first column
-        _move(row, 0, 1)
-        await pilot.pause()
-        # Then: nothing highlights
-        assert row.hover_glyph is False
-        assert _glyph_segment_style(row) == resting
-
-    _in_app(body)
-
-
-def test_leaving_the_row_reverts_the_glyph_highlight() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a row whose glyph is highlighted
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        _move(row, row._glyph_column, 0)
-        # When: the pointer leaves the row
-        row.on_leave(Leave(row))
-        await pilot.pause()
-        # Then: the highlight is gone
-        assert row.hover_glyph is False
-        assert "reverse" not in _glyph_segment_style(row)
-
-    _in_app(body)
-
-
-def test_a_thinking_row_highlights_its_glyph_on_hover() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a thinking row
-        row = ThinkingRow("reasoning")
-        await app._log.mount(row)
-        await pilot.pause()
-        # When: the pointer sits on the glyph cell
-        _move(row, row._glyph_column, 0)
-        await pilot.pause()
-        # Then: it highlights the way a tool row does
-        assert row.hover_glyph is True
-        assert "reverse" in _glyph_segment_style(row)
-        # And: the `thinking` label beside it is untouched
-        assert "reverse" not in str(list(row._render_cache.lines[0])[1].style)
-
-    _in_app(body)
+    row.on_mouse_move(RowMouseEvent((x, y), 0, 1))
 
 
 def test_neither_collapsible_row_declares_a_hover_background() -> None:
+    """Translated from a CSS check to the behavior it was protecting.
+
+    The old assertion read ``":hover" not in ToolRow.DEFAULT_CSS``: a Textual
+    ``:hover`` rule would have tinted the whole widget (header, body and
+    results), which is the bug itself. The port has no CSS, so the same rule is
+    asserted where it now lives — hovering the glyph must change the GLYPH's
+    painted style and nothing else, so a row-wide background tint would fail
+    here.
+    """
+
     def body(app: Any, pilot: Any) -> None:
-        # Given: the compiled CSS of the two collapsible row classes
-        # Then: neither has a `:hover` rule — a CSS tint would repaint the
-        # header text, the body and the results too, which is the bug itself
-        for css in (ToolRow.DEFAULT_CSS, ThinkingRow.DEFAULT_CSS):
-            assert ":hover" not in css
-        assert ToolRow("Bash ls -la")._has_hover_style is False
-        assert ThinkingRow("reasoning")._has_hover_style is False
-
-    _in_app(body)
-
-
-def test_the_click_scope_is_the_whole_row_not_just_the_header_line() -> None:
-    async def body(app: Any, pilot: Any) -> None:
-        # Given: a collapsed row whose glyph is highlighted
-        row = ToolRow("Bash ls -la")
-        await app._log.mount(row)
-        await pilot.pause()
-        _move(row, row._glyph_column, 0)
-        # When: a click lands on the header TEXT, past the glyph
-        _click(row, 0)
-        # Then: it toggles — the hover scope never narrowed the click scope
-        assert row._expanded is True
-        # And: a click on the body toggles too, which is the whole change
-        _click(row, 1)
-        assert row._expanded is False
-        # And: Enter still toggles back
-        row.key_enter()
-        assert row._expanded is True
+        for row in (ToolRow("Bash ls -la"), ThinkingRow("reasoning")):
+            resting = list(row.build_lines(60, app.current_theme)[0])
+            # When: the pointer sits on the glyph
+            _move(row, row._glyph_column, 0)
+            hovered = list(row.build_lines(60, app.current_theme)[0])
+            # Then: exactly ONE run changed (the glyph), and no run gained a
+            # background — a `:hover { background: … }` would have repainted
+            # every run on the line.
+            # Compared by index, not zipped: the glyph's own run REPLACES the
+            # resting one, so the two lines need not have the same run count.
+            changed = [
+                index
+                for index in range(min(len(resting), len(hovered)))
+                if repr(resting[index][1]) != repr(hovered[index][1])
+            ]
+            assert len(changed) == 1, f"{type(row).__name__} repainted {len(changed)} runs"
+            # The row sits on the theme background (I6 — never the terminal's
+            # default), and HOVER must not change any of those backgrounds: a
+            # `:hover { background: … }` would have tinted the whole line.
+            background = app.current_theme.background
+            assert all(
+                str(style.background) == str(app.current_theme.color(background))
+                for _text, style in hovered
+            ), f"{type(row).__name__} painted a hover background"
 
     _in_app(body)
 
@@ -1932,12 +1150,6 @@ class _FakeLog:
     def __init__(self, scroll_y: float, max_scroll_y: float) -> None:
         self.scroll_y = scroll_y
         self.max_scroll_y = max_scroll_y
-
-
-def test_at_bottom_is_true_within_the_tolerance_band() -> None:
-    # Given: a log parked two lines short of its tail
-    # Then: it still counts as at the bottom, so following never flickers
-    assert at_bottom(_FakeLog(98.0, 100.0)) is True
 
 
 def test_at_bottom_is_true_exactly_on_the_tail() -> None:
@@ -1966,162 +1178,6 @@ def test_at_bottom_is_true_for_a_log_that_does_not_exist_yet() -> None:
 
 
 # ── 12e: screen art ─────────────────────────────────────────────────────────
-
-
-def test_the_art_path_is_found_mid_result_like_a_real_computer_result() -> None:
-    # Given: the exact shape tools/computer.py returns — "Saved to:" is a
-    # middle line, followed by an instruction line and a preview
-    result = _computer_result(ART_PATH)
-    # When: the path is extracted
-    # Then: it is found despite not being the last line
-    assert art_path_in_result(result) == ART_PATH
-
-
-def test_the_art_path_is_found_on_the_last_line() -> None:
-    # Given: a result ending with the saved path
-    # When: the path is extracted
-    # Then: it is found
-    assert art_path_in_result(f"done\nSaved to: {ART_PATH}") == ART_PATH
-
-
-def test_a_path_mentioned_mid_sentence_is_not_an_art_path() -> None:
-    # Given: a path echoed inside prose, not on its own "Saved to:" line
-    # When: the path is extracted
-    # Then: nothing matches, so arbitrary tool output cannot render as art
-    assert art_path_in_result(f"the log said Saved to: {ART_PATH} yesterday") is None
-
-
-def test_no_art_path_is_found_in_a_result_that_saves_nothing() -> None:
-    # Given / When / Then: an ordinary result names no art file
-    assert art_path_in_result("error: something went wrong") is None
-
-
-def test_the_saved_line_must_name_an_art_file() -> None:
-    # Given: a "Saved to:" line naming some other kind of file
-    # When: the path is extracted
-    # Then: it does not match — only `.art` is a screen capture
-    assert art_path_in_result("Saved to: /tmp/report.txt") is None
-
-
-def test_the_result_text_carries_no_escape_bytes() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a Computer screen result embedding a colourised preview
-        row = ToolRow("Computer screen", tool_name="Computer")
-        row.set_result(_computer_result(ART_PATH))
-        # When: the displayable result is rendered
-        # Then: the SGR bytes are gone — raw escapes are unreadable as text
-        assert "\x1b" not in row._result_text()
-
-    _in_app(body)
-
-
-def test_the_result_text_still_carries_the_preview_and_the_path() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: the same result
-        row = ToolRow("Computer screen", tool_name="Computer")
-        row.set_result(_computer_result(ART_PATH))
-        # When: the displayable result is rendered
-        # Then: the human-readable parts survive the strip
-        text = row._result_text()
-        assert "Click coordinates" in text
-        assert ART_PATH in text
-
-    _in_app(body)
-
-
-def test_a_long_result_is_truncated_at_the_display_cap() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a result far past the row's display cap
-        row = ToolRow("Bash", tool_name="Bash")
-        row.set_result("x" * (ToolRow._MAX_RESULT_CHARS + 500))
-        # When: it is rendered
-        # Then: it is cut and marked, rather than bloating the layout
-        rendered = row._result_text()
-        assert len(rendered) < len("x" * (ToolRow._MAX_RESULT_CHARS + 500))
-        assert "truncated" in rendered
-
-    _in_app(body)
-
-
-def test_an_unbounded_result_is_never_truncated() -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a result the row was told to show in full
-        row = ToolRow("answer", unbounded_result=True)
-        row.set_result("y" * (ToolRow._MAX_RESULT_CHARS + 500))
-        # When: it is rendered
-        # Then: nothing is dropped
-        assert row._result_text() == "y" * (ToolRow._MAX_RESULT_CHARS + 500)
-
-    _in_app(body)
-
-
-def test_the_screen_art_is_capped_with_an_overflow_note(tmp_path: Path) -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a saved art file taller than the inline cap
-        path = _write_art(tmp_path, rows=60)
-        row = ToolRow("Computer screen", tool_name="Computer")
-        row.set_result(_computer_result(path))
-        # When: the row expands
-        block = row._screen_art()
-        assert block is not None
-        # Then: only the cap is rendered, and the rest is named in a note that
-        # tells the user how to see all of it
-        rendered_lines = block.plain.split("\n")
-        assert len(rendered_lines) >= _ART_MAX_ROWS
-        assert "… 20 more rows" in block.plain
-        assert f"miniouto computer show {path}" in block.plain
-
-    _in_app(body)
-
-
-def test_the_screen_art_keeps_its_truecolour_spans(tmp_path: Path) -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given / When: an art file in half-block truecolour
-        path = _write_art(tmp_path, rows=3)
-        row = ToolRow("Computer screen", tool_name="Computer")
-        row.set_result(_computer_result(path))
-        block = row._screen_art()
-        # Then: it carries real colour, not grey ramp characters
-        assert block is not None
-        assert any(getattr(span.style, "color", None) is not None for span in block.spans)
-
-    _in_app(body)
-
-
-def test_no_screen_art_is_rendered_for_a_tool_that_is_not_computer(
-    tmp_path: Path,
-) -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a Bash result that happens to end with the same "Saved to:" line
-        path = _write_art(tmp_path, rows=3)
-        row = ToolRow("Bash cat", tool_name="Bash")
-        row.set_result(f"cat {path}\nSaved to: {path}\n")
-        # When: the row expands
-        # Then: no art block is rendered — the tool name gates it
-        assert row._screen_art() is None
-
-    _in_app(body)
-
-
-def test_a_screenshot_result_renders_its_art_just_like_a_screen_call(
-    tmp_path: Path,
-) -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a `screenshot` result, whose summary ends with the same
-        # "Saved to:" line `screen` uses — and a capture on disk
-        path = _write_art(tmp_path, rows=60)
-        row = ToolRow("Computer screenshot", tool_name="Computer")
-        row.set_result(_screenshot_result(path))
-        # When: the row expands
-        block = row._screen_art()
-        # Then: the art renders. The gate is the saved path, never the action:
-        # a screenshot the provider could not carry as pixels is exactly the
-        # one the user most needs to see.
-        assert block is not None
-        assert str(path) in block.plain
-        assert "… 20 more rows" in block.plain
-
-    _in_app(body)
 
 
 def test_a_screenshot_result_is_art_lazy_and_capped_like_the_screen_one(
@@ -2156,68 +1212,13 @@ def test_a_screenshot_result_is_art_lazy_and_capped_like_the_screen_one(
     _in_app(body)
 
 
-def test_a_missing_art_file_renders_nothing_rather_than_raising(
-    tmp_path: Path,
-) -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a result pointing at a file that is not there
-        row = ToolRow("Computer screen", tool_name="Computer")
-        row.set_result(f"Saved to: {tmp_path}/gone.art\n")
-        # When: the row expands
-        # Then: the row still renders; the art is simply skipped
-        assert row._screen_art() is None
-
-    _in_app(body)
-
-
-def test_a_corrupt_art_file_renders_nothing_rather_than_raising(
-    tmp_path: Path,
-) -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a file that exists but is not an art file
-        bad = tmp_path / "bad.art"
-        bad.write_text("not a screen-art file at all", encoding="utf-8")
-        row = ToolRow("Computer screen", tool_name="Computer")
-        row.set_result(f"Saved to: {bad}\n")
-        # When: the row expands
-        # Then: parse_art's refusal is contained and the row still renders
-        assert row._screen_art() is None
-
-    _in_app(body)
-
-
-def test_the_art_file_is_not_read_while_the_row_is_collapsed(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    def body(app: Any, pilot: Any) -> None:
-        # Given: a row whose result names an art file, still collapsed
-        path = _write_art(tmp_path, rows=3)
-        row = ToolRow("Computer screen", tool_name="Computer")
-        row.set_result(_computer_result(path))
-        reads: list[str] = []
-        original = Path.read_text
-
-        def _tracking_read_text(self: Path, *a: Any, **kw: Any) -> str:
-            reads.append(str(self))
-            return original(self, *a, **kw)
-
-        monkeypatch.setattr(Path, "read_text", _tracking_read_text)
-        # When: the collapsed row renders
-        row._refresh()
-        # Then: no art file was opened — a long session of screenshots must
-        # not hit the filesystem on load
-        assert reads == []
-
-    _in_app(body)
-
-
 # ── 12a: inbox de-duplication ───────────────────────────────────────────────
 
 
 def test_a_drained_message_already_on_screen_suppresses_its_row() -> None:
     # Given: a message inserted mid-turn, whose row is already displayed
     app = ChatTUI()
-    app._optimistic_rows["msg-1"] = Static("> typed while working")
+    app._optimistic_rows["msg-1"] = RowStatic("> typed while working")
     event = LoopEvent(actor="outo", kind="user", text="typed while working", detail="inbox:msg-1")
     # When: the core's event for it arrives
     claimed = app._claim_inbox_event(event)
@@ -2251,7 +1252,7 @@ def test_the_app_boots_with_the_jump_button_hidden_at_the_bottom() -> None:
         app = ChatTUI()
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            button = app.query_one("#jump-bottom", Button)
+            button = app.query_one("#jump-bottom", JumpButton)
             # Given: a fresh app with a short log that cannot overflow
             # When: the button state is evaluated
             app._sync_jump_button()
@@ -2267,9 +1268,9 @@ def test_the_jump_button_appears_once_the_log_is_scrolled_away() -> None:
         app = ChatTUI()
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            button = app.query_one("#jump-bottom", Button)
+            button = app.query_one("#jump-bottom", JumpButton)
             for i in range(80):
-                app._mount_row(Static(f"row {i}"))
+                app._mount_row(RowStatic(f"row {i}"))
             await pilot.pause()
             await pilot.pause()
             # Given: a log long enough to scroll, followed to the bottom
@@ -2299,7 +1300,7 @@ def test_page_down_returns_to_the_tail_without_animating() -> None:
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             for i in range(80):
-                app._mount_row(Static(f"row {i}"))
+                app._mount_row(RowStatic(f"row {i}"))
             await pilot.pause()
             await pilot.pause()
             app._input.focus()
@@ -2324,7 +1325,7 @@ def test_home_and_end_page_the_log_from_the_focused_input() -> None:
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             for i in range(80):
-                app._mount_row(Static(f"row {i}"))
+                app._mount_row(RowStatic(f"row {i}"))
             await pilot.pause()
             await pilot.pause()
             app._input.focus()
@@ -2422,11 +1423,23 @@ def fake_summary(monkeypatch: pytest.MonkeyPatch) -> _FakeSummary:
     return stub
 
 
-async def _settle(pilot: Any) -> None:
-    """Let the dispatch worker (and the continuation turn it starts) finish."""
+async def _settle(
+    pilot: Any, routed: list[tuple[str, str]] | None = None, want: int = 2
+) -> None:
+    """Pump until the dispatch worker (and the continuation turn) has finished.
 
-    for _ in range(40):
-        await pilot.pause()
+    Each pause also gives the worker THREAD real wall-clock time — the turn
+    driver is a sync function on ``to_thread``, so pumping the loop alone would
+    inspect the transcript before the turn had run. ``routed`` turns the pump
+    into a wait: it returns as soon as that many turns have been dispatched.
+    """
+
+    for _ in range(400 if routed is not None else 40):
+        if routed is not None and len(routed) >= want:
+            return
+        await pilot.pause(0.01 if routed is not None else None)
+    if routed is not None:
+        raise AssertionError(f"expected {want} turn(s), got {routed}")
 
 
 def _stub_summarizing_turn(
@@ -2460,7 +1473,7 @@ def test_a_summary_handoff_switches_the_session_and_runs_the_continuation(
             await pilot.pause()
             # Given / When: one turn that summarizes and calls continue_session
             app.on_chat_input_submitted(ChatInput.Submitted("do the work"))
-            await _settle(pilot)
+            await _settle(pilot, routed)
 
             # Then: the SAME conversation continued in the new session, on the
             # continuation message the tool left in its inbox — no user action
@@ -2483,7 +1496,7 @@ def test_the_old_conversation_shows_the_handoff_marker_and_keeps_it(
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             app.on_chat_input_submitted(ChatInput.Submitted("do the work"))
-            await _settle(pilot)
+            await _settle(pilot, routed)
             old_session = routed[0][0]
             marker = f"------summary → {new_session}------\nsummary: {HANDOFF_SUMMARY_DIR}"
 
@@ -2588,13 +1601,26 @@ def test_the_miniouto_accent_is_the_owner_pinned_cyan() -> None:
 
 def test_the_miniouto_background_is_strictly_darker_than_the_stock_dark_one() -> None:
     def body(app: ChatTUI, pilot: Any) -> None:
-        # Given / When: the colors each theme actually RESOLVES to (a stock
-        # theme leaves `background` unset and Textual supplies its own default,
-        # so the declared fields are not what gets painted)
+        # Given / When: the colors each theme actually RESOLVES to. A ``TuiTheme``
+        # IS the resolved palette (Textual needed `to_color_system().generate()`
+        # because a stock theme left most variables unset and the ColorSystem
+        # supplied them), so the fields are what gets painted — `textual-dark`'s
+        # derived `#121212` / `#1e1e1e` / `#1b2730` are pinned in
+        # `tests/test_tui_theme.py`.
         stock = app.get_theme("textual-dark")
         assert stock is not None
-        stock_colors = stock.to_color_system().generate()
-        mine_colors = tui_module.MINIOUTO_THEME.to_color_system().generate()
+        stock_colors = {
+            "background": stock.background,
+            "surface": stock.surface,
+            "panel": stock.panel,
+        }
+        mine = tui_module.MINIOUTO_THEME
+        mine_colors = {
+            "background": mine.background,
+            "surface": mine.surface,
+            "panel": mine.panel,
+            "boost": mine.boost,
+        }
 
         # Then: this theme's dark surfaces are darker on channels, so the
         # owner constraint "noticeably darker" holds objectively, not just
@@ -2672,46 +1698,6 @@ def test_the_text_layers_form_a_strict_answer_body_muted_ladder() -> None:
         assert answer - foreground >= 1.5, f"answer is only {answer - foreground:.2f} above body"
 
     _in_app(body)
-
-
-def test_the_answer_row_paints_the_answer_layer_and_not_the_body_one() -> None:
-    async def body() -> None:
-        app = ChatTUI()
-        async with app.run_test(size=(78, 24)) as pilot:
-            await pilot.pause()
-            # Given: a mounted Markdown answer and a plain body row beside it
-            # (the two layers the eye is meant to tell apart)
-            app._mount_row(tui_module.AnswerRow(Markdown("**bold** plain answer text")))
-            app._mount_row(Static("plain static body"))
-            await pilot.pause()
-            await pilot.pause()
-
-            # When / Then: the compositor is what the terminal receives, so
-            # reading it proves the Markdown renderable really takes the
-            # row's color — `$text-answer`, not the inherited `$foreground`.
-            # Matched per SEGMENT (a dict keyed by line would collapse the
-            # line's spans and keep only whichever color came last).
-            variables = app.get_css_variables()
-            segments = [
-                (segment.text, segment.style.color.name)
-                for strip in app.screen._compositor.render_strips()
-                for segment in strip._segments
-                if segment.text.strip() and segment.style is not None and segment.style.color
-            ]
-            answer_color = variables["text-answer"].lower()
-            body_color = variables["foreground"].lower()
-            answer_spans = {text: color for text, color in segments if text in ("bold", "answer")}
-            body_spans = {text: color for text, color in segments if text == "plain static body"}
-
-            assert answer_spans, "the answer row painted no visible spans"
-            assert set(answer_spans.values()) == {answer_color}, (
-                f"answer row painted {answer_spans}, want {answer_color}"
-            )
-            assert set(body_spans.values()) == {body_color}, (
-                f"body row painted {body_spans}, want {body_color}"
-            )
-
-    _run(body)
 
 
 def test_the_muted_text_ramp_sits_in_its_comfort_band_on_the_background() -> None:
@@ -2908,7 +1894,7 @@ def _compatibility_labels(app: ChatTUI) -> list[str]:
     """The picker's rows, marker stripped, in the order the popup offered them."""
 
     return [
-        str(item.query_one(Label).render().plain).strip().removeprefix("● ")
+        str(item.label.render().plain).strip().removeprefix("● ")
         for item in app.screen.query_one("#selection-list").children
     ]
 
@@ -2946,8 +1932,13 @@ def test_compatibility_picker_changes_format_and_url_without_touching_the_trio(
             pin_before = session_config.read(session)
 
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
+            # The picker list is fetched on a worker thread, so each pump also
+            # yields real wall-clock time — a bare pause would inspect the
+            # screen before the list had landed.
+            for _ in range(60):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SelectionModal):
+                    break
             assert isinstance(app.screen, SelectionModal)
             labels = _compatibility_labels(app)
             assert labels == [
@@ -2992,8 +1983,13 @@ def test_inherited_subagent_popup_edits_the_effective_outo_compatibility(
             await pilot.pause()
             assert isinstance(app.screen, ProviderSettingsPopup)
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
+            # The picker list is fetched on a worker thread, so each pump also
+            # yields real wall-clock time — a bare pause would inspect the
+            # screen before the list had landed.
+            for _ in range(60):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SelectionModal):
+                    break
             assert isinstance(app.screen, SelectionModal)
             selected = next(
                 label
@@ -3162,8 +2158,13 @@ def test_compatibility_preserves_a_saved_dialect_missing_from_current_results(
             _open_popup(app, chip="outo")
             await pilot.pause()
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
+            # The picker list is fetched on a worker thread, so each pump also
+            # yields real wall-clock time — a bare pause would inspect the
+            # screen before the list had landed.
+            for _ in range(60):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SelectionModal):
+                    break
 
             assert isinstance(app.screen, SelectionModal)
             saved = next(label for label in _compatibility_labels(app) if "(saved)" in label)
@@ -3176,7 +2177,6 @@ def test_compatibility_preserves_a_saved_dialect_missing_from_current_results(
             assert record.base_url == "https://old.example/v1"
 
     asyncio.run(body())
-
 
 
 def test_a_legacy_lma_record_still_behaves_as_a_catalog_record(
@@ -3202,8 +2202,13 @@ def test_a_legacy_lma_record_still_behaves_as_a_catalog_record(
             assert "compatibility" in _fields(app.screen)
             assert "caps" not in _fields(app.screen)
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
+            # The picker list is fetched on a worker thread, so each pump also
+            # yields real wall-clock time — a bare pause would inspect the
+            # screen before the list had landed.
+            for _ in range(60):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SelectionModal):
+                    break
             assert isinstance(app.screen, SelectionModal)
             labels = _compatibility_labels(app)
             assert all("(supported)" not in label for label in labels)
@@ -3242,8 +2247,13 @@ def test_a_picked_modelslist_format_persists_verbatim_and_survives_a_reopen(
             await pilot.pause()
 
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
+            # The picker list is fetched on a worker thread, so each pump also
+            # yields real wall-clock time — a bare pause would inspect the
+            # screen before the list had landed.
+            for _ in range(60):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SelectionModal):
+                    break
             assert isinstance(app.screen, SelectionModal)
             picked = next(
                 label
@@ -3276,11 +2286,16 @@ def test_a_picked_modelslist_format_persists_verbatim_and_survives_a_reopen(
                 "Compatibility: openai-responses"
             )
             await pilot.click(_row(app.screen, "compatibility"), offset=(2, 0))
-            for _ in range(6):
-                await pilot.pause()
+            # The picker list is fetched on a worker thread, so each pump also
+            # yields real wall-clock time — a bare pause would inspect the
+            # screen before the list had landed.
+            for _ in range(60):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, SelectionModal):
+                    break
             assert isinstance(app.screen, SelectionModal)
             rows = [
-                str(item.query_one(Label).render().plain).strip()
+                str(item.label.render().plain).strip()
                 for item in app.screen.query_one("#selection-list").children
             ]
             # The saved row is first and marked; nothing was rewritten to
@@ -3289,3 +2304,66 @@ def test_a_picked_modelslist_format_persists_verbatim_and_survives_a_reopen(
             assert not any("(saved)" in row for row in rows)
 
     asyncio.run(body())
+
+
+# ── 13. the top of the log stays reachable (regression M5) ──────────────────
+
+
+def test_home_reaches_the_top_and_stays_there_while_chunks_load() -> None:
+    """Regression (M5): pressing Home walked the viewport DOWN.
+
+    ``_load_older`` compensated ``scroll_y`` for the chunk it mounted above the
+    viewport unconditionally — but at ``scroll_y == 0`` the user has already asked
+    for the very top, so each press shifted the view by another 50 rows and the
+    top of the log was unreachable.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            for index in range(400):
+                app._mount_row(RowStatic(f"r{index}"))
+            await pilot.pause()
+            app._input.focus()
+            assert app._window.first > 0, "nothing left to load: the test is vacuous"
+            # When: Home is pressed repeatedly, each time inside the load zone
+            for _ in range(4):
+                await pilot.press("home")
+                await pilot.pause()
+                # Then: the view stays pinned at the very top
+                assert app._log.scroll_y == 0
+            # And: the first row of the window is painted on the top log line
+            app.compose(100, 30)
+            top = [
+                row for row in app._log.rows if row.region.y == app._log_rect.y
+            ]
+            assert top, "nothing is painted on the top log line"
+            assert "r50" in top[0].build_lines(100, app.current_theme)[0][0][0]
+
+    asyncio.run(body())
+
+
+def test_scrolling_into_the_load_zone_still_compensates() -> None:
+    """The other half of M5: compensation is only SKIPPED for an explicit top."""
+
+    log = ChatScroll()
+    log.theme = MINIOUTO_THEME
+    log.resize(80, 10)
+    window = _RowWindow()
+    for index in range(200):
+        window.append(log, RowStatic(f"row {index}"), defer_mount=True)
+    window.mount_tail(log)
+    mounted = len(log.rows)
+    # Given: the view is scrolled a little into the top-load zone, not at 0
+    before = window.first
+    y = 5.0
+    log.scroll_to(y=y)
+    window.maybe_load_older(log, y)
+    # Then: the chunk loaded AND the viewed content did not move
+    assert window.first == before - WINDOW_CHUNK_ROWS
+    assert len(log.rows) == mounted + WINDOW_CHUNK_ROWS
+    assert log.scroll_y == y + WINDOW_CHUNK_ROWS

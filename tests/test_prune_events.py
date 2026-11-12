@@ -22,9 +22,8 @@ from typing import Any
 
 import coreouto as co
 import pytest
-from textual.widgets import Static
 
-from miniouto.cli.tui import ChatTUI, TUIEventSink, _RowWindow
+from miniouto.cli.tui import ChatTUI, Node, RowStatic, TUIEventSink, _RowWindow
 from miniouto.core import chat as chat_mod
 from miniouto.core import inbox
 from miniouto.core import runtime as rt
@@ -575,7 +574,13 @@ def test_a_removal_that_matches_nothing_here_still_reaches_the_persister(
 
 
 class _FakeLog:
-    """Records the mount calls `_RowWindow` makes; mounts nothing."""
+    """Records the mount calls `_RowWindow` makes; paints nothing.
+
+    It speaks the harness log's protocol for the calls the window makes while it
+    moves rows around: measuring a row (``_row_height``) and dropping one
+    (``remove``). Every height is one line, so the scroll-compensation arithmetic
+    these tests assert on stays arithmetical.
+    """
 
     def __init__(self) -> None:
         self.mounted: list[Any] = []
@@ -584,6 +589,15 @@ class _FakeLog:
 
     def mount(self, widget: Any, before: Any = None) -> None:
         self.mounted.append(widget)
+        widget.parent = self
+
+    def remove(self, row: Any) -> None:
+        if row in self.mounted:
+            self.mounted.remove(row)
+        row.parent = None
+
+    def _row_height(self, row: Any) -> int:
+        return 1
 
     def scroll_to(self, y: float, animate: bool = False) -> None:
         self.scroll_y = y
@@ -598,7 +612,7 @@ class _FakeLog:
 def test_removing_rows_keeps_the_window_first_in_range() -> None:
     # Given: a window of five rows with two already evicted
     window = _RowWindow()
-    rows = [Static(f"row {i}") for i in range(5)]
+    rows = [Node(f"row-{i}") for i in range(5)]
     for row in rows:
         window.rows.append(row)
     window.first = 2
@@ -617,7 +631,7 @@ def test_removing_the_tail_row_never_desynchronizes_chunk_loading() -> None:
     # Given: a window whose `first` pointed past the last row — the shape
     # a live "cut the last turn" prune leaves behind
     window = _RowWindow()
-    rows = [Static(f"row {i}") for i in range(3)]
+    rows = [Node(f"row-{i}") for i in range(3)]
     for row in rows:
         window.rows.append(row)
     window.first = 3
@@ -690,9 +704,9 @@ def test_the_tui_removes_only_the_pruned_rows() -> None:
             app._add_event_row(
                 LoopEvent(actor="watchdog", kind="alarm", text="change pattern")
             )
-            # A blank spacer between turns: a plain `Static`, so it has no
-            # msg_ref attribute at all and must not break the sweep.
-            app._mount_row(Static(""))
+            # A blank spacer between turns: a row with no `msg_ref`, which
+            # must not break the sweep.
+            app._mount_row(RowStatic(""))
             await pilot.pause()
             before = list(app._window.rows)
             # A tool call and its result are ONE row (the result attaches

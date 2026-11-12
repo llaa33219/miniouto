@@ -63,7 +63,7 @@ miniouto/
 ├── logo.svg
 ├── docs/                   # ← this directory
 └── src/miniouto/           # src-layout package
-    ├── cli/                # Typer commands + Textual TUI (incl. chat.py, message.py, computer.py)
+    ├── cli/                # Typer commands + xnano TUI (chat.py, message.py, computer.py, tui/)
     ├── core/               # chat loop + runtime (incl. inbox.py, spawn_state.py)
     ├── storage/            # filesystem persistence
     ├── tools/              # Bash + media loaders + Computer
@@ -85,7 +85,9 @@ miniouto/
 | `coreouto[all]` | 0.11.3 | Agent loop, providers, tools, hooks |
 | `typer` | 0.12.0 | CLI framework |
 | `rich` | 13.7.0 | Terminal output, tables, markdown |
-| `textual` | 0.80.0 | TUI framework |
+| `xnano[image]` | ==2.3.0 | The TUI substrate: a retained-mode canvas. **Pinned exactly** — the API churns between minor versions, and `cli/tui/{pt,graphics,app}.py` are written against this build |
+| `xnano-core` | ==2.2.3 | Styles/colors, input event types, the cell grid (`cell_grid_to_ansi`). Pinned |
+| `xnano-image` | ==0.2.0 | Kitty/Sixel encoding for Computer screenshots; a Rust extension, no Python deps. Pinned |
 | `pydantic` | 2.0 | Data models |
 | `httpx` | 0.27.0 | HTTP client (modelslist REST client + style repo fetcher + TUI update check) |
 | `packaging` | 23.0 | PEP 440 version comparison for the TUI update check |
@@ -93,6 +95,8 @@ miniouto/
 | `py-Vwayland` | 0.1.0 | Bundled virtual-display compositor behind the Computer tool |
 
 The `[all]` extra on `coreouto` pulls in all four provider SDKs (openai, openai-response, anthropic, google).
+
+The `dev` dependency group holds `pytest` and `pillow`: Pillow is **test-fixture only** — the graphics tests author real PNGs to measure placements against. Nothing in `src/` imports PIL, and the runtime image lane needs no Python imaging library because `xnano-image` is a Rust extension.
 
 ## Lint & format
 
@@ -230,18 +234,32 @@ miniouto chat "hello"   # next turn uses the new prompt
 
 ### TUI is misbehaving
 
-The TUI uses Textual's dev mode for debugging:
+The TUI has no dev-mode server (nor does its `xnano` substrate). Debug it through the **headless harness** instead — the same `nodes.py:run_test` / `Pilot` path the behavioural suite uses, which boots a real `ChatTUI` against a fixed screen size and lets you read the composited frame:
 
 ```bash
-TEXTUAL_DEVTOOLS=1 miniouto
+uv run python - <<'PY'
+import asyncio
+import sys
+sys.path.insert(0, "tests")
+from tui_harness import BOOT_SIZE            # (120, 32), the pty baseline
+from miniouto.cli.tui import ChatTUI
+
+
+async def main():
+    async with ChatTUI().run_test(size=BOOT_SIZE) as pilot:
+        print(pilot.app.screen._compositor.render_strips()[0].text)
+
+
+asyncio.run(main())
+PY
 ```
 
-Then visit the printed URL.
+For a live session, run the real thing under a pty (`script -q /dev/null miniouto` is the cheapest recorder) and read the captured bytes; `MINIOUTO_HOME=/tmp/scratch miniouto` keeps the run out of your real `~/.miniouto/`. `uv run pytest tests/test_tui_*.py` re-runs the behavioural suite against the same headless path.
 
 ## Known sharp edges (the easy-to-miss stuff)
 
 1. **Test coverage is uneven.** `tests/` covers inbox, delegation, message CLI, computer art, TUI navigation, styles, the summary hand-off (`test_handoff.py`), and a set of runtime/storage cases, plus the regression suite for the five provider-settings issues (`tests/test_issue_fixes.py`); `tools/bash.py` is still untested. Run `uv run pytest` before assuming a change is safe.
-2. **`tui/` and `utils/` are empty.** They look like package directories but contain no code. Don't add modules there without first deciding whether the contents should be moved into the proper package (TUI lives in `cli/tui.py`, utilities are scattered).
+2. **`tui/` and `utils/` are empty.** They look like package directories but contain no code. Don't add modules there without first deciding whether the contents should be moved into the proper package (TUI lives in the `cli/tui/` package, utilities are scattered).
 3. **`storage/skills.py` is not in `storage/__init__.py`'s `__all__`** — it's imported directly via `from ..storage import skills as skill_store`. Don't add it to `__all__` without auditing the import sites first.
 4. **There is no `continue_loop` tool, and there never should be.** coreouto's termination policy already covers progress updates: a response carrying text AND a tool call keeps the loop going and shows that text, while text with NO tool call is the final answer. So a progress update is just "say something while calling a tool" — the bundled styles and `_fallback_style` state exactly that. An earlier draft taught the model to call a `continue_loop` tool that was never registered, which made it invent calls that never executed; that reference has been removed everywhere (styles, docs, `_fallback_style`).
 5. **There is no in-process subagent engine.** The old `core/subagents.py` job registry, its `ContextVar`s, and the `call_subagent` tool are gone — `tests/test_no_call_subagent.py` guards against the tool returning. Delegation is `miniouto chat "<brief>" --style <style> --role <tag>` (see `cli/chat.py`) plus the cross-process inbox (`core/inbox.py`) — there is no second command and no second runtime path. A delegated run's bookkeeping rides on the inbox message's `meta` (`id`, `role`), not on ContextVars, so there is nothing in-process to attribute; the run gets the full `supervised_run` treatment inside its own process.
@@ -280,7 +298,7 @@ Only one place: `src/miniouto/storage/paths.py`. Update the `ROOT` constant to r
 ## Style notes for PRs
 
 - Match the existing code style: 4-space indents, dataclasses for value objects, `rich` for terminal output, type hints everywhere (including return types).
-- Don't add new top-level dependencies without discussion. `coreouto`, `typer`, `rich`, `textual`, `pydantic`, `httpx`, `tomli-w` is the entire runtime footprint.
+- Don't add new top-level dependencies without discussion. `coreouto`, `typer`, `rich`, `xnano`, `xnano-core`, `xnano-image`, `pydantic`, `httpx`, `packaging`, `tomli-w`, `py-Vwayland` is the entire runtime footprint.
 - Don't refactor while fixing — open separate PRs.
 - If you change a tool's behavior, update the corresponding `_<name>_description` in `tools/registry.py` (the description is what the LLM sees).
 - If you change a style's structure, re-test all five bundled templates for consistency.

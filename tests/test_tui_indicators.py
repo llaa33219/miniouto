@@ -22,18 +22,24 @@ import asyncio
 import threading
 from typing import Any
 
-from textual.widgets import Static
-
-from miniouto.cli.tui import ChatTUI, TUIEventSink
-
-
-def _rendered(widget: Any) -> str:
-    return "\n".join(strip.text.rstrip() for strip in widget._render_cache.lines)
+from miniouto.cli.tui import CHAT_MAX_WIDTH, ChatTUI, TUIEventSink
+from miniouto.cli.tui.rows import plain_of
 
 
 def _bottom_text(app: ChatTUI) -> str:
+    """The spinner row exactly as the panel paints it, right-stripped.
+
+    Read off the panel's own composition rather than a node's ``render()``: the
+    spinner row's content is ``(frame, text)`` state, so its painted line is the
+    only place the glyph and the notice actually meet.
+    """
+
     assert app._panel is not None
-    return _rendered(app._panel.query_one("#spinner-row", Static))
+    line = app._panel.build_lines(CHAT_MAX_WIDTH, app.current_theme)[0]
+    # `padding: 0 1` — the row's own cell, so the notice starts at the left edge
+    # exactly as it did when the panel was a Textual widget and the assertion
+    # read the widget's content (padding excluded) rather than its padded strip.
+    return plain_of(line).rstrip().lstrip()
 
 
 async def _tick(app: ChatTUI, pilot: Any, times: int) -> list[str]:
