@@ -787,9 +787,16 @@ class ChatTUI:
         return configured if self.get_theme(configured) else THEME_NAME
 
     def watch_theme(self) -> None:
-        """Persist the choice and repaint the ornament that carries the accent."""
+        """Persist the choice, retheme the screen's erases, repaint the ornament.
+
+        ``_sync_screen_background`` is here rather than in the picker because
+        the setter is the ONE door a theme change comes through (the picker, a
+        test, a future keybinding), and the terminal's erase colour has to
+        follow the theme it paints.
+        """
 
         settings_store.update(theme=self.theme)
+        self._sync_screen_background()
         if self._logo_shown:
             self._show_logo()
 
@@ -1224,6 +1231,7 @@ class ChatTUI:
         self.run_worker(self._check_for_updates(), exclusive=False)
         self.compose(*size)
         self._publish_title()
+        self._sync_screen_background()
 
     async def _boot_headless(self, size: tuple[int, int] = (80, 24)) -> ChatTUI:
         """The ``run_test`` boot: no terminal, no reader thread, no signal."""
@@ -2689,6 +2697,31 @@ class ChatTUI:
             return
         title = f"{self.title} — {self.sub_title}" if self.title else self.sub_title
         _write_terminal(_TITLE_OSC.format(title=title))
+
+    def _sync_screen_background(self) -> None:
+        """Tell the terminal what colour its ERASES paint — the theme background.
+
+        xnano erases the whole display on every resize (``ESC[2J``), and it does
+        it OUTSIDE its synchronized-output block: measured on a pty over six
+        resizes, eight ``ESC[2J`` and all eight ahead of the ``ESC[?2026h``. An
+        erase paints immediately, so it landed on the terminal's DEFAULT
+        background and the window flashed the wrong colour until the themed
+        frame followed — the owner's "the screen feels unstable".
+
+        ``pt.Terminal`` turns that clear into a themed one by putting the theme
+        background on the wire just before it (``set_screen_background``, and
+        the resize guard that re-asserts it), which is why this reads the palette
+        rather than composing anything. Called at boot and from `watch_theme`,
+        so the erase colour always matches the theme on screen.
+
+        A terminal double with no such method (the loop tests drive a fake) is
+        left alone: there is no real screen to protect.
+        """
+
+        setter = getattr(self._terminal, "set_screen_background", None)
+        if callable(setter):
+            with contextlib.suppress(Exception):
+                setter(self.current_theme.background)
 
     def _cursor_position(self) -> tuple[int, int] | None:
         """The input caret in screen cells, or None when it is not visible."""

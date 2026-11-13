@@ -1224,3 +1224,138 @@ def test_a_resize_drops_every_placement_before_the_new_frame() -> None:
     terminal.restore()
     if old_canvas is not None and not old_canvas.is_closed:
         old_canvas.close()
+
+
+# ─── the resize flash: what a CLEAR paints ──────────────────────────────────
+
+
+def test_a_clear_paints_the_theme_background_not_the_terminal_default() -> None:
+    """Regression (owner: "the screen flashes on refresh/resize").
+
+    xnano erases the whole display with ``ESC[2J`` whenever the canvas resizes,
+    and it emits that erase OUTSIDE its synchronized-output block — measured on
+    a pty over six resizes: eight ``ESC[2J``, all eight ahead of the
+    ``ESC[?2026h``. An erase is painted the instant it arrives, and with no SGR
+    background in force it paints the terminal's DEFAULT colour, so the window
+    flashed the wrong shade until the themed frame followed.
+
+    The fix names the colour an erase paints, and a back-colour-erase terminal
+    then fills the clear with the theme background. This pins the CONTRACT: the
+    SGR is ``48;2;r;g;b`` for the theme's own ``#rrggbb``, and it is the exact
+    sequence the guard writes before xnano's clear.
+    """
+
+    # Then: the theme background crosses as a truecolor BACKGROUND sequence
+    assert pt._bg_sgr("#0a0e14") == "\x1b[48;2;10;14;20m"
+    assert pt._bg_sgr("0a0e14") == pt._bg_sgr("#0a0e14")
+    assert pt._bg_sgr("#FFFFFF") == "\x1b[48;2;255;255;255m"
+    # And: a value that is not #rrggbb raises rather than flashing a wrong shade
+    for bad in ("", "#fff", "0a0e1", "#0a0e140", "rebeccapurple"):
+        with pytest.raises(ValueError):
+            pt._bg_sgr(bad)
+
+
+def test_the_screen_background_is_told_at_boot_and_after_a_theme_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The erase colour must follow the theme, through the ONE theme setter.
+
+    ``watch_theme`` is what every theme change goes through (the picker assigns
+    ``app.theme``, which calls it), so the terminal's erase colour is synced
+    there as well as at boot — otherwise switching to a light theme would leave
+    every resize clearing to the old dark shade.
+    """
+
+    from miniouto.cli.tui.app import ChatTUI
+    from miniouto.cli.tui.theme import MINIOUTO_THEME
+
+    seen: list[str] = []
+
+    class _Terminal:
+        def set_screen_background(self, hex_value: str) -> None:
+            seen.append(hex_value)
+
+    app = ChatTUI(terminal=_Terminal())
+    app._logo_shown = False
+    # When: the theme is set (what the picker does)
+    app.theme = "miniouto"
+    # Then: the terminal was given the theme's own background
+    assert seen == [MINIOUTO_THEME.background]
+    # And: a light theme moves it (the resize clear must not stay dark)
+    app.theme = "textual-light"
+    assert seen[-1] == app.current_theme.background != seen[0]
+
+
+def test_a_terminal_double_without_a_screen_background_is_left_alone() -> None:
+    """The loop tests drive a fake terminal; the sync must not need one."""
+
+    from miniouto.cli.tui.app import ChatTUI
+
+    class _Bare:
+        """A terminal with the surface the loop needs and nothing more."""
+
+    app = ChatTUI(terminal=_Bare())
+    app._logo_shown = False
+    app.theme = "miniouto"  # must not raise
+    # And: a headless app (no terminal at all) is equally fine
+    ChatTUI()._sync_screen_background()
+
+
+def test_the_resize_guard_writes_the_background_before_xnano_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard hook is what puts the SGR ahead of xnano's ``ESC[2J``.
+
+    xnano runs a ``'resize'`` hook BEFORE it emits the clear (pty-verified: the
+    hook's bytes land ahead of both ``ESC[2J``), so a hook that re-asserts the
+    background is exactly what makes the clear themed. It has to be registered
+    on the canvas before ``open()``, because a hook added to an already-open
+    canvas is attached and never runs.
+
+    The hook receives an xnano context; the guard accepts and ignores it, so it
+    can be registered without knowing the context shape.
+    """
+
+    from miniouto.cli.tui.theme import MINIOUTO_THEME
+
+    written: list[str] = []
+    monkeypatch.setattr(pt, "_write_screen", written.append)
+
+    terminal = pt.Terminal(real_screen=True)
+    terminal.set_screen_background(MINIOUTO_THEME.background)
+    # Then: naming a colour asserts it at once, on the real screen
+    assert written == ["\x1b[48;2;10;14;20m"]
+    assert terminal._screen_bg == MINIOUTO_THEME.background
+
+    # When: xnano reports a resize and runs the guard
+    written.clear()
+    terminal._guard_resize_clear(object())
+    # Then: the SGR goes out again, right before the clear it protects
+    assert written == ["\x1b[48;2;10;14;20m"]
+
+    # And: a theme change moves the colour it writes
+    terminal.set_screen_background("#fdf6e3")
+    written.clear()
+    terminal._guard_resize_clear(None)
+    assert written == ["\x1b[48;2;253;246;227m"]
+
+
+def test_a_headless_terminal_never_writes_to_the_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing offscreen may reach fd 1, whatever background it was given.
+
+    The whole test suite paints headless canvases; a guard that wrote there
+    would corrupt a redirected stdout and make every headless assertion depend
+    on the order tests ran in.
+    """
+
+    written: list[str] = []
+    monkeypatch.setattr(pt, "_write_screen", written.append)
+
+    terminal = pt.Terminal(width=12, height=3)
+    terminal.set_screen_background("#0a0e14")
+    terminal._guard_resize_clear(None)
+    # Then: the colour is remembered, and NOTHING was written
+    assert terminal._screen_bg == "#0a0e14"
+    assert written == []

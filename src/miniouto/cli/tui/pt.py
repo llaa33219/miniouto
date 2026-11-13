@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import os
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -764,7 +765,41 @@ def _normalize_alignment(alignment: str) -> str:
     return _ALIGNMENTS.get(str(alignment).lower(), "left")
 
 
-# ─── the terminal ───────────────────────────────────────────────────────────
+# ─── the background a CLEAR paints (the resize flash) ───────────────────────
+
+
+_STDOUT_FD = 1
+"""The descriptor the terminal is written on (xnano runs with ``capture=False``)."""
+
+_RESIZE_CLEAR_SGR = "\x1b[48;2;{red};{green};{blue}m"
+"""The SGR a terminal's erase fills with (``48;2;r;g;b``)."""
+
+
+def _bg_sgr(hex_value: str) -> str:
+    """The ``ESC[48;2;r;g;b m`` sequence for a ``#rrggbb`` colour.
+
+    Raises on anything else: a silently wrong colour here would be a flash of
+    the wrong shade, which is the bug this guards against.
+    """
+
+    text = str(hex_value).strip().lstrip("#")
+    if len(text) != 6:
+        raise ValueError(f"not a #rrggbb colour: {hex_value!r}")
+    return _RESIZE_CLEAR_SGR.format(
+        red=int(text[0:2], 16), green=int(text[2:4], 16), blue=int(text[4:6], 16)
+    )
+
+
+def _write_screen(payload: str) -> None:
+    """Write escape bytes to the terminal, never raising into the caller."""
+
+    with _suppressed():
+        data = payload.encode("ascii", "replace")
+        while data:
+            written = os.write(_STDOUT_FD, data)
+            if written <= 0:
+                return
+            data = data[written:]
 
 
 _CARET_SHAPE = "bar"
@@ -875,6 +910,14 @@ class Terminal:
         """The cell last WRITTEN to xnano's cursor, so an unchanged tick writes nothing."""
         self._hooks: list[tuple[str, Callable[[Any], None]]] = []
         self._opened = False
+        self._screen_bg: str | None = None
+        """The ``#rrggbb`` the terminal's ERASES paint, or ``None`` for its default.
+
+        Set by :meth:`set_screen_background`, and re-asserted from the resize
+        hook before xnano clears: xnano erases the display on a resize with no
+        background of its own, so without this the clear lands on the terminal
+        default and the whole screen flashes.
+        """
 
     # ── input hooks ─────────────────────────────────────────────────────────
     def hook(self, kind: str, callback: Callable[[Any], None]) -> None:
@@ -892,6 +935,54 @@ class Terminal:
         canvas = self._canvas
         if canvas is not None:
             canvas.hook(callback, on=str(kind))
+
+    def set_screen_background(self, hex_value: str | None) -> None:
+        """Say what colour the terminal's ERASES should paint.
+
+        xnano erases the whole display (``ESC[2J``) whenever the canvas is
+        resized, and it emits that erase OUTSIDE its synchronized-output block —
+        measured on a pty over six resizes: eight ``ESC[2J``, every one of them
+        ahead of the ``ESC[?2026h``. An erase is painted the instant it arrives,
+        so it lands on the terminal's DEFAULT background and the screen shows a
+        full-window flash of the wrong colour until the themed frame follows.
+        That is the owner's "the screen feels unstable".
+
+        A back-colour-erase terminal fills an erase with the CURRENT SGR
+        background, so naming the theme background right before the erase turns
+        the flash into the theme's own colour: the screen goes from one themed
+        frame straight to the next. :meth:`_guard_resize_clear` does that on
+        every resize report, and this method is how the app says WHICH colour,
+        at boot and again whenever the theme changes.
+
+        ``None`` means "stop guarding": the erase paints the terminal default
+        again, which is what a headless canvas and a caller that never themed
+        the screen want.
+        """
+
+        self._screen_bg = None if hex_value is None else str(hex_value)
+        self._paint_screen_background()
+
+    def _paint_screen_background(self) -> None:
+        """Assert the screen background now, if there is one and a real screen."""
+
+        if not self._real_screen or self._screen_bg is None:
+            return
+        # The SGR covers the write AND the colour conversion: a malformed value
+        # must cost the guard, never the frame.
+        with _suppressed():
+            _write_screen(_bg_sgr(self._screen_bg))
+
+    def _guard_resize_clear(self, _context: Any = None) -> None:
+        """Re-assert the screen background before xnano's resize clear.
+
+        Registered on the REAL canvas as a ``'resize'`` hook, and that ordering
+        is the whole mechanism: xnano runs the hook first and emits the clear
+        afterwards, so the SGR written here is what the erase paints. Verified
+        on a pty — the hook's bytes land ahead of both ``ESC[2J``, and the clear
+        after it leaves the theme background on every cell.
+        """
+
+        self._paint_screen_background()
 
     # ── context ─────────────────────────────────────────────────────────────
     def __enter__(self) -> Terminal:
@@ -916,6 +1007,12 @@ class Terminal:
         """Claim the screen: create the canvas, hook it, open it, size up."""
 
         canvas = xnano.new()
+        # The resize-flash guard goes on FIRST, before the caller's hooks: xnano
+        # runs hooks in registration order, and this one only has to get its SGR
+        # onto the wire ahead of xnano's own erase. Being registered before
+        # `open()` also means it joins the canvas without needing input, so it
+        # cannot turn a terminal setting on by accident.
+        canvas.hook(self._guard_resize_clear, on="resize")
         for kind, callback in self._hooks:
             canvas.hook(callback, on=kind)
         # `mouse='motion'` is what makes row hover work (the log highlights the
