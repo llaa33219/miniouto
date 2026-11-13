@@ -547,8 +547,17 @@ async def supervised_run(
                 task = asyncio.create_task(start(prompt, history))
     finally:
         repetition.set_trip_notifier(previous_notifier)
-        if waiter is not None:
-            waiter.cancel()
+        # Cancel AND await every task this supervisor owns, so none is left
+        # pending on the (persistent) turn loop. A bare cancel() leaves the
+        # task pending until the loop runs it again; on a loop that lives for
+        # the whole process that surfaces as "Task was destroyed but it is
+        # pending!" when the task is later GC'd. Awaiting the cancelled task
+        # drives it to completion (CancelledError) here and now.
+        for owned in (waiter, task):
+            if owned is not None and not owned.done():
+                owned.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await owned
         _ACTIVE_SUPERVISORS.pop(token, None)
 
 
