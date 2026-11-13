@@ -55,6 +55,48 @@ _tool_trace: list[dict[str, Any]] = []
 _tool_trace_lock = threading.Lock()
 
 
+# Persistent turn loop. A turn's async work (the agent and its httpx/AsyncOpenAI
+# connection pools) must not run on a loop that is closed when the turn ends.
+# asyncio.run() creates AND closes a fresh loop per call; the provider's httpx
+# pool outlives that close (keep-alive connections, GC cleanup), so the NEXT
+# turn (a new loop) trips "Event loop is closed" deep in httpcore's connection
+# pool and the traceback paints over the TUI. One long-lived loop on a dedicated
+# daemon thread, reused for every turn, keeps clients on a live loop. run_chat
+# stays synchronous (invariant 10): it submits the coroutine with
+# run_coroutine_threadsafe and blocks on the result. The CLI one-shot path is
+# unchanged in behaviour (the loop simply lives until process exit).
+_turn_loop: asyncio.AbstractEventLoop | None = None
+_turn_loop_lock = threading.Lock()
+
+
+def _get_turn_loop() -> asyncio.AbstractEventLoop:
+    """The process-wide turn loop, started once on a daemon thread."""
+
+    global _turn_loop
+    with _turn_loop_lock:
+        if _turn_loop is None or _turn_loop.is_closed():
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever, name="miniouto-turn-loop", daemon=True
+            )
+            thread.start()
+            _turn_loop = loop
+        return _turn_loop
+
+
+def _run_turn_coro(coro: Any) -> Any:
+    """Run a turn coroutine on the persistent loop and block for its result.
+
+    Replaces asyncio.run(coro): same synchronous contract, but the loop is
+    never closed, so async clients created during the turn stay valid for the
+    next one. Exceptions propagate to the caller exactly as asyncio.run did.
+    """
+
+    loop = _get_turn_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()
+
+
 @dataclass
 class ChatOptions:
     prompt: str
@@ -418,7 +460,7 @@ def _run_chat_prepared(opts: ChatOptions, sink: _RecordingSink) -> str:
     sink.begin_working()
     try:
         try:
-            response = asyncio.run(
+            response = _run_turn_coro(
                 _run_with_watchdog(
                     agent, opts.prompt, core_msgs,
                     sink=sink, cancel_event=stop,
