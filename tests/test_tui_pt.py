@@ -1359,3 +1359,133 @@ def test_a_headless_terminal_never_writes_to_the_screen(
     # Then: the colour is remembered, and NOTHING was written
     assert terminal._screen_bg == "#0a0e14"
     assert written == []
+
+
+def test_the_canvas_background_is_themed_so_clears_never_paint_the_default() -> None:
+    """A removed placement's cells must be filled with the THEME background.
+
+    This is the flash the owner still saw while typing. xnano fills the cells no
+    placement covers with the CANVAS background, and a canvas that has none of
+    its own fills them with the terminal's default. The log fills from the
+    bottom, so a new row shifts every row below it, their ``(x, y, width)``
+    placement keys change, and the old placements are removed before the
+    rewritten ones paint — a rectangle of the wrong colour for one frame.
+
+    ``set_screen_background`` is the ONE door the theme comes through (boot and
+    every theme change), so the canvas is themed there. Asserted through the
+    PAINTED ANSI: the clear's own SGR decides the colour a terminal shows, and it
+    is ``ESC[0m`` (reset, i.e. the terminal default) unthemed against
+    ``ESC[0;48;2;10;14;20m`` themed.
+    """
+
+    surface = pt.Color.rgb(15, 20, 27)
+
+    def row(text: str, background: pt.Color) -> pt.Text:
+        style = pt.Style().bg(background)
+        return pt.Text([pt.Line([pt.Span(text, style)], style)])
+
+    rows = {index: row(chr(ord("a") + index) * 20, surface) for index in range(4)}
+
+    def paint(count: int):
+        def callback(frame: pt.Frame) -> None:
+            for index in range(count):
+                frame.render_widget(rows[index], pt.Rect(0, index, 20, 1))
+
+        return callback
+
+    # When: the theme background is named, then a frame paints one row fewer
+    terminal = pt.Terminal(width=20, height=4)
+    terminal.set_screen_background("#0a0e14")
+    terminal.draw(paint(4))
+    terminal.draw(paint(3))
+    # Then: the row that lost its placement was cleared to the THEME background
+    assert "48;2;10;14;20" in terminal.output_ansi().splitlines()[-1]
+    terminal.restore()
+
+    # And: a canvas with no background named still paints the terminal default,
+    # which is the bug this pins (the assertion would pass vacuously otherwise).
+    bare = pt.Terminal(width=20, height=4)
+    bare.draw(paint(4))
+    bare.draw(paint(3))
+    assert "48;2;10;14;20" not in bare.output_ansi().splitlines()[-1]
+    bare.restore()
+
+
+def test_the_canvas_background_resets_and_covers_the_whole_screen() -> None:
+    """``None`` goes back to the terminal default; the theme covers every cell.
+
+    Two halves of the same contract: a caller that stops theming gets the old
+    behaviour back (``screen.color.bg`` refuses ``None``, so the shim translates
+    it to ``"reset"``), and a themed canvas leaves no cell on the default — the
+    whole screen is the theme's colour, not just the rows a frame painted.
+    """
+
+    terminal = pt.Terminal(width=16, height=3)
+    terminal.set_screen_background("#0a0e14")
+    grid = terminal.canvas.screen.core_buffer
+    # Then: every cell of the canvas wears the theme background
+    for x in range(16):
+        for y in range(3):
+            assert str(grid[x, y].background) == "Color('#0a0e14')"
+
+    # When: the caller stops naming a colour
+    terminal.set_screen_background(None)
+    # Then: the canvas is back on the terminal's own default
+    assert terminal._screen_bg is None
+    assert str(terminal.canvas.screen.core_buffer[0, 0].background) == "Color('reset')"
+    terminal.restore()
+
+
+def test_a_canvas_created_after_the_background_was_named_is_themed() -> None:
+    """The canvas may not exist yet when the app names the colour.
+
+    ``set_screen_background`` runs at boot, and the real canvas does not exist
+    until ``__enter__`` opens it — while the headless canvas is created lazily by
+    the ``canvas`` property. Either way the colour has to reach the canvas that
+    turns up afterwards, or the clears of the FIRST frames are unthemed.
+    """
+
+    # When: the colour is named before any canvas exists
+    terminal = pt.Terminal(width=10, height=2)
+    assert terminal._canvas is None
+    terminal.set_screen_background("#0a0e14")
+
+    # Then: the headless canvas is themed as the property builds it
+    assert str(terminal.canvas.screen.core_buffer[0, 0].background) == "Color('#0a0e14')"
+    terminal.restore()
+
+
+def test_a_theme_change_themes_the_canvas_as_well_as_the_erase() -> None:
+    """One setter, two lanes: the theme must reach the CANVAS as well as fd 1.
+
+    ``_sync_screen_background`` is the single door a theme comes through (boot
+    and every change), and it feeds the FULL shim here rather than a recorder,
+    so this pins the wiring end to end: the erase colour and the colour a
+    removed placement's cells are filled with move together. A theme that only
+    reached one of them is exactly the bug that survived the resize fix — the
+    erases were themed while every placement clear still showed the terminal
+    default.
+    """
+
+    from miniouto.cli.tui.app import ChatTUI
+
+    terminal = pt.Terminal(width=24, height=4)
+    app = ChatTUI(terminal=terminal)
+    app._logo_shown = False
+
+    # When: the theme is set, the way the picker sets it
+    app.theme = "miniouto"
+    # Then: the erase colour and the canvas background are the theme's own
+    dark = app.current_theme.background
+    assert terminal._screen_bg == dark
+    assert str(terminal.canvas.screen.core_buffer[0, 0].background) == f"Color('{dark}')"
+
+    # And: switching to a light theme moves BOTH (a resize must not clear to the
+    # old dark shade, and a placement clear must not blank to the default)
+    app.theme = "textual-light"
+    light = app.current_theme.background
+    assert terminal._screen_bg == light
+    assert str(terminal.canvas.screen.core_buffer[0, 0].background).lower() == (
+        f"Color('{light}')".lower()
+    )
+    terminal.restore()

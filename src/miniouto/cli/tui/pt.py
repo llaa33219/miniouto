@@ -937,7 +937,7 @@ class Terminal:
             canvas.hook(callback, on=str(kind))
 
     def set_screen_background(self, hex_value: str | None) -> None:
-        """Say what colour the terminal's ERASES should paint.
+        """Say what colour the terminal's ERASES and CLEARS paint.
 
         xnano erases the whole display (``ESC[2J``) whenever the canvas is
         resized, and it emits that erase OUTSIDE its synchronized-output block —
@@ -954,13 +954,53 @@ class Terminal:
         every resize report, and this method is how the app says WHICH colour,
         at boot and again whenever the theme changes.
 
-        ``None`` means "stop guarding": the erase paints the terminal default
-        again, which is what a headless canvas and a caller that never themed
-        the screen want.
+        ``None`` means "stop": the erase paints the terminal default again and
+        the canvas goes back to having no background of its own, which is what
+        a headless canvas and a caller that never themed the screen want.
+
+        The SECOND clear is the one the owner still saw while TYPING: the cells
+        a REMOVED placement covered are filled with the CANVAS background, and
+        a canvas with no background of its own fills them with the terminal
+        default. :meth:`_paint_canvas_background` assigns it
+        (``screen.color.bg``), which is what fixes THAT clear and has no effect
+        on the resize erase above — the two were probed separately.
         """
 
         self._screen_bg = None if hex_value is None else str(hex_value)
         self._paint_screen_background()
+        self._paint_canvas_background()
+
+    def _paint_canvas_background(self) -> None:
+        """Give the canvas the screen background, so its CLEARS paint it too.
+
+        ``screen.color.bg`` is the colour xnano fills a cell with when no
+        placement covers it: a removed row, a row a frame left behind, the tail
+        of a placement shorter than the width it declares. Unset — the default
+        this shim ran with until now — it is the terminal's own background,
+        which is the one colour this UI never shows on purpose.
+
+        That is the flash the owner still saw while TYPING: the log fills from
+        the BOTTOM, so a new row shifts every row below it, their
+        ``(x, y, width)`` placement keys change, and the old ones are removed
+        before the rewritten ones paint (:meth:`_drop_stale_placements`). A
+        probe of that removal headless emitted ``ESC[0m`` and blank spaces with
+        no canvas background, and ``ESC[0;48;2;10;14;20m`` with one.
+
+        Assigned on the HEADLESS canvas too: a probe showed the assignment alone
+        puts nothing on the wire, it only changes what a later clear paints, and
+        it is what lets the offscreen tests reproduce the flash and prove it
+        gone.
+
+        ``"reset"`` is how xnano is told to go back to the terminal default: it
+        rejects ``None`` ("a color cannot be None").
+        """
+
+        canvas = self._canvas
+        if canvas is None:  # no canvas yet: the opener and the property theme it
+            return
+        # A value the canvas cannot take must cost the guard, never the frame.
+        with _suppressed():
+            canvas.screen.color.bg = self._screen_bg if self._screen_bg is not None else "reset"
 
     def _paint_screen_background(self) -> None:
         """Assert the screen background now, if there is one and a real screen."""
@@ -1038,6 +1078,10 @@ class Terminal:
         self._opened = True
         self._width = max(1, int(canvas.screen.width))
         self._height = max(1, int(canvas.screen.height))
+        # The screen background lives on the CANVAS too (it is what a removed
+        # placement's cells are filled with), and the canvas only exists from
+        # here: `set_screen_background` ran at boot with nothing to theme yet.
+        self._paint_canvas_background()
 
     # ── the canvas ──────────────────────────────────────────────────────────
     @property
@@ -1046,6 +1090,9 @@ class Terminal:
 
         if self._canvas is None:
             self._canvas = xnano.new(width=self._width, height=self._height)
+            # An offscreen canvas themes its CLEARS too, so the frame the
+            # tests read here is the one the real screen paints.
+            self._paint_canvas_background()
         return self._canvas
 
     @property
