@@ -50,6 +50,9 @@ from __future__ import annotations
 import contextlib
 import enum
 import os
+import select
+import struct
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -802,6 +805,327 @@ def _write_screen(payload: str) -> None:
             data = data[written:]
 
 
+_ERASE_SEQUENCES: tuple[bytes, ...] = (
+    b"\x1b[2J",
+    b"\x1b[3J",
+    b"\x1b[J",
+    b"\x1b[0J",
+    b"\x1b[1J",
+)
+"""Every sequence that erases part of the screen, so the pen must be themed first.
+
+``ESC[2J`` is the one xnano emits on a resize and the one the owner saw; ``ESC[3J``
+(erase saved lines) and the bare ``ESC[J`` / ``ESC[0J`` / ``ESC[1J`` forms (erase
+from or to the cursor) are here because a terminal paints all of them with the
+CURRENT SGR background on a back-colour-erase terminal — which Konsole is
+(``infocmp konsole`` reports ``bce``). Guarding only ``2J`` would leave the same
+flash behind any of the others if a future frame used them.
+"""
+
+
+def _unfinished_tail(data: bytes) -> int:
+    """Where the trailing run that may still be an incomplete escape starts.
+
+    A write(2) can split a control sequence in half — measured on a pty, 35 of
+    468 writes in one session ended mid-escape (``...48;2;15;20;`` and the like).
+    A guard that scanned such a buffer for ``ESC[2J`` would miss an erase whose
+    bytes arrive in the NEXT write, so the tail is held back until it is a whole
+    sequence again.
+
+    Returns ``len(data)`` when the buffer ends on a whole sequence.
+    """
+
+    start = data.rfind(b"\x1b")
+    if start < 0:
+        return len(data)
+    tail = data[start:]
+    if len(tail) == 1:
+        return start  # a lone ESC: its final byte has not arrived
+    introduced = tail[1:2]
+    if introduced in (b"(", b")", b"*", b"+", b"#", b"%", b" "):
+        return start if len(tail) < 3 else len(data)  # charset designation
+    if introduced == b"[":
+        # A CSI runs until a final byte in 0x40..0x7E.
+        return len(data) if any(0x40 <= byte <= 0x7E for byte in tail[2:]) else start
+    if introduced in (b"]", b"P", b"_", b"^", b"X"):
+        # OSC / DCS / APC / PM / SOS: terminated by BEL or ST.
+        done = tail.endswith(b"\x07") or tail.endswith(b"\x1b\\")
+        return len(data) if done else start
+    return len(data)  # some other two-byte sequence: complete
+
+
+def _guard_erases(data: bytes, sgr: bytes) -> bytes:
+    """Put ``sgr`` immediately before every erase in ``data``.
+
+    This is the whole fix, and it works because of what a terminal does with an
+    erase: it fills the erased cells with the CURRENT SGR background (BCE). Give
+    it the theme background in the SAME WRITE as the erase and the clear becomes
+    a themed one — the screen goes from one themed frame straight to the next
+    instead of flashing the terminal's default colour.
+
+    Why "in the same write" is not a detail: xnano runs the ``'resize'`` hook,
+    then draws a frame whose trailing ``ESC[39m ESC[49m ESC[0m`` resets the pen,
+    and only then emits ``ESC[2J``. Measured on a pty over a resize storm (24
+    resizes, 50-350 ms apart): 43 erases, 4 of them with the pen back at the
+    terminal default. A separate hook write is therefore always in a different
+    write group from the erase and loses that race. Prefixing the erase HERE —
+    inside the bytes actually handed to ``write`` — cannot lose it.
+
+    ``sgr`` is repeated per erase when one buffer carries several, so the
+    guarantee is per-erase rather than per-buffer.
+    """
+
+    if not data or not sgr:
+        return data
+    cut = _unfinished_tail(data)
+    head, tail = data[:cut], data[cut:]
+    out = bytearray()
+    start = 0
+    while True:
+        found = [(head.find(seq, start), seq) for seq in _ERASE_SEQUENCES]
+        found = [(index, seq) for index, seq in found if index >= 0]
+        if not found:
+            out += head[start:]
+            break
+        index, seq = min(found)
+        out += head[start:index] + sgr + seq
+        start = index + len(seq)
+    out += tail
+    return bytes(out)
+
+
+class _EraseTap:
+    """Own fd 1 so every erase xnano emits can be given the theme background.
+
+    WHY A DESCRIPTOR TAP, when a resize hook already exists: xnano emits the
+    erase OUTSIDE its synchronized-output block and AFTER the frame that resets
+    the pen, so the hook's SGR is in a different write group and the guard loses
+    the race (measured: 4 unguarded erases in 43 over a resize storm, and a
+    per-frame hook written from Python loses the same race). Reaching the erase
+    per-emit makes it a guarantee instead of a race, and the only place every
+    byte xnano writes passes through is the descriptor itself: xnano 2.3.0
+    exposes no writer seam, and its ``capture`` option swaps fd 1 for a pipe
+    that kills resize detection and both OSC lanes.
+
+    HOW: a pty pair. fd 1 becomes the SLAVE, so ``isatty(1)`` stays true and
+    ``TIOCGWINSZ`` still answers (both verified on a pty) — that is what xnano
+    measures the canvas from, and what :func:`~.input.terminal_size` and the
+    graphics lane read. A thread reads the MASTER, prefixes the theme SGR to
+    every erase, and writes the result to the descriptor saved from before the
+    swap: the real terminal.
+
+    The tap is installed ONLY for the real screen and ONLY when fd 1 is a
+    terminal, so a headless canvas, a redirected stdout and the whole test
+    suite write nothing through it and nothing offscreen is reordered.
+    """
+
+    _CHUNK = 65536
+    """How much to read from the master at a time."""
+
+    def __init__(self, sgr: Callable[[], bytes]) -> None:
+        self._sgr = sgr
+        """What to write before an erase, read fresh so a theme change follows."""
+
+        self._master = -1
+        self._saved_fd = -1
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._carry = b""
+        """Bytes of a control sequence whose tail has not arrived yet."""
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+    def install(self) -> bool:
+        """Point fd 1 at a pty and pump it to the real terminal. False = no tap.
+
+        Returning ``False`` rather than raising is the contract: a terminal that
+        cannot give a pty, or a stdout that is not a terminal, must cost the
+        GUARD and never the frame — the resize hook still runs in that case, so
+        the screen is exactly as good as it was before this class existed.
+        """
+
+        if self._thread is not None:
+            return True
+        if not _stdout_is_terminal():
+            return False
+        try:
+            master, slave = os.openpty()
+        except (OSError, AttributeError):  # pragma: no cover - no pty at all
+            return False
+        try:
+            _mirror_window_size(slave)
+            _disable_output_processing(slave)
+            saved = os.dup(_STDOUT_FD)
+        except OSError:  # pragma: no cover - a pty that cannot be configured
+            os.close(master)
+            os.close(slave)
+            return False
+        self._master, self._saved_fd = master, saved
+        os.dup2(slave, _STDOUT_FD)
+        if slave != _STDOUT_FD:  # pragma: no cover - pty(2) gives low numbers
+            os.close(slave)
+        self._thread = threading.Thread(
+            target=self._pump, name="miniouto-erase-guard", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def close(self) -> None:
+        """Give fd 1 back, after the last of xnano's bytes has been forwarded.
+
+        Idempotent: :meth:`Terminal.restore` and the interpreter's exit both call
+        it, and the second call must not touch a descriptor already restored.
+        """
+
+        thread, self._thread = self._thread, None
+        if thread is None:
+            return
+        self._stop.set()
+        thread.join(timeout=1.0)
+        self._flush_carry()
+        master, saved = self._master, self._saved_fd
+        self._master = self._saved_fd = -1
+        if saved >= 0:
+            with contextlib.suppress(OSError):
+                os.dup2(saved, _STDOUT_FD)
+                os.close(saved)
+        if master >= 0:
+            with contextlib.suppress(OSError):
+                os.close(master)
+
+    @property
+    def is_active(self) -> bool:
+        """Whether fd 1 is currently the pty this tap owns."""
+
+        return self._thread is not None
+
+    # ── the pump ────────────────────────────────────────────────────────────
+    def _pump(self) -> None:
+        """Forward everything fd 1 receives, guarding each erase on the way.
+
+        Never raises: a pump that died would freeze the screen, so the loop just
+        ends and :meth:`close` restores the descriptor.
+        """
+
+        while True:
+            try:
+                ready, _, _ = select.select([self._master], [], [], 0.01)
+            except (OSError, ValueError):  # pragma: no cover - closed under us
+                return
+            if not ready:
+                if self._stop.is_set():
+                    return
+                continue
+            try:
+                chunk = os.read(self._master, self._CHUNK)
+            except OSError:  # pragma: no cover - the pty went away
+                return
+            if not chunk:
+                return
+            self._forward(chunk)
+
+    def _forward(self, chunk: bytes) -> None:
+        """Guard ``chunk`` and write it to the real terminal as one write.
+
+        The unfinished tail is held back, so an erase whose bytes are split
+        across two reads is guarded too — the erase only reaches the terminal
+        once its whole sequence is in hand.
+        """
+
+        buffered = self._carry + chunk
+        cut = _unfinished_tail(buffered)
+        self._carry = buffered[cut:]
+        data = buffered[:cut]
+        if not data:
+            return
+        try:
+            guarded = _guard_erases(data, self._sgr())
+        except Exception:  # pragma: no cover - a colour that cannot be built
+            guarded = data
+        _write_all(self._saved_fd, guarded)
+
+    def _flush_carry(self) -> None:
+        """Send a held-back tail verbatim: the canvas is gone, nothing follows."""
+
+        carry, self._carry = self._carry, b""
+        if carry:
+            _write_all(self._saved_fd, carry)
+
+    # ── the pty's own shape ─────────────────────────────────────────────────
+    def sync_size(self) -> None:
+        """Copy the real window's size onto the pty, after a resize.
+
+        xnano measures fd 1, which is the pty, and the pty keeps whatever size it
+        was created with. Without this the canvas would never see a resize.
+        """
+
+        if self._thread is None:
+            return
+        _mirror_window_size(_STDOUT_FD, source=self._saved_fd)
+
+
+def _stdout_is_terminal() -> bool:
+    """Whether fd 1 is a terminal, which is the only case the tap helps."""
+
+    try:
+        return os.isatty(_STDOUT_FD)
+    except OSError:  # pragma: no cover - a closed descriptor
+        return False
+
+
+def _disable_output_processing(fd: int) -> None:
+    """Turn OPOST off on the pty, so escapes reach the real terminal verbatim.
+
+    A pty applies ONLCR by default: every ``\\n`` inside a frame would become
+    ``\\r\\n`` and the cursor would jump to column 1 mid-sequence. The tap owns
+    this pty for one purpose — carrying bytes unchanged.
+    """
+
+    try:
+        import termios
+    except ImportError:  # pragma: no cover - Windows
+        return
+    with contextlib.suppress(OSError, ValueError):
+        attrs = termios.tcgetattr(fd)
+        attrs[1] &= ~termios.OPOST
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+def _mirror_window_size(target: int, *, source: int = _STDOUT_FD) -> None:
+    """Copy ``source``'s window size onto ``target``, tolerating a failure.
+
+    A size that cannot be read or set costs nothing: xnano falls back to its own
+    80x24, which is what it does on any stdout without a size, and the resize
+    poll in the app has the same fallback.
+    """
+
+    try:
+        import fcntl
+        import termios
+    except ImportError:  # pragma: no cover - Windows
+        return
+    with contextlib.suppress(OSError, ValueError):
+        packed = fcntl.ioctl(source, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+        fcntl.ioctl(target, termios.TIOCSWINSZ, packed)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write all of ``data`` to ``fd``, finishing a short write.
+
+    A truncated escape sequence corrupts the terminal's parser instead of merely
+    dropping bytes, so a partial write is continued rather than abandoned.
+    """
+
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except OSError:  # pragma: no cover - the terminal went away
+            return
+        if written <= 0:  # pragma: no cover - defensive
+            return
+        view = view[written:]
+
+
 _CARET_SHAPE = "bar"
 _CARET_BLINKING = True
 """How the hardware caret looks while the input band owns it.
@@ -918,6 +1242,13 @@ class Terminal:
         background of its own, so without this the clear lands on the terminal
         default and the whole screen flashes.
         """
+        self._tap: _EraseTap | None = None
+        """The fd-1 tap that gives every erase the theme background, or ``None``.
+
+        Installed by :meth:`_open_real_screen` and given back by
+        :meth:`restore`. See :class:`_EraseTap` for why the resize hook alone
+        cannot keep the guard ahead of xnano's erase.
+        """
 
     # ── input hooks ─────────────────────────────────────────────────────────
     def hook(self, kind: str, callback: Callable[[Any], None]) -> None:
@@ -1013,16 +1344,46 @@ class Terminal:
             _write_screen(_bg_sgr(self._screen_bg))
 
     def _guard_resize_clear(self, _context: Any = None) -> None:
-        """Re-assert the screen background before xnano's resize clear.
+        """Re-assert the screen background, and keep the tap's pty the right size.
 
-        Registered on the REAL canvas as a ``'resize'`` hook, and that ordering
-        is the whole mechanism: xnano runs the hook first and emits the clear
-        afterwards, so the SGR written here is what the erase paints. Verified
-        on a pty — the hook's bytes land ahead of both ``ESC[2J``, and the clear
-        after it leaves the theme background on every cell.
+        This was the WHOLE mechanism until the race was measured: xnano runs the
+        hook, but then draws a frame whose trailing ``ESC[39m ESC[49m ESC[0m``
+        resets the pen, and only then emits ``ESC[2J`` — so on a fast resize the
+        SGR written here is in a different write group and the erase still
+        paints the terminal default (4 unguarded erases in 43, measured). It
+        stays because it is free and it covers an erase that arrives with no
+        frame in between; the guarantee is :class:`_EraseTap`, which prefixes
+        the SGR to the erase itself.
+
+        The size sync belongs here too: this hook is how the app learns the
+        window moved, and the tap's pty has to follow before xnano measures it.
         """
 
         self._paint_screen_background()
+        if self._tap is not None:
+            self._tap.sync_size()
+
+    def sync_window_size(self) -> None:
+        """Re-read the window's size onto fd 1 when the tap owns it.
+
+        The app polls ``TIOCGWINSZ`` on fd 1 as a backstop for a resize xnano
+        never reported, and fd 1 is the tap's pty while the tap is up. Mirroring
+        the real window's size onto it keeps that poll honest; without the tap
+        there is nothing to mirror and this is a no-op.
+        """
+
+        if self._tap is not None:
+            self._tap.sync_size()
+
+    def _erase_background(self) -> bytes:
+        """The SGR the tap writes before an erase, or empty when there is none."""
+
+        if self._screen_bg is None:
+            return b""
+        try:
+            return _bg_sgr(self._screen_bg).encode("ascii")
+        except ValueError:  # pragma: no cover - set_screen_background checks it
+            return b""
 
     # ── context ─────────────────────────────────────────────────────────────
     def __enter__(self) -> Terminal:
@@ -1045,6 +1406,13 @@ class Terminal:
 
     def _open_real_screen(self) -> None:
         """Claim the screen: create the canvas, hook it, open it, size up."""
+
+        # The tap goes on BEFORE the canvas opens, so the erases xnano emits
+        # while opening are guarded too, and so every write the canvas makes
+        # from here on travels through it. A pty that cannot be had leaves the
+        # resize hook below as the (racy, but non-zero) guard it was.
+        tap = _EraseTap(self._erase_background)
+        self._tap = tap if tap.install() else None
 
         canvas = xnano.new()
         # The resize-flash guard goes on FIRST, before the caller's hooks: xnano
@@ -1078,6 +1446,10 @@ class Terminal:
         self._opened = True
         self._width = max(1, int(canvas.screen.width))
         self._height = max(1, int(canvas.screen.height))
+        # The pty starts at the window's size, so this is a no-op unless the
+        # window moved between the install and the open.
+        if self._tap is not None:
+            self._tap.sync_size()
         # The screen background lives on the CANVAS too (it is what a removed
         # placement's cells are filled with), and the canvas only exists from
         # here: `set_screen_background` ran at boot with nothing to theme yet.
@@ -1323,6 +1695,12 @@ class Terminal:
         if canvas is not None and not canvas.is_closed:
             with _suppressed():
                 canvas.close()
+        # AFTER the canvas closed: xnano's leave sequences travel through the
+        # tap, so giving fd 1 back first would send them into the pty instead.
+        tap, self._tap = self._tap, None
+        if tap is not None:
+            with _suppressed():
+                tap.close()
 
     @property
     def is_open(self) -> bool:

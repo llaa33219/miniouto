@@ -2970,6 +2970,13 @@ class ChatTUI:
         handler just recomposes).
         """
 
+        # fd 1 is the erase guard's pty while that is up, so the window's real
+        # size is mirrored onto it first; otherwise this poll would keep reading
+        # the size the pty was created with and never see a resize.
+        sync = getattr(self._terminal, "sync_window_size", None)
+        if callable(sync):
+            with contextlib.suppress(Exception):
+                sync()
         width, height = terminal_size()
         if (width, height) == (self.size.width, self.size.height):
             return
