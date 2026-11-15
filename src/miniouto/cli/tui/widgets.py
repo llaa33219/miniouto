@@ -11,7 +11,7 @@ What each one owes the frame:
 * :class:`Header` — the ``$panel`` background, with the ``title — sub`` string
   centred in the cells the docked 10-cell clock space leaves; every cell on the
   row is ``$panel`` to the last column.
-* :class:`StatusChip` — ``bg $boost``, bold, ``padding 0 1``, one cell of right
+* :class:`StatusChip` — ``bg $background`` at rest (bold, ``padding 0 1``, one cell of
   margin, and the value rendered WHOLE: an earlier one-row layout elided the
   values with ``…`` and the owner rejected it, so the panel has two chip rows.
 * :class:`ChatInput` — a multiline editor of our own (pyratatui's ``TextState`` is a
@@ -98,11 +98,10 @@ HELP_TEXT = (
     f"{_LQUO}Ctrl+L{_RQUO} clear  {_MIDDOT}  "
     f"{_LQUO}Ctrl+C{_RQUO} quit"
 )
-"""The bottom hint's plain text (88 cells, matching the Textual baseline).
+"""The retired bottom hint's plain text, kept for the exported name.
 
-Textual stored this as Rich markup with a ``[dim]`` wrapper; the port paints it
-with an explicit muted style instead, so the string itself must carry no markup — a
-stray ``[dim]`` would otherwise be drawn literally.
+The panel no longer paints a help row (the Keys entry in the Ctrl+P palette
+lists the bindings now); the constant stays because the package re-exports it.
 """
 
 ACTION_TOLERANCE_LINES = 2
@@ -275,7 +274,14 @@ class Header(Node):
                 pieces.append((" \u2014 ", dim))
             pieces.append((self.sub_title, dim))
         if pieces and start < width:
-            line = place_at(line, start, truncate_to(pieces, width - start), background)
+            # `place_at` REPLACES the cells past `start`, so the painted title
+            # comes back short of `width`; padding it out again keeps `$panel`
+            # on the whole row — the docked clock space included.
+            line = pad_to(
+                place_at(line, start, truncate_to(pieces, width - start), background),
+                width,
+                background,
+            )
         self.place(0, 0, width, 1)
         return [line]
 
@@ -372,7 +378,7 @@ class StatusChip(Node):
         return (
             pt.Style()
             .fg(theme.color(self._variant_color(theme)))
-            .bg(theme.color(theme.boost))
+            .bg(theme.color(theme.background))
             .add_modifier(pt.Modifier.bold())
         )
 
@@ -381,8 +387,9 @@ class StatusChip(Node):
             return theme.accent
         if self.variant == "muted":
             return theme.text_muted
-        # `color: $text` on `$boost` — auto 87% against the chip's own surface.
-        return auto_text(theme, theme.boost)
+        # `color: $text` — auto 87% against the chip's own surface, which
+        # at rest is the app background the row already paints.
+        return auto_text(theme, theme.background)
 
     def build_lines(self, width: int, theme: TuiTheme) -> list[StyledLine]:
         """The chip painted into ``width`` cells: padding, text, padding.
@@ -438,7 +445,7 @@ class StatusChip(Node):
 
 
 class BottomPanel(Node):
-    """The 4-row panel under the input: spinner, two chip rows, help hint.
+    """The 3-row panel under the input: the spinner and the two chip rows.
 
     The panel's surface spans the terminal but its CONTENT stops at the chat
     column, so the chips line up with the log and the input. The chips sit in two
@@ -450,7 +457,6 @@ class BottomPanel(Node):
         "spinner-row",
         "chip-row-a",
         "chip-row-b",
-        "help-row",
     )
 
     def __init__(self, *, id: str | None = None) -> None:
@@ -498,7 +504,7 @@ class BottomPanel(Node):
         return self._framed
 
     def row(self, name: str) -> Node:
-        """The structural row node (``spinner-row`` … ``help-row``)."""
+        """The structural row node (``spinner-row`` … ``chip-row-b``)."""
 
         return self._rows[name]
 
@@ -520,7 +526,7 @@ class BottomPanel(Node):
             self._spinner_line(width, theme),
             self._chip_line(width, theme, "outo", "style", 1),
             self._chip_line(width, theme, "subagent", "session", 2),
-            self._help_line(width, theme),
+            # (no help row: the Keys entry in the Ctrl+P palette lists them)
         ]
         for index, name in enumerate(self.ROWS):
             self._rows[name].place(0, index, width, 1)
@@ -586,7 +592,8 @@ class BottomPanel(Node):
         right.place(right_x, y, right_width, 1)
         return line
 
-    def _help_line(self, width: int, theme: TuiTheme) -> StyledLine:
+    def _help_line(self, width: int, theme: TuiTheme) -> StyledLine:  # pragma: no cover
+        """Retired with the help row; kept one release for the private name."""
         style = pt.Style().fg(theme.color(theme.text_muted)).bg(theme.color(theme.background))
         pieces: StyledLine = [(" ", style), (HELP_TEXT, style)]  # padding: 0 1
         return place_at(

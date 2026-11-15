@@ -48,7 +48,7 @@ from rich.text import Text
 
 from ...tools import ascii_art
 from . import pt
-from .render import blend, render_markdown, rich_text_to_lines, wrap_spans
+from .render import TAB_WIDTH, blend, render_markdown, rich_text_to_lines, wrap_spans
 from .theme import MINIOUTO_THEME, TuiTheme
 
 __all__ = [
@@ -860,6 +860,195 @@ class ThinkingRow(ToggleGlyphHover, ClickToToggle, EventRow):
         return Text.assemble(*pieces)
 
 
+# ─── incremental stream wrap ─────────────────────────────────────────────
+#
+# WHY a second wrap walker lives here: a streamed row used to re-wrap its
+# WHOLE text on every delta — O(n²) over a message, measured ~10ms per
+# append+build at 2000 tokens. But ``append`` only ever EXTENDS the text, so
+# every visual line a previous wrap had already broken away — every line but
+# the last — is final: nothing a later delta adds can move an earlier line's
+# break. ``StreamRow`` therefore keeps those lines frozen and re-wraps only
+# the tail that starts where the last visual line begins — a region bounded
+# by the wrap width, not by the message length.
+#
+# The price is finding that start offset. It cannot be read off the wrapped
+# result (the engine expands tabs and drops trailing spaces by then), so
+# ``_visual_line_starts`` walks the SAME atom / indent / break rules and
+# records where each visual line began. It mirrors render.py's ``_tokenise``
+# + ``_wrap_line`` step for step: when the engine's rules change, this mirror
+# must change with them — the equivalence tests in ``test_tui_rows.py`` are
+# what holds the two together.
+#
+# ``_safe_start`` then decides which of those starts the incremental path may
+# re-wrap from. The engine measures a word with ONE ``cell_len`` over the
+# whole chunk, so a freeze must hand the re-wrap atoms that are measured
+# exactly as the full wrap measured them: the start has to sit on an atom
+# boundary, AND the line it starts has to begin that atom on an empty budget
+# (a word that arrived mid-line is broken apart character by character — a
+# different path whose result the re-wrap cannot reproduce). Only a CLEAN
+# start survives every future delta unchanged.
+
+_STREAM_ATOM_RE = re.compile(r"\s+|\S+")
+"""``render._ATOM_RE`` mirrored: the tail scan must split atoms identically."""
+
+
+def _atom_cells(chunk: str) -> int:
+    """Cells an atom spends — a tab counts as :data:`TAB_WIDTH` spaces."""
+
+    if "\t" not in chunk:
+        return cell_len(chunk)
+    return cell_len(chunk.replace("\t", " " * TAB_WIDTH))
+
+
+def _visual_line_starts(source: str, width: int) -> list[tuple[int, bool]]:
+    """Where every visual line of ``source``'s wrap begins, and if that is CLEAN.
+
+    A start is clean when no word was sliced to open the line — the line began
+    because the previous one was full (or a newline), not because the
+    character-level break loop cut a word that arrived mid-line. The walk is
+    :func:`render._wrap_line` over each logical line the Rich bridge keeps
+    (a trailing ``"\\n"`` contributes no line of its own — see
+    ``_text_pieces``), with the growing line tracked as ``(start, end)`` source
+    spans so a flushed line can report where it began. Leading indentation
+    seeds the first line, the spaces sitting on a break are consumed by it,
+    and a word that cannot fit breaks at cell boundaries with a wide glyph
+    moving down whole — each rule exactly as the engine applies it.
+    """
+
+    width = max(1, width)
+    starts: list[tuple[int, bool]] = []
+    base = 0
+    logical = source.split("\n")
+    if source.endswith("\n"):
+        logical.pop()  # a trailing "\n" contributes no line of its own
+    for line_src in logical:
+        atoms: list[tuple[int, int, int, bool]] = []  # (start, end, cells, is_space)
+        for match in _STREAM_ATOM_RE.finditer(line_src):
+            chunk = match.group(0)
+            is_space = chunk[0].isspace()
+            cells = _atom_cells(chunk)
+            if atoms and atoms[-1][3] == is_space:
+                start, _end, total, _space = atoms[-1]
+                atoms[-1] = (start, match.end(), total + cells, is_space)
+            else:
+                atoms.append((match.start(), match.end(), cells, is_space))
+
+        indent: list[tuple[int, int]] = []
+        indent_cells = 0
+        index = 0
+        while index < len(atoms) and atoms[index][3] and indent_cells + atoms[index][2] <= width:
+            indent.append((atoms[index][0], atoms[index][1]))
+            indent_cells += atoms[index][2]
+            index += 1
+
+        cur: list[tuple[int, int]] = list(indent)  # the growing line, as spans
+        cur_cells = indent_cells
+        started = False  # does the current line hold any non-space text?
+        opened_clean = True  # did this line open on a whole atom, not a word slice?
+        line_starts: list[tuple[int, bool]] = []
+
+        def flush(line_starts: list[tuple[int, bool]] = line_starts) -> None:
+            # the default arg binds THIS line's list, not the next loop turn's
+            nonlocal cur, cur_cells, started, opened_clean
+            line_starts.append((cur[0][0] if cur else 0, opened_clean))
+            cur, cur_cells, started, opened_clean = [], 0, False, True
+
+        for start, end, cells, is_space in atoms[index:]:
+            if is_space:
+                if cur_cells + cells <= width:
+                    cur.append((start, end))
+                    cur_cells += cells
+                elif started:
+                    flush()  # the spaces sit ON the break and are consumed by it
+                continue
+            if cur_cells + cells <= width:
+                cur.append((start, end))
+                cur_cells += cells
+                started = True
+                continue
+
+            # The word does not fit on the current line. From here the
+            # character-level break loop places SLICES of it, and a line that
+            # opens on a slice can never be a resume point: the full wrap split
+            # the word because it did not fit where it arrived, while a re-wrap
+            # from the slice start would measure the whole word again at an
+            # empty budget and lay it down differently.
+            if started:
+                flush()
+            else:
+                # Only indentation so far: the indent yields to the content rather
+                # than emitting a line holding nothing but blanks.
+                cur, cur_cells = [], 0
+            # The emptied line opens CLEAN — the whole word may land on it
+            # in one slice, exactly as the engine's fits check would place
+            # it. Only a slice that ends mid-word (below) opens one unclean.
+            pos = start
+            while pos < end:
+                span_start = pos
+                budget = max(1, width - cur_cells)
+                taken = 0
+                consumed = 0
+                while pos < end and taken + cell_len(line_src[pos]) <= budget:
+                    taken += cell_len(line_src[pos])
+                    pos += 1
+                    consumed += 1
+                if consumed == 0 and pos < end:
+                    taken = cell_len(line_src[pos])  # a wide glyph never stalls
+                    pos += 1
+                cur.append((span_start, pos))
+                # the engine re-measures the SLICE whole (``render._cells``),
+                # which is not the per-character sum when the slice carries a
+                # VS16/ZWJ cluster — mirror that, not ``taken``.
+                cur_cells += cell_len(line_src[span_start:pos])
+                started = True
+                if pos < end:
+                    # this line ends mid-word, so it opened on a slice —
+                    opened_clean = False  # not a resume point either
+                    flush()
+                    opened_clean = False  # the next line opens mid-word too
+        if cur or not line_starts:
+            flush()
+        starts.extend((base + offset, clean) for offset, clean in line_starts)
+        base += len(line_src) + 1
+    return starts or [(0, True)]
+
+
+def _safe_start(text: str, start: int, clean: bool) -> bool:
+    """May the incremental re-wrap begin at ``start`` without drifting?
+
+    Three conditions, all about handing the engine the SAME measurement the
+    full wrap made — now and under every future append. (1) ``start`` must be
+    an atom boundary (or sit right after a newline): ``cell_len`` measures a
+    chunk holding a ZWJ (``\\u200d``) or VS16 (``\\ufe0f``) as one grapheme
+    cluster — non-additively — so a region cut mid-word hands the engine a
+    differently-measured atom than the full wrap measured, and the two drift
+    apart. (2) the line must be CLEAN — no word was sliced to open it. A word
+    that arrived mid-line is placed by the character-level break loop, whose
+    slices a whole-atom fits check on a fresh line cannot reproduce;
+    re-wrapping that line from its start would displace those slices and
+    drift. (3) the word the region begins on must be CLOSED — followed by a
+    space inside the text. ``cell_len`` of a growing word changes as it grows
+    (``'\\u200b'`` measures 0 alone but joins the CJK run after it), and the
+    last word of the text is exactly the one a later delta can still extend.
+    A clean start on a closed word hands the engine atoms measured exactly as
+    the full wrap measured them — forever — so the wrap cannot drift.
+    """
+
+    if start <= 0 or start >= len(text):
+        return True
+    if not clean:
+        return False
+    if text[start - 1] != "\n" and text[start - 1].isspace() == text[start].isspace():
+        return False  # mid-atom (a newline always ends its atom)
+    end = start
+    limit = len(text)
+    while end < limit and not text[end].isspace():
+        end += 1
+    # a word that runs to the end of the text is still OPEN — a delta may
+    # extend it and change how it is measured
+    return text[start].isspace() or end < limit
+
+
 class StreamRow(EventRow):
     """Live assistant text: one row, updated in place as tokens arrive.
 
@@ -867,11 +1056,33 @@ class StreamRow(EventRow):
     for each subsequent one, so a streamed message costs one row instead of one
     per token. The final answer replaces this row with the canonical Markdown
     :class:`AnswerRow`.
+
+    The wrap is INCREMENTAL: the visual lines a previous build had already
+    broken away are frozen and only the tail is re-wrapped, so an append costs
+    O(tail) — bounded by the wrap width — instead of a full re-wrap of the
+    whole message. The tail begins at the LATEST wrap line start that is safe
+    to resume from (:func:`_safe_start`): the engine measures an atom — and a
+    ZWJ/VS16 grapheme cluster inside it — whole, so a resume point that cuts
+    one, or re-lays a line the break loop had sliced, would re-measure the
+    text differently and drift the wrap off the full re-wrap's result. The
+    frozen prefix stays
+    valid only while the text GROWS by :meth:`append` (a delta never touches
+    earlier characters); anything else falls back to a full re-wrap through
+    the length guard in :meth:`_content_lines`. A width or ink (``base``
+    style) change re-wraps everything, exactly as the base class always did.
     """
 
     def __init__(self, text: str = "", *, id: str | None = None) -> None:
         super().__init__("", id=id)
         self._text = text
+        self._wrap_key: tuple[int, pt.Style, int] | None = None
+        """``(width, base style, text length)`` the frozen lines were built for."""
+        self._wrap_frozen: list[StyledLine] = []
+        """Visual lines before the unfrozen tail, shared (never mutated) with the cache."""
+        self._wrap_tail_start = 0
+        """Source offset where the unfrozen tail — what the next append re-wraps — begins."""
+        self._wrap_tail_clean = True
+        """Was the tail's line opened clean (no word sliced to open it)? See ``_safe_start``."""
 
     def append(self, delta: str) -> None:
         if not delta:
@@ -885,6 +1096,64 @@ class StreamRow(EventRow):
 
     def _content_text(self, theme: TuiTheme) -> Text:
         return Text(self._text)
+
+    def _content_lines(
+        self, width: int, theme: TuiTheme, base: pt.Style
+    ) -> list[StyledLine]:
+        """The streamed text wrapped to ``width``, re-wrapping only the tail.
+
+        Byte-identical to the full ``_wrap(_text_pieces(...))`` the base class
+        runs — the equivalence tests hold the two together — but linear in
+        the tail instead of the message: the frozen lines are reused as-is
+        and only the unfrozen tail goes back through the engine, from a
+        start that never splits a measured cluster (:func:`_safe_start`
+        picks which).
+        """
+
+        text = self._text
+        key = self._wrap_key
+        frozen = self._wrap_frozen
+        start = self._wrap_tail_start
+        if (
+            key is None
+            or key[0] != width
+            or key[1] != base
+            or len(text) < key[2]
+            or not _safe_start(text, start, self._wrap_tail_clean)
+        ):
+            # First build, a width/ink change, a non-append mutation, or a
+            # tail the grown text has rendered unsafe (see ``_safe_start``):
+            # wrap the whole text and restart the freeze from it.
+            lines = _wrap(_text_pieces(Text(text), base), width)
+            starts = _visual_line_starts(text, width)
+        else:
+            tail = text[start:]
+            # A trailing newline ends the last logical line and contributes no
+            # line of its own, so the engine is handed the piece without it.
+            piece = tail[:-1] if tail.endswith("\n") else tail
+            wrapped = wrap_spans([(piece, base)], width)
+            lines = [*frozen, *wrapped]
+            starts = [
+                (start + offset, clean)
+                for offset, clean in _visual_line_starts(tail, width)
+            ]
+        # Freeze at the LATEST safe start: the lines before it are final (the
+        # text only ever grows), the rest is what the next append re-wraps.
+        freeze = len(starts) - 1
+        while freeze > 0 and not _safe_start(text, *starts[freeze]):
+            freeze -= 1
+        if not _safe_start(text, *starts[freeze]):
+            # Even the first start is unsafe (a sliced line the region cannot
+            # reproduce); the frozen prefix is unusable, so start over whole.
+            lines = _wrap(_text_pieces(Text(text), base), width)
+            starts = _visual_line_starts(text, width)
+            freeze = len(starts) - 1
+            while freeze > 0 and not _safe_start(text, *starts[freeze]):
+                freeze -= 1
+        self._wrap_frozen = lines[: len(lines) - len(starts) + freeze]
+        self._wrap_tail_start, self._wrap_tail_clean = starts[freeze]
+        self._wrap_key = (width, base, len(text))
+        return lines
 
 
 # ANY Computer result that names a `.art` file: the `screen` action ends with

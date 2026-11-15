@@ -21,6 +21,8 @@ takes a bare ``str`` code). Everything else matches the binding.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 import xnano.styles as xstyles
 
@@ -1488,4 +1490,211 @@ def test_a_theme_change_themes_the_canvas_as_well_as_the_erase() -> None:
     assert str(terminal.canvas.screen.core_buffer[0, 0].background).lower() == (
         f"Color('{light}')".lower()
     )
+    terminal.restore()
+
+
+# ─── the transitional frame: placement changes must be atomic ────────────────
+
+
+class _RecordingHost:
+    """A canvas host double: ``call`` records, and runs, what it was handed."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.calls: list[Callable[[], object]] = []
+        self.fail = fail
+
+    def call(self, function: Callable[[], object]) -> object:
+        if self.fail:
+            raise RuntimeError("canvas closed under us")
+        self.calls.append(function)
+        return function()
+
+
+def _paint_two_rows(terminal: pt.Terminal) -> None:
+    terminal.draw(
+        lambda frame: frame.render_widget(
+            pt.Paragraph(pt.Text.from_string("ab")), pt.Rect(0, 0, 2, 1)
+        )
+    )
+
+
+def test_a_real_screens_placement_changes_run_on_the_canvas_loop() -> None:
+    """Regression (owner: "changed rows flash the terminal default for a frame").
+
+    xnano composes frames on a loop thread of its own, and the app thread's
+    ``remove()`` → rewrite left a window where the removed row's cells were
+    filled with the terminal DEFAULT background: a compose in that window is
+    what the one-frame flash WAS. The whole change — removals, the paint, the
+    stale sweep — has to reach the canvas as ONE step on ITS thread, which is
+    what ``canvas._host.call`` does. The host double runs it inline, so the
+    test can SEE the path was taken: one call, and a frame painted by it.
+    """
+
+    terminal = pt.Terminal(width=4, height=2, real_screen=True)
+    host = _RecordingHost()
+    terminal._canvas = _CanvasDouble(host)
+    _paint_two_rows(terminal)
+
+    # Then: the mutation went through the host — the loop thread — and painted
+    assert len(host.calls) == 1
+    assert terminal._placements, "the serialized call must have painted the rows"
+    terminal.restore()
+
+
+def test_a_headless_terminal_paints_directly_without_a_host() -> None:
+    """Offscreen there is no loop to race: the offscreen canvas renders itself.
+
+    The serialization is a real screen's need. The headless path (every unit
+    test, the Pilot) must not grow a host round-trip: the paint runs inline and
+    the presentation is the canvas's own explicit ``render()``. A canvas that
+    HAS a host attribute proves the MODE, not the attribute, decides the path.
+    """
+
+    terminal = pt.Terminal(width=4, height=2)
+    host = _RecordingHost()
+    terminal._canvas = _CanvasDouble(host)
+    _paint_two_rows(terminal)
+
+    # Then: nothing was handed to a host — the paint ran inline
+    assert host.calls == []
+    assert terminal._placements
+    terminal.restore()
+
+
+def test_a_host_that_fails_falls_back_to_painting_the_frame() -> None:
+    """A canvas that closed under us must not take the frame with it.
+
+    ``host.call`` raises once the canvas has finished; the draw then takes the
+    old direct path, which is what a headless canvas always takes. The frame
+    still lands — the removal, the paint and the stale sweep all ran — so the
+    fallback is observable as a failed call AND a painted row.
+    """
+
+    terminal = pt.Terminal(width=4, height=2, real_screen=True)
+    host = _RecordingHost(fail=True)
+    terminal._canvas = _CanvasDouble(host)
+    _paint_two_rows(terminal)
+
+    # Then: the attempt failed and the frame was painted anyway
+    assert host.calls == []  # the failure happened before the record
+    assert terminal._placements, "the fallback must still paint the frame"
+    terminal.restore()
+
+
+def test_a_terminal_without_a_host_paints_directly() -> None:
+    """The fallback of fallbacks: a canvas with no host attribute at all.
+
+    A canvas swapped under us, a future xnano that renames the attribute — the
+    draw must paint regardless, exactly the way it did before the serialization
+    existed. The double's write is a stub, so the proof is that draw returned
+    and the row was kept.
+    """
+
+    terminal = pt.Terminal(width=4, height=2, real_screen=True)
+    terminal._canvas = _CanvasDouble.__new__(_CanvasDouble)  # no host at all
+    terminal._canvas.screen = _ScreenDouble()
+    terminal._canvas.is_closed = True
+    _paint_two_rows(terminal)
+    assert terminal._rows  # the stub write is still kept as a placement
+    terminal.restore()
+
+
+class _CanvasDouble:
+    """The canvas surface ``draw`` touches: a screen, and a host to serialize."""
+
+    def __init__(self, host: _RecordingHost) -> None:
+        self._host = host
+        self.screen = _ScreenDouble()
+        self.is_closed = True  # a closed canvas: restore must not close it
+
+    def render(self) -> None:
+        """The offscreen presentation the headless draw makes."""
+
+    def write(self, *_args: object, **_kwargs: object) -> object:
+        """A stub placement; the tests only read what the terminal kept."""
+
+        return _StubPlacement()
+
+
+class _StubPlacement:
+    """The surface a terminal keeps: text, and a remove that clears it."""
+
+    def __init__(self) -> None:
+        self.text: object = None
+
+    def remove(self) -> None:
+        return None
+
+
+class _ScreenDouble:
+    """A screen double with the size the terminal reads."""
+
+    width = 4
+    height = 2
+
+
+# ─── force_full_repaint: the recovery draw ─────────────────────────────────
+
+
+def test_force_full_repaint_makes_the_next_draw_recreate_every_placement() -> None:
+    """The recovery API: unchanged rows must be REPAINTED, not diffed away.
+
+    A corrupted screen (a stray stderr write, a hard-copy) is exactly the case
+    the placement reuse cannot fix: the placement's text still compares equal,
+    so the canvas would emit nothing and the damage stays. Dropping the
+    placements forces the next ``draw`` to recreate every one of them, which
+    repaints every cell — the full clear+redraw, on this substrate.
+    """
+
+    terminal = pt.Terminal(width=12, height=2)
+
+    def paint(frame: pt.Frame) -> None:
+        for row in range(2):
+            frame.render_widget(
+                pt.Paragraph(pt.Text.from_string(f"row {row}")), pt.Rect(0, row, 12, 1)
+            )
+
+    terminal.draw(paint)
+    first = list(terminal._placements)
+    assert len(first) == 2
+
+    # Given: the SAME frame is drawn again — the reuse path, nothing emitted
+    terminal.draw(paint)
+    assert terminal._placements == first
+
+    # When: the screen is declared corrupted and the frame redrawn
+    terminal.force_full_repaint()
+    assert terminal._placements == [], "the placements were kept"
+    assert terminal._rows == {}, "the reuse memo was kept"
+    terminal.draw(paint)
+
+    # Then: every placement is a NEW object — the canvas cannot diff the frame
+    # against the corrupted one, so all of it is repainted.
+    assert len(terminal._placements) == 2
+    assert all(a is not b for a, b in zip(terminal._placements, first, strict=True))
+    assert terminal.output_lines() == ["row 0", "row 1"]
+    terminal.restore()
+
+
+def test_force_full_repaint_on_a_real_screen_runs_the_removal_on_the_host() -> None:
+    """The removal must follow ``draw``'s serialization (``host.call``).
+
+    A live canvas composes frames whenever it likes; removing the placements
+    from under it is the half-done state the serialization exists to prevent,
+    so the strip runs on the canvas loop like every other placement change.
+    """
+
+    terminal = pt.Terminal(width=4, height=2, real_screen=True)
+    host = _RecordingHost()
+    terminal._canvas = _CanvasDouble(host)
+    _paint_two_rows(terminal)
+    assert terminal._placements
+    calls_after_paint = len(host.calls)
+
+    terminal.force_full_repaint()
+
+    # Then: the strip went through the host — exactly one call after the
+    # paint's own, and the placements are gone.
+    assert len(host.calls) == calls_after_paint + 1, host.calls
+    assert terminal._placements == []
     terminal.restore()

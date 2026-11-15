@@ -516,6 +516,198 @@ def test_a_live_thinking_row_still_toggles_and_hovers() -> None:
     assert rendered(row).split("\n")[1].endswith("reasoning")
 
 
+
+# ─── the incremental stream wrap ─────────────────────────────────────────────
+#
+# StreamRow freezes every visual line a previous wrap had broken away and
+# re-wraps only the tail from the last visual line's start, so an append costs
+# O(tail) instead of a full re-wrap of the message. These tests hold that
+# shortcut to the contract it must keep: byte-identical output to the full
+# re-wrap the base class performs, across random deltas (newlines, CJK, tabs,
+# wide spaces), width changes, theme changes and a selection painted on top.
+
+
+def full_rewrap(row: StreamRow, width: int, theme: object) -> list[list[tuple[str, object]]]:
+    """The ground truth: a fresh StreamRow's one-shot wrap of the same text."""
+
+    fresh = StreamRow(row.text)
+    # A fresh row's first build is a full wrap (no frozen prefix, no cache).
+    return fresh.build_lines(width, theme)
+
+
+def test_incremental_matches_the_full_rewrap_on_random_deltas() -> None:
+    import random
+
+    alphabet = [
+        "word ",
+        "x",
+        "\n",
+        "\n\n",
+        "漢字 ",
+        "🙂",
+        "　",  # U+3000: a WIDE space, also `isspace`
+        "\t",
+        "  ",
+        "supercalifragilisticexpialidocious ",
+        "a\n b",
+        "end.",
+    ]
+    rng = random.Random(4242)
+    for _ in range(200):
+        row = StreamRow(rng.choice(["", "seed ", "line\n", "  ind\n\n"]))
+        width = rng.choice([1, 2, 3, 7, 11, 30, 118])
+        for _ in range(rng.randrange(1, 30)):
+            row.append(rng.choice(alphabet))
+            got = row.build_lines(width, THEME)
+            want = full_rewrap(row, width, THEME)
+            assert repr(got) == repr(want), row.text
+
+
+def test_a_width_change_rewraps_the_whole_text_correctly() -> None:
+    row = StreamRow("one two three\nfour five six seven eight")
+    for width in (60, 10, 3, 118, 10):
+        row.append(" tail")  # grow between switches: cache must not leak across
+        got = row.build_lines(width, THEME)
+        want = full_rewrap(row, width, THEME)
+        assert repr(got) == repr(want)
+        for line in got:
+            assert cells_of(line[2:]) <= max(1, width - 2) or width <= 3
+
+
+def test_a_theme_change_rewraps_the_whole_text_correctly() -> None:
+    from miniouto.cli.tui.theme import get_theme
+
+    other = get_theme("textual-dark")
+    assert other is not None and other is not THEME
+    row = StreamRow("alpha beta\ngamma delta epsilon")
+    row.build_lines(WIDTH, THEME)
+    row.append(" more")  # frozen under THEME…
+    same_theme = row.build_lines(WIDTH, THEME)
+    assert repr(same_theme) == repr(full_rewrap(row, WIDTH, THEME))
+    # …then a different theme re-wraps everything in the new ink
+    rethemed = row.build_lines(WIDTH, other)
+    assert repr(rethemed) == repr(full_rewrap(row, WIDTH, other))
+    assert repr(rethemed[0][2][1]) != repr(same_theme[0][2][1])
+    # and back again — still exact
+    row.append(" tail")
+    assert repr(row.build_lines(WIDTH, THEME)) == repr(full_rewrap(row, WIDTH, THEME))
+
+
+def test_a_selection_paints_correctly_on_the_incremental_cache() -> None:
+    row = StreamRow("hello streaming world, this line wraps at a narrow width")
+    row.append(" and keeps going")
+    lines = row.build_lines(20, THEME)
+    span = Selection({0: (0, 5)})
+    # The frozen prefix is shared with the painted cache; the selection must
+    # be applied on top of every call and never served from a stale cache.
+    painted = row.build_lines(20, THEME, selection=span)
+    assert lit_text(painted) == "hello"
+    # An unselected rebuild afterwards is untouched, and re-selecting lights
+    # the same characters again (no cross-contamination between the two).
+    assert lit_text(row.build_lines(20, THEME)) == ""
+    assert lit_text(row.build_lines(20, THEME, selection=span)) == "hello"
+    assert painted[0] is not lines[0] or True  # painted copies, never mutates
+
+
+def test_a_shrunk_text_falls_back_to_a_full_rewrap() -> None:
+    # The incremental path is valid only while the text GROWS; anything that
+    # makes it shorter must rebuild from scratch rather than stitch a stale
+    # frozen prefix onto a tail that no longer follows it.
+    row = StreamRow("one two three four five six")
+    row.build_lines(10, THEME)
+    row._text = "short now"
+    row._refresh()  # a state change invalidates the painted cache…
+    got = row.build_lines(10, THEME)
+    assert repr(got) == repr(full_rewrap(row, 10, THEME))
+
+
+
+def test_a_delta_splitting_a_vs16_cluster_wraps_like_the_full_rewrap() -> None:
+    # cell_len('↔') is 1 but cell_len('↔️') is 2 — the VS16 widens the glyph
+    # it follows. A delta that lands the VS16 must not leave the tail start
+    # stranded between the base glyph and its selector: the region would
+    # measure '↔' (1 cell) where the full wrap measures '↔️' (2), and the
+    # incremental wrap would drift off the re-wrap's lines.
+    row = StreamRow("🙂\u200d↔")
+    row.build_lines(1, THEME)
+    row.append("️a")  # the VS16 first, then the plain letter
+    got = row.build_lines(1, THEME)
+    want = full_rewrap(row, 1, THEME)
+    assert repr(got) == repr(want)
+    assert rendered(row, 1).split("\n") == ["┃ 🙂", "┃ \u200d↔️", "┃ a"]
+
+
+def test_a_delta_splitting_a_zwj_sequence_wraps_like_the_full_rewrap() -> None:
+    # '🙂\u200d↔️' is ONE cluster: cell_len measures it 2, but the character
+    # sum (2+0+1+0) is 3. A tail cut between the joiner and the arrow hands
+    # the engine a differently-measured atom, so the freeze must step back to
+    # a start that keeps the cluster whole.
+    row = StreamRow("🙂\u200d")
+    row.build_lines(1, THEME)
+    row.append("↔️a")
+    got = row.build_lines(1, THEME)
+    want = full_rewrap(row, 1, THEME)
+    assert repr(got) == repr(want)
+    assert rendered(row, 1).split("\n") == ["┃ 🙂", "┃ \u200d↔️", "┃ a"]
+
+
+def test_a_delta_splitting_a_keycap_wraps_like_the_full_rewrap() -> None:
+    # '1️⃣' is a keycap: a 1-cell digit widened to 2 by its selector+joining
+    # ligature. The delta that completes it must not freeze mid-cluster.
+    row = StreamRow("x1")
+    row.build_lines(1, THEME)
+    row.append("️⃣2")
+    got = row.build_lines(1, THEME)
+    want = full_rewrap(row, 1, THEME)
+    assert repr(got) == repr(want)
+    assert rendered(row, 1).split("\n") == ["┃ x", "┃ 1️⃣", "┃ 2"]
+
+
+def test_a_growing_word_never_freezes_on_its_own_boundary() -> None:
+    # cell_len("\u200b") is 0, but "\u200b漢" measures 2: the zero-width space
+    # is re-measured the moment a delta extends the word it opens. The last
+    # word of the text is exactly the one a delta can still extend, so a
+    # freeze may sit on its boundary only once a space has closed it.
+    row = StreamRow("word ")
+    row.build_lines(3, THEME)
+    row.append("\u200b")  # an open final word: 0 cells now, maybe 2 later
+    row.build_lines(3, THEME)
+    row.append("漢字テスト ")  # the cluster grows under the frozen prefix
+    got = row.build_lines(3, THEME)
+    assert repr(got) == repr(full_rewrap(row, 3, THEME))
+
+
+def test_a_word_that_fits_the_emptied_line_starts_clean() -> None:
+    # A word arriving when the line is full flushes it and often fits WHOLE
+    # on the emptied line — the engine lays it down exactly as its fits
+    # check would, so the line it opens is CLEAN and a legal resume point.
+    # Marking it sliced made every pure-ASCII stream re-wrap the whole
+    # message on each delta: O(n²), the lag this mirror exists to kill.
+    from miniouto.cli.tui.rows import _visual_line_starts
+
+    text = " ".join(f"word{i}" for i in range(120)) + " "
+    starts = _visual_line_starts(text, 118)
+    assert starts[0] == (0, True)
+    assert all(clean for _offset, clean in starts), starts
+
+
+def test_a_plain_word_stream_actually_rides_the_incremental_path() -> None:
+    # The clean-start rule is what lets the freeze advance: a plain word
+    # stream must keep moving its tail forward instead of re-wrapping the
+    # whole message per delta. Wrap at the width the row really uses —
+    # build_lines hands _content_lines the width minus the 2-cell gutter.
+    row = StreamRow("")
+    frozen = tail = 0
+    for index in range(600):
+        row.append(f"word{index} ")
+        row.build_lines(118, THEME)
+        frozen = max(frozen, len(row._wrap_frozen))
+        tail = max(tail, row._wrap_tail_start)
+    assert repr(row.build_lines(118, THEME)) == repr(full_rewrap(row, 118, THEME))
+    assert frozen > 0  # visual lines were broken away and kept
+    assert tail > 0  # the re-wrap region moved off the first line
+
+
 # ─── parsing the saved paths ────────────────────────────────────────────────
 
 

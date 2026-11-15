@@ -70,7 +70,7 @@ def _restore_settings() -> Any:
 
 
 def test_the_boot_frame_starts_with_the_header_and_ends_with_the_panel() -> None:
-    """The whole-frame regression: header on row 0, panel on the last four rows."""
+    """The whole-frame regression: header on row 0, panel on the last three rows."""
 
     async def body() -> None:
         app = ChatTUI()
@@ -86,20 +86,21 @@ def test_the_boot_frame_starts_with_the_header_and_ends_with_the_panel() -> None
             assert "⠀" in lines[1], f"the logo does not start on row 1: {lines[1]!r}"
             ready = [i for i, line in enumerate(lines) if "Ready. Press Ctrl+P" in line]
             assert ready and 1 < ready[0] < BOOT[1], f"no ready line: {ready}"
-            # And: the panel keeps its four rows at the bottom of the frame —
-            # a blank spinner row, then the two chip rows, then the help hint.
-            panel_rows = lines[-4:]
+            # And: the panel keeps its three rows at the bottom of the frame —
+            # a blank spinner row, then the two chip rows. The retired help
+            # hint stays retired: the Keys popup lists the bindings now.
+            panel_rows = lines[-3:]
             assert panel_rows[0].strip() == "", f"the idle spinner row is not blank: {panel_rows}"
             assert "outo:" in panel_rows[1], panel_rows
             assert "subagent:" in panel_rows[2], panel_rows
-            assert HELP_TEXT in panel_rows[3], panel_rows
+            assert HELP_TEXT not in "\n".join(panel_rows), panel_rows
             # And: no logo leaked into any of them
             assert "⠀" not in "".join(panel_rows)
 
     asyncio.run(body())
 
 
-def test_the_panel_occupies_the_last_four_rows_of_the_screen() -> None:
+def test_the_panel_occupies_the_last_three_rows_of_the_screen() -> None:
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=BOOT) as pilot:
@@ -107,12 +108,12 @@ def test_the_panel_occupies_the_last_four_rows_of_the_screen() -> None:
             _log, _input, panel, _x = app.layout(*BOOT)
             # Then: the panel's region is the bottom band, and the composited
             # screen agrees (that is the copy a terminal actually draws).
-            assert panel.y == BOOT[1] - 4, panel
+            assert panel.y == BOOT[1] - 3, panel
             assert panel.y + panel.height == BOOT[1], panel
             assert tui_harness.painted_line(app, panel.y).strip() == "", "spinner row"
             assert "outo:" in tui_harness.painted_line(app, panel.y + 1)
             assert "subagent:" in tui_harness.painted_line(app, panel.y + 2)
-            assert HELP_TEXT in tui_harness.painted_line(app, panel.y + 3)
+            assert HELP_TEXT not in tui_harness.painted_line(app, panel.y + 2)
             # The row above the panel is the input band; the panel owns the
             # rows below it and nothing else writes down here.
             assert "█" in tui_harness.painted_line(app, panel.y - 1)
@@ -120,20 +121,20 @@ def test_the_panel_occupies_the_last_four_rows_of_the_screen() -> None:
     asyncio.run(body())
 
 
-def test_the_boot_frame_shows_the_logo_the_chips_and_the_help_hint() -> None:
+def test_the_boot_frame_shows_the_logo_the_chips_and_the_keys_popup() -> None:
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=BOOT) as pilot:
             await pilot.pause()
             screen = "\n".join(tui_harness.painted(app))
-            # Then: the ornament, the four chips and the key hint are all there.
+            # Then: the ornament, the four chips and the bindings are all there.
             assert "⠀" in screen, "no logo"
             assert "Ready. Press Ctrl+P for commands." in screen
             values = tui_harness.chip_values(app)
             assert set(values) == {"outo", "style", "subagent", "session"}
             for kind, text in values.items():
                 assert text in screen, f"the {kind} chip is not on screen: {text!r}"
-            assert HELP_TEXT in screen, "the help hint is missing"
+            assert HELP_TEXT not in screen, "the retired help hint is painted"
 
     asyncio.run(body())
 
@@ -1591,8 +1592,9 @@ def test_the_chat_column_stays_centred_and_inside_the_screen(width: int, height:
             assert mark.index("COLUMN-MARK") == column_x + 1, mark
             # The input band's left rule sits at the column's x + margin + …
             assert painted[input_rect.y].index("\u2588") == column_x + 2
-            # The panel's content starts at the column too (its bg spans the row).
-            assert painted[panel.y + 3].index("\u2039Tab\u203a") == column_x + 1
+            # The panel's content starts at the column too (its bg spans the row):
+            # the last chip row's left chip sits at the column's x + padding.
+            assert painted[panel.y + 2].index("subagent:") == column_x + 1
 
     asyncio.run(body())
 
@@ -1672,8 +1674,8 @@ def test_every_frame_cell_carries_a_theme_background(size: tuple[int, int]) -> N
     asyncio.run(body())
 
 
-def test_the_logo_the_panel_and_the_help_row_share_the_log_background() -> None:
-    """The owner's exact complaint: those four areas must be the SAME colour."""
+def test_the_logo_the_panel_and_the_chip_rows_share_the_log_background() -> None:
+    """The owner's exact complaint: those areas must be the SAME colour."""
 
     async def body() -> None:
         app = ChatTUI()
@@ -1690,7 +1692,7 @@ def test_the_logo_the_panel_and_the_help_row_share_the_log_background() -> None:
                 "logo": (column_x + 4, 2),
                 "spinner row": (column_x + 4, panel.y),
                 "panel empty cell": (column_x + 4, panel.y),
-                "help row": (column_x + 2, panel.y + 3),
+                "last chip row": (column_x + 2, panel.y + 2),
                 "log blank": (column_x + 4, 20),
             }
             for label, (x, y) in samples.items():
@@ -1861,3 +1863,506 @@ def test_the_isolated_probe_publishes_the_mode_so_the_render_path_sees_it(
     )
     assert app_module._detect_graphics_mode() == "sixel"
     assert app_module.graphics_module._GRAPHICS_MODE == "sixel"
+
+# ── 12. frame cost: repaint only what changed ───────────────────────────────
+
+
+def test_an_unchanged_frame_skips_the_compositor_blit() -> None:
+    """The measured idle hotspot: an identical frame must not re-blit its cells.
+
+    ``Compositor.paint`` was 60% of an idle compose (3.7 ms of 6.2 ms for a
+    120x32 frame). When the composed lines equal the last frame painted, the
+    grid already holds exactly those cells, so the clear+blit pair is skipped
+    and ``render_strips`` still describes the frame.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            strips = tui_harness.painted(app)
+            painted_calls: list[Any] = []
+            compositor = app._base_screen._compositor
+            original = compositor.paint
+
+            def counting(lines: Any, x: int = 0, y: int = 0) -> None:
+                painted_calls.append((x, y, len(lines)))
+                original(lines, x, y)
+
+            compositor.paint = counting  # type: ignore[method-assign]
+            try:
+                for _ in range(3):
+                    app.compose(*BOOT)
+            finally:
+                compositor.paint = original  # type: ignore[method-assign]
+            # Then: not one blit ran — the frame was already on the grid
+            assert painted_calls == [], painted_calls
+            # And: what the screen reads is unchanged by the skipped blits
+            assert tui_harness.painted(app) == strips
+
+    asyncio.run(body())
+
+
+def test_a_changed_frame_blits_only_the_rows_that_differ() -> None:
+    """A streaming frame pays for the rows the tokens touched, not all 32."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            before = [st.text for st in app.screen._compositor.render_strips()]
+            painted_rows: list[int] = []
+            compositor = app._base_screen._compositor
+            original = compositor.paint
+
+            def counting(lines: Any, x: int = 0, y: int = 0) -> None:
+                assert len(lines) == 1, "a differing row is blitted on its own"
+                painted_rows.append(y)
+                original(lines, x, y)
+
+            compositor.paint = counting  # type: ignore[method-assign]
+            try:
+                app._post_system("a new line changes exactly one row band")
+                app.compose(*BOOT)
+            finally:
+                compositor.paint = original  # type: ignore[method-assign]
+            # Then: fewer rows were blitted than the screen has — the identical
+            # majority was left alone
+            assert 0 < len(painted_rows) < BOOT[1], painted_rows
+            # And: the grid matches a from-scratch full paint of the same frame
+            after = [st.text for st in app.screen._compositor.render_strips()]
+            assert after != before  # the new row really did change the frame
+            app._painted_frame = None
+            app.compose(*BOOT)
+            assert [st.text for st in app.screen._compositor.render_strips()] == after
+
+    asyncio.run(body())
+
+
+def test_a_resize_repaints_the_whole_frame() -> None:
+    """A size change must fall back to the full clear+blit."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            app.compose(*BOOT)
+            painted: list[Any] = []
+            compositor = app._base_screen._compositor
+            original = compositor.paint
+
+            def counting(lines: Any, x: int = 0, y: int = 0) -> None:
+                painted.append(len(lines))
+                original(lines, x, y)
+
+            compositor.paint = counting  # type: ignore[method-assign]
+            try:
+                smaller = (BOOT[0] - 10, BOOT[1] - 4)
+                app.compose(*smaller)
+            finally:
+                compositor.paint = original  # type: ignore[method-assign]
+            # Then: ONE whole-frame blit, not a per-row patch series
+            assert painted == [smaller[1]], painted
+
+    asyncio.run(body())
+
+
+def test_the_x0_overlay_matches_the_general_branch() -> None:
+    """``_overlay_line`` at cell 0 is the common case and must not drift.
+
+    The chat column starts at cell 0 on any terminal up to ``CHAT_MAX_WIDTH``,
+    so the fast branch there is exercised by every frame; this pins it against
+    the general head/tail assembly for narrow, exact-width and overflowing
+    pieces, wide characters included.
+    """
+
+    from miniouto.cli.tui import pt
+    from miniouto.cli.tui.app import _overlay_line, _slice_from
+    from miniouto.cli.tui.rows import cells_of, pad_to, truncate_to
+
+    fill = pt.Style()
+    base = [("0123456789", fill)]
+    for pieces in (
+        [("hi", fill)],
+        [("x" * 10, fill)],
+        [("x" * 14, fill)],  # wider than the base line
+        [("あいう", fill)],  # wide characters
+        [],
+    ):
+        fast = _overlay_line(list(base), 0, list(pieces), fill)
+        head = pad_to(truncate_to(list(base), 0), 0, fill)
+        slow = [*head, *pieces, *_slice_from(list(base), 0 + cells_of(pieces))]
+        assert fast == slow, (pieces, fast, slow)
+
+
+def test_slice_from_is_cell_accurate_with_wide_characters() -> None:
+    """The slice helper's fast paths must match the per-character walk."""
+
+    from miniouto.cli.tui.app import _slice_from
+
+    def reference(line: Any, start: int) -> Any:
+        out = []
+        position = 0
+        for text, style in line:
+            if position >= start:
+                out.append((text, style))
+                position += cell_len(text)
+                continue
+            chunk = ""
+            for char in text:
+                if position >= start:
+                    chunk += char
+                position += cell_len(char)
+            if chunk:
+                out.append((chunk, style))
+        return out
+
+    line = [("ab😀cd", "s1"), ("あz", "s2"), ("tail", "s3")]
+    for start in range(-1, 14):
+        assert _slice_from(line, start) == reference(line, start), start
+
+
+def test_row_heights_invalidate_only_on_content_width_or_theme_change() -> None:
+    """The height pass rides the rows' ``(width, theme, _version)`` cache.
+
+    ``_paint_log`` measures every mounted row every frame through
+    ``row.height()`` → ``build_lines``, so the cache rows.py keeps is what makes
+    that cheap: scrolling must not re-wrap anything, while a content, width or
+    theme change must invalidate exactly then. Pinned here because the app's
+    frame cost (see the compose diff-guard tests above) depends on it.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            row = RowStatic(Text("word " * 40))  # wraps to several lines
+            app._mount_row(row)
+            await pilot.pause()
+
+            wraps: list[int] = []
+            original = RowStatic._content_lines
+
+            def counting(self: Any, width: int, theme: Any, base: Any) -> Any:
+                wraps.append(id(self))
+                return original(self, width, theme, base)
+
+            RowStatic._content_lines = counting  # type: ignore[method-assign]
+            try:
+                # Drop the row's cache so the first compose below MUST wrap.
+                row._cache.clear()
+                app.compose(*BOOT)
+                first = len(wraps)
+                assert first >= 1, "the row was never wrapped"
+
+                # Scroll: heights are re-read but nothing may re-wrap.
+                app._log.scroll_to(y=0)
+                app.compose(*BOOT)
+                app._log.scroll_end()
+                app.compose(*BOOT)
+                assert len(wraps) == first, "scrolling re-wrapped a row"
+
+                # Content change (the streaming case): invalidated exactly once.
+                row._content = Text("word " * 200)
+                row._refresh()
+                app.compose(*BOOT)
+                after_content = len(wraps)
+                assert after_content > first, "a content change did not re-wrap"
+
+                # Width change: every row re-wraps at the new width.
+                app.compose(BOOT[0] - 20, BOOT[1])
+                after_width = len(wraps)
+                assert after_width > after_content, "a width change did not re-wrap"
+
+                # Theme change: the row's cache key names the theme.
+                app.theme = "nord" if app.get_theme("nord") else app.theme
+                app.compose(*BOOT)
+                assert len(wraps) > after_width, "a theme change did not re-wrap"
+            finally:
+                RowStatic._content_lines = original  # type: ignore[method-assign]
+
+    asyncio.run(body())
+
+
+# ── 14. round 4: the Keys popup · three-row panel · unified backgrounds ─────
+
+
+def test_the_keys_palette_entry_opens_the_binding_popup() -> None:
+    """The palette's Keys entry pushes the KeyModal, not a one-line spinner."""
+
+    async def body() -> None:
+        from miniouto.cli.tui.modals import KeyModal
+
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            app.action_show_help()
+            await pilot.pause()
+            # Then: the popup is on the stack, and it is the Keys dialog
+            assert isinstance(app.screen, KeyModal)
+            screen = "\n".join(tui_harness.painted(app))
+            for expected in ("Keys", "Ctrl+P", "Esc Esc"):
+                assert expected in screen, f"{expected!r} missing from the popup"
+            # And: Esc closes it and the base screen is back
+            await pilot.press("esc")
+            assert not isinstance(app.screen, KeyModal)
+
+    asyncio.run(body())
+
+
+def test_the_panel_is_three_rows_and_occupies_the_last_three() -> None:
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            _log, _input, panel, _x = app.layout(*BOOT)
+            # Then: the panel is the bottom three rows — spinner + two chip rows
+            assert panel.height == 3, panel
+            assert panel.y == BOOT[1] - 3, panel
+            assert panel.y + panel.height == BOOT[1], panel
+            assert tui_harness.painted_line(app, panel.y).strip() == "", "spinner row"
+            assert "outo:" in tui_harness.painted_line(app, panel.y + 1)
+            assert "subagent:" in tui_harness.painted_line(app, panel.y + 2)
+            # And: the retired help hint is gone from the whole frame
+            screen = "\n".join(tui_harness.painted(app))
+            assert HELP_TEXT not in screen
+            assert "\u2039Tab\u203a cycle chips" not in screen
+
+    asyncio.run(body())
+
+
+def test_the_resting_chips_and_the_header_row_carry_one_background_each() -> None:
+    """Round 4's two colour calls, on the composited frame."""
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-round4-bg")
+            await pilot.pause()
+            app.compose(*BOOT)
+            theme = app.current_theme
+            cells = app.screen._compositor.cells
+            _log, _input, panel, _x = app.layout(*BOOT)
+            # (C) every chip CELL on both chip rows rests on the page background
+            background = str(theme.color(theme.background))
+            for row in (panel.y + 1, panel.y + 2):
+                for x in range(BOOT[0]):
+                    assert str(cells[row][x].style.background) == background, (x, row)
+            # (D) the header row is $panel across its WHOLE width
+            panel_color = str(theme.color(theme.panel))
+            header_bgs = {str(cells[0][x].style.background) for x in range(BOOT[0])}
+            assert header_bgs == {panel_color}, header_bgs
+
+    asyncio.run(body())
+
+
+# ─── abnormal errors: collect, log, recover ─────────────────────────────────
+
+
+def test_a_render_exception_is_logged_and_the_screen_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (owner: "an abnormal error breaks the TUI for good").
+
+    A normal error is one the TURN raises, and ``_dispatch`` already posts it
+    as an ``[error: …]`` row. An ABNORMAL one is raised by the loop itself —
+    compose, the draw — and before this nothing caught it: the coroutine died,
+    the frame froze, and whatever the error painted stayed on the screen. This
+    drives the REAL ``run_async`` and makes the SECOND tick's paint raise, then
+    asserts the whole contract: the loop kept running, the traceback is in the
+    session's ``tui-error-<session>.log`` under ``LOG_DIR``, the row is on
+    screen, and the frame after the error is a whole-screen repaint.
+    """
+
+    from miniouto.cli.tui import app as app_module
+    from miniouto.storage import paths
+
+    async def body() -> None:
+        terminal = _FakeTerminal((80, 24))
+        app = ChatTUI(terminal=terminal)
+        tui_harness.pin_session(app, "err-recovery")
+        monkeypatch.setattr(app_module, "terminal_size", lambda: (80, 24))
+        monkeypatch.setattr(app_module, "_write_terminal", lambda _payload: None)
+        # When: compose raises on the second tick and works again after it
+        calls: list[int] = []
+        real_compose = ChatTUI.compose
+
+        def exploding(self: ChatTUI, width: int, height: int) -> Any:
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("compose exploded mid-render")
+            return real_compose(self, width, height)
+
+        monkeypatch.setattr(ChatTUI, "compose", exploding)
+        ticks: list[int] = []
+        real_tick = ChatTUI.tick
+
+        def counting_tick(self: ChatTUI, dt: float = 0.0) -> None:
+            real_tick(self, dt)
+            ticks.append(1)
+            if len(ticks) >= 5:
+                app.exit()
+
+        monkeypatch.setattr(ChatTUI, "tick", counting_tick)
+        await app.run_async()
+
+        # Then: the loop SURVIVED — five ticks ran although tick 2 raised, and
+        # the run returned instead of propagating the exception.
+        assert len(ticks) >= 5, ticks
+        assert len(calls) >= 3, calls
+        # And: the traceback is in the session's own TUI error log, timestamped
+        log_path = paths.LOG_DIR / "tui-error-err-recovery.log"
+        assert log_path.is_file(), f"no TUI error log at {log_path}"
+        record = log_path.read_text(encoding="utf-8")
+        assert "RuntimeError" in record and "compose exploded mid-render" in record
+        assert record.startswith("["), "the record is not timestamped"
+        assert "Traceback" in record or "in exploding" in record, record
+        # And: the user saw it as the same row a turn error gets
+        assert "[error: RuntimeError: compose exploded mid-render]" in tui_harness.painted(app)
+        # And: the recovery forced a whole-screen repaint — the paint memo the
+        # compose diff-guard reads was dropped, so the next frame was full.
+        assert app._painted_frame is not None  # recomposed after the error
+        assert app._tui_errors == 1, app._tui_errors
+
+    asyncio.run(body())
+
+
+def test_a_loop_error_past_the_limit_still_logs_but_stops_repainting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repaint half of the contract has a budget; the log half does not.
+
+    A state that raises on EVERY tick would otherwise burn a full clear+redraw
+    60 times a second, so ``_TUI_ERROR_REPAINT_LIMIT`` bounds the repaints.
+    The log and the ``[error:]`` row stay unconditional — that is the part the
+    owner reads afterwards.
+    """
+
+    from miniouto.cli.tui import app as app_module
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            limit = app_module._TUI_ERROR_REPAINT_LIMIT
+            repaints: list[int] = []
+            real = app._repaint_whole_screen
+
+            def counting(term: Any = None) -> None:
+                repaints.append(1)
+                real(term)
+
+            monkeypatch.setattr(app, "_repaint_whole_screen", counting)
+            for _ in range(limit + 2):
+                app._recover_loop_error(RuntimeError("again"))
+            # Then: only the first `limit` errors forced the repaint
+            assert len(repaints) == limit, (repaints, limit)
+            assert app._tui_errors == limit + 2
+            # And: the last error still posted its row — the paint settles
+            # on the next pause, so the count is over the PAINTED frame.
+            await pilot.pause()
+            painted = "\n".join(tui_harness.painted(app))
+            assert painted.count("[error: RuntimeError: again]") == limit + 2
+
+    asyncio.run(body())
+
+
+def test_the_asyncio_handler_logs_what_would_have_hit_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Task was destroyed but is pending!`` must land in the log, not on fd 2.
+
+    The default loop handler writes to ``sys.stderr``; on the alt screen that
+    paints over the frame. Installing ``_on_loop_exception`` routes the same
+    report into the TUI's own error log.
+    """
+
+    from miniouto.storage import paths
+
+    async def body() -> None:
+        app = ChatTUI()
+        tui_harness.pin_session(app, "asyncio-handler")
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            loop = asyncio.get_running_loop()
+            previous = loop.get_exception_handler()
+            loop.set_exception_handler(app._on_loop_exception)
+            try:
+                # When: the loop reports an unretrieved task exception — the
+                # exact shape "Task was destroyed but is pending!" arrives in.
+                task: asyncio.Task[None] = loop.create_task(
+                    _raise_and_finish(), name="destroyed-pending"
+                )
+                await asyncio.sleep(0)
+                del task  # never awaited/retrieved
+                import gc
+
+                gc.collect()
+            finally:
+                loop.set_exception_handler(previous)
+            # Then: the handler recorded it in the session's TUI error log
+            await pilot.pause()
+            log_path = paths.LOG_DIR / "tui-error-asyncio-handler.log"
+            assert log_path.is_file(), f"no TUI error log at {log_path}"
+            record = log_path.read_text(encoding="utf-8")
+            assert "boom" in record, record
+
+    asyncio.run(body())
+
+
+async def _raise_and_finish() -> None:
+    raise RuntimeError("boom from a destroyed task")
+
+
+def test_the_stderr_tap_captures_to_the_log_and_restores_fd2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fd 2 must never reach the alt screen, and must come back afterwards.
+
+    "Task was destroyed but is pending!" leaked to the terminal and painted
+    over the frame. The tap moves the REAL descriptor (not ``sys.stderr``) so
+    a C extension or a child that inherits fd 2 is caught too, batches what it
+    captured into the TUI error log, and puts the terminal's stderr back on
+    restore. fd 1 — the OSC lanes and the resize poll — is never touched.
+    """
+
+    from miniouto.cli.tui import app as app_module
+    from miniouto.storage import paths
+
+    async def body() -> None:
+        app = ChatTUI()
+        tui_harness.pin_session(app, "stderr-tap")
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            real_stderr_fd = os.dup(2)
+            try:
+                real_stderr_stat = os.fstat(2)
+                restore = app_module._tap_stderr(app)
+                # Then: fd 2 is no longer the terminal's stderr…
+                assert os.fstat(2) != real_stderr_stat
+                # …and fd 1 still is what it was (the OSC/resize lane).
+                # When: something writes to the REAL fd 2 — the descriptor a
+                # library or a child process holds, not sys.stderr.
+                os.write(2, b"Task was destroyed but is pending!\n")
+                # Then: the tap batched it into the session's TUI error log
+                for _ in range(50):
+                    await asyncio.sleep(0.02)
+                    record = (paths.LOG_DIR / "tui-error-stderr-tap.log")
+                    if record.is_file() and "pending" in record.read_text(
+                        encoding="utf-8"
+                    ):
+                        break
+                text = record.read_text(encoding="utf-8")
+                assert "Task was destroyed but is pending!" in text, text
+                assert "stderr" in text, text
+                # And: restore puts the terminal's fd 2 back
+                restore()
+                # (Comparing the file, not the number: the dup'd fd is closed
+                # by restore, so the number is free for reuse.)
+                assert os.fstat(2) == real_stderr_stat
+            finally:
+                os.close(real_stderr_fd)
+            await pilot.pause()
+
+    asyncio.run(body())

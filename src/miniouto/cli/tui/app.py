@@ -40,6 +40,7 @@ import select
 import signal
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -94,11 +95,12 @@ from .input import (
     Resize,
     key_from_xnano,
     mouse_from_xnano,
-    scroll_from_xnano,
+   scroll_from_xnano,
     terminal_size,
 )
 from .modals import (
     CommandPalette,
+    KeyModal,
     Modal,
     ProviderSettingsPopup,
     SelectionModal,
@@ -215,6 +217,12 @@ WHEEL_LINES = 3
 
 _REDRAW_SECONDS = 1 / 60
 """Target frame interval of the real loop."""
+
+_TUI_ERROR_REPAINT_LIMIT = 3
+"""Loop errors past this count still log and post a row, but stop forcing the
+whole-screen repaint — a state that raises on every tick would otherwise burn
+a full clear+redraw 60 times a second."""
+
 
 
 # ─── logo ────────────────────────────────────────────────────────────────────
@@ -719,6 +727,9 @@ class ChatTUI:
         self._log_rect = Rect()
         self._select_anchor: tuple[Any, Offset] | None = None
         self._select_dragged = False
+        # The last frame handed to the compositor (see `compose`): comparing
+        # against it is what lets an unchanged frame skip the cell blit.
+        self._painted_frame: list[list[tuple[str, pt.Style]]] | None = None
         self._overlay = graphics_module.GraphicsOverlay()
         self._booted = False
         self._running = False
@@ -728,6 +739,11 @@ class ChatTUI:
         """``threading.get_ident()`` of the loop thread — the hop's destination."""
         self._alt_screen_entered = False
         """Did ``Terminal.__enter__`` open the alt screen (it then also closes it)?"""
+        # Abnormal-error counter (see `_recover_loop_error`): every loop-level
+        # exception increments it, and only the first few also force a repaint,
+        # so a state that keeps raising cannot spin 60 fps full repaints.
+        self._tui_errors = 0
+
 
         # ── theme (last: `watch_theme` reads `_logo_shown`) ────────────────
         # The NAME is stored directly rather than through the `theme` setter:
@@ -1063,6 +1079,128 @@ class ChatTUI:
         self._mark_clean()
         return self.compose(self.size.width, self.size.height)
 
+    # ── abnormal-error collection and recovery ────────────────────────────
+    def _tui_error_log_path(self) -> Path:
+        """``~/.miniouto/logs/tui-error-<session>.log`` (``paths.LOG_DIR``).
+
+        turn's failure diagnostics use, so the two logs for one conversation sit
+        next to each other. This is deliberately NOT ``core.chat``'s failure
+        log: that one is written by the turn driver, this one by the TUI's own
+        loop, and keeping them apart is what lets either fail alone.
+        """
+
+        name = self._pinned_session()
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+        return paths.LOG_DIR / f"tui-error-{safe}.log"
+
+    def _log_tui_failure(self, kind: str, payload: str, exc: BaseException | None) -> None:
+        """Append a timestamped record to the TUI's own error log, never raising.
+
+        The log is the part of the abnormal-error contract that must ALWAYS
+        happen — the alt screen hides stderr from the user, so on-disk is the
+        only place a loop-level traceback can be read later. Every step is
+        therefore individually suppressed: a read-only ``~``, a full disk, or a
+        session name that will not encode must cost the RECORD, never the loop
+        that is already recovering from an error.
+        """
+
+        with contextlib.suppress(Exception):
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            body = payload if payload.endswith("\n") else payload + "\n"
+            lines = [
+                f"[{stamp}] {kind}",
+                body.rstrip("\n"),
+                "=" * 60,
+            ]
+            if exc is not None:
+                lines.append("".join(traceback.format_exception(exc)).rstrip("\n"))
+                lines.append("=" * 60)
+            paths.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with self._tui_error_log_path().open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+
+    def _repaint_whole_screen(self, term: Any = None) -> None:
+        """Invalidate every paint memo so the next draw is a full clear+redraw.
+
+        THREE layers hold a "what is already on screen" memo, and every one of
+        them has to drop its belief or the recovery frame is diffed against the
+        frame the error corrupted:
+
+        * ``_painted_frame`` — ``compose``'s row-diff guard. Left in place, an
+          unchanged row would not be blitted to the compositor at all.
+        * the compositor's own grid — cleared so ``compose``'s full path runs.
+        * ``term.force_full_repaint`` — the canvas's placement reuse. Left in
+          place, xnano would diff the new frame against the corrupted cells
+          and emit nothing for every row that "did not change".
+
+        A terminal double without the method (the loop tests drive a fake) is
+        skipped: there is no canvas to re-prime.
+        """
+
+        self._painted_frame = None
+        with contextlib.suppress(Exception):
+            self._base_screen._compositor.clear()
+        repaint = getattr(term if term is not None else self._terminal, "force_full_repaint", None)
+        if callable(repaint):
+            with contextlib.suppress(Exception):
+                repaint()
+
+    def _recover_loop_error(self, exc: BaseException, term: Any = None) -> None:
+        """One abnormal loop error: log it, show it, and resurrect the screen.
+
+        This is the TUI-level counterpart of ``_dispatch``'s ``[error: …]``
+        row: a normal error is one the TURN raises, and ``_dispatch`` already
+        posts it; an ABNORMAL one is raised by the loop itself — compose, the
+        overlay, a hook hop — where nothing else was going to catch it. The
+        process survives (the loop's ``try`` keeps running), so all three
+        halves of the contract run here: the traceback goes to the TUI error
+        log where the alt screen cannot eat it, a ``[error: …]`` row tells the
+        user what happened, and the next frame repaints the WHOLE screen over
+        whatever the error left painted.
+
+        The repaint is what makes the recovery visible, so it runs while the
+        error count is small; past ``_TUI_ERROR_REPAINT_LIMIT`` the log and the
+        row stay but the repaint stops, because a state that raises on every
+        tick would otherwise burn a full repaint 60 times a second.
+        """
+
+        self._tui_errors += 1
+        detail = f"{type(exc).__name__}: {exc}"
+        self._log_tui_failure("tui-error", detail, exc)
+        self._post_system(f"error: {detail}")
+        if self._tui_errors <= _TUI_ERROR_REPAINT_LIMIT:
+            self._repaint_whole_screen(term)
+            self._invalidate()
+        else:
+            self._invalidate()
+
+    def _on_loop_exception(self, loop: asyncio.AbstractEventLoop, context: Any) -> None:
+        """The loop's exception handler: log what asyncio would print to stderr.
+
+        ``Task exception was never retrieved`` and friends are delivered to the
+        DEFAULT handler, which writes to ``sys.stderr`` — and on the alt screen
+        a stderr write paints over the frame the TUI composes. Installing this
+        handler is what routes those into the TUI's own error log instead. The
+        message is the whole record here: there is no traceback to format, and
+        a context that carries an ``exception`` is logged with it.
+
+        Never raises: an exception handler that raises is logged by the loop
+        with yet another stderr write, which is the exact leak this closes.
+        """
+
+        with contextlib.suppress(Exception):
+            parts = [str(context.get("message", "unhandled asyncio error"))]
+            task = context.get("future") or context.get("task")
+            if task is not None:
+                parts.append(repr(task))
+            self._log_tui_failure(
+                "asyncio",
+                " ".join(parts),
+                context.get("exception"),
+            )
+            self._invalidate()
+
+
     def copy_to_clipboard(self, text: str) -> None:
         """Copy ``text`` with OSC 52 — no clipboard library, works over ssh."""
 
@@ -1083,7 +1221,9 @@ class ChatTUI:
         self.exit()
 
     def action_show_help(self) -> None:
-        self._spinner_status("Ctrl+P palette · Ctrl+L clear · Esc Esc stop · Ctrl+C quit")
+        """The palette's Keys entry: the real bindings, as a modal popup."""
+
+        self.push_screen(KeyModal())
 
     def action_maximize(self) -> None:
         self._spinner_status("maximize is not available in the terminal TUI")
@@ -2514,8 +2654,31 @@ class ChatTUI:
 
         compositor = self._base_screen._compositor
         compositor.resize(width, height)
-        compositor.clear()
-        compositor.paint(lines)
+        # REPAINT ONLY WHAT CHANGED. The blit was measured at 60% of an idle
+        # compose (3.7 ms of 6.2 ms for a 120x32 frame; see
+        # .miniouto/plans/tui-refresh-lag/frame_bench.py), and an unchanged
+        # frame re-blits the exact same cells: `paint` walks every character
+        # of every row only to write values the grid already holds. Comparing
+        # the rows costs ~0.03 ms, so only the rows that differ from the last
+        # frame painted at this size are blitted — an idle frame paints none,
+        # a streaming frame paints the rows the new tokens touched. Every
+        # composed row is padded edge to edge and starts at x=0, so painting
+        # one row over the grid writes exactly what a full clear+paint would.
+        # The memo is the composed lines themselves; the modal branch copies
+        # every row before dimming, so a caller mutating the returned value
+        # cannot desync it from what is on the grid.
+        previous = self._painted_frame
+        # `resize` above has already matched the grid to this size, so a
+        # different row count (a height change rebuilt the grid blank) is what
+        # forces the full path back on.
+        if previous is None or len(previous) != len(lines):
+            compositor.clear()
+            compositor.paint(lines)
+        else:
+            for index, line in enumerate(lines):
+                if line != previous[index]:
+                    compositor.paint([line], 0, index)
+        self._painted_frame = lines
         self.screen._compositor_cache = compositor
         return lines
 
@@ -2782,38 +2945,76 @@ class ChatTUI:
                 self._boot(self._terminal_size())
                 with contextlib.suppress(ValueError, OSError):
                     previous_sigint = signal.signal(signal.SIGINT, self._on_sigint)
+                # ABNORMAL-ERROR COLLECTION, installed inside the Terminal
+                # context and undone in its `finally` below:
+                #   * the loop's exception handler routes "Task was destroyed
+                #     but is pending!"-style reports to the TUI error log
+                #     instead of asyncio's default `sys.stderr` write, which
+                #     paints over the alt screen this app owns;
+                #   * the fd-2 tap catches everything the handler CANNOT — a
+                #     library printing on error, a spawned child that inherits
+                #     the descriptor — before the bytes reach the screen.
+                # fd 1 is untouched (OSC lanes + TIOCGWINSZ live there).
+                restore_stderr = _tap_stderr(self)
+                loop = asyncio.get_running_loop()
+                previous_handler = loop.set_exception_handler(self._on_loop_exception)
                 try:
                     while self._running:
-                        # Drain the posted-message queue: a key handler that
-                        # posts a message (Enter -> ChatInput.Submitted, a click
-                        # -> a chip's ChipClicked) only APPENDS to `_messages`,
-                        # so without this the real terminal never dispatched
-                        # anything the headless `pilot` path handled for free.
-                        self._drain_messages()
-                        # Resize is polled as well as hooked: xnano reports a
-                        # size change, but the app's geometry is also the thing
-                        # `_cursor_position` reads, so the cheap ioctl keeps the
-                        # two honest even if a resize report is coalesced away.
-                        self._sync_terminal_size()
-                        self.tick(_REDRAW_SECONDS)
-                        # DRAW ONLY WHEN SOMETHING CHANGED. Every mutation sets
-                        # `_dirty` (a key/mouse handler, a fired timer, a queued
-                        # message, a worker hop, a tree edit), so a tick that
-                        # changed nothing has a frame on screen that already
-                        # matches the state. Composing again there was the whole
-                        # cost of an idle tick: 42% of one core at 60 fps for
-                        # output the terminal already had, and it raced xnano's
-                        # own frame loop, which is what the owner felt as stutter.
-                        lines = self._paint_now()
-                        if lines is not None:
-                            term.draw(self._draw_lines(lines))
-                            self._emit_overlay()
-                            # The caret is placed WITH the frame it belongs to,
-                            # one placement per painted frame: xnano re-asserts
-                            # its own cursor on every frame it draws, so a
-                            # placement on a skipped tick would be a no-op at
-                            # best and a second xnano frame at worst.
-                            self._position_cursor(term)
+                        # ABNORMAL-ERROR GUARD, at the tick boundary: an
+                        # exception anywhere in ONE tick's body (the message
+                        # drain, the size poll, compose, the draw, the overlay,
+                        # the caret) is caught here, logged, shown and painted
+                        # over, and the `while` then runs the NEXT tick — the
+                        # loop itself never ends because a frame failed.
+                        try:
+                            # Drain the posted-message queue: a key handler that
+                            # posts a message (Enter -> ChatInput.Submitted, a click
+                            # -> a chip's ChipClicked) only APPENDS to `_messages`,
+                            # so without this the real terminal never dispatched
+                            # anything the headless `pilot` path handled for free.
+                            self._drain_messages()
+                            # Resize is polled as well as hooked: xnano reports a
+                            # size change, but the app's geometry is also the thing
+                            # `_cursor_position` reads, so the cheap ioctl keeps the
+                            # two honest even if a resize report is coalesced away.
+                            self._sync_terminal_size()
+                            self.tick(_REDRAW_SECONDS)
+                            # DRAW ONLY WHEN SOMETHING CHANGED. Every mutation sets
+                            # `_dirty` (a key/mouse handler, a fired timer, a queued
+                            # message, a worker hop, a tree edit), so a tick that
+                            # changed nothing has a frame on screen that already
+                            # matches the state. Composing again there was the whole
+                            # cost of an idle tick: 42% of one core at 60 fps for
+                            # output the terminal already had, and it raced xnano's
+                            # own frame loop, which is what the owner felt as stutter.
+                            lines = self._paint_now()
+                            if lines is not None:
+                                term.draw(self._draw_lines(lines))
+                                self._emit_overlay()
+                                # The caret is placed WITH the frame it belongs to,
+                                # one placement per painted frame: xnano re-asserts
+                                # its own cursor on every frame it draws, so a
+                                # placement on a skipped tick would be a no-op at
+                                # best and a second xnano frame at worst.
+                                self._position_cursor(term)
+
+                        except asyncio.CancelledError:
+                            # Cancellation is an EXIT (Ctrl-C through
+                            # `asyncio.run`, a test stopping the loop), not an
+                            # error: re-raise so the shutdown paths run —
+                            # never "recover" from it.
+                            raise
+                        except Exception as exc:
+                            # ABNORMAL ERROR: the process survives (this
+                            # handler is why), and `_recover_loop_error`
+                            # runs the whole contract — the traceback into
+                            # the TUI error log, an `[error: …]` row for
+                            # the user, and the whole-screen repaint that
+                            # buries whatever the error painted. The `while`
+                            # condition is re-evaluated right after, so a
+                            # quitting user still quits.
+                            with contextlib.suppress(Exception):
+                                self._recover_loop_error(exc, term)
                         await asyncio.sleep(_REDRAW_SECONDS)
                 finally:
                     # The ONE owner of the caret restore: this runs INSIDE the
@@ -2828,6 +3029,17 @@ class ChatTUI:
                             signal.signal(signal.SIGINT, previous_sigint)
                     with contextlib.suppress(Exception):
                         term.show_cursor()
+                    # Undo the abnormal-error collection in the reverse order of
+                    # its install, while the alt screen is still up: fd 2 goes
+                    # back to the terminal first (a warning that lands after the
+                    # leave would be LOST to the alt-screen switch), then the
+                    # loop's exception handler — both suppressed, because a
+                    # teardown that raises here would eat the real exit reason.
+                    with contextlib.suppress(Exception):
+                        restore_stderr()
+                    if previous_handler is not None:
+                        with contextlib.suppress(Exception):
+                            loop.set_exception_handler(previous_handler)
         finally:
             self._running = False
             self._loop = None
@@ -3101,6 +3313,13 @@ def _overlay_line(
     if x < 0:  # a right-anchored box can hang off a narrow terminal
         pieces = _slice_from(pieces, -x)
         x = 0
+    if x == 0:
+        # The common overlay (the chat column on any terminal up to
+        # CHAT_MAX_WIDTH) starts at cell 0, where the head is empty and
+        # `truncate_to`/`pad_to` above measured as pure overhead: they walk the
+        # whole base line only to return nothing. Only the tail past `pieces`
+        # survives, exactly as the general branch produces.
+        return [*pieces, *_slice_from(base, cells_of(pieces))]
     head = pad_to(truncate_to(list(base), x), x, fill)
     return [*head, *pieces, *_slice_from(base, x + cells_of(pieces))]
 
@@ -3125,15 +3344,30 @@ def _slice_from(
     out: list[tuple[str, pt.Style]] = []
     position = 0
     for text, style in line:
+        cells = cell_len(text)
         if position >= start:
             out.append((text, style))
-            position += cell_len(text)
+            position += cells
             continue
-        chunk = ""
-        for char in text:
-            if position >= start:
-                chunk += char
-            position += cell_len(char)
+        if position + cells <= start:
+            # The whole piece ends before ``start``: nothing of it survives,
+            # and iterating its characters one cell_len() at a time was the
+            # single hottest spot of an idle compose (measured at 0.9 ms per
+            # frame for a 300-row log; every blank row paid 120 calls to drop
+            # a piece that a single width check could skip).
+            position += cells
+            continue
+        if cells == len(text):
+            # Every character is one cell, so the cell offset IS the character
+            # offset and the slice needs no per-character walk.
+            chunk = text[start - position :]
+            position += cells
+        else:
+            chunk = ""
+            for char in text:
+                if position >= start:
+                    chunk += char
+                position += cell_len(char)
         if chunk:
             out.append((chunk, style))
     return out
@@ -3155,6 +3389,99 @@ _GRAPHICS_RESULT_MARK = b"\x00MINIOUTO-GRAPHICS\x00"
 
 _GRAPHICS_PROBE_TIMEOUT = 12.0
 """Seconds to wait for the isolated probe (its own terminal query allows 2)."""
+
+
+def _tap_stderr(app: ChatTUI) -> Callable[[], None]:
+    """Move the REAL fd 2 to a pipe that appends to the TUI error log.
+
+    While the TUI owns the alt screen, ANY byte on stderr paints over the frame
+    it composes — "Task was destroyed but is pending!" was the one the owner
+    actually saw. The default asyncio handler writes there (``sys.stderr``), so
+    the exception handler alone cannot close the leak: warnings and any library
+    that prints on error still reach fd 2. This redirects the DESCRIPTOR, which
+    is what a spawned child, a C extension or ``os.write(2, ...)`` all use —
+    ``sys.stderr`` only covers Python's own writes.
+
+    fd 1 is never touched: the OSC lanes (window title, clipboard) and the
+    ``TIOCGWINSZ`` resize poll all live on it. Only fd 2 moves, and it moves to
+    a pipe this process owns end to end.
+
+    The pipe is drained EAGERLY by a daemon thread: an untapped pipe fills at
+    64 kB and the next stderr write then BLOCKS the writer, which on the loop
+    thread would freeze the TUI — the cure worse than the disease. The reader
+    batches whatever is waiting and writes it to the session's TUI error log
+    with one timestamped header per burst, so a traceback and its follow-ups
+    stay one record.
+
+    Returns the restore callable, which the loop's ``finally`` calls to put the
+    REAL fd 2 back (the alt screen is still up then, so the restore itself
+    cannot leak; after it, stderr reaches the user's terminal again as before).
+    Nothing here may raise into the caller — a TUI that cannot afford a pipe
+    simply keeps its stderr, exactly as it was.
+    """
+
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError:  # pragma: no cover - fd exhaustion
+        return lambda: None
+    saved_fd = os.dup(2)
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+    stop = threading.Event()
+
+    def drain() -> None:
+        # One loop pass = one burst: everything already waiting on the pipe is
+        # read and logged together, so a traceback and its "During handling…"
+        # follow-up share a single timestamped record.
+        while not stop.is_set():
+            try:
+                ready, _, _ = select.select([read_fd], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    data = os.read(read_fd, 4096)
+                except OSError:
+                    break
+                if not data:  # the write end closed under us
+                    break
+                chunks.append(data)
+                # Anything else already in the pipe belongs to this burst; a
+                # zero timeout polls without blocking, so an empty pipe ends
+                # the burst instead of waiting for the next write.
+                try:
+                    more_ready, _, _ = select.select([read_fd], [], [], 0)
+                except (OSError, ValueError):
+                    break
+                if not more_ready:
+                    break
+            if not chunks:
+                continue
+            app._log_tui_failure(
+                "stderr", b"".join(chunks).decode("utf-8", "replace"), None
+            )
+
+    def restore() -> None:
+        # The daemon reader is allowed one last 0.2 s poll; the pipe's write
+        # end is fd 2 itself, which is about to move back to the terminal, so
+        # the reader sees EOF on its next pass and exits on its own.
+        stop.set()
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        with contextlib.suppress(OSError):
+            os.close(read_fd)
+
+    try:
+        threading.Thread(target=drain, daemon=True).start()
+    except RuntimeError:  # pragma: no cover - cannot spawn the reader
+        restore()
+        return lambda: None
+    return restore
+
+
 
 
 def _detect_graphics_mode() -> str:

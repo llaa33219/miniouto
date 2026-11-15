@@ -197,10 +197,10 @@ def test_the_chip_is_padded_and_as_wide_as_its_value() -> None:
     assert cell_len(plain_of(painted)) == chip.width_cells
 
 
-def test_the_chip_resting_style_is_boost_background_bold() -> None:
+def test_the_chip_resting_style_is_background_bold() -> None:
     chip = StatusChip("outo", "m", variant="accent")
     style = repr(chip.style(THEME))
-    assert rgb(THEME.boost) in style
+    assert rgb(THEME.background) in style
     assert rgb(THEME.accent) in style
     assert "BOLD" in style
 
@@ -263,10 +263,10 @@ def test_a_chip_delivers_through_the_app_when_one_is_attached() -> None:
 # ─── the bottom panel ───────────────────────────────────────────────────────
 
 
-def test_the_panel_has_exactly_four_rows() -> None:
+def test_the_panel_has_exactly_three_rows() -> None:
     panel = BottomPanel()
-    assert len(panel.build_lines(120, THEME)) == 4
-    assert panel.ROWS == ("spinner-row", "chip-row-a", "chip-row-b", "help-row")
+    assert len(panel.build_lines(120, THEME)) == 3
+    assert panel.ROWS == ("spinner-row", "chip-row-a", "chip-row-b")
     for name in panel.ROWS:
         assert panel.row(name) is not None
 
@@ -382,17 +382,17 @@ def test_a_notice_has_no_glyph_and_the_row_blanks_when_idle() -> None:
     assert plain_of(panel.build_lines(120, THEME)[0]).strip() == ""
 
 
-def test_the_help_hint_is_the_owner_s_exact_string() -> None:
+def test_the_help_hint_is_retired_from_the_panel() -> None:
+    # Round 4 removed the row: the Keys popup lists the bindings now. The
+    # constant keeps the owner's exact glyphs (the package re-exports it),
+    # but NO painted panel line carries them — there is no fourth row.
     panel = BottomPanel()
-    line = plain_of(panel.build_lines(120, THEME)[3])
-    assert HELP_TEXT in line
-    assert line.startswith(" ")
-    # The escapes are the owner's baseline glyphs, spelled out so ruff's
-    # ambiguous-character rule stays quiet about a deliberate choice.
-    assert "\u2039Tab\u203a cycle chips" in line
-    assert "\u2039Ctrl+C\u203a quit" in line
-    # It is a hint, so it is the muted layer, not the body one
-    assert rgb(THEME.text_muted) in repr(panel.build_lines(120, THEME)[3][1][1])
+    lines = panel.build_lines(120, THEME)
+    assert len(lines) == 3
+    assert HELP_TEXT.startswith("\u2039Tab\u203a cycle chips")
+    assert HELP_TEXT.endswith("\u2039Ctrl+C\u203a quit")
+    for line in lines:
+        assert "\u2039Tab\u203a cycle chips" not in plain_of(line)
 
 
 @pytest.mark.skipif(not BASELINE.exists(), reason="no pty baseline fixture")
@@ -968,3 +968,53 @@ def test_the_caret_is_pulled_back_to_a_character_boundary() -> None:
     assert _clamped_caret_column("ab", 2, 1) == 1
     # A mixed row keeps the widest whole prefix that fits
     assert _clamped_caret_column("a日日", 5, 4) == 3
+
+
+# ─── round 4: no help row · resting chips on the background ─────────────────
+
+
+def test_the_panel_has_exactly_three_rows_and_no_help_row() -> None:
+    panel = BottomPanel()
+    assert panel.ROWS == ("spinner-row", "chip-row-a", "chip-row-b")
+    lines = panel.build_lines(120, THEME)
+    assert len(lines) == 3
+    for name in panel.ROWS:
+        assert panel.row(name) is not None
+    # And: the retired hint is painted nowhere on the panel
+    for line in lines:
+        assert HELP_TEXT not in plain_of(line)
+
+
+def test_the_chip_resting_style_is_the_app_background_bold() -> None:
+    """The owner's round-4 call: at rest a chip is the row's own colour."""
+    chip = StatusChip("outo", "m", variant="accent")
+    style = repr(chip.style(THEME))
+    assert rgb(THEME.background) in style
+    assert rgb(THEME.accent) in style
+    assert "BOLD" in style
+    # And: the old boost box is gone from the RESTING style
+    assert rgb(THEME.boost) not in style
+
+
+def test_each_variant_takes_its_own_text_colour_on_the_background() -> None:
+    assert rgb(THEME.accent) in repr(StatusChip("o", "v", variant="accent").style(THEME))
+    assert rgb(THEME.text_muted) in repr(
+        StatusChip("o", "v", variant="muted").style(THEME)
+    )
+    # `$text` on `$background` is the auto 87% ramp, NOT the body foreground
+    default = repr(StatusChip("o", "v").style(THEME))
+    assert rgb(THEME.foreground) not in default
+
+
+def test_the_header_fills_the_whole_row_with_the_panel_background() -> None:
+    """Round 4: the docked clock space is `$panel` too, not the page background."""
+    header = Header("~/miniouto", "miniouto v0.11.10")
+    line = header.build_lines(120, THEME)[0]
+    panel = rgb(THEME.panel)
+    background = rgb(THEME.background)
+    # EVERY run carries the panel background — the blank tail included
+    assert all(panel in repr(style) for text, style in line if text.strip())
+    # And: the composed line is exactly the screen width (no background fill-in)
+    assert cell_len(plain_of(line)) == 120
+    # And: the page background appears nowhere on the row
+    assert background not in repr(line)

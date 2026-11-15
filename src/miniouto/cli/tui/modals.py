@@ -91,6 +91,7 @@ from .theme import TuiTheme, color
 __all__ = [
     "BACKDROP_ALPHA",
     "CURSOR_BLINK_SECONDS",
+    "KEYS_HINT",
     "LIST_MAX_ROWS",
     "NATIVE_DIALECT_LABEL",
     "PALETTE_HINT",
@@ -100,6 +101,7 @@ __all__ = [
     "SELECTION_HINT",
     "TEXT_INPUT_HINT",
     "CommandPalette",
+    "KeyModal",
     "Label",
     "ListItem",
     "Modal",
@@ -2323,6 +2325,98 @@ class CommandPalette(Modal):
                 if command is not None:
                     self._invoke(command)
                 return True
+        return True
+
+
+KEYS_HINT = "Esc to close"
+"""The Keys popup's closing hint (it has no list to navigate)."""
+
+DEFAULT_KEY_BINDINGS: tuple[tuple[str, str], ...] = (
+    ("Ctrl+P", "open the command palette"),
+    ("Ctrl+L", "clear the log"),
+    ("Esc Esc", "stop the running turn"),
+    ("Ctrl+C", "quit"),
+    ("Tab / Shift+Tab", "cycle the chips"),
+    ("Enter", "open the focused chip · submit the prompt"),
+    ("Esc", "cancel a modal"),
+    ("PageUp / PageDown", "scroll the log a page"),
+    ("Home / End", "jump to the log's top / bottom"),
+   ("Up / Down", "move the caret between input rows"),
+    ("Left / Right", "move the caret a character"),
+    ("Ctrl+Left / Ctrl+Right", "move the caret a word"),
+    ("Ctrl+Shift+C", "copy the selected text"),
+)
+"""The app's real bindings, one row per branch ``ChatTUI.handle_key`` takes.
+
+The editor block (Backspace/Delete, arrows, Home/End, typing) belongs to the
+focused :class:`~.widgets.ChatInput` and is summarised by the arrow rows above;
+this tuple is the single source the :class:`KeyModal` paints.
+"""
+
+
+class KeyModal(Modal):
+    """Ctrl+P → Keys: the app's real key bindings, in the modal house style.
+
+    The list is not a wish: every line mirrors a branch the app's
+    ``handle_key`` actually takes (plus the editor keys the focused
+    :class:`~.widgets.ChatInput` owns), so the popup can never advertise a
+    binding the terminal does not answer. Esc and a click outside close it.
+    """
+
+    def __init__(self, bindings: Sequence[tuple[str, str]] | None = None) -> None:
+        super().__init__(id="key-modal", dialog_id="key-dialog")
+        self._bindings = list(bindings) if bindings is not None else DEFAULT_KEY_BINDINGS
+        self.title_label = self.dialog.add(
+            Label("Keys", "key-title", align="center", bold=True)
+        )
+        self.hint = self.dialog.add(
+            Label(KEYS_HINT, "key-hint", tone="muted", align="center")
+        )
+
+    # ── state ───────────────────────────────────────────────────────────────
+    @property
+    def title_text(self) -> str:
+        return self.title_label.plain
+
+    @property
+    def hint_text(self) -> str:
+        return self.hint.plain
+
+    @property
+    def bindings(self) -> list[tuple[str, str]]:
+        """The ``(key, action)`` rows, exactly as the dialog shows them."""
+
+        return list(self._bindings)
+
+    # ── painting ────────────────────────────────────────────────────────────
+    def content_rows(self, width: int, theme: TuiTheme, budget: int) -> list[StyledLine]:
+        """Title, blank, one key/action row each, blank, the hint."""
+
+        surface = _style(bg=theme.surface)
+        body = _style(bg=theme.boost, bold=True)
+        action = _style(fg=theme.text_muted, bg=theme.boost)
+        lines: list[StyledLine] = [
+            *self.title_label.build_lines(width, theme, bg=theme.surface),
+            _pad(surface, width),
+        ]
+        for key, what in self._bindings[: max(0, budget - 4)]:
+            lines.append(_fit([("  " + key, body), ("   ", body), (what, action)], width, body))
+        lines.extend([_pad(surface, width), *self.hint.build_lines(width, theme, bg=theme.surface)])
+        return lines[:budget]
+
+    def place(self, inner: Rect) -> None:
+        self.title_label.region = Rect(inner.x, inner.y, inner.width, 1)
+        top = inner.y + 2
+        self.hint.region = Rect(
+            inner.x, top + min(len(self._bindings), self.row_budget(self._area) - 4) + 1,
+            inner.width, 1,
+        )
+
+    # ── input ───────────────────────────────────────────────────────────────
+    def handle_mouse(self, ev: Mouse) -> bool:
+        if ev.kind == "down" and ev.button == 0 and not self.region.contains(ev.x, ev.y):
+            # A click outside the dialog closes the popup.
+            self.dismiss(None)
         return True
 
 

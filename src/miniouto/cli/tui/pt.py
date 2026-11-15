@@ -1503,17 +1503,49 @@ class Terminal:
         (a resize, a modal that covered a row and is gone), the leftovers are
         removed first, or the old text would stay on screen underneath the new
         frame.
+
+        On the real screen that change runs as ONE step, on xnano's own loop
+        thread. A live canvas composes a frame whenever it likes, and one that
+        composed between a placement's removal and the rewrite that follows
+        painted the uncovered cells with the terminal's DEFAULT background for
+        a frame — the flash that survived the themed clears, on every theme
+        change, modal, stream shift and resize. ``canvas._host.call`` runs the
+        mutation on the loop's thread and waits, and while it runs the loop
+        cannot compose: a frame is drawn from before the change or after it,
+        never the half-done middle. A canvas with no host — or a call that
+        fails, because the canvas closed under us — takes the direct call
+        instead, which is the old behaviour and still paints the frame.
         """
 
         self._frame_marks += 1
         area = self.area()
         self._width, self._height = area.width, area.height
-        if (area.width, area.height) != self._last_area:
-            # A resize invalidates every placement's geometry at once.
-            self._remove_placements()
-            self._last_area = (area.width, area.height)
-        draw_fn(Frame(area, self.render_widget))
-        self._drop_stale_placements()
+
+        def mutate() -> None:
+            """Every placement change this frame makes, as one indivisible step."""
+
+            if (area.width, area.height) != self._last_area:
+                # A resize invalidates every placement's geometry at once.
+                self._remove_placements()
+                self._last_area = (area.width, area.height)
+            draw_fn(Frame(area, self.render_widget))
+            self._drop_stale_placements()
+
+        # The host is the canvas's own loop; `call` hands it the mutation and
+        # waits for it, and while it runs the loop cannot compose a frame. Only
+        # a real screen has a loop to race — an offscreen canvas is rendered
+        # explicitly, below, on this thread.
+        host = getattr(self._canvas, "_host", None) if self._real_screen else None
+        if host is None:
+            mutate()
+        else:
+            try:
+                host.call(mutate)
+            except Exception:
+                # The canvas closed under us (xnano raises): paint the frame
+                # here instead, the way an offscreen canvas is painted, so it
+                # still lands.
+                mutate()
         # A live canvas redraws itself on its own loop; asking it to render here
         # would draw twice per frame. Offscreen, this IS the presentation.
         if not self._real_screen:
@@ -1598,6 +1630,46 @@ class Terminal:
         self._row_marks.clear()
 
     # ── screen-wide operations ──────────────────────────────────────────────
+    def force_full_repaint(self) -> None:
+        """Drop every placement so the next ``draw`` repaints the whole frame.
+
+        The canvas diffs a frame against the placements the previous frame left
+        behind, so a placement whose text compares equal emits nothing — exactly
+        right for an unchanged tick, and exactly wrong when the CELLS UNDER
+        those placements are no longer what the placement says: a stray stderr
+        write, a hard-copy, or any other paint this app did not make. The reuse
+        memo (``_rows`` / ``_row_marks``) would keep that diff alive, so both
+        are cleared here and the next ``draw`` recreates every placement from
+        scratch — the full clear+redraw of the alt screen, on this substrate.
+
+        ``_last_area`` is left alone deliberately: the canvas really is that
+        size, and ``draw``'s own resize branch would only repeat this clear.
+
+        The removal follows ``draw``'s serialization (``host.call``): on a real
+        screen xnano's loop must not compose a frame while the placements are
+        half removed. Unlike ``draw`` there is no repaint in the same step —
+        that is the next ``draw``'s job — so the window the removal opens is
+        covered by the CANVAS background (``screen.color.bg``), which the theme
+        sets and which is what any compose in the gap paints the uncovered cells
+        with: themed, never the terminal default. A canvas with no host, or a
+        call that fails because the canvas closed under us, removes inline —
+        the way a headless canvas always does.
+        """
+
+        def strip() -> None:
+            self._remove_placements()
+
+        host = getattr(self._canvas, "_host", None) if self._real_screen else None
+        if host is None:
+            strip()
+        else:
+            try:
+                host.call(strip)
+            except Exception:
+                strip()
+        if not self._real_screen:
+            self.canvas.render()
+
     def clear(self) -> None:
         """Erase everything painted so far."""
 

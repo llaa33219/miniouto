@@ -1561,3 +1561,59 @@ def test_a_modal_ignores_keys_it_does_not_own_but_stays_open() -> None:
 
     assert modal.handle_key(Key("F5")) is True
     assert modal.dismissed is False
+
+
+# ─── KeyModal (the palette's Keys entry) ────────────────────────────────────
+
+
+def test_the_key_modal_lists_the_apps_real_bindings() -> None:
+    from miniouto.cli.tui.modals import DEFAULT_KEY_BINDINGS, KeyModal
+
+    modal = KeyModal()
+    # Then: every row is a (key, action) pair taken from the real router
+    assert modal.title_text == "Keys"
+    assert modal.bindings == list(DEFAULT_KEY_BINDINGS)
+    keys = [key for key, _ in modal.bindings]
+    # And: the bindings the app's handle_key actually answers are all listed
+    for expected in ("Ctrl+P", "Ctrl+L", "Esc Esc", "Ctrl+C", "Tab / Shift+Tab",
+                     "Enter", "Esc", "PageUp / PageDown", "Home / End"):
+        assert expected in keys, expected
+
+
+def test_the_key_modal_paints_the_house_style_and_closes_on_esc() -> None:
+    from miniouto.cli.tui.modals import KeyModal
+
+    app = FakeApp()
+    modal = KeyModal()
+    app.push_screen(modal)
+    modal.build_lines(SCREEN, MINIOUTO_THEME)
+    rendered = modal.render().plain
+    # Then: the title, every key and the hint are in the dialog
+    assert "Keys" in rendered
+    for key, _ in modal.bindings:
+        assert key in rendered, key
+    assert "Esc to close" in rendered
+    # And: the dialog is the house box — █ corners on the primary border
+    assert modal.region.width == 60
+    # And: Esc dismisses (the modal base owns that key)
+    assert modal.handle_key(Key("Esc")) is True
+    assert modal.dismissed is True
+
+
+def test_the_key_modal_closes_on_a_click_outside_the_dialog() -> None:
+    from miniouto.cli.tui.modals import KeyModal
+
+    app = FakeApp()
+    modal = KeyModal()
+    app.push_screen(modal)
+    modal.build_lines(SCREEN, MINIOUTO_THEME)
+    corner = Mouse("down", 2, SCREEN.height - 1, button=0)
+    assert modal.handle_mouse(corner) is True
+    assert modal.dismissed is True
+    # And: a click INSIDE the dialog leaves it open
+    second = KeyModal()
+    app.push_screen(second)
+    second.build_lines(SCREEN, MINIOUTO_THEME)
+    inside = Mouse("down", second.region.x + 3, second.region.y + 2, button=0)
+    assert second.handle_mouse(inside) is True
+    assert second.dismissed is False
