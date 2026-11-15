@@ -21,6 +21,7 @@ from pathlib import Path
 from ..core import inbox, summary
 from ..paths_runtime import INVOCATION_CWD
 from ..storage import session_config
+from ..storage import sessions as session_store
 
 _SESSION_STAMP = "%Y%m%d-%H%M%S"
 _MARKDOWN = "*.md"
@@ -79,6 +80,13 @@ def continue_session(summary_dir: str) -> str:
     summary.request_handoff(
         new_session, from_session=from_session, summary_dir=str(directory)
     )
+    # The hand-off is also a PERSISTENT pointer: the summarized session now
+    # names its successor, so a later interaction (a wakeup, an alarm, a TUI
+    # message) lands in the session that actually continues the work, chains
+    # included, even after this process is gone. `set_redirect` refuses a
+    # `from_session` that never existed; the hand-off above still went
+    # through, so the miss is never fatal.
+    session_store.set_redirect(from_session, new_session)
     return _ack(new_session, directory, contract)
 
 

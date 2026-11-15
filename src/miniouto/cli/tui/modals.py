@@ -18,9 +18,9 @@ same hints. The look comes from the verified pty captures in
   20 rows, and a focused row painted solid primary with near-black bold text;
 * the text input — tall ``▊▔▎`` primary border, ``$surface`` body, a blinking
   reversed block cursor and the ``$text-disabled`` placeholder;
-* the command palette — a full-width ``▔``/``▁`` hkey frame hanging three rows
-  down over a dimmed backdrop, the ``🔎`` query row, then one bold name row and
-  its dim help row per command.
+* the command palette — the same centred dialog listing EVERY command (no
+  search box): one bold name row and its dim help row per command, then the
+  hint line.
 
 Protocol notes for the app layer:
 
@@ -51,7 +51,6 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import replace
-from itertools import pairwise
 from typing import Any, NamedTuple
 
 from rich.cells import cell_len
@@ -2053,11 +2052,11 @@ class CommandPalette(Modal):
     ``padding 1 2`` and a bold centred title — exactly like
     :class:`ProviderSettingsPopup` and :class:`SelectionModal`.
 
-    The body is: the framed search input, then one row per match on ``$boost``
-    (the same list surface the pickers use) with the highlighted row painted
-    solid primary, then the hint line. Typing filters fuzzily — a substring
-    beats a scattered subsequence and the matched characters are drawn
-    bold+underlined. Up/Down move, Enter runs, Esc or a click outside closes.
+    The body is: one row per command on ``$boost`` (the same list surface the
+    pickers use) with the highlighted row painted solid primary, then the
+    hint line. There is no search box — every command is always on show and
+    the list scrolls. Up/Down move, Enter runs, Esc or a click outside
+    closes.
     """
 
     def __init__(
@@ -2073,10 +2072,7 @@ class CommandPalette(Modal):
         self._commands = list(commands) if commands is not None else None
         self._placeholder = placeholder
         self.title_label = self.dialog.add(
-            Label("Commands", "command-palette-title", align="center", bold=True)
-        )
-        self.query_input = self.dialog.add(
-            TextInput(placeholder=placeholder, id="command-palette-input")
+            Label("Menu", "command-palette-title", align="center", bold=True)
         )
         self.hint = self.dialog.add(
             Label(PALETTE_HINT, "command-palette-hint", tone="muted", align="center")
@@ -2086,8 +2082,6 @@ class CommandPalette(Modal):
         self._panel = Rect()
         self._row_regions: list[Rect] = []
         self._row_offsets: list[int] = []
-        self._filtered: list[tuple[Any, list[int]]] = []
-        self._query = ""
 
     # ── commands ────────────────────────────────────────────────────────────
     @property
@@ -2109,53 +2103,14 @@ class CommandPalette(Modal):
             return list(getter())
 
     @property
-    def query_text(self) -> str:
-        return self.query_input.value
-
-    def set_query(self, text: str) -> None:
-        """Replace the query and refilter (what typing does, in one call)."""
-
-        self.query_input.set_value(text)
-        self._refresh()
-
-    @property
     def results(self) -> list[Any]:
-        """The commands the current query leaves, in palette order."""
+        """Every command, in palette order — there is no query to filter."""
 
-        self._refresh()
-        return [command for command, _ in self._filtered]
-
-    def _refresh(self) -> None:
-        """Refilter from the query text. Cheap enough to run per keystroke.
-
-        Navigation state resets only when the QUERY actually changed: `results`
-        and the paint path both call this, and a repaint must never yank the
-        highlight back to the top row the user just moved off.
-        """
-
-        query = self.query_text
-        unchanged = query == self._query
-        scored: list[tuple[float, int, Any, list[int]]] = []
-        for position, command in enumerate(self.commands):
-            title = str(getattr(command, "title", command))
-            score, offsets = _fuzzy_match(query, title)
-            if score is None:
-                continue
-            scored.append((score, position, command, offsets))
-        if query:
-            # A better match sorts first; ties keep the discovery order.
-            scored.sort(key=lambda entry: (-entry[0], entry[1]))
-        self._filtered = [(command, offsets) for _, _, command, offsets in scored]
-        if unchanged and self._filtered:
-            self.index = max(0, min(self.index, len(self._filtered) - 1))
-            return
-        self._query = query
-        self.index = 0 if self._filtered else -1
-        self.scroll = 0
+        return list(self.commands)
 
     def highlighted(self) -> Any | None:
-        if 0 <= self.index < len(self._filtered):
-            return self._filtered[self.index][0]
+        if 0 <= self.index < len(self.commands):
+            return self.commands[self.index]
         return None
 
     # ── geometry ────────────────────────────────────────────────────────────
@@ -2166,25 +2121,23 @@ class CommandPalette(Modal):
 
     # ── painting ────────────────────────────────────────────────────────────
     def content_rows(self, width: int, theme: TuiTheme, budget: int) -> list[StyledLine]:
-        """Title, blank, the search input, the list (``$boost``), blank, hint."""
+        """Title, blank, the list (``$boost``), blank, hint."""
 
-        self._refresh()
         surface = _style(bg=theme.surface)
         rows = self.max_result_rows(self._area)
         lines: list[StyledLine] = [
             *self.title_label.build_lines(width, theme, bg=theme.surface),
             _pad(surface, width),
-            *self.query_input.build_lines(width, theme),
         ]
         list_top = len(lines)
-        visible = self._filtered[self.scroll : self.scroll + rows]
+        visible = self.commands[self.scroll : self.scroll + rows]
         self._row_offsets = list(range(list_top, list_top + len(visible)))
-        for offset, (command, offsets) in enumerate(visible):
+        for offset, command in enumerate(visible):
             selected = self.scroll + offset == self.index
-            lines.append(self._row_lines(width, theme, command, offsets, selected))
+            lines.append(self._row_lines(width, theme, command, selected))
         if not visible:
             empty = _style(fg=theme.text_muted, bg=theme.boost)
-            lines.append(_fit([("  no matches", empty)], width, _style(bg=theme.boost)))
+            lines.append(_fit([("  no commands", empty)], width, _style(bg=theme.boost)))
         lines.extend(
             [
                 _pad(surface, width),
@@ -2194,7 +2147,7 @@ class CommandPalette(Modal):
         return lines[:budget]
 
     def _row_lines(
-        self, width: int, theme: TuiTheme, command: Any, offsets: Sequence[int], selected: bool
+        self, width: int, theme: TuiTheme, command: Any, selected: bool
     ) -> StyledLine:
         """One command row: its name (and, when the dialog is wide, its help).
 
@@ -2207,7 +2160,7 @@ class CommandPalette(Modal):
             style = _style(fg=_auto_text(theme.primary), bg=theme.primary, bold=True)
         else:
             style = _style(fg=_text_hex(theme), bg=theme.boost, bold=True)
-        pieces = self._highlight(style, command, offsets)
+        pieces = [("  ", style), (str(getattr(command, "title", command)), style)]
         help_text = str(getattr(command, "help", "") or "")
         # The help rides on the SAME row, two cells after the name, and only
         # when at least a few cells of it would actually fit — a name that
@@ -2220,14 +2173,13 @@ class CommandPalette(Modal):
         return _fit(pieces, width, _style(bg=theme.primary if selected else theme.boost))
 
     def place(self, inner: Rect) -> None:
-        """Assign the title, the search input, the list rows and the hint."""
+        """Assign the title, the list rows and the hint."""
 
         rows = self.max_result_rows(self._area)
         self.title_label.region = Rect(inner.x, inner.y, inner.width, 1)
-        self.query_input.region = Rect(inner.x, inner.y + 2, inner.width, 3)
-        # The list starts under the input: title, blank, the 3-row framed
-        # input, i.e. 2 + 3 rows below the dialog body top.
-        top = inner.y + 5
+        # The list starts under the title: title plus one blank row, i.e.
+        # 2 rows below the dialog body top.
+        top = inner.y + 2
         self._panel = Rect(inner.x, top, inner.width, rows)
         self._row_regions = [
             Rect(inner.x, inner.y + offset, inner.width, 1)
@@ -2235,37 +2187,16 @@ class CommandPalette(Modal):
         ]
         self.hint.region = Rect(inner.x, top + rows, inner.width, 1)
 
-    @staticmethod
-    def _highlight(style: pt.Style, command: Any, offsets: Sequence[int]) -> StyledLine:
-        """The command name with each matched character bold+underlined."""
-
-        title = str(getattr(command, "title", command))
-        matched = style.add_modifier(pt.Modifier.underlined())
-        pieces: StyledLine = [("  ", style)]
-        cursor = 0
-        for position in offsets:
-            if not 0 <= position < len(title) or position < cursor:
-                continue
-            if position > cursor:
-                pieces.append((title[cursor:position], style))
-            pieces.append((title[position : position + 1], matched))
-            cursor = position + 1
-        if cursor < len(title):
-            pieces.append((title[cursor:], style))
-        return pieces
-
     def render(self) -> Text:
-        """The title, the query and one row per result (plain text)."""
+        """The title, then one row per command (plain text)."""
 
         text = Text(self.title_label.plain)
-        text.append("\n" + (self.query_text or self._placeholder))
         for command in self.results:
             text.append("\n" + str(getattr(command, "title", command)))
         return text
 
     # ── input ───────────────────────────────────────────────────────────────
     def handle_key(self, key: Key) -> bool:
-        self._refresh()
         if key.code == "Esc" or (key.code == "P" and key.ctrl):
             self.dismiss(None)
         elif key.code in ("Down", "Tab"):
@@ -2280,17 +2211,13 @@ class CommandPalette(Modal):
             self._move(self.max_result_rows(self._area))
         elif key.code == "PageUp":
             self._move(-self.max_result_rows(self._area))
-        elif key.ctrl or key.alt:
-            return True
-        elif self.query_input.handle_key(key):
-            self._refresh()
         return True
 
     def _move(self, direction: int) -> None:
-        if not self._filtered:
+        if not self.commands:
             return
         rows = self.max_result_rows(self._area)
-        self.index = max(0, min(self.index + direction, len(self._filtered) - 1))
+        self.index = max(0, min(self.index + direction, len(self.commands) - 1))
         if self.index < self.scroll:
             self.scroll = self.index
         elif self.index >= self.scroll + rows:
@@ -2418,37 +2345,3 @@ class KeyModal(Modal):
             # A click outside the dialog closes the popup.
             self.dismiss(None)
         return True
-
-
-def _fuzzy_match(query: str, candidate: str) -> tuple[float | None, list[int]]:
-    """Score ``candidate`` against ``query`` — Textual's matcher, simplified.
-
-    Returns ``(score, offsets)``, or ``(None, [])`` when the query does not
-    match. An empty query matches everything with no offsets (the palette's
-    discovery mode); a substring match beats a scattered subsequence and an
-    exact match beats both, mirroring ``textual.fuzzy.FuzzySearch`` closely
-    enough that the result order looks the same.
-    """
-
-    if not query:
-        return (0.0, [])
-    haystack = candidate.lower()
-    needle = query.lower()
-    if needle in haystack:
-        start = haystack.find(needle)
-        offsets = list(range(start, start + len(needle)))
-        return (float(len(offsets)) * (2.0 if haystack == needle else 1.5), offsets)
-    offsets: list[int] = []
-    position = 0
-    for letter in needle:
-        found = haystack.find(letter, position)
-        if found < 0:
-            return (None, [])
-        offsets.append(found)
-        position = found + 1
-    groups = 1
-    for previous, current in pairwise(offsets):
-        if current != previous + 1:
-            groups += 1
-    contiguous = (len(offsets) - (groups - 1)) / len(offsets)
-    return (float(len(offsets)) * (1 + contiguous * contiguous), offsets)

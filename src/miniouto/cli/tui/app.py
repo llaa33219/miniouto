@@ -2428,6 +2428,26 @@ class ChatTUI:
         if self._busy:
             self._queue_inbox_message(text)
             return
+        # TALKING to a summarized conversation moves this TUI into the session
+        # that continues it (chains resolved to the final destination): the
+        # typed message is FOR the live work, not the transcript that stopped.
+        # The submitted text still goes to dispatch below, and the input is
+        # RESTORED to it (it was cleared above) so nothing typed is lost —
+        # while the history reload shows where the work now lives.
+        final, chain = session_store.resolve_redirect(self._pinned_session())
+        if len(chain) > 1:
+            hops = ", ".join(chain[1:-1])
+            via = f" (via {hops})" if hops else ""
+            notice = (
+                f"session {chain[0]} was summarized → moved to {final}{via}. "
+                "Continue here."
+            )
+            self._input.text = text
+            self._pin_session(final)
+            self._load_session_history(final)
+            self._refresh_chips()
+            self._post_system(notice)
+            self._spinner_status(f"redirect → {final}")
         if self._logo_shown:
             self._log.remove_children()
             self._reset_rows()
@@ -3465,23 +3485,30 @@ def _tap_stderr(app: ChatTUI) -> Callable[[], None]:
             )
 
     def restore() -> None:
-        # The daemon reader is allowed one last 0.2 s poll; the pipe's write
-        # end is fd 2 itself, which is about to move back to the terminal, so
-        # the reader sees EOF on its next pass and exits on its own.
+        # Put fd 2 back FIRST (the alt screen is still up, so the restore
+        # itself cannot leak), then JOIN the reader so its last burst is on
+        # disk before run_async returns. Without the join the reader can still
+        # be holding the log open mid-write when the caller reads it — the
+        # recovery log then looks empty for a moment (a race the error-recovery
+        # test caught). The write end is fd 2 itself, which just moved back to
+        # the terminal, so the reader sees EOF and exits promptly; the join is
+        # bounded so a wedged reader can never hang the shutdown.
         stop.set()
         os.dup2(saved_fd, 2)
         os.close(saved_fd)
+        if reader is not None:
+            reader.join(timeout=1.0)
         with contextlib.suppress(OSError):
             os.close(read_fd)
 
+    reader: threading.Thread | None = None
     try:
-        threading.Thread(target=drain, daemon=True).start()
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
     except RuntimeError:  # pragma: no cover - cannot spawn the reader
         restore()
         return lambda: None
     return restore
-
-
 
 
 def _detect_graphics_mode() -> str:
@@ -3508,7 +3535,6 @@ def _detect_graphics_mode() -> str:
     nothing and a probe that raises all fall back to calling the module here,
     which is the pre-port behaviour and answers TEXT on any failure.
     """
-
     probe = package_seam("detect_graphics_mode", graphics_module.detect_graphics_mode)
     answer = _probe_in_child(probe)
     if answer is not None:
@@ -3581,7 +3607,6 @@ def _read_probe_answer(read_fd: int) -> str | None:
     return payload[len(_GRAPHICS_RESULT_MARK):].split(b"\n", 1)[0].decode("utf-8", "replace")
 
 
-
 def _placements(row: Any) -> list[tuple[int, int, Any]]:
     """``(line, x, placement)`` for a row's image lane (empty for a plain row)."""
 
@@ -3592,11 +3617,6 @@ def _placements(row: Any) -> list[tuple[int, int, Any]]:
         return list(getter())
     except Exception:  # a broken image must cost the image, never the frame
         return []
-
-
-# ─── entry points ────────────────────────────────────────────────────────────
-
-
 def run_tui() -> None:
     """Run the real TUI until the user quits.
 

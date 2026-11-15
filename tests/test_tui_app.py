@@ -486,7 +486,7 @@ def test_ctrl_l_clears_the_log_including_the_logo() -> None:
 # ── 5. the command palette ──────────────────────────────────────────────────
 
 
-def test_ctrl_p_opens_the_palette_and_typing_filters_it() -> None:
+def test_ctrl_p_opens_the_palette_and_typing_does_not_filter_it() -> None:
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=BOOT) as pilot:
@@ -502,9 +502,10 @@ def test_ctrl_p_opens_the_palette_and_typing_filters_it() -> None:
             assert not any(title[:2].isdigit() for title in titles), titles
             assert "Clear log" not in titles and "Maximize" not in titles
             assert "Screenshot" not in titles, titles
-            # And: a query narrows it to the matching command
-            palette.set_query("theme")
-            assert [str(c.title) for c in palette.results] == ["Theme"]
+            # And: there is no search box, so typing leaves the WHOLE list
+            for char in "theme":
+                await pilot.press(char)
+            assert [str(c.title) for c in palette.results] == titles
             await pilot.pause()
 
     asyncio.run(body())
@@ -518,7 +519,8 @@ def test_the_palette_runs_the_highlighted_command_and_closes() -> None:
             tui_harness.pin_session(app, "app-palette-session")
             await pilot.press("ctrl+p")
             palette = app.screen
-            palette.set_query("new session")
+            # "New session" is the first row and already highlighted
+            assert str(palette.highlighted().title) == "New session"
             await pilot.press("enter")
             # Then: `New session` ran (the logo is back, a session was
             # minted) and the palette is gone
@@ -544,8 +546,10 @@ def test_the_palette_mentions_and_escape_closes_it() -> None:
     asyncio.run(body())
 
 
-@pytest.mark.parametrize(("query", "expected"), [("theme", "Theme"), ("style", "Pick style")])
-def test_palette_search_is_fuzzy_and_finds_the_command(query: str, expected: str) -> None:
+@pytest.mark.parametrize(("steps", "expected"), [(1, "Pick session"), (5, "Theme")])
+def test_the_palette_lists_every_command_and_down_moves_through_it(
+    steps: int, expected: str
+) -> None:
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=BOOT) as pilot:
@@ -553,8 +557,22 @@ def test_palette_search_is_fuzzy_and_finds_the_command(query: str, expected: str
             await pilot.press("ctrl+p")
             palette = app.screen
             assert isinstance(palette, CommandPalette)
-            palette.set_query(query)
-            assert str(palette.results[0].title) == expected
+            # No filtering exists: every command is always on show
+            titles = [str(c.title) for c in palette.results]
+            assert titles == [
+                "New session",
+                "Pick session",
+                "Configure outo",
+                "Configure subagent",
+                "Pick style",
+                "Theme",
+                "Keys",
+                "Quit",
+            ]
+            # And the list is navigated with Down, not typed into
+            for _ in range(steps):
+                await pilot.press("down")
+            assert str(palette.highlighted().title) == expected
 
     asyncio.run(body())
 

@@ -1244,29 +1244,30 @@ def test_the_palette_lists_every_command_in_order() -> None:
     assert palette.highlighted().title == "New session"
 
 
-def test_typing_filters_fuzzily_until_one_command_is_left() -> None:
+def test_typing_does_not_filter_the_palette_keeps_the_whole_list() -> None:
     palette = CommandPalette(palette_commands())
 
     for char in "theme":
         palette.handle_key(Key(char))
 
-    assert palette.query_text == "theme"
-    assert [command.title for command in palette.results] == ["Theme"]
-    assert palette.highlighted().title == "Theme"
+    # There is no search box, so typing changes nothing: every command stays.
+    assert [command.title for command in palette.results] == [
+        "New session",
+        "Pick session",
+        "Configure outo",
+        "Configure subagent",
+        "Pick style",
+        "Theme",
+        "Keys",
+        "Quit",
+    ]
+    assert palette.highlighted().title == "New session"
 
 
-def test_a_subsequence_match_still_finds_the_command() -> None:
-    palette = CommandPalette(palette_commands())
+def test_an_empty_command_list_leaves_no_highlight() -> None:
+    """No query exists any more, so only an empty list deselects."""
 
-    palette.set_query("cfgsub")
-
-    assert [command.title for command in palette.results] == ["Configure subagent"]
-
-
-def test_a_query_with_no_match_leaves_no_highlight() -> None:
-    palette = CommandPalette(palette_commands())
-
-    palette.set_query("zzzz")
+    palette = CommandPalette([])
 
     assert palette.results == []
     assert palette.highlighted() is None
@@ -1343,12 +1344,12 @@ def test_the_palette_is_a_centred_dialog_in_the_modal_house_style() -> None:
     assert painted[top + palette.region.height - 1][left] == "█"
     assert painted[top + palette.region.height - 1][left + 1] == "▄"
     assert left > 0 and top > 0, "the dialog is not centred"
-    # The title is centred inside the border, and the search input is framed.
-    title_row = next(line for line in painted if "Commands" in line)
-    assert title_row.strip("█ ").strip() == "Commands"
-    assert "Search for commands…" in "".join(painted)
+    # The title is centred inside the border, and there is NO search box.
+    title_row = next(line for line in painted if "Menu" in line)
+    assert title_row.strip("█ ").strip() == "Menu"
+    assert "Search for commands…" not in "".join(painted)
     # The Textual hkey frame (a full-width ▔/▁ rule) is gone, and so is 🔎.
-    # The ▔/▁ glyphs that remain belong to the input's own tall frame.
+    # The input's tall frame is gone with the search box: no ▔/▁ glyphs at all.
     assert not any(line.startswith("▔") or line.startswith("▁") for line in painted)
     assert "🔎" not in "".join(painted)
     # No numeric prefixes in front of the commands.
@@ -1375,15 +1376,14 @@ def test_the_palette_rows_carry_the_list_surface_and_a_full_highlight() -> None:
     assert "New session" in "".join(text for text, _ in first)
 
 
-def test_a_mismatched_query_paints_a_no_matches_row() -> None:
-    palette = CommandPalette(palette_commands(), placeholder="Search for commands…")
-    palette.set_query("zzzz")
+def test_an_empty_command_list_paints_a_no_commands_row() -> None:
+    palette = CommandPalette([])
     painted = [
         "".join(text for text, _ in line)
         for line in palette.build_lines(SCREEN, MINIOUTO_THEME)
     ]
 
-    assert any("no matches" in line for line in painted)
+    assert any("no commands" in line for line in painted)
 
 
 def test_a_click_outside_the_panel_closes_and_a_click_on_a_row_runs_it() -> None:
@@ -1413,9 +1413,10 @@ def test_a_click_outside_the_panel_closes_and_a_click_on_a_row_runs_it() -> None
     assert second.result is not None
 
 
-def test_matched_characters_are_underlined_in_the_painted_name() -> None:
+def test_no_search_remains_so_nothing_is_underlined_in_the_painted_name() -> None:
+    """The fuzzy matcher is gone: the whole name is one plain run."""
+
     palette = CommandPalette([SystemCommand("Theme", "Change the current theme")])
-    palette.set_query("theme")
     lines = palette.build_lines(SCREEN, MINIOUTO_THEME)
 
     underlined = [
@@ -1424,8 +1425,8 @@ def test_matched_characters_are_underlined_in_the_painted_name() -> None:
         for text, style in line
         if "UNDERLINED" in str(style)
     ]
-    # "Theme"'s five characters, each its own run, are the highlighted matches.
-    assert "".join(underlined) == "Theme"
+    assert "".join(underlined) == ""
+    assert "Theme" in "".join(text for line in lines for text, _ in line)
 
 
 def test_the_palette_scrolls_when_there_are_more_commands_than_rows() -> None:
@@ -1444,9 +1445,7 @@ def test_the_palette_scrolls_when_there_are_more_commands_than_rows() -> None:
     assert palette.index == presses
     assert palette.scroll == presses - rows + 1
     # The highlight is the LAST visible row of the window.
-    visible = [command for command, _ in palette._filtered[
-        palette.scroll : palette.scroll + rows
-    ]]
+    visible = palette.commands[palette.scroll : palette.scroll + rows]
     assert palette.highlighted() is visible[-1]
 
 

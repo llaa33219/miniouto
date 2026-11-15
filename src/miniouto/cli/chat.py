@@ -285,6 +285,35 @@ def _fail(message: str) -> typer.Exit:
     return typer.Exit(code=1)
 
 
+def _redirect_notice(final: str, chain: list[str]) -> str:
+    """The one line every interactive redirect prints, chain included.
+
+    `chain` is the full hop path `resolve_redirect` walked, starting with the
+    session the operator named; the intermediate stops are shown so a long
+    chain reads as one deliberate move, not a mystery.
+    """
+
+    hops = chain[1:-1]
+    via = f" (via {', '.join(hops)})" if hops else ""
+    return f"session {chain[0]} was summarized → continuing in {final}{via}"
+
+
+def _apply_session_redirect(session_name: str) -> str:
+    """Follow a summarization redirect to the FINAL session, or keep the name.
+
+    The interactive triggers (`-c`, `--alarms -c`) resolve the conversation
+    they were pointed at, not merely the file that names it: a summarized
+    session continues elsewhere, chains included, and the operator is told
+    where the work landed. Plain viewing never comes through here.
+    """
+
+    final, chain = session_store.resolve_redirect(session_name)
+    if len(chain) == 1:
+        return session_name
+    typer.echo(_redirect_notice(final, chain))
+    return final
+
+
 def _now() -> datetime.datetime:
     return datetime.datetime.now()
 
@@ -543,17 +572,26 @@ def _deliver_alarm(
 ) -> None:
     if run.alarm_session is None:
         return
+    # The alarm is an INTERACTION with the receiver's conversation, so it
+    # follows that conversation's redirect: an alarm pointed at a summarized
+    # session belongs to the session that continues the work, chains
+    # included — otherwise it would queue on a session nobody resumes. The
+    # note is appended so the receiver sees the move.
+    alarm_session, chain = session_store.resolve_redirect(run.alarm_session)
+    text = _alarm_text(
+        role=run.role,
+        job_id=run.job_id,
+        session=run.session,
+        status=status,
+        path=run.path,
+        answer=answer,
+        continued=continued,
+    )
+    if len(chain) > 1:
+        text = f"{text}\n{_redirect_notice(alarm_session, chain)}"
     inbox.insert(
-        run.alarm_session,
-        _alarm_text(
-            role=run.role,
-            job_id=run.job_id,
-            session=run.session,
-            status=status,
-            path=run.path,
-            answer=answer,
-            continued=continued,
-        ),
+        alarm_session,
+        text,
         kind=inbox.ALARM_KIND,
         source="chat",
         meta={
@@ -769,6 +807,11 @@ def chat_cmd(
     session_name = _resolve_session(
         name, continue_session=continue_session, bg=bg, s=s
     )
+    # An INTERACTIVE resume follows a summarization redirect: `-c` names a
+    # conversation to rejoin, and the session that conversation moved into is
+    # the one worth continuing. A fresh/minted session never has a redirect,
+    # so a plain run pays one cheap `load` here and keeps its own name.
+    session_name = _apply_session_redirect(session_name)
 
     # The STYLE is pinned per session, like the model: an explicit `--style`
     # wins, then this session's pin, then the global default. Reading the

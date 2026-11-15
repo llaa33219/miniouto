@@ -29,6 +29,10 @@ render it as interrupted, and `begin_turn` reaps such stale records before
 starting a new turn.
 
 v1 files (no `version` key, flat `messages` list) are migrated on load.
+
+`redirect_to` (optional) names the session that continues this one after a
+summary hand-off. Plain viewing never follows it; interactive use resolves
+the link via `resolve_redirect` (chains supported, cycles defended).
 """
 
 from __future__ import annotations
@@ -44,6 +48,10 @@ from .. import paths_runtime
 from .paths import SESSION_DIR, ensure_dirs
 
 SCHEMA_VERSION = 2
+
+# Hard cap on the redirect chain in `resolve_redirect`: a hand-edited or
+# buggy file must never be able to loop the walk forever.
+REDIRECT_MAX_CHAIN = 64
 
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
@@ -92,6 +100,10 @@ class SessionData:
     # Launch directory, stamped on the first turn only; "" for sessions
     # written before this field existed (they group as "other" in pickers).
     cwd: str = ""
+    # Session that continues this one after a summary hand-off; "" for
+    # sessions that were never summarized. Interactive triggers follow it
+    # (`resolve_redirect`), plain viewing does not.
+    redirect_to: str = ""
 
 
 def path_for(name: str) -> Path:
@@ -119,7 +131,11 @@ def load(name: str) -> SessionData:
         history = [d for d in raw.get("history", []) if isinstance(d, dict)]
         turns = [TurnRecord.from_dict(t) for t in raw.get("turns", []) if isinstance(t, dict)]
         return SessionData(
-            name=name, history=history, turns=turns, cwd=str(raw.get("cwd") or "")
+            name=name,
+            history=history,
+            turns=turns,
+            cwd=str(raw.get("cwd") or ""),
+            redirect_to=str(raw.get("redirect_to") or ""),
         )
     return _migrate_v1(name, raw)
 
@@ -133,6 +149,8 @@ def save(name: str, data: SessionData) -> None:
     }
     if data.cwd:
         payload_dict["cwd"] = data.cwd
+    if data.redirect_to:
+        payload_dict["redirect_to"] = data.redirect_to
     payload_dict["history"] = data.history
     payload_dict["turns"] = [t.to_dict() for t in data.turns]
     payload = json.dumps(payload_dict, ensure_ascii=False, indent=2)
@@ -142,6 +160,57 @@ def save(name: str, data: SessionData) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(payload, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def set_redirect(name: str, target: str) -> bool:
+    """Stamp `redirect_to` on an existing session; report whether it took.
+
+    A summarized session points at the session continuing it, so the
+    hand-off survives the process that performed it. An empty `target`
+    clears the field (`save` omits it), `name == target` is rejected — a
+    self-redirect would pin the walk on its first step — and a session
+    that does not exist yet is never created here: redirects belong to
+    sessions that already happened.
+    """
+
+    if not path_for(name).exists():
+        return False
+    if target == name:
+        return False
+    data = load(name)
+    data.redirect_to = target
+    save(name, data)
+    return True
+
+
+def resolve_redirect(name: str) -> tuple[str, list[str]]:
+    """Follow `redirect_to` links to the final session.
+
+    Returns `(final, chain)`; `chain` names every session visited in
+    order, starting with `name`, so callers can show the whole hop path.
+    A session without a redirect resolves to `(name, [name])`. The walk
+    stops at the last valid session on a cycle (A→B→A), a self-reference
+    or a missing successor, and at `REDIRECT_MAX_CHAIN` entries — it
+    never loops forever.
+    """
+
+    chain = [name]
+    seen = {name}
+    current = name
+    while len(chain) < REDIRECT_MAX_CHAIN:
+        target = load(current).redirect_to
+        if not target or target == current or target in seen:
+            break
+        chain.append(target)
+        seen.add(target)
+        current = target
+    return current, chain
+
+
+def redirect_chain(name: str) -> list[str]:
+    """The chain half of `resolve_redirect`, for redirect notices."""
+
+    return resolve_redirect(name)[1]
 
 
 def _find_running_turn(data: SessionData) -> TurnRecord | None:
