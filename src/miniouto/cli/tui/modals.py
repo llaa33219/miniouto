@@ -2120,6 +2120,23 @@ class CommandPalette(Modal):
         return max(1, min(PALETTE_MAX_ROWS, self.row_budget(area) - 4))
 
     # ── painting ────────────────────────────────────────────────────────────
+    def build_lines(
+        self,
+        area: Any,
+        theme: TuiTheme,
+        behind: Sequence[StyledLine] | None = None,
+    ) -> list[StyledLine]:
+        """The whole area over an OPAQUE backdrop — ``behind`` is ignored.
+
+        Every other modal dims the app's rows underneath the dialog. The
+        palette alone does not: the dimmed answer fragments that survived
+        either side of the dialog read as horizontally torn text, so its
+        backdrop is a plain ``$background`` fill instead. The dialog itself
+        (border, list, hint) is exactly the base class's.
+        """
+
+        return super().build_lines(area, theme)
+
     def content_rows(self, width: int, theme: TuiTheme, budget: int) -> list[StyledLine]:
         """Title, blank, the list (``$boost``), blank, hint."""
 

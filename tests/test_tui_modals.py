@@ -1449,6 +1449,116 @@ def test_the_palette_scrolls_when_there_are_more_commands_than_rows() -> None:
     assert palette.highlighted() is visible[-1]
 
 
+def _answer_behind() -> list[Any]:
+    """``behind`` rows for a modal opened over an answer: the theme's own
+    foreground ink on its own background, padded edge to edge the way the
+    app's composed rows always are."""
+
+    style = modals_module._style(
+        fg=MINIOUTO_THEME.foreground, bg=MINIOUTO_THEME.background
+    )
+    row = modals_module._fit([("The answer is 42.", style)], SCREEN.width, style)
+    return [list(row) for _ in range(SCREEN.height)]
+
+
+def _outside_stripes(lines: list[Any], region: Rect) -> list[Any]:
+    """Every stripe OUTSIDE the dialog: the rows above and below it, plus the
+    columns to either side of it — where a dimmed answer used to show through
+    (and, for the palette, must not anymore)."""
+
+    above_below = [
+        stripe
+        for row, line in enumerate(lines)
+        if row < region.y or row >= region.bottom
+        for stripe in line
+    ]
+    beside = [
+        stripe
+        for row, line in enumerate(lines)
+        if region.y <= row < region.bottom
+        for stripe in [
+            *modals_module._slice_cells(line, 0, region.x),
+            *modals_module._slice_cells(line, region.right, SCREEN.width),
+        ]
+    ]
+    return [*above_below, *beside]
+
+
+def test_the_palette_paints_an_opaque_backdrop_not_dimmed_answers() -> None:
+    """Regression: the palette's backdrop is SOLID — the app must not bleed.
+
+    Every other modal dims the app underneath; the palette alone does not,
+    because the dimmed answer fragments that survive either side of its
+    dialog read as horizontally torn text once the menu opens over an
+    answer.
+    """
+
+    palette = CommandPalette(palette_commands())
+    lines = palette.build_lines(SCREEN, MINIOUTO_THEME, behind=_answer_behind())
+
+    stripes = _outside_stripes(lines, palette.region)
+    assert stripes, "the dialog covers the whole area"
+    assert all(text.strip() == "" for text, _ in stripes), stripes
+    background = str(color(MINIOUTO_THEME.background))
+    assert all(background in str(style.background) for _, style in stripes), stripes
+
+
+def test_every_other_modal_keeps_dimming_the_app_behind_it() -> None:
+    """The pickers' backdrop is UNCHANGED: the app shows through, dimmed."""
+
+    from miniouto.cli.tui.modals import KeyModal
+
+    dimmed = str(
+        color(
+            modals_module.blend(
+                MINIOUTO_THEME.foreground,
+                MINIOUTO_THEME.background,
+                1.0 - modals_module.BACKDROP_ALPHA,
+            )
+        )
+    )
+    for modal in (
+        SelectionModal("Pick", ["a"], current="a"),
+        TextInputModal("Title"),
+        KeyModal(),
+    ):
+        lines = modal.build_lines(SCREEN, MINIOUTO_THEME, behind=_answer_behind())
+
+        stripes = _outside_stripes(lines, modal.region)
+        assert stripes, type(modal).__name__
+        # The answer still shows through outside the dialog — every row
+        # above, below and beside it carries the dimmed text — and the
+        # dim is the backdrop's 40%, exactly as the pickers always painted.
+        outside = "".join(text for text, _ in stripes)
+        assert "The answer is 42." in outside, type(modal).__name__
+        assert all(
+            str(stripe_style.foreground) == dimmed for _, stripe_style in stripes
+        ), type(modal).__name__
+
+
+def test_the_palletes_opaque_backdrop_leaves_the_dialog_itself() -> None:
+    """Solid backdrop, unchanged dialog: the border, title, rows and hint."""
+
+    palette = CommandPalette(palette_commands())
+    with_behind = palette.build_lines(SCREEN, MINIOUTO_THEME, behind=_answer_behind())
+    without = palette.build_lines(SCREEN, MINIOUTO_THEME)
+
+    def plain(lines: list[Any]) -> list[str]:
+        return ["".join(text for text, _ in line) for line in lines]
+
+    # ``behind`` changes nothing at all: with and without it the frame — the
+    # thick border, the centred title, the first command row, the hint — is
+    # the one the palette has always painted.
+    assert plain(with_behind) == plain(without)
+    painted = plain(with_behind)
+    region = palette.region
+    assert painted[region.y][region.x] == "█"
+    assert painted[region.bottom - 1][region.x] == "█"
+    assert next(line for line in painted if "Menu" in line).strip("█ ") == "Menu"
+    assert modals_module.PALETTE_HINT in "".join(painted)
+    assert "New session" in painted[palette._row_regions[0].y]
+
+
 # ── default_system_commands ─────────────────────────────────────────────────
 
 
