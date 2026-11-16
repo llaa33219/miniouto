@@ -372,7 +372,7 @@ Full results, not truncated:
 jq -r '.turns[].events[] | select(.kind == "tool_result") | "[\(.tool_name)] \(.text)"' "$S"
 ```
 
-**Handoff marker turns** — a summarization transition, as a TUI session records it (`cli/tui.py:_persist_handoff_marker` appends a trailing turn holding one `handoff` event):
+**Handoff marker turns** — a summarization transition, as a TUI session records it (`cli/tui/app.py:_persist_handoff_marker` appends a trailing turn holding one `handoff` event):
 
 ```bash
 jq -r '.turns[] | .events[]? | select(.kind == "handoff") | .text' "$S"

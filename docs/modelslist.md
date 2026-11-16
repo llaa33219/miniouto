@@ -1,6 +1,6 @@
 # modelslist integration
 
-`miniouto` reads its provider/model catalog from [`https://modelslist.blp.sh`](https://modelslist.blp.sh). The client is `core/modelslist.py` (imported as `catalog_api` by `cli/provider.py` and `cli/tui.py`). There is **no** `lma.blp.sh` client and no `models.dev` fetch path: every catalog request goes to modelslist, and the official provider endpoints modelslist advertises (`modelLists[].source == "official"`) are **never fetched** — miniouto only reads the catalog-owned list (`source == "modelslist"`).
+`miniouto` reads its provider/model catalog from [`https://modelslist.blp.sh`](https://modelslist.blp.sh). The client is `core/modelslist.py` (imported as `catalog_api` by `cli/provider.py` and the TUI). There is **no** `lma.blp.sh` client and no `models.dev` fetch path: every catalog request goes to modelslist, and the official provider endpoints modelslist advertises (`modelLists[].source == "official"`) are **never fetched** — miniouto only reads the catalog-owned list (`source == "modelslist"`).
 
 The root index is a **curated** index, not the full universe of LLM vendors (it held **17 entries** when this was written — treat the count as observed, not guaranteed). It carries the providers miniouto can host plus their exact wire-protocol base URLs.
 
@@ -188,7 +188,7 @@ Consumers:
 
 ## TUI integration
 
-`cli/tui.py` uses modelslist in three places (`catalog_api`):
+`cli/tui/` uses modelslist in three places (`catalog_api`):
 
 1. **`+ add from catalog…`** (`SENTINEL_CATALOG_ADD` → `ChatTUI._catalog_add_flow`) — fetches the root index, keeps only entries `resolve_catalog_dialect` can host, shows a `SelectionModal` sorted by display name, confirms before overwriting an existing slug, asks for the API key, takes the **first** model of the catalog-owned list as `default_model`, offers a reasoning picker built from `reasoning_choices` (pre-selected on `default_reasoning_choice`), then persists via `add_provider_from_catalog` (`source="modelslist"`) and adopts the new provider.
 2. **The popup's `Model` row** (`ProviderSettingsPopup._model_flow`) — `list_models(provider)` → `id — name` rows in catalog order. When the provider has no list (a hand-added endpoint need not exist in the catalog at all), the "no models" case falls back to a free-text `TextInputModal`. There is no `source` dispatch: catalog and custom providers share this flow.

@@ -160,7 +160,7 @@ Semantics (`storage/session_config.py`):
 - **Freeze at first use.** `effective(session, default=…)` materializes the pin: a session with no file gets the current global default written as its pin and that value returned. A model switch made by the TUI in another process can never redirect a session that is already running.
 - **Seeding is copy-if-absent.** `seed_from(new, source)` copies a source session's pin into a freshly minted one — a delegated run's `chat-`/`spawn-` name, a summary hand-off's `cont-*` name, the TUI's "new session". A session that already carries a pin keeps it, and a source with no pin seeds nothing (the new session freezes the default itself).
 - Writes are atomic (tmp + `os.replace`), and a **corrupt pin is treated as absent**, not raised over — the session simply follows the default again (the same tolerance `sessions.load` applies).
-- Nothing else writes here. A TUI **provider/model** edit writes the pin **and** the global default at once (`cli/tui.py:_persist_trio`), so the edit survives a later default change while the newest choice still reaches other processes and the next session. A TUI **style** edit goes through `core/runtime.py:set_active_style`, which writes the pin of the session making the change AND the global default, after freezing the existing sessions' styles into their own pins — so the last style chosen is the default for the next session, and the sessions already running keep the style they are on.
+- Nothing else writes here. A TUI **provider/model** edit writes the pin **and** the global default at once (`cli/tui/config.py:_persist_trio`), so the edit survives a later default change while the newest choice still reaches other processes and the next session. A TUI **style** edit goes through `core/runtime.py:set_active_style`, which writes the pin of the session making the change AND the global default, after freezing the existing sessions' styles into their own pins — so the last style chosen is the default for the next session, and the sessions already running keep the style they are on.
 - The **style** key resolves as: explicit `--style` > this session's pin > the global `settings.style` > `"default"`. It is pinned like the model, for the same reason.
 - **Choosing a style makes it the default AND leaves the running sessions alone.** `core/runtime.py:set_active_style` (the TUI's style picker and `miniouto style set` both call it) writes the global default and then freezes the style of every EXISTING session into that session's own pin (`freeze_style` — the `style` key only, never the provider trio). A session that already pins a style keeps it; one without a pin freezes the style it was running under. The new default therefore applies to sessions started from now on, and never to a conversation already under way.
 
@@ -176,6 +176,7 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
   "session": "<name>",
   "updated": "2026-07-23T10:34:12Z",
   "cwd": "/home/luke/miniouto",   # launch directory, stamped on the first turn only
+  "redirect_to": "cont-20260723-105900-3f9ab2",  # set when this session was summarized: the session continuing it
   "history": [
     {"role": "user", "content": "hello"},
     {
@@ -208,6 +209,7 @@ Schema v2 (`"version": 2`). Two sections with distinct jobs:
 Notes:
 - **`cwd`** — the directory the session was **created** in (`paths_runtime.INVOCATION_CWD` at import), stamped by `begin_turn` on the **first turn only**, so a session belongs to one directory and later turns (even from another one) never overwrite it. It is purely presentational: the TUI session picker groups "This directory" first, then "Other directories" (`[basename] name`, or `[?] name` for legacy files with no cwd), and `miniouto status` prints `Sessions (this directory)` / `Sessions (other)`. The field is **additive** — `save()` writes it only when non-empty and `load()`'s v2 branch reads it, so `SCHEMA_VERSION` stays 2 and pre-existing files round-trip with `cwd=""` (they group as "other"). Sessions written before the field existed load unchanged.
 - **v1 migration**: files without a `version` key (flat `messages` list) are migrated on load — records become `history` entries, and user/assistant pairs are synthesized into `turns`. The `(session created)` system marker is dropped.
+- **`redirect_to`** — the **summarization redirect** (additive like `cwd`; `save()` writes it only when non-empty, so `SCHEMA_VERSION` stays 2 and pre-redirect files round-trip unchanged). `set_redirect(name, target)` stamps it on a session that already exists (a missing session and a self-reference are refused; an empty target clears the field) and **forwards pending inbox messages** to the target (`_forward_inbox` renames every `inbox/<name>/*.json` into the target's inbox, so an alarm that arrived before the hand-off is not stranded). `resolve_redirect(name) -> (final, chain)` follows the links to the final session — the chain names every hop starting with `name` — stopping at a cycle, a self-reference, a missing successor, or `REDIRECT_MAX_CHAIN = 64` entries (`redirect_chain(name)` is its chain half). It is stamped by `continue_session` and followed by INTERACTIVE triggers only: the alarm delivery, a TUI submission, `chat -c` / `chat --alarms -c`; plain viewing (the TUI session picker, `message list`) never follows it. `drain` follows the whole chain, delivering every queued message on the path.
 - **Tolerant loading**: corrupt JSON, non-dict envelopes, and unknown record fields never raise — they yield an empty `SessionData`.
 - **Media handling**: media tool results (Image/Video/Audio) are never persisted as media. coreouto's providers build them as raw API wire dicts via `Message.model_construct` (validation bypass), which fail `Message.model_validate` on reload — so `core/chat.py:_dump_message` flattens any content list containing media blocks to plain text (`[image omitted from restored history: image/png]` placeholder) at persist time. A message whose blocks still fail JSON serialization (raw bytes) degrades to a text placeholder too, but **keeps `tool_call_id`/`name`/`tool_calls`** — dropping them would break tool_use/tool_result pairing and make the provider reject the whole restored request with HTTP 400.
 
@@ -259,7 +261,7 @@ The cross-process message inbox (`core/inbox.py`) — the durable hand-off from 
 
 - The **filename stem is the message id** — the microsecond stamp sorts in insertion order, so `drain`'s ordering is independent of `listdir` order, and `LoopEvent.detail` carries `inbox:<id>` as the display de-duplication key.
 - `insert` writes `<stem>.tmp` then `os.replace`s it into place: a drainer sees a message either not at all or complete, never half-written. `MAX_INBOX_MESSAGES = 200` are kept per session (`prune` deletes the oldest); text over `MAX_TEXT_CHARS = 100_000` is rejected.
-- `drain` is `listdir → read → unlink`, and it unlinks only **after** a successful parse, so a crash re-delivers rather than drops. An unparseable file is renamed `<stem>.bad` and skipped — it never raises, same as session files.
+- `drain` is `listdir → read → unlink`, and it unlinks only **after** a successful parse, so a crash re-delivers rather than drops. An unparseable file is renamed `<stem>.bad` and skipped — it never raises, same as session files. **A drain follows the redirect chain** (`resolve_redirect` first, then every session on the chain is drained, deduped by id, oldest first), so a message queued on a summarized session before its hand-off is delivered, not stranded; plain viewing (`message list`, the TUI session picker) never drains, so it never follows a redirect.
 - **One consumer per session, deliberately.** Nothing serializes two drainers: whichever process lists the directory first unlinks the files and the other never sees them. Two live processes bound to one session would steal each other's messages — isolate them with a distinct `MINIOUTO_HOME` or session name instead of adding a locking protocol here.
 
 ### `spawn-logs/<id>.json` and `spawn-logs/<id>.log`
@@ -453,7 +455,7 @@ class Settings:
     reasoning: str = ""       # the outo reasoning effort — same pair
     style: str = "default"
     session: str = "default"
-    theme: str = "miniouto"    # TUI theme name (cli/tui.py:MINIOUTO_THEME)
+    theme: str = "miniouto"    # TUI theme name (cli/tui/theme.py:MINIOUTO_THEME)
     subagent_provider: str = ""
     subagent_model: str = ""
     subagent_reasoning: str = ""
@@ -516,6 +518,7 @@ class SessionData:
     history: list[dict[str, Any]] = field(default_factory=list)  # coreouto Message dumps
     turns: list[TurnRecord] = field(default_factory=list)
     cwd: str = ""                 # launch directory, stamped once by begin_turn
+    redirect_to: str = ""         # session continuing this one after a summary hand-off
 ```
 
 | Function | Returns | Notes |
@@ -533,6 +536,9 @@ class SessionData:
 | `list_sessions()` | `list[str]` | sorted by name |
 | `list_sessions_by_mtime()` | `list[str]` | most recently written first (TUI picker order) |
 | `list_sessions_with_meta()` | `list[(str, str, float)]` | `(name, cwd, mtime)`, mtime-descending. Parses the session JSON **directly** instead of calling `load()`, because `load()` calls `ensure_dirs()` and would force-write the five bundled style files — a read-only picker must never write. Missing / unreadable / unparseable files yield `("", 0.0)` |
+| `set_redirect(name, target) -> bool` | `bool` | stamp `redirect_to` on an existing session (False for a missing session or a self-reference; an empty target clears); also `_forward_inbox` — move the session's pending inbox files to the target so a pre-hand-off alarm is not stranded |
+| `resolve_redirect(name) -> (str, list[str])` | `(final, chain)` | follow `redirect_to` links to the final session; the chain names every hop from `name`; stops at a cycle / self-reference / missing successor / `REDIRECT_MAX_CHAIN = 64` |
+| `redirect_chain(name)` | `list[str]` | the chain half of `resolve_redirect`, for redirect notices |
 
 **Turn lifecycle / crash safety:** `core/chat.py` calls `begin_turn` before the loop starts, rewrites the running turn's `events` as they stream in, snapshots the sanitized live history at every outo iteration (`update_history`), and calls `finish_turn` at the end. A turn still marked `"running"` on disk therefore means the process was force-killed mid-turn — the TUI renders it with an explicit "turn interrupted" marker instead of a (nonexistent) final answer, and the persisted partial history lets `--continue` resume from real progress.
 

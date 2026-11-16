@@ -26,7 +26,7 @@ From `README.md`:
 
 ```
 src/miniouto/
-├── __init__.py              # __version__ = "0.1.1"
+├── __init__.py              # __version__ = "0.12.7"
 ├── paths_runtime.py         # INVOCATION_CWD: Path  (captured cwd at import)
 ├── cli/                     # Typer commands + xnano TUI (cli/tui/ package)
 ├── core/                    # Chat loop + runtime assembly + event sinks

@@ -389,7 +389,8 @@ An interactive UI built on the `xnano` canvas (a retained-mode terminal canvas w
 
 | Action | How |
 |---|---|
-| Command palette | `Ctrl+P` (centred search dialog: new session / pick session / change model/provider/style/theme / keys / quit) |
+| Command palette | `Ctrl+P` (the **Menu** dialog: every command listed, no search input — new session / pick session / change model/provider/style/theme / keys / quit) |
+| Keys popup | palette → **Keys** (or the same list via `modals.py:KeyModal`): the app's real bindings, one row each (`DEFAULT_KEY_BINDINGS`) |
 | Clear log | `Ctrl+L` |
 | Quit | `Ctrl+C` |
 | Submit input | `Enter` (a newline inside the input is its own binding) |
@@ -398,7 +399,7 @@ An interactive UI built on the `xnano` canvas (a retained-mode terminal canvas w
 | Copy the selection | `Ctrl+Shift+C` |
 | Close a modal | `Esc` |
 
-The chips sit in the bottom panel in two left/right-anchored pairs (`outo`/`style`, then `subagent`/`session`).
+The chips sit in the bottom panel's two chip rows, in two left/right-anchored pairs (`outo`/`style`, then `subagent`/`session`); a spinner row above them is the panel's third and last row (there is no help-hint row — the palette's Keys entry lists the bindings).
 
 - **outo** — click → the provider settings popup: three rows, `Provider` / `Model` / `Reasoning`, each opening its own picker. The `Provider` row lists registered providers plus two sentinels (`+ add from catalog…`, `+ add custom…`); `Model` fetches the provider's catalog-owned model list and falls back to a free-text id for a hand-added endpoint; `Reasoning` lists the levels modelslist reports for the resolved model. **Picking a Provider or a Model resets Reasoning** to that model's default — an effort level belongs to a model — and Reasoning is one more click away.
 - **subagent** — the same popup, editing the `subagent_provider` / `subagent_model` / `subagent_reasoning` trio; empty still reads `same as outo`, which is what a delegated run inherits.

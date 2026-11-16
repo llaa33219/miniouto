@@ -13,7 +13,7 @@ This dispatches into the `app: typer.Typer` object defined in `src/miniouto/cli/
 
 ```
 miniouto [--version]
-   ├─ (no subcommand)            → TUI mode (cli/tui.py:run_tui)
+   ├─ (no subcommand)            → TUI mode (cli/tui/app.py:run_tui)
    ├─ status                     → show current configuration
    ├─ chat <prompt> [options]    → one-shot chat turn (also the delegation door)
    ├─ provider
@@ -72,11 +72,10 @@ The package still owns its cell-correct word wrap (`rich.cells.cell_len`, never 
 Layout (top to bottom):
 - `Header` — a full-width bar: the centred `title — sub` string (no icon)
 - log (the windowed chat transcript) + `ChatInput` (a 1..N-row multiline editor), both inside the centred `CHAT_MAX_WIDTH` column
-- `BottomPanel` (height 4) with four rows:
+- `BottomPanel` (height 3) with three rows:
   1. spinner row (a braille spinner, one ticker at ~12.5 fps, shown while a chat turn is in flight)
   2. chip row A — `outo` on the left, `style` on the right
   3. chip row B — `subagent` on the left, `session` on the right
-  4. help-hint row
 
 There is **no** Footer key bar — it was dropped deliberately, so every action lives on a key (see "Keybindings") or in the command palette. The header's background and the panel's background span the terminal; both stop their *content* at the chat column so the chips line up with the log and input. A modal renders itself over a dimmed copy of the frame below it.
 
@@ -113,7 +112,7 @@ Finalization avoids showing the same text twice: the live `StreamRow` is dropped
 - **Mid-turn insertion.** Typing while a turn is running does not poke the live message list: it goes to `inbox.insert(session, text, kind="user", source="tui")`. One code path then serves human interjections, spawn alarms, and `chat --alarms` wakeups. The row renders optimistically, and when the drain later produces the matching loop event `ChatTUI._claim_inbox_event` matches `detail="inbox:<id>"` and drops the duplicate.
 - **Idle delivery.** No registry callback pushes messages any more (a detached process may write at any moment), so the TUI polls the inbox every `_INBOX_POLL_INTERVAL` (1 s) and at the tail of `_dispatch`: anything drained starts a turn whose prompt **is** the joined message text, recorded as that turn's `user` so display, replay, and model perception are the same string by construction.
 - **Single consumer.** One session belongs to one live process; a second process bound to the same session would steal each other's messages (see `docs/core.md` § `core/inbox.py`). Before a TUI has chosen a session, it polls a unique `tui-pending-<hex>` queue, never the shared `default` or another process's published session.
-- **Summary hand-off.** If a turn ends because the model called `continue_session`, `ChatTUI._apply_handoff` appends the `------summary → <new>------` + `summary: <dir>` marker as a system row in the **old** conversation, persists it there for replay (`_persist_handoff_marker`), re-pins the new `cont-*` session, and lets the 1 s inbox poll auto-deliver the continuation message — so the transition needs no user action. The old conversation keeps its history: a hand-off is a session change, never a history edit.
+- **Summary hand-off.** If a turn ends because the model called `continue_session`, `ChatTUI._apply_handoff` appends the `------summary → <new>------` + `summary: <dir>` marker as a system row in the **old** conversation, persists it there for replay (`_persist_handoff_marker`), re-pins the new `cont-*` session, and lets the 1 s inbox poll auto-deliver the continuation message — so the transition needs no user action. The old conversation keeps its history: a hand-off is a session change, never a history edit. **Talking to a summarized session follows its redirect**: a submitted message resolves `resolve_redirect` of the pinned session first and, when the chain is longer than one hop, the TUI moves there (`_pin_session` + history reload + a `session <old> was summarized → redirected to <final> (via …). Continue here.` notice), and the typed text is restored to the input UNSENT (left for the operator to re-send) — it is for the live work, not the stopped transcript. Opening a session from the picker is plain viewing and never follows a redirect.
 - **Width cap.** The log column is centered and capped at `CHAT_MAX_WIDTH = 150` cells (theme variable `$chat-max-width`), so wide terminals do not stretch the transcript. The header chips sit in two left/right-anchored pairs inside that column (`outo` / `style`, then `subagent` / `session`) and render their values whole — two chips a row is what keeps every value short enough not to truncate, so every picker stays clickable at any terminal width.
 - **Scrolling.** `PgUp` / `PgDn` / `Home` / `End` act **instantly**: the TUI takes them at the app level before the input sees them (they would otherwise move the caret), and no scroll is ever animated — animating through a long transcript's heights would lose the target. The wheel scrolls `WHEEL_LINES = 3` rows per detent. A windowed log (`_RowWindow`: a trailing window of rows is painted, older chunks load as the view nears the top, far-above rows evict) keeps a long session's per-frame cost flat, and a jump-to-bottom button sits under the log whenever the view is scrolled up.
 
@@ -174,7 +173,7 @@ In the TUI, every row shows the **configured** value when there is one, else wha
 
 Keybindings (one app-level router in `ChatTUI._handle_key`: global keys first, then the modal on top, then the focused node):
 - App-level: `Ctrl+L` — clear log; `Ctrl+C` — quit; `Ctrl+Shift+C` — copy the selection; `Ctrl+P` — open (or dismiss) the command palette; `Esc Esc` (two presses within 2.0 s while the agent is busy) — force-stop the running turn. The stop is cooperative: a `threading.Event` is passed via `ChatOptions.cancel_event`, and the loop's cancel-guard hook raises `LoopCancelledError` at the next hook boundary (before the next LLM call / tool execution) — additionally, the stall watchdog's 5 s poll watches the same event and hard-cancels the turn task, so an in-flight LLM call IS interrupted promptly, and an in-flight **Bash** process IS killed (`tools/bash.py` polls the same event — Bash's 1-hour hard cap, `BASH_TIMEOUT_SECONDS`, is far too slow to serve as the stop mechanism). The TUI shows `[stopped by user (esc esc)]`; a single `Esc` while busy shows a persistent "press esc again to stop" hint in the spinner line (it survives spinner ticks for the full 2.0 s window; after a successful double-press, "stopping after the current step…" persists until the turn ends).
-- `Ctrl+P` — the command palette: a centred dialog (`modals.py:CommandPalette` + `default_system_commands`, behind `get_system_commands`) with a search input and a list — new session, pick session, configure outo, configure subagent, pick style, theme, keys, quit. No numeric prefixes (`00`, `01`, … were Textual's alphabetical-sort workaround) and no clear-log / maximize / screenshot entries; `clear log` is still on `Ctrl+L`. The splash text on boot says "Press Ctrl+P for commands."
+- `Ctrl+P` — the command palette (`modals.py:CommandPalette` + `default_system_commands`, behind `get_system_commands`): a centred dialog titled **Menu** listing every command — new session, pick session, configure outo, configure subagent, pick style, theme, keys, quit. There is **no search input**: the list is unfiltered and scrolls (`Up`/`Down`/`Tab` move, `Enter` runs, `PageUp`/`PageDown` page, mouse clicks a row, `Esc` or a click outside closes). No numeric prefixes (`00`, `01`, … were Textual's alphabetical-sort workaround) and no clear-log / maximize / screenshot entries; `clear log` is still on `Ctrl+L`. The splash text on boot says "Press Ctrl+P for commands."
 - Node-level (inside modals / chips / the input): `Tab` / `Shift+Tab` — cycle focus; `Enter` — confirm; `Esc` — cancel.
 
 Submission flow: each submitted prompt is dispatched by `self.run_worker(self._dispatch(prompt), exclusive=True)`, which calls `core.chat.run_chat(opts, sink)` inside `asyncio.to_thread` so the asyncio loop (and the ~60 Hz draw) stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output becomes row objects (see "Chat log rows" above), composed into the next frame; errors/system messages render as `[…]` (e.g. `[error: {exc}]`) in theme warning.
@@ -185,7 +184,7 @@ Submission flow: each submitted prompt is dispatched by `self.run_worker(self._d
 
 ## `miniouto --version`
 
-Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.10.2"`) and raises `typer.Exit()` (exit code 0).
+Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.12.7"`) and raises `typer.Exit()` (exit code 0).
 
 ---
 
@@ -316,6 +315,7 @@ A wakeup takes no prompt: the queued messages *are* the prompt. It is the explic
 | No prompt argument | `chat "…" --alarms` is rejected. Two sources for one user message is a mistake, not a merge |
 | `-c` / `--continue` is **mandatory** | History is never loaded implicitly. Asking for it is the operator's decision |
 | The session must **exist** | `nothing to wake: session '<s>' does not exist`. With no `--name` and no `settings.session`: `nothing to wake: no session to continue — pass --name <session>` |
+| A summarized session is **handed over, not run** | `_apply_session_redirect` resolves `resolve_redirect` of the named session (after `_resolve_session`, before any write/drain/model call): when the chain is longer than one hop it prints `session <old> was summarized → the work continues in <final> (via …). Re-run with --name <final> to continue there.` and exits WITHOUT a turn — the queued messages survive for the re-run the notice asks for. A fresh/minted session never has a redirect |
 | All of the above are checked **before anything is written** | A rejected wakeup costs no model call, writes no session file, and leaves the queue untouched |
 | The drained texts, blank-line joined, become the turn's user message | So history rides in only because `-c` was passed |
 | An **empty inbox is a no-op, not a turn** | `no pending messages in session '<s>'.` on stdout, exit 0, no session marker, no finish marker, no model call |
@@ -353,6 +353,7 @@ Validation happens **first, ahead of every resolution**: `--answer-only` + `--wi
    - elif `--name` was supplied: use `name` verbatim.
    - elif `--bg`: a fresh `spawn-{YYYYMMDD-HHMMSS}-{6hex}` — a detached run must never share a session writer, since whole-file saves from two processes lose turns.
    - else: generate a fresh `chat-{YYYYMMDD-HHMMSS}-{6hex}` name.
+   - then `_apply_session_redirect(session_name)`: an INTERACTIVE resume (`-c`, `--alarms -c`) of a summarized session prints the hand-over notice and stops the run (returns before any write, drain, or model call); a session with no redirect keeps its own name.
 2. Calls `settings.update(session=session_name)` — **only for a plain run** (`_is_plain_run`: not `--bg`, not `--bg-child`, no `--role`, no `--alarm-session`, no `--return`). A delegated run is a guest: it mints its own `chat-`/`spawn-` name and writes its transcript there, but never repoints the active session (otherwise the caller's conversation — and the TUI, which reads the active session — would jump onto the subagent's file). Plain `miniouto chat` still persists the active session, with or without `--name`. Every turn instead passes `ChatOptions.session` through `ChatOverrides.session` into `runtime.session`, so it drains its own inbox and expands `{this_session}` to its own name — never the caller's — without temporarily rewriting the shared active-session setting. A delegated `--continue` run must provide `--name SESSION` (it cannot inherit the caller's active session).
 3. Emits the `------{session_name}------` marker to stdout unless `--answer-only` was passed, then builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts, sink=ConsoleEventSink(quiet=answer_only or with_session))`. **Session persistence is unconditional** — `run_chat` builds its `_TurnPersister` before any branch on delegation, so every run (plain outo, a delegated `--role` run, and `--answer-only`/`-a`) writes its session file; `-a` suppresses stdout only, and the file on disk is identical either way.
 4. On exception: `run_chat` itself calls `_dump_failure_diagnostics` (appends `✗ {ExceptionType}: {msg}` + the last ≤5 tool calls + a full traceback to `logs/failure-<session>.log`, and prints the same to **stderr** — the CLI leaves `quiet_diagnostics` False, so this output is unchanged) and **re-raises**. Typer prints the traceback and exits 1. A *delegated* run catches it instead — see the post-step below.
@@ -425,7 +426,7 @@ The brief is the **whole input**: a delegated run starts with no history, so a b
 
 With no `--return` there is no file, and the alarm carries the answer inline instead.
 
-**Completion alarm.** Exactly one message per run is inserted into the alarm session's inbox (`core/inbox.py`), with `kind="alarm"` and `source="chat"`, whose first line is always `core.inbox.ALARM_HEADER` = `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`:
+**Completion alarm.** Exactly one message per run is inserted into the alarm session's inbox (`core/inbox.py`), with `kind="alarm"` and `source="chat"`, whose first line is always `core.inbox.ALARM_HEADER` = `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]`. The insert **follows the receiver's summarization redirect**: `_deliver_alarm` resolves `resolve_redirect(run.alarm_session)` (chains included) and inserts into the FINAL session — an alarm pointed at a summarized session belongs to the session that continues the work — appending `session <old> was summarized → continuing in <final> (via …)` (`_redirect_notice`) when the chain is longer than one hop:
 
 ```
 [SYSTEM ALARM - THIS IS NOT A USER MESSAGE]
@@ -711,7 +712,7 @@ cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.pr
                   ├─→ cli/subagent.py ─→ storage.providers, storage.settings
                   ├─→ cli/message.py  ─→ core.inbox, storage.settings
                   ├─→ cli/computer.py ─→ storage.paths, tools.ascii_art
-                   ├─→ cli/tui.py      ─→ core.{chat,events,inbox,modelslist}, core.providers, storage.{paths,providers,settings,styles,sessions}
+                  ├─→ cli/tui/ (app)  ─→ core.{chat,events,inbox,modelslist}, core.providers, storage.{paths,providers,settings,styles,sessions}
                    └─→ cli/chat.py     ─→ core.{chat,events,inbox,spawn_state,runtime}, storage.{paths,settings,styles}
 ```
 

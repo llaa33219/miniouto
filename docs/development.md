@@ -125,7 +125,7 @@ Use `uvx`, not `uv run ruff` — ruff is not in the `[dependency-groups]` in `py
 
 ## Tests
 
-The suite is ~301 tests and must stay green:
+The suite is ~1480 tests and must stay green:
 
 ```bash
 uv run pytest
@@ -160,9 +160,9 @@ Releases are published automatically by `.github/workflows/release.yml`. Push a 
 $EDITOR pyproject.toml
 
 # 2. Commit and tag
-git commit -am "v0.1.1"
-git tag v0.1.1
-git push origin v0.1.1
+git commit -am "v0.12.7"
+git tag v0.12.7
+git push origin v0.12.7
 ```
 
 The workflow triggers on any `v*` tag. It builds the wheel + sdist with `uv build`, then publishes to PyPI using OIDC trusted publishing (no API token in the repo).
