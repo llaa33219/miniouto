@@ -1616,3 +1616,58 @@ def test_the_key_modal_closes_on_a_click_outside_the_dialog() -> None:
     inside = Mouse("down", second.region.x + 3, second.region.y + 2, button=0)
     assert second.handle_mouse(inside) is True
     assert second.dismissed is False
+
+
+# ─── CJK backdrop: the dialog never shifts on a wide-glyph boundary ──────────
+
+
+def _cjk_behind_rows(pad: int) -> list[list[tuple[str, Any]]]:
+    """A screen whose answer row has a 2-cell glyph straddling the dialog edge.
+
+    ``pad`` ASCII cells then a CJK run: at some pads a glyph sits exactly on the
+    dialog's left edge column, the case that used to drop a cell and jag the
+    border row to row.
+    """
+
+    from miniouto.cli.tui import pt
+
+    bg = pt.Style().bg(MINIOUTO_THEME.color(MINIOUTO_THEME.background))
+    blank = [(" " * SCREEN.width, bg)]
+    rows = [list(blank) for _ in range(SCREEN.height)]
+    text = "a" * pad + "한글테스트" + "b" * 100
+    rows[SCREEN.height // 2] = [(text, bg)]
+    return rows
+
+
+@pytest.mark.parametrize("modal_factory", [
+    lambda: CommandPalette(),
+    lambda: SelectionModal("Pick", ["a", "b"]),
+])
+def test_a_cjk_glyph_on_the_dialog_edge_does_not_shift_the_border(modal_factory) -> None:
+    """Regression (owner: CJK answers make the menu border jag horizontally).
+
+    A 2-cell glyph straddling the dialog edge is dropped whole by the backdrop
+    slice, so the head came back one cell short and the whole dialog row shifted
+    left. Every dialog row must keep the SAME left/right border column and the
+    full screen width, at every CJK offset.
+    """
+
+    from rich.cells import cell_len
+
+    for pad in range(0, 30):
+        app = FakeApp()
+        modal = modal_factory()
+        app.push_screen(modal)
+        behind = _cjk_behind_rows(pad)
+        lines = modal.build_lines(SCREEN, MINIOUTO_THEME, behind=behind)
+        left = modal.region.x
+        right = modal.region.x + modal.region.width - 1
+        for line in lines:
+            plain = "".join(t for t, _ in line)
+            assert sum(cell_len(t) for t, _ in line) == SCREEN.width, (pad, plain)
+            if "█" in plain:
+                # CELL columns, not char indices: a CJK glyph is 1 char but 2 cells.
+                first = sum(cell_len(c) for c in plain[: plain.find("█")])
+                last = sum(cell_len(c) for c in plain[: plain.rfind("█")])
+                assert first == left, (pad, plain)
+                assert last == right, (pad, plain)

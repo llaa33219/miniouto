@@ -1017,8 +1017,16 @@ class Modal(Node):
             if not 0 <= row < len(base):
                 continue
             span = _cells(line)
-            head = _slice_cells(base[row], 0, left)
-            tail = _slice_cells(base[row], left + span, rect.width)
+            # Pad head/tail to their EXACT cell widths. A CJK (2-cell) glyph
+            # straddling the dialog edge is dropped whole by _slice_cells, so
+            # the head can come back one cell short — without the pad the whole
+            # dialog row shifts left by that cell and the border jags row to row.
+            head = _fit(_slice_cells(base[row], 0, left), left, backdrop)
+            tail = _fit(
+                _slice_cells(base[row], left + span, rect.width),
+                rect.width - left - span,
+                backdrop,
+            )
             base[row] = _fit([*head, *line, *tail], rect.width, backdrop)
         return base
 
