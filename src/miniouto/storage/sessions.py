@@ -180,7 +180,35 @@ def set_redirect(name: str, target: str) -> bool:
     data = load(name)
     data.redirect_to = target
     save(name, data)
+    _forward_inbox(name, target)
     return True
+
+
+def _forward_inbox(name: str, target: str) -> None:
+    """Move pending inbox messages from a summarized session to its successor.
+
+    An alarm that arrived BEFORE the hand-off sits in the old session's inbox;
+    the conversation now polls the new one, so without the move the message is
+    stranded forever. Renaming the files (atomic, same filesystem) delivers
+    them to the session that continues the work. Best-effort: a failure here
+    costs the forward, never the redirect — the drain also follows the chain.
+    """
+
+    from ..core import inbox
+
+    try:
+        src_dir = inbox.inbox_dir(name)
+        if not src_dir.is_dir():
+            return
+        dst_dir = inbox.inbox_dir(target)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for path in src_dir.glob("*.json"):
+            try:
+                path.rename(dst_dir / path.name)
+            except OSError:
+                continue
+    except Exception:
+        pass
 
 
 def resolve_redirect(name: str) -> tuple[str, list[str]]:

@@ -793,6 +793,48 @@ def _bg_sgr(hex_value: str) -> str:
     )
 
 
+_LEAVE_ALT_SCREEN = "\x1b[?1049l"
+"""Leave the alternate screen, restoring the saved normal screen."""
+
+
+_TERMINAL_RESET = (
+    "\x1b[?2026l\x1b[?2004l\x1b[?1004l\x1b[<1u\x1b[?25h\x1b[0 q\x1b[?7h"
+    "\x1b[0m\x1b[!p\x0f\x1b(B\x1b)B\x1b[0m\x1b[39m\x1b[49m\x1b[59m"
+    "\x1b[?25h\x1b[0 q\x1b[?7h\x1b[?1000l\x1b[?1002l\x1b[?1003l"
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?2026l"
+)
+"""Mode/cursor/colour restore, emitted AFTER the alt-screen leave.
+
+The DECSTR (``ESC[!p``) sits in here deliberately AFTER the leave: issued on
+the normal screen it is harmless, but issued while the alt screen is active
+it resets Konsole's saved normal-screen state (the pre-TUI shell history).
+No alt-screen leave follows it, so nothing re-triggers that corruption.
+"""
+
+
+def _suppress_stdout() -> int | None:
+    """Point fd 1 at /dev/null; return the saved descriptor (or None)."""
+
+    try:
+        saved = os.dup(_STDOUT_FD)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, _STDOUT_FD)
+        os.close(devnull)
+        return saved
+    except OSError:  # pragma: no cover - fd exhaustion
+        return None
+
+
+def _restore_stdout(saved: int | None) -> None:
+    """Give fd 1 back to the descriptor saved by :func:`_suppress_stdout`."""
+
+    if saved is None:
+        return
+    with _suppressed():
+        os.dup2(saved, _STDOUT_FD)
+        os.close(saved)
+
+
 def _write_screen(payload: str) -> None:
     """Write escape bytes to the terminal, never raising into the caller."""
 
@@ -1765,8 +1807,23 @@ class Terminal:
         canvas, self._canvas = self._canvas, None
         self._opened = False
         if canvas is not None and not canvas.is_closed:
-            with _suppressed():
-                canvas.close()
+            # xnano's close() emits its reset blob (which contains DECSTR,
+            # ``ESC[!p``) BEFORE the alt-screen leave. On Konsole a DECSTR
+            # issued while the alt screen is active resets the saved
+            # normal-screen state, so the leave then restores a BLANK screen —
+            # the shell history the user had before the TUI is wiped. We
+            # therefore discard xnano's close output (fd 1 -> /dev/null for the
+            # duration) and emit our OWN restore below: a single leave FIRST,
+            # then the mode/reset blob, so the DECSTR lands on the normal
+            # screen where it is harmless and the saved screen survives.
+            saved_fd = _suppress_stdout()
+            try:
+                with _suppressed():
+                    canvas.close()
+            finally:
+                _restore_stdout(saved_fd)
+            if self._real_screen:
+                _write_screen(_LEAVE_ALT_SCREEN + _TERMINAL_RESET)
         # AFTER the canvas closed: xnano's leave sequences travel through the
         # tap, so giving fd 1 back first would send them into the pty instead.
         tap, self._tap = self._tap, None

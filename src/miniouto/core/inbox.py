@@ -108,17 +108,32 @@ def insert(
 
 
 def drain(session: str) -> list[InboxMessage]:
-    """Read and unlink every message file, oldest first. Never raises on content."""
+    """Read and unlink every message file, oldest first. Never raises on content.
 
-    directory = inbox_dir(session)
-    if not directory.is_dir():
-        return []
+    A summarized session redirects to the one continuing its work, so a drain
+    follows the redirect chain: messages queued on the named session AND on
+    every session it redirects through are delivered together (an alarm that
+    arrived before the hand-off is not stranded on the dead session). The
+    final session's own inbox is drained too, so a wakeup lands on the live
+    conversation. Plain viewing never drains, so it never follows a redirect.
+    """
 
+    from ..storage import sessions as session_store
+
+    final, chain = session_store.resolve_redirect(session)
+    # Drain every session in the chain (the named one, the intermediates, and
+    # the final destination); dedupe by id so a message is delivered once.
+    seen: set[str] = set()
     messages: list[InboxMessage] = []
-    for path in directory.glob(f"*{_SUFFIX}"):
-        message = _read_one(path)
-        if message is not None:
-            messages.append(message)
+    for name in dict.fromkeys([*chain, final]):
+        directory = inbox_dir(name)
+        if not directory.is_dir():
+            continue
+        for path in directory.glob(f"*{_SUFFIX}"):
+            message = _read_one(path)
+            if message is not None and message.id not in seen:
+                seen.add(message.id)
+                messages.append(message)
     # Ids are the filenames, whose zero-padded microsecond stamps sort in
     # insertion order — so the result is ordered regardless of listdir order.
     messages.sort(key=lambda m: m.id)

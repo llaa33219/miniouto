@@ -58,7 +58,7 @@ from rich.text import Text
 from ... import __version__, paths_runtime
 from ...core import inbox, runtime, summary, update_check
 from ...core import modelslist as catalog_api
-from ...core.chat import ChatOptions, run_chat
+from ...core.chat import ChatOptions, run_chat, shutdown_turn_loop
 from ...core.events import STREAM_THINKING, LoopEvent
 from ...core.providers import SUPPORTED_FORMATS, add_provider_from_catalog, resolve_catalog_dialect
 from ...core.runtime import LoopCancelledError
@@ -3661,6 +3661,11 @@ def run_tui() -> None:
         # `run_async`'s own `finally` INSIDE the context.
         if not app._alt_screen_entered:
             _write_terminal(_LEAVE_ALT_SCREEN)
+        # Drain the persistent turn loop's pending tasks so the process exits
+        # without "Task was destroyed but it is pending!" over the restored
+        # shell (the repetition supervisor's Event.wait() waiter lives there).
+        with contextlib.suppress(Exception):
+            shutdown_turn_loop()
 
 
 def tui_summary() -> dict[str, Any]:

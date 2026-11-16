@@ -80,3 +80,30 @@ def test_an_async_client_survives_across_turns() -> None:
 
     chat._run_turn_coro(turn_one())
     chat._run_turn_coro(turn_two())  # must not raise
+
+
+def test_shutdown_turn_loop_drains_pending_tasks_quietly() -> None:
+    """The Ctrl-C exit warning: a pending Event.wait() on the turn loop must be
+    cancelled and awaited at shutdown, not GC'd with a 'Task was destroyed'
+    warning over the restored shell."""
+
+    import asyncio
+    import warnings
+
+    from miniouto.core import chat as chat_module
+
+    loop = chat_module._get_turn_loop()
+    ev = asyncio.Event()
+    waiter = asyncio.run_coroutine_threadsafe(ev.wait(), loop)
+    # let the waiter actually start
+    import time
+
+    time.sleep(0.1)
+    assert not waiter.done()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chat_module.shutdown_turn_loop(timeout=2.0)
+
+    assert waiter.cancelled() or waiter.done()
+    assert not any("destroyed" in str(w.message) for w in caught)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import re
 import threading
 import time
@@ -95,6 +96,47 @@ def _run_turn_coro(coro: Any) -> Any:
     loop = _get_turn_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result()
+
+
+def shutdown_turn_loop(timeout: float = 2.0) -> None:
+    """Cancel and drain every task on the persistent turn loop, then stop it.
+
+    The turn loop lives on a daemon thread for the whole process so async
+    clients survive between turns. At exit its pending tasks (the repetition
+    supervisor's ``Event.wait()`` waiter, an in-flight provider call) would be
+    garbage-collected still pending, and asyncio prints "Task was destroyed
+    but it is pending!" to stderr — over the shell the TUI just restored.
+    Cancelling and awaiting them here drives each to completion first, so the
+    process exits quiet. Bounded by ``timeout`` so a wedged call cannot hang
+    the exit; never raises.
+    """
+
+    global _turn_loop
+    with _turn_loop_lock:
+        loop, _turn_loop = _turn_loop, None
+    if loop is None or loop.is_closed():
+        return
+
+    async def _drain() -> None:
+        tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_drain(), loop)
+        future.result(timeout=timeout)
+    except Exception:
+        pass
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+# Every entry point (TUI, one-shot chat, delegated run) shares this loop; drain
+# it at process exit so no pending task is GC'd with a "Task was destroyed"
+# warning over the user's terminal. Idempotent: the TUI also calls it explicitly.
+atexit.register(shutdown_turn_loop)
 
 
 @dataclass

@@ -301,13 +301,13 @@ def test_a_delegated_alarm_lands_in_the_redirected_session() -> None:
     # When: the subagent finishes and its alarm is delivered
     _deliver_alarm(run, status="done", answer="RESULT")
 
-    # Then: the message went to the FINAL session's inbox, and the text says
-    # the receiver was moved
-    old = inbox.drain("redir-alarm-old")
-    new = inbox.drain("redir-alarm-new")
-    assert old == []
-    assert len(new) == 1
-    assert "session redir-alarm-old was summarized → continuing in redir-alarm-new" in new[0].text
+    # Then: the message physically sits in the FINAL session's inbox (the
+    # delivery resolved the redirect), and the text says the receiver moved.
+    assert inbox.pending_count("redir-alarm-old") == 0
+    assert inbox.pending_count("redir-alarm-new") == 1
+    delivered = inbox.drain("redir-alarm-new")
+    assert len(delivered) == 1
+    assert "session redir-alarm-old was summarized → continuing in redir-alarm-new" in delivered[0].text
 
 
 def test_a_cli_wakeup_follows_the_redirect_to_the_final_session(
@@ -450,3 +450,34 @@ def test_a_tui_session_picker_load_does_not_redirect() -> None:
             assert app._session_name != "redir-view-new"
 
     asyncio.run(body())
+
+
+def test_an_alarm_queued_before_the_handoff_is_forwarded_not_stranded() -> None:
+    # Given: an alarm arrived on the OLD session BEFORE it summarized
+    session_store.create("redir-fwd-old")
+    session_store.create("redir-fwd-new")
+    inbox.insert("redir-fwd-old", "early result", kind="alarm", source="chat")
+
+    # When: the old session summarizes and redirects
+    session_store.set_redirect("redir-fwd-old", "redir-fwd-new")
+
+    # Then: the pending message moved to the continuing session, so the live
+    # conversation's drain delivers it instead of leaving it stranded
+    assert inbox.pending_count("redir-fwd-old") == 0
+    delivered = inbox.drain("redir-fwd-new")
+    assert [m.text for m in delivered] == ["early result"]
+
+
+def test_drain_follows_the_redirect_chain() -> None:
+    # Given: A -> B -> C, with a message on A and one on C
+    for n in ("redir-drain-a", "redir-drain-b", "redir-drain-c"):
+        session_store.create(n)
+    session_store.set_redirect("redir-drain-a", "redir-drain-b")
+    session_store.set_redirect("redir-drain-b", "redir-drain-c")
+    inbox.insert("redir-drain-c", "live message", kind="alarm", source="chat")
+
+    # When: draining the summarized head of the chain
+    delivered = inbox.drain("redir-drain-a")
+
+    # Then: the final session's message is delivered (chain followed)
+    assert [m.text for m in delivered] == ["live message"]
