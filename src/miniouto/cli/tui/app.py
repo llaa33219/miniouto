@@ -2429,25 +2429,27 @@ class ChatTUI:
             self._queue_inbox_message(text)
             return
         # TALKING to a summarized conversation moves this TUI into the session
-        # that continues it (chains resolved to the final destination): the
-        # typed message is FOR the live work, not the transcript that stopped.
-        # The submitted text still goes to dispatch below, and the input is
-        # RESTORED to it (it was cleared above) so nothing typed is lost —
-        # while the history reload shows where the work now lives.
+        # that continues it (chains resolved to the final destination) — and
+        # STOPS there: the typed message is for the live work, not for the
+        # transcript that stopped, so it is NOT sent from the summarized
+        # session. The input is RESTORED to it (it was cleared above) and
+        # left untouched for the operator to re-send — now pointed at the
+        # session the history reload shows the work lives in.
         final, chain = session_store.resolve_redirect(self._pinned_session())
         if len(chain) > 1:
             hops = ", ".join(chain[1:-1])
             via = f" (via {hops})" if hops else ""
             notice = (
-                f"session {chain[0]} was summarized → moved to {final}{via}. "
+                f"session {chain[0]} was summarized → redirected to {final}{via}. "
                 "Continue here."
             )
-            self._input.text = text
             self._pin_session(final)
             self._load_session_history(final)
             self._refresh_chips()
             self._post_system(notice)
             self._spinner_status(f"redirect → {final}")
+            self._input.text = text
+            return
         if self._logo_shown:
             self._log.remove_children()
             self._reset_rows()

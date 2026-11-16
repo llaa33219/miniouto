@@ -332,13 +332,15 @@ def test_a_cli_wakeup_follows_the_redirect_to_the_final_session(
     # When: the summarized session is woken
     code, output = _chat("--alarms", "--continue", "--name", "redir-cli-a")
 
-    # Then: the turn ran in the FINAL session, over ITS history, and the
-    # operator was told about the whole hop path
+    # Then: NO turn ran — the wakeup handed the work over instead, the
+    # queued message SURVIVED for the re-run the notice asks for, and the
+    # operator was told the whole hop path and where to re-run
     assert code == 0
-    assert [o.session for o in seen] == ["redir-cli-c"]
-    assert seen[0].continue_session is True
+    assert seen == []
+    assert inbox.pending_count("redir-cli-c") == 1
     assert (
-        "session redir-cli-a was summarized → continuing in redir-cli-c (via redir-cli-b)"
+        "session redir-cli-a was summarized → the work continues in redir-cli-c "
+        "(via redir-cli-b). Re-run with --name redir-cli-c to continue there."
         in output
     )
 
@@ -360,10 +362,15 @@ def test_a_cli_continue_with_prompt_also_follows(monkeypatch) -> None:
     # When: the operator continues the conversation by name
     code, output = _chat("what is left?", "--continue", "--name", "redir-cli-d")
 
-    # Then: the interaction went to the session that continues the work
+    # Then: NO turn ran — the resume handed the work over with the notice
+    # naming the session that continues it and how to reach it
     assert code == 0
-    assert [o.session for o in seen] == ["redir-cli-e"]
-    assert "session redir-cli-d was summarized → continuing in redir-cli-e" in output
+    assert seen == []
+    assert (
+        "session redir-cli-d was summarized → the work continues in redir-cli-e. "
+        "Re-run with --name redir-cli-e to continue there."
+        in output
+    )
 
 
 def test_a_plain_new_chat_does_not_follow_anything(monkeypatch) -> None:
@@ -389,7 +396,9 @@ def test_a_plain_new_chat_does_not_follow_anything(monkeypatch) -> None:
     assert "was summarized" not in output
 
 
-def test_a_tui_message_moves_the_conversation_and_keeps_the_input() -> None:
+def test_a_tui_message_moves_the_conversation_and_keeps_the_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Given: a TUI pinned to a summarized session, mid-chain A→B→C
     async def body() -> None:
         session_store.create("redir-tui-a")
@@ -398,21 +407,25 @@ def test_a_tui_message_moves_the_conversation_and_keeps_the_input() -> None:
         session_store.set_redirect("redir-tui-a", "redir-tui-b")
         session_store.set_redirect("redir-tui-b", "redir-tui-c")
         app = ChatTUI()
-        app = ChatTUI()
+        turns: list[dict[str, Any]] = []
         async with app.run_test(size=(120, 32)) as pilot:
             await pilot.pause()
             tui_harness.pin_session(app, "redir-tui-a")
             # And: the user typed a message and submitted it
+            tui_harness.stub_run_chat(monkeypatch, turns)
             app.on_chat_input_submitted(ChatInput.Submitted("keep going"))
+            await pilot.pause(0.05)
 
             # Then: the conversation moved to the FINAL session, the notice is
             # on screen naming the hop, the history was reloaded, and the
-            # submitted text survived in the input AND went to dispatch
+            # submitted text survived in the input — but was NOT sent: no
+            # turn ran, so the operator re-sends it from the final session
             assert app._pinned_session() == "redir-tui-c"
             assert app._input.text == "keep going"
+            assert turns == []
             texts = [tui_harness.row_text(r) for r in app._log.rows]
             assert any(
-                "session redir-tui-a was summarized → moved to redir-tui-c "
+                "session redir-tui-a was summarized → redirected to redir-tui-c "
                 "(via redir-tui-b). Continue here." in t
                 for t in texts
             ), texts

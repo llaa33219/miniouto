@@ -286,7 +286,7 @@ def _fail(message: str) -> typer.Exit:
 
 
 def _redirect_notice(final: str, chain: list[str]) -> str:
-    """The one line every interactive redirect prints, chain included.
+    """The line the ALARM delivery appends when a receiver was summarized.
 
     `chain` is the full hop path `resolve_redirect` walked, starting with the
     session the operator named; the intermediate stops are shown so a long
@@ -298,20 +298,27 @@ def _redirect_notice(final: str, chain: list[str]) -> str:
     return f"session {chain[0]} was summarized → continuing in {final}{via}"
 
 
-def _apply_session_redirect(session_name: str) -> str:
-    """Follow a summarization redirect to the FINAL session, or keep the name.
+def _apply_session_redirect(session_name: str) -> str | None:
+    """Resolve an interactive resume; a summarized one is handed over, not run.
 
     The interactive triggers (`-c`, `--alarms -c`) resolve the conversation
-    they were pointed at, not merely the file that names it: a summarized
-    session continues elsewhere, chains included, and the operator is told
-    where the work landed. Plain viewing never comes through here.
+    they were pointed at, chains included — and then STOP: the summarized
+    transcript is not the place to run a turn, and the queued messages are
+    not this invocation's to spend. The operator is told where the work
+    continues and how to reach it; `None` refuses the run (no session file,
+    no inbox drain, no model call). Plain viewing never comes through here.
     """
 
     final, chain = session_store.resolve_redirect(session_name)
     if len(chain) == 1:
         return session_name
-    typer.echo(_redirect_notice(final, chain))
-    return final
+    hops = chain[1:-1]
+    via = f" (via {', '.join(hops)})" if hops else ""
+    typer.echo(
+        f"session {chain[0]} was summarized → the work continues in {final}{via}. "
+        f"Re-run with --name {final} to continue there."
+    )
+    return None
 
 
 def _now() -> datetime.datetime:
@@ -807,11 +814,15 @@ def chat_cmd(
     session_name = _resolve_session(
         name, continue_session=continue_session, bg=bg, s=s
     )
-    # An INTERACTIVE resume follows a summarization redirect: `-c` names a
-    # conversation to rejoin, and the session that conversation moved into is
-    # the one worth continuing. A fresh/minted session never has a redirect,
-    # so a plain run pays one cheap `load` here and keeps its own name.
+    # An INTERACTIVE resume checks the summarization redirect: `-c` names a
+    # conversation to rejoin, and a summarized one continues elsewhere. The
+    # hand-over happens HERE — before any write, any inbox drain, any model
+    # call — so the refusal costs nothing and the queued messages survive
+    # for the re-run the notice tells the operator to make. A fresh/minted
+    # session never has a redirect, so a plain run keeps its own name.
     session_name = _apply_session_redirect(session_name)
+    if session_name is None:
+        return
 
     # The STYLE is pinned per session, like the model: an explicit `--style`
     # wins, then this session's pin, then the global default. Reading the
