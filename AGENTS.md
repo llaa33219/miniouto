@@ -17,7 +17,7 @@
 
 Three principles from `README.md`: **Minimalism** (no bloat — extend with styles), **Automation-friendly** (full CLI, TUI optional), **Fluidity** (adapts to any environment).
 
-**Version**: `0.12.8` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
+**Version**: `0.12.9` (alpha). **Python**: `>=3.10`. **Build**: `hatchling`. **Console script**: `miniouto = "miniouto.cli:app"`.
 
 ---
 
@@ -422,7 +422,7 @@ Grouping is a presentation concern: the TUI session picker renders two `Selectio
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | `__version__ = "0.12.8"` |
+| `__init__.py` | `__version__ = "0.12.9"` |
 | `__main__.py` | `python -m miniouto` — same entrypoint as the console script (this is how a `--bg` child re-enters the command) |
 | `paths_runtime.py` | `INVOCATION_CWD: Path` (captured cwd at import, used by every tool to absolutize relative paths) |
 | `cli/__init__.py` | Typer `app`, root callback (TUI fallback), `status` command |
