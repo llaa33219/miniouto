@@ -64,18 +64,19 @@ Rules:
 
 ## Dynamic tokens
 
-Five tokens are substituted into every style body at system-prompt assembly, by `core/runtime.py:expand_prompt_tokens`:
+Six tokens are substituted into every style body at system-prompt assembly, by `core/runtime.py:expand_prompt_tokens`:
 
 | Token | Expands to |
 |---|---|
 | `{cwd}` | the directory miniouto was invoked from — `paths_runtime.INVOCATION_CWD`, captured at import, so it is stable for the whole process |
-| `{skills}` | the lazy-load skill catalog for the **default roots**: the invocation directory's `./skills/` **first**, then `~/.agents/skills` |
-| `{skills:<dir>[,<dir>…]}` | the same catalog merged from the named roots (an empty argument — bare `{skills}` or `{skills:}` — means the two default roots above), comma-separated, in the order listed. `~` is expanded; a relative path resolves against `INVOCATION_CWD`, so a style can point at `./skills`. Missing or unreadable roots are skipped silently; entries are ordered by root order then name; a name present in two roots appears twice, each line naming its own root; nothing found → the empty string |
+| `{skills}` | the lazy-load skill catalog for the **default roots**: the invocation directory's `./skills/` **first**, then `~/.agents/skills`  Rendered once per process and served from the same stat-signature cache as `{skills:…}` — an unchanged tree costs no re-parse. |
+| `{skills:<dir>[,<dir>…]}` | the same catalog merged from the named roots (an empty argument — bare `{skills}` or `{skills:}` — means the two default roots above), comma-separated, in the order listed. `~` is expanded; a relative path resolves against `INVOCATION_CWD`, so a style can point at `./skills`. Missing or unreadable roots are skipped silently; entries are ordered by root order then name; a name present in two roots appears twice, each line naming its own root; nothing found → the empty string  The rendered catalog is memoized per-process on a stat signature of the roots' SKILL.md files (name, mtime_ns, size) — an unchanged tree costs a shallow stat walk and no re-parse; any add/remove/rewrite refreshes it. |
 | `{this_session}` | this run's own session name — `runtime.session`, or `"default"` when it is empty |
 | `{style}` | the resolved style name — `runtime.style_name` |
 | `{subagent_pm}` | the effective subagent provider config in `--pm` form — `PROVIDER/MODEL` or `PROVIDER/MODEL:REASONING`. Resolved from the **subagent trio** (`session_config`'s `subagent_provider` / `subagent_model` / `subagent_reasoning`, else the `settings.subagent_*` global default, falling back to outo's own provider/model/reasoning per key). Left **literal** when the trio does not resolve |
+| `{file:<path>}` | the CURRENT content of that file, embedded verbatim — rendered once and served from a per-process cache until the file's (mtime_ns, size) changes, then re-read. The path resolves against `INVOCATION_CWD` (`~` expanded; absolute paths read as-is); the primary use is baking `AGENTS.md` into the prompt so project rules are in force without relying on the model to read them. No fence or header is added — the style author owns the layout. A missing file, a directory, a non-regular file (FIFO/device), or unreadable/non-UTF-8 content expands to a one-line notice naming the path (the turn never fails); the read is bounded at the cap, so even a huge regular file costs at most `FILE_TOKEN_MAX_CHARS + 1` characters; an empty file embeds nothing; content over `FILE_TOKEN_MAX_CHARS = 1_000_000` characters keeps its head plus a truncation notice. Bare `{file}` / `{file:}` are not tokens and stay literal |
 
-Six spellings, five tokens: `{skills}` is the no-argument form of `{skills:…}`, and a bare `{skills:}` means the same thing — both default to the **two** default roots, local before global.
+Seven spellings, six tokens: `{skills}` is the no-argument form of `{skills:…}`, and a bare `{skills:}` means the same thing — both default to the **two** default roots, local before global. `{file:…}` has no no-argument form — a path is required.
 
 Three representative configurations:
 
@@ -87,8 +88,8 @@ Three representative configurations:
 
 Rules:
 
-- Substitution happens per body: **both** the `<outo>` body **and** every role body, on every turn (nothing is persisted).
-- **Order matters.** The parameterized `{skills…}` regex pass runs **first** (the catalog text itself contains braces), then the plain `str.replace` passes: `{cwd}`, then `{this_session}` and `{style}`, then `{subagent_pm}`. `{subagent_pm}` is only resolved when the token is still present after the earlier passes.
+- Substitution happens per body: **both** the `<outo>` body **and** every role body, on every turn (nothing is persisted); the {file:…} and {skills:…} renders are cached per-process and invalidated on source change, so an unchanged source yields a byte-stable prompt.
+- **Order matters.** The `{file:…}` regex pass runs **first and stashes** each embed behind a per-call brace-free placeholder (`\x00mo-file-<uuid>-<index>\x00`); then the `{skills…}` regex pass; then the plain `str.replace` passes (`{cwd}`, then `{this_session}` and `{style}`, then `{subagent_pm}` — only resolved when still present); then ONE final regex restores the placeholders verbatim (`re.sub` never rescans its replacements). No content-bearing pass ever re-scans another's output: an embedded rules file quoting a literal `{cwd}` stays verbatim, and a `{file:…}` inside a skill description or a substituted value stays literal instead of pulling file content into the prompt. The model never sees a placeholder.
 - **A body with no tokens simply has no cwd and no skills.** There is no compatibility fallback and no implicit layer — the layout is yours.
 - **Any other `{...}` text is left verbatim.** There is no escape mechanism, and an unknown token is not an error — so `{brief}` or a JSON-looking brace in your prose is safe.
 - **The model never sees the token syntax.** By the time the prompt reaches the model, the recipe line reads as a fully literal, copy-ready command. That is the point: the delegated command line is run through `Bash`, so it must be the same command every time it is typed, from any agent, in any session.
@@ -145,10 +146,10 @@ The five bundled templates live in `src/miniouto/default_style/`. They are seede
 | File | Size | Persona | Orchestrator? |
 |---|---|---|---|
 | `default.md` | ~15 KB | "**outo**" — minimal, sparse | No (deliberately) |
-| `coding.md` | ~4.7 KB | "**outo**" — expert coding agent, minimal ruleset | Light (delegation for non-trivial work) |
-| `coding-pro.md` | ~38 KB | "**pro**" — senior staff engineer orchestrator | **Aggressive** (with a delegate-vs-DIY decision framework) |
-| `coding-work.md` | ~49 KB | "**coding-work**" — pragmatic senior engineer orchestrator | **Aggressive but proportionate** (one subagent per slice, one reviewer when warranted) |
-| `coding-ultra.md` | ~90 KB | "**ultra**" — relentless MAX-mode execution orchestrator | **Aggressive** (layered subagent fan-out, best-of-N editors, multi-focus review) |
+| `coding.md` | ~5.9 KB | "**outo**" — expert coding agent, minimal ruleset | Light (delegation for non-trivial work) |
+| `coding-pro.md` | ~57 KB | "**pro**" — senior staff engineer orchestrator | **Aggressive** (with a delegate-vs-DIY decision framework) |
+| `coding-work.md` | ~83 KB | "**coding-work**" — pragmatic senior engineer orchestrator | **Aggressive but proportionate** (one subagent per slice, one reviewer when warranted) |
+| `coding-ultra.md` | ~137 KB | "**ultra**" — relentless MAX-mode execution orchestrator | **Aggressive** (layered subagent fan-out, best-of-N editors, multi-focus review) |
 
 `coding-pro.md`, `coding-work.md`, and `coding-ultra.md` include explicit guidance on when and how to delegate, taught entirely as **Bash recipes** (`miniouto chat "<brief>" --style {style} --role <tag> --pm {subagent_pm} [--bg --alarm-session {this_session}] --return` — the tokens expand per run, see [Dynamic tokens](#dynamic-tokens)); `default.md` and `coding.md` compress the same mechanic to one or two lines.
 
@@ -172,22 +173,22 @@ Key points:
 
 ### `coding.md`: expert coding agent, minimal
 
-A deliberately terse style (~1.6 KB) — an "expert coding agent" persona with
+A deliberately terse style (~5.9 KB) — an "expert coding agent" persona with
 only the load-bearing rules. Both halves are a short ruleset:
 
 - **Identity**: "expert coding agent. Be precise, minimal, and verified."
-The `default.md` orchestrator and the three detailed coding orchestrators distinguish independent work from waiting. After a `--bg` delegation with `--alarm-session`, do independent work while it is useful. When none remains, say you will wait for the completion message and **end the turn**, rather than polling status files, logs, the inbox, or the result file (or using `sleep`). A TUI inbox poll or `chat --alarms -c` wakes the session; then read the named result and verify it.
-
-For the three detailed coding styles, the strengthened contract above is explicit: the waiting assistant response is user-facing plain text with **no tool call**, names the pending run, and is not a final task report. Continue only with real work that needs no pending result; a dependent edit, brief, review, validation, or synthesis means stop and wait. Partial alarms resume only the work they unblock. Nested role prompts carry the same exception to their ordinary final-message contract. `coding.md` is unchanged.
-  files only), and `rwe edit` for UTF-8 text, with hexadecimal
+- **Tools**: `rwe read` / `rwe write` (new files only), and `rwe edit` for UTF-8 text, with hexadecimal
   original-line addresses and a fresh read after each edit. If `rwe` is
   absent, coding uses `uvx --from read-write-edit-tools rwe ...` rather
   than installing it. Bash handles search, commands, and deletion;
   delegation remains `miniouto chat` through Bash.
-- **Seven rules** (outo half): follow matching skills; read before editing
-  and follow project conventions; smallest change; verify with real
-  commands and never fabricate; fetch web content instead of recalling it;
-  ask before destructive/ambiguous moves; match the user's language.
+- **Eight rules** (outo half): follow matching skills (from the root that
+  listed them — project-local `./skills/` and `./.agents/skills/` before the
+  global `~/.agents/skills/`); read before editing and follow project
+  conventions (AGENTS.md is embedded in the prompt when present); smallest
+  change; verify with real commands and never fabricate; fetch web content
+  instead of recalling it; ask before destructive/ambiguous moves; match the
+  user's language; summarize explicitly on the context-budget alarm.
 - **Six rules** (single legacy `<subagent>` block, named `"subagent"`): same core — brief is the whole spec, read first, rwe-based text work with the same ephemeral `uvx` fallback, verified reporting (files changed, commands + output, blockers), no unauthorized destructive actions, match the brief's language.
 
 ### `coding-pro.md`: senior staff engineer orchestrator
@@ -382,6 +383,14 @@ Re-seeds all bundled styles from the miniouto package (same force-refresh that `
 ### Skills guidance in bundled styles
 
 The larger templates (`default.md`, `coding-pro.md`, `coding-work.md`, `coding-ultra.md`) include a **Skills — MANDATORY first check** section in their `<outo>` half (immediately before the tools list) and a mirror section in each named subagent's tag body as applicable. It instructs the agent to scan the skill catalog injected into its context (a name + one-line description listing, sourced from the default roots — the project's `./skills/` and `~/.agents/skills/`) before starting any work, and — when a skill matches the work's domain — to `cat` that skill's SKILL.md (and any files it references) and follow it as the primary workflow, taking precedence over the style's default workflow. It also tells the agent to name the matching skill in the delegation brief so the subagent follows it too. The minimal `coding.md` compresses this to a single rule ("if a listed skill matches the work, read its SKILL.md and follow it") in each role's prompt. Keep some form of this guidance when authoring a custom style; it is what makes installed skills actually get used.
+
+### AGENTS.md guidance in bundled styles
+
+`coding-pro.md` and `coding-work.md` state that **`AGENTS.md` is read-only by default**: follow it, and modify it only on the user's explicit request in the conversation or when the file itself explicitly authorizes agent edits (a written self-update rule); a wrong or stale rule is surfaced in the report, never silently rewritten. The same protection covers the other instruction files (`AGENT.md`, `CLAUDE.md`, …). All four coding styles (`coding.md`, `coding-pro.md`, `coding-work.md`, `coding-ultra.md`) now **bake `{file:AGENTS.md}` into their outo bodies** (coding.md into both bodies), framed as explicitly-labelled AGENTS.md content: a 'What AGENTS.md is' explanation (project-root instructions — description, rules, cautions), the read-only-by-default rule (edit only on the user's explicit request or a written self-edit guide in the file), and a 'not found' notice means the project has no AGENTS.md. The token reads the file fresh whenever it changes (render-cached between changes); embedded content is in force exactly as if read. A style author can embed any other project file the same way.
+
+### Minimal-work guidance in bundled styles
+
+`coding-pro.md` and `coding-work.md` carry an explicit **work only the needed parts — never stretch short work into long work** rule: the failure mode is a task that could finish in two commands being inflated into extra passes, extra agents, extra checks, and a long report — not a long answer about a genuinely large task. Each step must still be needed; when the deliverable is done and verified, stop. The communication sections add the matching reply ceiling: answer at the size of the question, never re-narrate the transcript. The `editor` role bodies carry the same discipline (no extra passes, no extra polish, no unrequested improvements) and the AGENTS.md read-only rule.
 
 ### Web access guidance in bundled styles
 

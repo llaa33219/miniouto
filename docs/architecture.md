@@ -26,7 +26,7 @@ From `README.md`:
 
 ```
 src/miniouto/
-├── __init__.py              # __version__ = "0.12.7"
+├── __init__.py              # __version__ = "0.12.8"
 ├── paths_runtime.py         # INVOCATION_CWD: Path  (captured cwd at import)
 ├── cli/                     # Typer commands + xnano TUI (cli/tui/ package)
 ├── core/                    # Chat loop + runtime assembly + event sinks
@@ -185,7 +185,7 @@ Each style file is parsed by `storage.styles.parse_style(content) -> tuple[str, 
 The **delegation surface itself is not conditional**: `Bash` is always registered, so a delegated `miniouto chat --role <tag>` run is reachable from the model in every style. What a style controls is only which role bodies exist.
 
 ### 3. Prompt assembly: the token-expanded style body
-The system prompt **is** the `<outo>` section of the active style (or the whole-document fallback) with its tokens expanded by `core.runtime.expand_prompt_tokens` — `{cwd}`, `{skills}`, `{skills:<dir>…}`, `{this_session}`, `{style}`, `{subagent_pm}`. Nothing else is prepended: the old cwd preamble and the implicit skill catalog are gone, so the working directory and the skill listing appear exactly where the style puts them (or not at all).
+The system prompt **is** the `<outo>` section of the active style (or the whole-document fallback) with its tokens expanded by `core.runtime.expand_prompt_tokens` — `{cwd}`, `{skills}`, `{skills:<dir>…}`, `{file:<path>}`, `{this_session}`, `{style}`, `{subagent_pm}`. Nothing else is prepended: the old cwd preamble and the implicit skill catalog are gone, so the working directory and the skill listing appear exactly where the style puts them (or not at all).
 
 A role run (`chat --role <tag>`) is that tag's body through the same expansion call — assembled by the same `build_runtime`, so there is no second assembly path to drift.
 

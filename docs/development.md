@@ -160,9 +160,9 @@ Releases are published automatically by `.github/workflows/release.yml`. Push a 
 $EDITOR pyproject.toml
 
 # 2. Commit and tag
-git commit -am "v0.12.7"
-git tag v0.12.7
-git push origin v0.12.7
+git commit -am "v0.12.8"
+git tag v0.12.8
+git push origin v0.12.8
 ```
 
 The workflow triggers on any `v*` tag. It builds the wheel + sdist with `uv build`, then publishes to PyPI using OIDC trusted publishing (no API token in the repo).

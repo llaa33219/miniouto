@@ -537,7 +537,7 @@ Before (two extra layers on top of every body):
 After (the body alone; the style decides the layout):
 
 ```
-<the style body, with {cwd} / {skills} / {skills:…} / {this_session} / {style} / {subagent_pm} expanded>
+<the style body, with {cwd} / {skills} / {skills:…} / {file:…} / {this_session} / {style} / {subagent_pm} expanded>
 ```
 
 A body naming no tokens tells the model no working directory and no skills, which is a legitimate choice. Both the outo body and every role body go through the same call, so there is no second assembly path. See `docs/styles.md` § Dynamic tokens for the per-token rules and `AGENTS.md` invariant 3 for the invariant form.

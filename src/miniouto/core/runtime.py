@@ -14,8 +14,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import os
 import re
+import stat
 import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -1109,42 +1112,242 @@ def _read_raw_style(name: str, overrides: dict[str, str] | None) -> str:
 
 
 _SKILLS_TOKEN = re.compile(r"\{skills(?::([^}]*))?\}")
+_FILE_TOKEN = re.compile(r"\{file:([^}]+)\}")
+
+# One `{file:...}` embed must not eat the context window whole. Referenced
+# bare inside `_replace_file_token`, so a test can retune it.
+FILE_TOKEN_MAX_CHARS = 1_000_000
+
+# Render caches for the two content-bearing tokens. Per-process, never
+# persisted, keyed by RESOLVED path / resolved roots tuple; the value's
+# leading members are the invalidation key, so a hit needs one stat() (file)
+# or one shallow stat walk (skills) and NO read. They exist so an unchanged
+# source is not re-read/re-parsed on every turn; a changed source (mtime_ns
+# or size moved) is re-read and re-stored. `clear_token_render_caches()` is
+# the test seam — production never calls it.
+_FILE_RENDER_CACHE: dict[Path, tuple[int, int, str]] = {}
+_SKILLS_RENDER_CACHE: dict[tuple[Path, ...], tuple[tuple, str]] = {}
+
+
+def clear_token_render_caches() -> None:
+    """Drop both token render caches (mirror of `clear_model_cache`)."""
+    _FILE_RENDER_CACHE.clear()
+    _SKILLS_RENDER_CACHE.clear()
 
 
 def expand_prompt_tokens(text: str, *, session: str, style: str) -> str:
     """Substitute the style tokens into a style body.
 
     `{cwd}` becomes the invocation directory, `{skills}` (or
-    `{skills:dir,dir}`) the lazy-load skill catalog, `{this_session}` the
-    run's own session name, `{style}` the resolved style name, and
-    `{subagent_pm}` the EFFECTIVE subagent provider config rendered in the
-    `--pm` spelling (`PROVIDER/MODEL[:REASONING]`) — so a style can teach a
-    delegation command whose values vary per run while the model still copies
-    a fully literal command (Bash idempotency) — it never sees the token
-    syntax. Expansion is plain `str.replace` (plus one regex pass for the
-    parameterized `{skills:...}` form) on the style-derived body, applied to
-    the outo body AND every role body. Any other `{...}` text is left
-    verbatim — there is no escape mechanism and an unknown token is not an
-    error.
+    `{skills:dir,dir}`) the lazy-load skill catalog, `{file:path}` the
+    CURRENT content of that file — read fresh whenever its (mtime_ns, size)
+    changes and served from the render cache between changes, so a style
+    can bake a rules file (typically AGENTS.md) into the prompt,
+    `{this_session}` the run's own session name, `{style}` the resolved
+    style name, and `{subagent_pm}` the EFFECTIVE subagent provider config
+    rendered in the `--pm` spelling (`PROVIDER/MODEL[:REASONING]`) — so a
+    style can teach a delegation command whose values vary per run while
+    the model still copies a fully literal command (Bash idempotency) — it
+    never sees the token syntax. Any other `{...}` text is left verbatim —
+    there is no escape mechanism and an unknown token is not an error.
+
+    Pass order: the `{file:...}` pass runs FIRST, but each match's
+    replacement is stashed behind a per-call unique placeholder instead of
+    being spliced in; then the `{skills...}` regex pass, then the plain
+    replaces (`{cwd}`, `{this_session}`/`{style}`, `{subagent_pm}`);
+    finally ONE regex pass restores the placeholders. A placeholder is
+    `\x00mo-file-<uuid>-<index>\x00` — it contains no braces, so no later
+    pass can match or rewrite it, and the stashed content is invisible to
+    every later pass.
+
+    This is the only arrangement where (a) embedded file content is never
+    re-scanned by ANY later pass — the old "file pass LAST" slot still let
+    the plain replaces' inputs (catalog text, session/style/pm values)
+    carry `{file:...}` into the file pass — and (b) the catalog and the
+    substituted values can never trigger a file embed: a `{file:...}`
+    inside an untrusted project skill's description stays literal instead
+    of pulling that file's content into the system prompt. The restoration
+    pass is safe because `re.sub` never rescans its replacements, so the
+    embedded content goes back verbatim. The model never sees a
+    placeholder: restoration completes before the prompt is assembled.
+    Grammar limitation, same as `{skills:...}`: a path containing `}` ends
+    the token at the first `}`.
 
     The catalog is a *catalog*: skill bodies are never injected, the model
     reads the matching SKILL.md via Bash when a task calls for it.
     """
 
+    # The `{file:...}` pass runs FIRST and STASHES its results: the callback
+    # never returns content, only a placeholder naming the list slot the
+    # content went into. Every pass below then operates on text whose file
+    # embeds are already replaced by brace-free markers.
+    prefix = "\x00mo-file-" + uuid.uuid4().hex + "-"
+    embedded: list[str] = []
+
+    def _stash_file_token(match: re.Match[str]) -> str:
+        embedded.append(_replace_file_token(match))
+        return prefix + str(len(embedded) - 1) + "\x00"
+
+    text = _FILE_TOKEN.sub(_stash_file_token, text)
     text = _SKILLS_TOKEN.sub(_replace_skills_token, text)
     text = text.replace("{cwd}", str(INVOCATION_CWD))
     text = text.replace("{this_session}", session).replace("{style}", style)
-    if "{subagent_pm}" not in text:
-        return text
-    subagent_pm = _effective_subagent_pm(session)
-    # An unresolvable provider/model leaves the token LITERAL (same rule as
-    # any unknown token) — a half-filled `--pm` would be a malformed command
-    # for the model to copy.
-    return text.replace("{subagent_pm}", subagent_pm) if subagent_pm else text
+    if "{subagent_pm}" in text:
+        subagent_pm = _effective_subagent_pm(session)
+        # An unresolvable provider/model leaves the token LITERAL (same rule as
+        # any unknown token) — a half-filled `--pm` would be a malformed command
+        # for the model to copy.
+        text = text.replace("{subagent_pm}", subagent_pm) if subagent_pm else text
+    # Restore the stashed embeds in ONE pass: `re.sub` never rescans its
+    # replacements, so the embedded content is spliced back verbatim — brace
+    # text inside it can never be re-expanded. A forged out-of-range index
+    # (text that merely looks like a placeholder) stays literal.
+    return re.sub(
+        re.escape(prefix) + r"(\d+)\x00",
+        lambda m: embedded[int(m.group(1))] if int(m.group(1)) < len(embedded) else m.group(0),
+        text,
+    )
+
+
+def _replace_file_token(match: re.Match[str]) -> str:
+    """The CURRENT content of the file a `{file:...}` token names, verbatim.
+
+    The file is read HERE, at substitution time, and the render memoized in
+    `_FILE_RENDER_CACHE` keyed by the resolved path: an unchanged file costs
+    one stat() per turn, a changed one is re-read and re-cached (the token
+    exists so a style can bake a rules file into the prompt without
+    trusting the model to read it). The
+    path is required — `{file}` and `{file:}` are not tokens — `~` is
+    expanded via `os.path.expanduser`, which leaves an unknown user's `~`
+    ALONE instead of raising, so `~nosuchuser/...` is simply a path that is
+    not there, and a relative path resolves against INVOCATION_CWD: the
+    module-level name, read at call time, mirroring `_resolve_skill_roots`.
+
+    Only a REGULAR file is read — one `stat()` call decides, so a FIFO
+    (whose open blocks) or a character device (`/dev/zero`, whose read never
+    ends) becomes a notice instead of hanging the turn. The read is bounded
+    at FILE_TOKEN_MAX_CHARS + 1 characters, so even a huge regular file
+    costs at most the cap rather than the whole file.
+
+    A bad path NEVER fails the turn: the replacement becomes a one-line
+    notice naming the resolved path instead of content. An empty file
+    legitimately embeds the empty string. Oversized content keeps its head
+    plus a truncation notice — never a silent cut.
+    """
+
+    arg = match.group(1).strip()
+    path = Path(os.path.expanduser(arg))
+    if not path.is_absolute():
+        path = INVOCATION_CWD / path
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return f"[style file token: '{path}' not found — no content embedded]"
+    except (OSError, ValueError):
+        return (
+            f"[style file token: '{path}' could not be read as UTF-8 text"
+            " — no content embedded]"
+        )
+    if stat.S_ISDIR(info.st_mode):
+        return f"[style file token: '{path}' is a directory — no content embedded]"
+    if not stat.S_ISREG(info.st_mode):
+        return (
+            f"[style file token: '{path}' is not a regular file"
+            " — no content embedded]"
+        )
+    # Cache gate — nanosecond mtime + size is the standard cheap
+    # invalidator (same pair ccache/make-style systems use): it detects any
+    # real edit while costing one stat(), which we already paid for the
+    # regular-file gate above. The residual trap — a rewrite landing in the
+    # SAME nanosecond with the SAME byte count — is not a realistic editor
+    # behavior, and hashing instead would re-read every turn, defeating the
+    # cache entirely. Notices from the gates above are never cached: only a
+    # successfully rendered embed is.
+    stamp = (info.st_mtime_ns, info.st_size)
+    cached = _FILE_RENDER_CACHE.get(path)
+    if cached is not None and cached[0] == stamp[0] and cached[1] == stamp[1]:
+        return cached[2]
+    try:
+        with path.open(encoding="utf-8") as f:
+            content = f.read(FILE_TOKEN_MAX_CHARS + 1)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return (
+            f"[style file token: '{path}' could not be read as UTF-8 text"
+            " — no content embedded]"
+        )
+    if len(content) > FILE_TOKEN_MAX_CHARS:
+        render = (
+            content[:FILE_TOKEN_MAX_CHARS]
+            + f"\n[style file token: '{path}' truncated at {FILE_TOKEN_MAX_CHARS}"
+            " characters — read the file for the rest]"
+        )
+    else:
+        render = content
+    _FILE_RENDER_CACHE[path] = (stamp[0], stamp[1], render)
+    return render
+
+
+def _skills_signature(roots: tuple[Path, ...]) -> tuple | None:
+    """A cheap change-detector for a skills-roots tuple: stats, never parses.
+
+    Mirrors `storage/skills.py`'s discovery shape closely enough to detect a
+    change: for each root that is a directory, its sorted subdirectories,
+    each subdir carrying a SKILL.md stat()'d to (name, mtime_ns, size).
+    Everything a catalog render depends on moves the signature — a skill
+    added or removed, a SKILL.md rewritten, a rename, a root appearing or
+    vanishing. Hidden skills are INCLUDED on purpose: their SKILL.md stats
+    too, so toggling `hidden:` still refreshes the catalog — the cost is one
+    extra fresh render on an invisible edit, never a stale render on a
+    visible one. The RENDER itself still comes from `skill_store.list_skills`,
+    whose visibility filtering is untouched.
+
+    `None` means "could not walk" (any OSError mid-iteration): the caller
+    treats that as a miss and deliberately stores nothing for a tree it
+    cannot see, so an unreadable root re-renders instead of pinning a
+    catalog nobody can verify.
+    """
+
+    walked: list[tuple[Path, tuple[tuple[str, int, int], ...]]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            return None
+        per_root: list[tuple[str, int, int]] = []
+        for skill_dir in entries:
+            if not skill_dir.is_dir():
+                continue
+            try:
+                info = (skill_dir / "SKILL.md").stat()
+            except OSError:
+                continue
+            per_root.append((skill_dir.name, info.st_mtime_ns, info.st_size))
+        walked.append((root, tuple(per_root)))
+    return tuple(walked)
 
 
 def _replace_skills_token(match: re.Match[str]) -> str:
-    return _skills_catalog(_resolve_skill_roots(match.group(1)))
+    """The catalog for the named roots, memoized on the tree's stat signature.
+
+    The signature walk costs a handful of stat() calls and parses no
+    SKILL.md; a match returns the stored render without touching
+    `skill_store.list_skills` at all. The `{skills...}` slot itself is
+    unchanged — same roots resolution, same render, pass order intact.
+    """
+
+    roots = _resolve_skill_roots(match.group(1))
+    key = tuple(roots)
+    signature = _skills_signature(key)
+    if signature is not None:
+        cached = _SKILLS_RENDER_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+    render = _skills_catalog(roots)
+    if signature is not None:
+        _SKILLS_RENDER_CACHE[key] = (signature, render)
+    return render
 
 
 def _resolve_skill_roots(arg: str | None) -> list[Path]:
@@ -1174,6 +1377,9 @@ def _skills_catalog(roots: list[Path]) -> str:
     the catalog entirely rather than advertised to the model. A name present
     in two roots appears twice: the two entries live at distinct paths, and
     each line names the root it came from when there is more than one.
+
+    In the token slot this render is memoized by `_replace_skills_token`'s
+    stat-signature cache; rendered standalone it reads fresh every call.
     """
 
     entries = [(skill, root) for root in roots for skill in skill_store.list_skills(root)]

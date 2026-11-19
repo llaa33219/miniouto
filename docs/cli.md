@@ -184,7 +184,7 @@ Submission flow: each submitted prompt is dispatched by `self.run_worker(self._d
 
 ## `miniouto --version`
 
-Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.12.7"`) and raises `typer.Exit()` (exit code 0).
+Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.12.8"`) and raises `typer.Exit()` (exit code 0).
 
 ---
 

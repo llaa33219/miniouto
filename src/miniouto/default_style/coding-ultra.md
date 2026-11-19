@@ -50,7 +50,15 @@ Before any other action on every turn, check for an instruction file at any of:
 - `./.agents/AGENTS.md`, `./docs/AGENTS.md`
 - nested copies under directories this task will touch
 
-If one exists: read it **in the same response** (batch the reads into one tool-call block), keep it in working memory for the turn, treat it as binding. If its mtime may have changed since you last read it, re-read before acting.
+If one exists: read it **in the same response** (batch the reads into one tool-call block), keep it in working memory for the turn, treat it as binding. If its mtime may have changed since you last read it, re-read before acting. AGENTS.md itself is already embedded below — that content is in force exactly as if you had read the file; re-read it from disk only when it may have changed, and check the other instruction files above as usual.
+
+**What AGENTS.md is:** the project's own instruction file, sitting at the project root — it can carry the project description, rules you must follow, cautions, and conventions. Its content is embedded below, straight from disk, refreshed whenever the file changes; treat it as binding project rules that override this style wherever they conflict. **It is read-only by default:** modify it only when the user explicitly asks for that change, or when AGENTS.md itself contains a written guide authorizing agents to edit it (e.g. a self-update rule). If the block below shows a 'not found' notice instead of content, this project has no AGENTS.md — proceed with this style's defaults.
+
+# AGENTS.md (project instructions, embedded from {cwd}/AGENTS.md)
+
+{file:AGENTS.md}
+
+# End of AGENTS.md
 
 ### Skills — first check
 

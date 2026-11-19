@@ -317,3 +317,74 @@ def test_classification_is_nature_based_not_size_based() -> None:
     assert "bug fix that needs debugging or functional testing is NOT trivial" in ultra
     assert "one-file bug fix needing debugging or functional testing" in ultra
     assert "an already-known, obvious local answer or edit" not in ultra
+
+
+@pytest.mark.parametrize("style", ("coding-pro", "coding-work"))
+def test_agents_md_is_read_only_and_embedded_instruction_files_are_binding(style: str) -> None:
+    body = _body(style)
+
+    assert "**`AGENTS.md` is read-only by default.**" in body
+    assert "the user explicitly asks" in body
+    assert "the file itself explicitly authorizes" in body
+    assert "never silently rewrite it" in body
+    assert "in force exactly as if you had read the file" in body
+    assert "fresh whenever it changes" in body
+
+
+@pytest.mark.parametrize("style", ("coding-pro", "coding-work"))
+def test_styles_forbid_stretching_short_work_into_long_work(style: str) -> None:
+    body = _body(style)
+
+    assert "Work only the needed parts — never stretch short work into long work" in body
+    assert "could have been finished in two commands" in body
+    assert "do not keep working to look thorough" in body
+    assert "Answer at the size of the question." in body
+
+
+@pytest.mark.parametrize("style", ("coding-pro", "coding-work"))
+def test_editor_roles_do_only_what_the_brief_needs(style: str) -> None:
+    body = _body(style, "editor")
+
+    assert "no extra passes, no extra polish, no unrequested improvements" in body
+    assert "read-only unless the brief explicitly authorizes" in body
+
+
+CODING_STYLE_FAMILY = ("coding", "coding-pro", "coding-work", "coding-ultra")
+DETAILED_STYLE_FAMILY = ("coding-pro", "coding-work", "coding-ultra")
+EMBEDDED_TOKEN = "{file:AGENTS.md}"
+PROJECT_LOCAL_SKILLS = "{skills:./skills,./.agents/skills,~/.agents/skills}"
+
+
+@pytest.mark.parametrize("style", CODING_STYLE_FAMILY)
+def test_every_coding_style_embeds_agents_md_from_disk(style: str) -> None:
+    assert EMBEDDED_TOKEN in _body(style)
+
+
+@pytest.mark.parametrize("style", CODING_STYLE_FAMILY)
+def test_every_coding_style_teaches_the_agents_md_read_only_rule(style: str) -> None:
+    body = _body(style)
+
+    assert "read-only" in body
+    assert "the user explicitly asks" in body or "the user asks" in body
+    assert "authorizes" in body
+
+
+@pytest.mark.parametrize("style", CODING_STYLE_FAMILY)
+def test_every_coding_style_teaches_what_a_missing_agents_md_means(style: str) -> None:
+    assert "not found" in _body(style)
+
+
+def test_minimal_coding_points_skill_roots_at_the_project_first() -> None:
+    for role in (None, "subagent"):
+        body = _body("coding", role)
+        assert PROJECT_LOCAL_SKILLS in body
+        assert "{skills}" not in body
+        assert "~/.agents/skills/<name>/SKILL.md" not in body
+
+
+@pytest.mark.parametrize("style", DETAILED_STYLE_FAMILY)
+def test_detailed_styles_frame_the_embedded_agents_md_block(style: str) -> None:
+    body = _body(style)
+
+    assert "# AGENTS.md (project instructions" in body
+    assert "# End of AGENTS.md" in body
