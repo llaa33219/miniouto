@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
 from ..storage import skills as skill_store
+from ._yaml import print_yaml
 
 app = typer.Typer(help="Manage agent skills.")
 console = Console()
@@ -14,26 +14,17 @@ console = Console()
 
 @app.command("list")
 def list_cmd() -> None:
-    """List all available skills."""
+    """List all available skills, as YAML."""
 
-    skills = skill_store.list_skills()
-    if not skills:
-        console.print(
-            f"[yellow]No skills found.[/yellow] Check "
-            f"{' or '.join(str(root) for root in skill_store.default_roots())}"
-        )
-        return
-
-    table = Table(title="Available Skills", show_header=True, header_style="bold")
-    table.add_column("Name", style="cyan")
-    table.add_column("Description")
-    table.add_column("Root", style="dim")
-
-    for skill in skills:
-        desc = skill.description[:80] + "..." if len(skill.description) > 80 else skill.description
-        table.add_row(skill.name, desc, str(skill.directory))
-
-    console.print(table)
+    skills = [
+        {
+            "name": skill.name,
+            "description": skill.description,
+            "directory": str(skill.directory),
+        }
+        for skill in skill_store.list_skills()
+    ]
+    print_yaml({"skills": skills})
 
 
 @app.command("show")

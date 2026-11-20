@@ -216,6 +216,48 @@ def test_a_plain_transition_publishes_the_new_active_session(
     assert settings_store.load().session == calls[-1].session
 
 
+def test_the_transition_records_the_marker_in_the_old_session_file(
+    fake: FakeSummary, calls: list[ChatOptions], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The OLD conversation is closed on disk, not only on stdout.
+
+    The TUI wrote this record itself (`_persist_handoff_marker`); the CLI now
+    owns it, so a reader that reloads the old session file — the TUI after a
+    file reload, a wrapper, plain viewing — sees the transition where it
+    happened instead of a transcript that just stops mid-work.
+    """
+
+    # Given: a turn that summarizes, with a real OLD session file on disk
+    monkeypatch.setattr(chat_mod, "run_chat", _summarizing(fake, calls))
+    old_session = "handoff-old-file"
+    session_store.begin_turn(old_session, "the work so far")
+    session_store.finish_turn(old_session, assistant="progress")
+
+    # When: the chain hands off
+    chat_mod.run_turn_chain(
+        ChatOptions(prompt="go", session=old_session), quiet=True,
+        state=chat_mod.ChainState(session=old_session),
+    )
+
+    # Then: the old session's file ends with a display turn holding ONE
+    # `handoff` event whose text is the marker — its own turn, so replay
+    # renders it below the final answer instead of above it
+    turns = session_store.load(old_session).turns
+    assert turns[-1].user == ""
+    assert turns[-1].status == session_store.STATUS_DONE
+    assert len(turns[-1].events) == 1
+    event = turns[-1].events[0]
+    assert event["actor"] == "outo"
+    assert event["kind"] == "handoff"
+    assert event["text"] == chat_mod.handoff_marker(
+        Handoff(
+            new_session=calls[1].session,
+            from_session=old_session,
+            summary_dir=SUMMARY_DIR,
+        )
+    )
+
+
 def test_the_marker_has_the_finish_marker_dash_shape() -> None:
     # Given: a pending hand-off
     handoff = Handoff(

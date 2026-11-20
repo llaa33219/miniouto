@@ -21,7 +21,6 @@ from typing import Any
 
 import pytest
 
-from miniouto.cli import tui as tui_module
 from miniouto.cli.tui import ChatTUI
 from miniouto.core import inbox
 from miniouto.core.inbox import ALARM_HEADER
@@ -74,20 +73,22 @@ def _assign_session(app: ChatTUI, name: str) -> None:
 
 
 def _stub_run_chat(monkeypatch: pytest.MonkeyPatch, prompts: list[str]) -> None:
-    """Stand in for the turn driver: record the prompt, persist the turn.
+    """Stand in for the chat child: record the prompt, persist the turn.
 
-    `run_chat` is what writes the turn record, so the stub does the same
-    two calls with the same `ChatOptions` fields the TUI passed — a turn's
-    `user` is then provably the prompt the TUI handed over.
+    The turn is a CLI subprocess now; the double intercepts the SPAWN
+    (``tui_harness.stub_run_chat``, which writes the same session record the
+    real CLI writes) and mirrors each recorded turn's prompt here — a turn's
+    ``user`` is then provably the prompt the TUI handed over. The alarm
+    wakeup's drain stays REAL (the double drains the inbox exactly as
+    ``chat --alarms`` does), which is what these tests exercise.
     """
 
-    def fake_run_chat(opts: Any, sink: Any = None) -> str:
-        prompts.append(opts.prompt)
-        session_store.begin_turn(opts.session, opts.prompt)
-        session_store.finish_turn(opts.session, assistant="")
-        return ""
+    def on_prompt(recorded: dict[str, Any]) -> None:
+        prompts.append(recorded["prompt"])
 
-    monkeypatch.setattr(tui_module, "run_chat", fake_run_chat)
+    import tui_harness
+
+    tui_harness.stub_run_chat(monkeypatch, [], on_session=None, on_prompt=on_prompt)
 
 
 async def _settle(pilot: Any, *, want: int, have: list[str]) -> None:
@@ -288,5 +289,143 @@ def test_a_plain_user_kind_message_is_delivered_without_a_banner(
             assert prompts == ["proceed with plan B"]
             assert ALARM_HEADER not in prompts[0]
             assert inbox.pending_count("inbox-user") == 0
+
+    asyncio.run(body())
+
+
+def test_a_concurrent_second_delivery_does_not_mount_the_row_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (the double alarm row): two overlapping deliveries.
+
+    The repro (real provider, scratch home): an external ``message insert``
+    lands, the 1 s poll's stat check kicks a ``_refresh_inbox`` worker, and
+    the poll timer itself fires again on the worker's cached listing — BOTH
+    reached ``_post_user`` before the wakeup child's ``--alarms`` drain
+    unlinked the files, so ``> [SYSTEM ALARM…]`` mounted twice. The wakeup
+    is not ``_dispatch``, so ``_busy`` was never set for it. The delivery
+    now claims ``_delivery_in_flight`` before mounting and holds it for the
+    whole wakeup turn (invariant 16: one wakeup per message).
+    """
+
+    import threading
+
+    import tui_harness
+    from miniouto.cli.tui import app as app_module
+    from miniouto.cli.tui.app import _inbox_signature
+
+    release = threading.Event()
+
+    class _GatedChild(tui_harness._FakeChatProcess):
+        """A wakeup child that holds the drain until the test releases it.
+
+        The double row needed the second poll to land BETWEEN the row mount
+        and the child's unlink of the message files — a fast fake child
+        closes that window before the second call can run.
+        """
+
+        def __init__(self, argv: list[str]) -> None:
+            super().__init__(argv)
+            self._argv = argv
+
+        def _render(self) -> bytes:  # the drain happens at spawn: hold it
+            from miniouto.core import inbox as inbox_api
+
+            session = self._parse()[1]
+            release.wait(timeout=10.0)
+            messages = inbox_api.drain(session)
+            prompt = "\n\n".join(m.text for m in messages)
+            session_store.begin_turn(session, prompt)
+            session_store.finish_turn(session, assistant="")
+            self.returncode = 0
+            out = f"------{session}------\n------finish------\n"
+            return out.encode("utf-8")
+
+    async def gated_exec(*argv: str, **_kwargs: Any) -> Any:
+        return _GatedChild(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            app_module.bridge, "asyncio_create_subprocess_exec", gated_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._log.remove_children()
+            app._reset_rows()
+            await pilot.pause()
+            _assign_session(app, "alarm-once")
+
+            # Given: a message waiting while the TUI is idle, already listed
+            # and cached — the state the `_refresh_inbox` worker leaves
+            # behind when the poll timer fires on its answer
+            _deliver(ALARM_TEXT, "alarm-once")
+            session = "alarm-once"
+            app._inbox_signature[session] = _inbox_signature(session)
+            app._inbox_cache[session] = [
+                {"id": "x", "text": ALARM_TEXT, "kind": inbox.ALARM_KIND}
+            ]
+
+            # When: the delivery mounts the row and starts the wakeup child
+            # (gated, so the files are NOT unlinked yet)…
+            app._deliver_pending_messages()
+            assert app._delivery_in_flight
+            assert inbox.pending_count(session) == 1
+            # …and a second entry runs inside that window — exactly the
+            # poll timer firing again on the cached listing
+            app._deliver_pending_messages()
+
+            # Then: the re-entry was a no-op — ONE user row while the claim
+            # is held, and the message is still queued for the child
+            rows = _prompt_rows(app)
+            assert len(rows) == 1, [_rendered(r) for r in app._window.rows]
+
+            # And when the child settles, the claim frees and one turn ran
+            release.set()
+            for _ in range(300):
+                await pilot.pause(0.02)
+                if not app._busy and not app._delivery_in_flight:
+                    break
+            assert not app._delivery_in_flight
+            assert inbox.pending_count(session) == 0
+            data = session_store.load(session)
+            assert [t.user for t in data.turns] == [ALARM_TEXT]
+            assert len(_prompt_rows(app)) == 1
+
+    asyncio.run(body())
+
+
+def test_a_back_to_back_second_poll_does_not_repeat_the_delivered_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The settled wakeup: a later poll finds an EMPTY inbox and a cleared claim."""
+
+    prompts: list[str] = []
+
+    async def body() -> None:
+        _stub_run_chat(monkeypatch, prompts)
+        app = ChatTUI()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._log.remove_children()
+            app._reset_rows()
+            await pilot.pause()
+            _assign_session(app, "alarm-idle-again")
+
+            # Given: one message, delivered once and settled
+            _deliver(ALARM_TEXT, "alarm-idle-again")
+            app._deliver_pending_messages()
+            await _settle(pilot, want=1, have=prompts)
+            await pilot.pause()
+            assert inbox.pending_count("alarm-idle-again") == 0
+            assert not app._delivery_in_flight
+
+            # When: the poll fires twice more (the cached listing is empty)
+            app._deliver_pending_messages()
+            app._deliver_pending_messages()
+            await pilot.pause()
+
+            # Then: nothing new — one row, one turn, the claim free
+            assert len(_prompt_rows(app)) == 1
+            assert len(prompts) == 1
+            assert not app._delivery_in_flight
 
     asyncio.run(body())

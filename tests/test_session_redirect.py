@@ -429,6 +429,11 @@ def test_a_tui_message_moves_the_conversation_and_keeps_the_input(
                 "(via redir-tui-b). Continue here." in t
                 for t in texts
             ), texts
+            # (the publish is a `config set --active-session` child on a worker)
+            for _ in range(400):
+                if settings_store.load().session == "redir-tui-c":
+                    break
+                await pilot.pause(0.05)
             assert settings_store.load().session == "redir-tui-c"
 
     asyncio.run(body())

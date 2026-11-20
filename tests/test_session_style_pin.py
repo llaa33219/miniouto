@@ -182,8 +182,10 @@ def test_the_tui_style_picker_pins_to_the_session(monkeypatch) -> None:
     """Picking a style in the TUI must not rewrite the global default.
 
     The TUI style picker used to write `settings.style`, so the choice
-    followed the user into every other session. It now writes the session's
-    own pin, and the global default keeps whatever it had.
+    followed the user into every other session. The write is the CLI's now
+    (``style set NAME --session S``, which pins the session and moves the
+    default), so the test asserts on the STORAGE the child wrote — the same
+    contract, verified through the CLI lane the TUI actually uses.
     """
 
     import asyncio
@@ -192,24 +194,9 @@ def test_the_tui_style_picker_pins_to_the_session(monkeypatch) -> None:
     from miniouto.storage import styles as style_store
 
     monkeypatch.setattr(style_store, "list_styles", lambda: ["default", "coding-work"])
-    monkeypatch.setattr(
-        settings_store, "load", lambda: settings_store.Settings(style="default")
-    )
-    global_writes: list[dict] = []
-    monkeypatch.setattr(
-        settings_store, "update", lambda **kw: global_writes.append(kw)
-    )
 
     session = "pin-picker-session"
     session_config.clear(session)
-    written: list[tuple[str, dict]] = []
-    real_set_fields = session_config.set_fields
-
-    def spy_set_fields(name, **fields):
-        written.append((name, fields))
-        return real_set_fields(name, **fields)
-
-    monkeypatch.setattr(tui_module.session_config, "set_fields", spy_set_fields)
 
     async def main() -> None:
         app = tui_module.ChatTUI()
@@ -221,14 +208,16 @@ def test_the_tui_style_picker_pins_to_the_session(monkeypatch) -> None:
             # pick the second entry (the style of the session)
             options = app.screen.query("ListItem")
             await pilot.click(options[1])
-            await pilot.pause()
+            # The write is a `style set` child on a worker; wait for the pin.
+            for _ in range(400):
+                pinned = session_config.read(session)
+                if pinned is not None and pinned.style == "coding-work":
+                    break
+                await pilot.pause(0.05)
 
     asyncio.run(main())
 
     # the choice is written to the SESSION's pin
-    assert written, "the picker wrote no pin"
-    name, fields = written[-1]
-    assert name == session
-    assert fields.get("style") == "coding-work"
-    # and it also became the DEFAULT (the last style chosen wins)
-    assert any(w.get("style") == "coding-work" for w in global_writes)
+    pinned = session_config.read(session)
+    assert pinned is not None and pinned.style == "coding-work", pinned
+

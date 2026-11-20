@@ -23,6 +23,7 @@ from collections.abc import Callable
 from typing import Any
 
 from miniouto.cli.tui import ChatTUI
+from miniouto.cli.tui import app as app_module
 from miniouto.cli.tui.modals import Modal
 from miniouto.storage import session_config
 from miniouto.storage import sessions as session_store
@@ -89,38 +90,196 @@ def plain_of(node: Any) -> str:
 # ── the turn driver double ──────────────────────────────────────────────────
 
 
+class _FakeChatProcess:
+    """A chat child that speaks the CLI's stdout contract, in-process.
+
+    The TUI runs its turn as ``python -m miniouto chat <prompt> --name S -c``
+    now, so the double replaces the SPAWN: ``argv`` is inspected exactly as the
+    real wrapper inspects it, and the "child" then performs what the real CLI
+    would — begin/finish the turn on the session file, print the session
+    marker, raw answer deltas and the finish marker — through the same
+    parsing path the app uses. What a test asserts on (the prompt the TUI
+    handed over, the session it routed on, ``-c``) is provably what the real
+    argv would have carried.
+    """
+
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        turns: list[dict[str, Any]] | None = None,
+        answer: str = "",
+        stderr_text: str = "",
+    ) -> None:
+        self.argv = argv
+        self._turns = turns
+        self._answer = answer
+        self.returncode: int | None = None
+        self.stdout = _FakeStreamReader(self._render())
+        self.stderr = _FakeStreamReader(stderr_text.encode("utf-8"))
+
+    def _parse(self) -> tuple[str, str, bool]:
+        """``(prompt, session, continue_flag)`` out of the chat argv."""
+
+        prompt = ""
+        session = ""
+        continue_session = False
+        positional: list[str] = []
+        index = 0
+        only_positional = False
+        args = self.argv[self.argv.index("chat") + 1 :]
+        while index < len(args):
+            arg = args[index]
+            if not only_positional:
+                if arg == "--":
+                    only_positional = True
+                    index += 1
+                    continue
+                if arg == "--name":
+                    session = args[index + 1]
+                    index += 2
+                    continue
+                if arg in ("-c", "--continue"):
+                    continue_session = True
+                    index += 1
+                    continue
+                if arg.startswith("-"):
+                    index += 1
+                    continue
+            positional.append(arg)
+            index += 1
+        prompt = " ".join(positional)
+        return prompt, session, continue_session
+
+    def _render(self) -> bytes:
+        prompt, session, _continue = self._parse()
+        # The alarm wakeup has no prompt argument: the drain is the CLI's, and
+        # the DRAINED TEXT is what the turn's `user` becomes — exactly as the
+        # real `chat --alarms` builds its prompt.
+        if "--alarms" in self.argv:
+            from miniouto.core import inbox as inbox_api
+
+            messages = inbox_api.drain(session)
+            prompt = "\n\n".join(m.text for m in messages)
+        if self._turns is not None:
+            self._turns.append(
+                {
+                    "prompt": prompt,
+                    "session": session,
+                    "continue": _continue,
+                    # The real child is `python -m miniouto chat`: diagnostics
+                    # never go to ITS stderr, which is what the flag asserted.
+                    "quiet_diagnostics": True,
+                }
+            )
+        session_store.begin_turn(session, prompt)
+        session_store.finish_turn(session, assistant=self._answer)
+        self.returncode = 0
+        out = f"------{session}------\n"
+        if self._answer:
+            out += self._answer
+            if not self._answer.endswith("\n"):
+                out += "\n"
+        out += "------finish------\n"
+        return out.encode("utf-8")
+
+    def send_signal(self, _sig: int) -> None:  # pragma: no cover - stop path
+        self.returncode = 130
+
+    async def wait(self) -> int:
+        return self.returncode if self.returncode is not None else 0
+
+
+class _FakeStreamReader:
+    """The slice of asyncio's StreamReader the reader task touches.
+
+    ``read`` hands out the data ONCE and EOF after — the semantics the
+    incremental reader loop relies on (`while chunk := await read(4096)`).
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read(self, _n: int = -1) -> bytes:
+        data, self._data = self._data, b""
+        return data
+
+
+async def _fake_create_subprocess_exec(*argv: str, **_kwargs: Any) -> _FakeChatProcess:
+    return _FakeChatProcess(list(argv), turns=_CURRENT_TURNS[0], answer=_CURRENT_ANSWER[0])
+
+
+_CURRENT_TURNS: list[list[dict[str, Any]] | None] = [None]
+_CURRENT_ANSWER: list[str] = [""]
+
+
 def stub_run_chat(
     monkeypatch: Any,
     turns: list[dict[str, Any]],
     *,
     answer: str = "",
-) -> Callable[..., str]:
-    """Replace ``run_chat`` with a recorder that persists the turn it was given.
+    on_session: Any = None,
+    on_prompt: Any = None,
+) -> None:
+    """Replace the chat SUBPROCESS with a recorder honouring the CLI contract.
 
-    ``run_chat`` is also what writes the session record, so the double makes the
-    same two calls with the same ``ChatOptions`` fields the TUI passed: a turn's
-    ``user`` is then provably the prompt the TUI handed over, and a test can
-    assert on routing (``session``) as well as on the prompt.
+    The turn is ``[sys.executable, -m, miniouto, chat, <prompt>, --name, S,
+    -c]``: the double intercepts the spawn, records the argv's meaning (the
+    prompt the TUI handed over, the session it routed on, ``-c``) and writes
+    the session record the real CLI writes, so a test can assert on routing
+    as well as on the prompt. stdout follows the measured contract (session
+    marker, raw answer, ``------finish------``).
     """
 
-    def fake_run_chat(opts: Any, sink: Any = None) -> str:
-        turns.append(
-            {
-                "prompt": opts.prompt,
-                "session": opts.session,
-                "continue": opts.continue_session,
-                # The TUI owns the alternate screen, so the turn's failure
-                # diagnostics must not go to stderr. Recorded here because
-                # `run_chat` is the only consumer that can see the flag.
-                "quiet_diagnostics": opts.quiet_diagnostics,
-            }
-        )
-        session_store.begin_turn(opts.session, opts.prompt)
-        session_store.finish_turn(opts.session, assistant=answer)
-        return answer
+    _CURRENT_TURNS[0] = _RecordingTurns(turns, on_session, on_prompt)
+    _CURRENT_ANSWER[0] = answer
+    # The spawn seam lives on the bridge module — one patch target for every
+    # chat child the TUI starts.
+    monkeypatch.setattr(
+        app_module.bridge, "asyncio_create_subprocess_exec", _fake_create_subprocess_exec
+    )
 
-    monkeypatch.setattr("miniouto.cli.tui.run_chat", fake_run_chat)
-    return fake_run_chat
+
+class _RecordingTurns(list):  # type: ignore[type-arg]
+    """The ``turns`` list, mirroring each record through an optional callback.
+
+    ``on_session`` (the navigation suites' flattened form) fires per turn.
+    """
+
+    def __init__(
+        self,
+        inner: list[dict[str, Any]],
+        on_session: Any,
+        on_prompt: Any = None,
+    ) -> None:
+        super().__init__()
+        self._inner = inner
+        self._on_session = on_session
+        self._on_prompt = on_prompt
+
+    def append(self, item: dict[str, Any]) -> None:
+        self._inner.append(item)
+        if self._on_session is not None:
+            self._on_session(item["session"])
+        if self._on_prompt is not None:
+            self._on_prompt(item)
+
+    def __len__(self) -> int:
+        return len(self._inner)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self._inner[index]
+
+
+def stub_chat_output(
+    monkeypatch: Any,
+    *,
+    answer: str = "",
+    turns: list[dict[str, Any]] | None = None,
+) -> None:
+    """Alias of :func:`stub_run_chat` for tests that only feed output."""
+
+    stub_run_chat(monkeypatch, turns if turns is not None else [], answer=answer)
 
 
 async def settle(pilot: Any, *, want: int, turns: list[Any], rounds: int = 300) -> None:
@@ -177,5 +336,6 @@ __all__ = [
     "row_text",
     "settle",
     "settle_until",
+    "stub_chat_output",
     "stub_run_chat",
 ]

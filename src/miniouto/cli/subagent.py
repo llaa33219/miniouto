@@ -9,59 +9,66 @@ from rich.console import Console
 
 from ..storage import providers as provider_store
 from ..storage import settings as settings_store
+from ._yaml import print_yaml
 
 app = typer.Typer(help="Manage the subagent's provider and model.")
 console = Console()
 
 
-def _resolved() -> tuple[str, str]:
-    """Return (provider, model) the subagent would run with right now.
+def _effective_trio() -> tuple[str, str, str]:
+    """The (provider, model, reasoning) a subagent run resolves right now.
 
-    Mirrors the runtime precedence (settings value, then the subagent
-    provider's default_model) and falls back to "same as outo
-    (<provider>/<model>)" when no subagent override is set.
+    Per key, the same precedence `runtime._effective_subagent_pm` applies:
+    `settings.subagent_*`, then (for the model) the subagent provider's own
+    record `default_model`, then — only when the subagent inherits outo's
+    provider — outo's own trio (`settings.provider` / `model` / `reasoning`,
+    with the provider record's defaults answering where nothing names a
+    model). An unresolved key stays `""`, which is the honest answer for a
+    machine interface: no "-" placeholder and no display sentence.
     """
 
     s = settings_store.load()
-    outo_provider = provider_store.get(s.provider) if s.provider else None
-    outo_model = outo_provider.default_model if outo_provider else ""
-
-    if s.subagent_provider or s.subagent_model:
-        provider_name = s.subagent_provider or s.provider
-        sub_provider = provider_store.get(provider_name) if provider_name else None
-        model = s.subagent_model or (sub_provider.default_model if sub_provider else "")
-        return provider_name or "-", model or "- (no model resolved)"
-    return (
-        s.provider or "-",
-        f"same as outo ({s.provider or '-'}/{outo_model or '-'})",
+    outo_record = provider_store.get(s.provider) if s.provider else None
+    outo_model = s.model or (outo_record.default_model if outo_record else "")
+    outo_reasoning = s.reasoning or (
+        (outo_record.reasoning_effort or "") if outo_record else ""
     )
 
-
-def _resolved_reasoning() -> str:
-    """Return the reasoning effort the subagent would run with right now.
-
-    Mirrors the runtime precedence: settings.subagent_reasoning, then the
-    resolved subagent provider's reasoning_effort, else "auto".
-    """
-
-    s = settings_store.load()
-    if s.subagent_reasoning:
-        return s.subagent_reasoning
-    provider_name = s.subagent_provider or s.provider
-    sub_provider = provider_store.get(provider_name) if provider_name else None
-    if sub_provider is not None and sub_provider.reasoning_effort:
-        return sub_provider.reasoning_effort
-    return "auto"
+    provider = s.subagent_provider or s.provider
+    record = provider_store.get(provider) if provider else None
+    if s.subagent_provider:
+        # A provider of its OWN: the model comes from the subagent's own
+        # sources only — never outo's, which belongs to another endpoint.
+        model = s.subagent_model or (record.default_model if record else "")
+    else:
+        # SAME AS OUTO: the subagent runs on outo's provider and model.
+        model = s.subagent_model or outo_model
+    reasoning = s.subagent_reasoning or (
+        (record.reasoning_effort or "") if record else ""
+    )
+    if not s.subagent_provider and not s.subagent_reasoning:
+        reasoning = reasoning or outo_reasoning
+    return provider, model, reasoning
 
 
 @app.command("show")
 def show() -> None:
-    """Show the subagent's resolved provider, model, and reasoning."""
+    """Show the subagent's effective and override provider/model/reasoning, as YAML."""
 
-    provider, model = _resolved()
-    console.print(f"[bold]Subagent provider:[/bold] {provider}")
-    console.print(f"[bold]Subagent model:[/bold]    {model}")
-    console.print(f"[bold]Subagent reasoning:[/bold] {_resolved_reasoning()}")
+    s = settings_store.load()
+    provider, model, reasoning = _effective_trio()
+    print_yaml(
+        {
+            "provider": provider,
+            "model": model,
+            "reasoning": reasoning,
+            "overrides": {
+                "provider": s.subagent_provider,
+                "model": s.subagent_model,
+                "reasoning": s.subagent_reasoning,
+            },
+        }
+    )
 
 
 @app.command("set")
@@ -108,8 +115,8 @@ def set_cmd(
                 "(no --model given and the provider has no default_model). "
                 "Set one via `miniouto subagent set --model <name>`."
             )
-    _, resolved_model = _resolved()
-    console.print(f"[bold]Subagent model:[/bold]    {resolved_model}")
+    _, resolved_model, _ = _effective_trio()
+    console.print(f"[bold]Subagent model:[/bold]    {resolved_model or '-'}")
 
 
 @app.command("clear")

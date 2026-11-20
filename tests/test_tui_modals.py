@@ -53,6 +53,7 @@ from miniouto.cli.tui.modals import (
     default_system_commands,
 )
 from miniouto.cli.tui.theme import MINIOUTO_THEME, color
+from miniouto.core.providers import catalog_compatibility
 from miniouto.storage import providers as provider_store
 from miniouto.storage import session_config
 from miniouto.storage import settings as settings_store
@@ -97,23 +98,23 @@ class FakeApp:
         return self.screens[-1] if self.screens else None
 
     # workers / commands ─────────────────────────────────────────────────────
-    def run_worker(self, coro: Any, exclusive: bool = False) -> asyncio.Task[Any]:
-        """Schedule ``coro`` on the running loop; discard it when there is none.
+    def run_worker(self, coro: Any, exclusive: bool = False) -> asyncio.Task[Any] | None:
+        """Schedule ``coro`` on the running loop; RUN it to completion without one.
 
         ``ensure_future`` needs a CURRENT event loop. A synchronous test — an
         entry point called with no ``asyncio.run`` in scope, possibly after
-        another test closed the default loop — has none, and running the coroutine
-        there would BLOCK forever: a flow that awaits ``push_screen_wait`` waits on
-        a dialog only the test could dismiss. Such a caller is asserting the
-        SYNCHRONOUS part of the entry point (what it reports before starting any
-        flow), so the coroutine is closed unstarted, which is what Textual's
-        ``run_worker`` did for a message that never reached the pump.
+        another test closed the default loop — has none. The popup's writes
+        are CLI subprocess calls wrapped in ``asyncio.to_thread``, which need
+        a loop to await; such a caller is asserting the STORED RESULT of the
+        flow, so the coroutine is drained on a private loop instead of being
+        dropped. (The flows that await ``push_screen_wait`` are driven by the
+        ASYNC tests, which have a loop and take the task path.)
         """
 
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            coro.close()
+            asyncio.run(coro)
             return None
         task = asyncio.ensure_future(coro)
         self.tasks.append(task)
@@ -609,8 +610,8 @@ def test_picking_a_model_updates_its_row_and_writes_both_stores(
     settings_home: str, session: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        modals_module.catalog_api,
-        "list_models",
+        modals_module.bridge,
+        "list_catalog_models",
         lambda _provider: [{"id": "alpha-default"}, {"id": "alpha-fast", "name": "Fast"}],
     )
     settings_store.update(provider="pop-alpha")
@@ -626,7 +627,14 @@ def test_picking_a_model_updates_its_row_and_writes_both_stores(
         assert options[0].strip() == "● alpha-default —"
         assert options[1].strip() == "alpha-fast — Fast"
         app.screen.dismiss("alpha-fast — Fast")
-        await settle()
+        # The pick schedules a SECOND worker: the CLI trio write, then a
+        # repaint that re-reads the config through `config show`. Wait on the
+        # ROW, which lands last.
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            await settle()
+            if popup.row_text("model") == "Model: alpha-fast":
+                break
         assert task.done()
 
     run(body)
@@ -643,7 +651,7 @@ def test_picking_a_model_updates_its_row_and_writes_both_stores(
 def test_the_model_row_falls_back_to_free_text_when_the_catalog_is_empty(
     settings_home: str, session: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(modals_module.catalog_api, "list_models", lambda _provider: [])
+    monkeypatch.setattr(modals_module.bridge, "list_catalog_models", lambda _provider: [])
     settings_store.update(provider="pop-alpha")
     app = FakeApp()
     popup = open_popup(app, session)
@@ -654,7 +662,14 @@ def test_the_model_row_falls_back_to_free_text_when_the_catalog_is_empty(
         assert isinstance(app.screen, TextInputModal)
         assert app.screen.value == "alpha-default"
         app.screen.dismiss("alpha-hand-written")
-        await settle()
+        # The pick schedules a SECOND worker: the CLI trio write, then a
+        # repaint that re-reads the config through `config show` (another
+        # child). Wait on the ROW, which lands last.
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            await settle()
+            if popup.row_text("model") == "Model: alpha-hand-written":
+                break
         assert task.done()
 
     run(body)
@@ -909,8 +924,36 @@ def test_the_compatibility_row_shows_the_saved_dialect(dialect_provider: str, se
 
 
 def test_the_compatibility_picker_changes_format_and_url_without_touching_the_trio(
-    dialect_provider: str, session: str
+    dialect_provider: str, session: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The WRITE is `provider edit --compatibility D` in a child, which
+    # re-resolves the mapping from the real catalog — a stub on this
+    # process's catalog_api cannot reach it. The bridge is stubbed to apply
+    # the picked option directly; the LABELS (what the picker offered) still
+    # come from the in-process catalog read the popup itself performs.
+    applied: list[tuple[str, str]] = []
+
+    def fake_edit(name: str, dialect: str) -> tuple[bool, str]:
+        applied.append((name, dialect))
+        record = provider_store.get(name)
+        option = next(
+            candidate
+            for candidate in catalog_compatibility(
+                modals_module.catalog_api.find_provider_by_slug(name, record.base_url)
+            )
+            if candidate.dialect == dialect
+        )
+        provider_store.upsert(
+            replace(
+                record,
+                api_format=option.api_format,
+                base_url=option.base_url,
+                catalog_dialect=option.dialect,
+            )
+        )
+        return True, ""
+
+    monkeypatch.setattr(modals_module.bridge, "provider_edit_compatibility", fake_edit)
     settings_store.update(provider=dialect_provider)
     app = FakeApp()
     popup = open_popup(app, session)
@@ -930,10 +973,16 @@ def test_the_compatibility_picker_changes_format_and_url_without_touching_the_tr
             label for label in compatibility_labels(app.screen) if label.startswith("anthropic ")
         )
         app.screen.dismiss(selected)
-        await settle()
+        # The write lands on a worker; the row repaint follows it.
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            await settle()
+            if popup.row_text("compatibility") == "Compatibility: anthropic":
+                break
 
     run(body)
 
+    assert applied == [(dialect_provider, "anthropic")]
     record = provider_store.get(dialect_provider)
     assert record.catalog_dialect == "anthropic"
     assert record.api_format == "anthropic"
@@ -943,8 +992,33 @@ def test_the_compatibility_picker_changes_format_and_url_without_touching_the_tr
 
 
 def test_an_inheriting_subagent_popup_edits_the_effective_outo_compatibility(
-    dialect_provider: str, session: str
+    dialect_provider: str, session: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Same stub as the outo-side compatibility test: the write is a CLI child
+    # that re-resolves the mapping from the real catalog.
+    applied: list[tuple[str, str]] = []
+
+    def fake_edit(name: str, dialect: str) -> tuple[bool, str]:
+        applied.append((name, dialect))
+        record = provider_store.get(name)
+        option = next(
+            candidate
+            for candidate in catalog_compatibility(
+                modals_module.catalog_api.find_provider_by_slug(name, record.base_url)
+            )
+            if candidate.dialect == dialect
+        )
+        provider_store.upsert(
+            replace(
+                record,
+                api_format=option.api_format,
+                base_url=option.base_url,
+                catalog_dialect=option.dialect,
+            )
+        )
+        return True, ""
+
+    monkeypatch.setattr(modals_module.bridge, "provider_edit_compatibility", fake_edit)
     settings_store.save(
         replace(
             settings_store.load(),
@@ -968,10 +1042,15 @@ def test_an_inheriting_subagent_popup_edits_the_effective_outo_compatibility(
             if label.startswith("openai-responses ")
         )
         app.screen.dismiss(selected)
-        await settle()
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            await settle()
+            if applied:
+                break
 
     run(body)
 
+    assert applied == [(dialect_provider, "openai-responses")]
     record = provider_store.get(dialect_provider)
     assert record.catalog_dialect == "openai-responses"
     assert record.api_format == "openai-response"

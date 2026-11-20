@@ -49,6 +49,7 @@ from typing import Any
 
 import pytest
 
+import tui_harness
 from miniouto.cli import tui as tui_module
 from miniouto.cli.tui import (
     CHAT_MAX_WIDTH,
@@ -190,13 +191,17 @@ def _selected_text(app: Any, row: Any) -> str | None:
 
 
 def _stub_run_chat(monkeypatch: pytest.MonkeyPatch, sessions: list[str]) -> None:
-    """Stand in for the turn driver, recording the session each turn routed on."""
+    """Stand in for the chat child, recording the session each turn routed on.
 
-    def fake_run_chat(opts: Any, sink: Any = None) -> str:
-        sessions.append(opts.session)
-        return ""
+    The turn is a CLI subprocess now; the double intercepts the SPAWN
+    (``tui_harness.stub_run_chat``) and mirrors each recorded turn's session
+    into the list this file's assertions read.
+    """
 
-    monkeypatch.setattr(tui_module, "run_chat", fake_run_chat)
+    tui_harness.stub_run_chat(monkeypatch, [], on_session=sessions.append)
+    # The idle poll's inbox listing is also a CLI child; nothing is queued in
+    # these tests, so answer empty without a process.
+    monkeypatch.setattr(tui_module.bridge, "message_list", lambda session: [])
 
 
 def _fill_chips(app: ChatTUI) -> None:
@@ -572,6 +577,49 @@ def _fields(popup: ProviderSettingsPopup) -> list[str]:
     return [row.field for row in popup.query(SettingRow)]
 
 
+async def _await_mint(pilot: Any, app: ChatTUI, *, was: str | None = None) -> str:
+    """Pump until ``_new_session``'s worker has minted and pinned the name."""
+
+    for _ in range(300):
+        name = app._session_name
+        if name is not None and name.startswith("tui-") and name != was:
+            await pilot.pause()
+            return name
+        await pilot.pause(0.02)
+    raise AssertionError("no tui- session was minted")
+
+
+async def _await_pin(
+    pilot: Any,
+    session: str,
+    *,
+    field: str,
+    value: str,
+    popup: ProviderSettingsPopup | None = None,
+    row: str | None = None,
+    row_value: str | None = None,
+    rounds: int = 200,
+) -> None:
+    """Pump until the session pin holds ``field == value`` (and the row shows it).
+
+    The popup's writes are CLI children on workers, and the row repaint after
+    the write is ANOTHER child (`config show`); the assert that follows a pick
+    must wait for the whole chain to land.
+    """
+
+    for _ in range(rounds):
+        pinned = session_config.read(session)
+        written = pinned is not None and getattr(pinned, field) == value
+        painted = (
+            popup is None or row is None or row_value is None or _row_text(popup, row) == row_value
+        )
+        if written and painted:
+            await pilot.pause()
+            return
+        await pilot.pause(0.02)
+    raise AssertionError(f"pin {field} never became {value!r} with row {row}={row_value!r}")
+
+
 @pytest.mark.parametrize(
     ("chip", "title"),
     [("outo", "outo settings"), ("subagent", "subagent settings")],
@@ -625,8 +673,8 @@ def test_each_row_opens_its_own_picker(settings_home: str) -> None:
 def test_the_model_row_opens_the_model_list(settings_home: str, monkeypatch: Any) -> None:
     async def body() -> None:
         monkeypatch.setattr(
-            tui_module.catalog_api,
-            "list_models",
+            tui_module.bridge,
+            "list_catalog_models",
             lambda _p: [{"id": "alpha-default"}, {"id": "alpha-fast", "name": "Fast"}],
         )
         app = ChatTUI()
@@ -675,6 +723,8 @@ def test_the_chips_follow_a_pick_without_a_reload(settings_home: str) -> None:
             await pilot.pause()
             assert isinstance(app.screen, SelectionModal)
             app.screen.dismiss("low")
+            session = app._session_name or ""
+            await _await_pin(pilot, session, field="reasoning", value="low")
             await _settle(pilot)
             # Then: the popup row AND the chip behind it both show it
             assert _row_text(app.screen, "reasoning") == "Reasoning: low"
@@ -729,7 +779,14 @@ def catalog_caps(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     context_api.clear_model_cache()
 
 
-async def _edit_caps(app: ChatTUI, pilot: Any, context_window: str, output_tokens: str) -> None:
+async def _edit_caps(
+    app: ChatTUI,
+    pilot: Any,
+    context_window: str,
+    output_tokens: str,
+    *,
+    provider: str = "pop-custom",
+) -> None:
     """Click the Caps row and walk its two prompts, as a user would."""
 
     assert isinstance(app.screen, ProviderSettingsPopup)
@@ -740,6 +797,15 @@ async def _edit_caps(app: ChatTUI, pilot: Any, context_window: str, output_token
     await pilot.pause()
     assert isinstance(app.screen, TextInputModal), "no second caps prompt"
     app.screen.dismiss(output_tokens)
+    # The caps save is a `provider edit` child on a worker — wait for the
+    # RECORD to hold what this edit asked for (a set OR a clear: the wait is
+    # on the change, not on a value being present).
+    wanted_output = int(output_tokens) if output_tokens.strip() else None
+    for _ in range(120):
+        await pilot.pause(0.02)
+        current = provider_store.get(provider)
+        if current is not None and current.max_output_tokens == wanted_output:
+            break
     await _settle(pilot)
     assert isinstance(app.screen, ProviderSettingsPopup), "the popup did not survive the edit"
 
@@ -825,7 +891,15 @@ def test_the_subagent_trio_says_same_as_outo_and_persists_it_through_its_own_key
             await pilot.pause()
             assert isinstance(app.screen, SelectionModal)
             app.screen.dismiss("pop-alpha")
-            await pilot.pause()
+            await _await_pin(
+                pilot,
+                session,
+                field="subagent_provider",
+                value="pop-alpha",
+                popup=app.screen,
+                row="model",
+                row_value="Model: alpha-default",
+            )
             # Then: the rows resolve concretely and the write went to the
             # SUBAGENT keys — outo's own trio is untouched
             assert _row_text(app.screen, "model") == "Model: alpha-default"
@@ -850,12 +924,10 @@ def test_a_minted_session_inherits_the_config_it_continues_from(
             session_config.set_fields(
                 previous, provider="pop-alpha", model="alpha-default", reasoning="high"
             )
-            # Given / When: "new session" mints a fresh name over it
+            # Given / When: "new session" mints a fresh name over it (the
+            # mint is a worker: it seeds through the CLI)
             app._new_session()
-            await pilot.pause()
-            # Then: the new session starts on the config it continues from,
-            # instead of freezing whatever the default is at its first turn
-            minted = app._session_name
+            minted = await _await_mint(pilot, app, was=previous)
             assert minted != previous
             inherited = session_config.effective(minted)
             assert (inherited.provider, inherited.model, inherited.reasoning) == (
@@ -938,7 +1010,12 @@ def test_the_minted_session_keeps_the_tui_name_format_and_is_published(
             await app._dispatch("first prompt")
             # Then: the pin keeps the `tui-<ts>-<hex>` mint format, and the
             # "active session" convention still publishes it to settings
+            # (the publish is a `config set --active-session` child)
             assert re.fullmatch(r"tui-\d{8}-\d{6}-[0-9a-f]{6}", app._session_name)
+            for _ in range(400):
+                if settings_store.load().session == app._session_name:
+                    break
+                await pilot.pause(0.05)
             assert settings_store.load().session == app._session_name
 
     asyncio.run(body())
@@ -957,7 +1034,12 @@ def test_the_session_picker_pins_and_publishes_the_chosen_session() -> None:
             app.screen.dismiss("picked-session")
             await pilot.pause()
             # Then: the pin and the published active session both follow it
+            # (the publish is a `config set --active-session` child on a worker)
             assert app._session_name == "picked-session"
+            for _ in range(200):
+                if settings_store.load().session == "picked-session":
+                    break
+                await pilot.pause(0.02)
             assert settings_store.load().session == "picked-session"
             assert app._inbox_session() == "picked-session"
 
@@ -969,13 +1051,17 @@ def test_new_session_pins_and_publishes_the_new_name() -> None:
         app = ChatTUI()
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            # Given / When: "new session" mints a fresh one
+            # Given / When: "new session" mints a fresh one (a worker)
             app._new_session()
-            await pilot.pause()
+            minted = await _await_mint(pilot, app)
             # Then: it is pinned, published, and in the mint format
-            assert re.fullmatch(r"tui-\d{8}-\d{6}-[0-9a-f]{6}", app._session_name)
-            assert settings_store.load().session == app._session_name
-            assert app._inbox_session() == app._session_name
+            assert re.fullmatch(r"tui-\d{8}-\d{6}-[0-9a-f]{6}", minted)
+            for _ in range(400):  # the publish is one more CLI child behind
+                if settings_store.load().session == minted:
+                    break
+                await pilot.pause(0.05)
+            assert settings_store.load().session == minted
+            assert app._inbox_session() == minted
 
     asyncio.run(body())
 
@@ -1445,20 +1531,63 @@ async def _settle(
 def _stub_summarizing_turn(
     monkeypatch: pytest.MonkeyPatch, fake: _FakeSummary, routed: list[tuple[str, str]]
 ) -> str:
-    """A turn driver whose FIRST turn summarizes; returns the session it opens."""
+    """A chat child whose FIRST turn summarizes; returns the session it opens.
+
+    The child speaks the CLI's stdout contract: the first turn ends with the
+    hand-off marker pair (`------summary → X------` + `summary: <dir>`), the
+    OLD session's file gets the marker turn (the CLI's `_persist_handoff_marker`),
+    the continuation message lands in the NEW session's inbox, and the run
+    re-opens under the new session marker — exactly what `miniouto chat` does
+    through `_run_handoffs` / `_apply_handoff`.
+    """
 
     new_session = "cont-20260101-120000-abcd"
+    from miniouto.cli.chat import _persist_handoff_marker
 
-    def fake_run_chat(opts: Any, sink: Any = None) -> str:
-        routed.append((opts.session, opts.prompt))
-        if len(routed) == 1:
-            fake.request_handoff(
-                new_session, from_session=opts.session, summary_dir=HANDOFF_SUMMARY_DIR
-            )
-            inbox.insert(new_session, "요약을 보고 이어서 진행", kind="user", source="tool")
-        return ""
+    class _SummarizingProcess(tui_harness._FakeChatProcess):
+        def __init__(self, argv: list[str]) -> None:
+            # BEFORE super(): the base __init__ renders stdout, which is what
+            # appends to the routed list.
+            self._routed = routed
+            super().__init__(argv, turns=None)
 
-    monkeypatch.setattr(tui_module, "run_chat", fake_run_chat)
+        def _render(self) -> bytes:
+            from miniouto.cli.chat import handoff_marker
+
+            prompt, session, _continue = self._parse()
+            if "--alarms" in self.argv:
+                # The wakeup's prompt IS the drain, as the real CLI builds it.
+                messages = inbox.drain(session)
+                if not messages:
+                    # The real `chat --alarms` prints this and runs no turn.
+                    self.returncode = 0
+                    return f"no pending messages in session '{session}'.\n".encode()
+                prompt = "\n\n".join(m.text for m in messages)
+            self._routed.append((session, prompt))
+            if len(self._routed) == 1:
+                # The transition, as the CLI prints and persists it.
+                handoff = Handoff(
+                    new_session=new_session, from_session=session, summary_dir=HANDOFF_SUMMARY_DIR
+                )
+                inbox.insert(new_session, "요약을 보고 이어서 진행", kind="user", source="tool")
+                _persist_handoff_marker(session, handoff)
+                session_store.begin_turn(new_session, "")
+                session_store.finish_turn(new_session, assistant="")
+                out = (
+                    f"------{session}------\n"
+                    f"{handoff_marker(handoff)}\n"
+                    f"------{new_session}------\n"
+                )
+                out += "------finish------\n"
+                self.returncode = 0
+                return out.encode("utf-8")
+            self.returncode = 0
+            return super()._render()
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        return _SummarizingProcess(list(argv))
+
+    monkeypatch.setattr(tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec)
     return new_session
 
 
@@ -1518,12 +1647,25 @@ def test_the_old_conversation_shows_the_handoff_marker_and_keeps_it(
     _run(body)
 
 
-def test_a_dispatch_registers_the_pinned_session_as_the_run_contract(
-    fake_summary: _FakeSummary, monkeypatch: pytest.MonkeyPatch
+def test_a_dispatch_names_the_session_the_run_contract_will_use(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The run contract is the CHAT CHILD's now: it registers itself with the
+    session it was named. What the TUI must guarantee is that the argv pins
+    THAT session — the whole identity the contract will carry."""
+
+    argvs: list[list[str]] = []
+    real_argv = tui_module.bridge.chat_argv
+
+    def fake_argv(prompt: str, session: str, *, alarms: bool = False) -> list[str]:
+        argv = real_argv(prompt, session, alarms=alarms)
+        argvs.append(argv)
+        return argv
+
     async def body() -> None:
-        routed: list[tuple[str, str]] = []
+        routed: list[str] = []
         _stub_run_chat(monkeypatch, routed)
+        monkeypatch.setattr(tui_module.bridge, "chat_argv", fake_argv)
         app = ChatTUI()
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
@@ -1531,11 +1673,14 @@ def test_a_dispatch_registers_the_pinned_session_as_the_run_contract(
             await app._dispatch("do the work")
             await pilot.pause()
 
-            # Then: the summarization lane is told this session — and a TUI run
-            # is plain, so identity only, no delegation contract to carry
-            assert fake_summary.contracts == [
-                {"session": app._session_name, "style": settings_store.load().style or ""}
-            ]
+            # Then: the child was named THIS session, continuing it — the
+            # identity the child's own run-contract registration carries.
+            assert argvs and argvs[0][argvs[0].index("--name") + 1] == app._session_name
+            assert "-c" in argvs[0]
+            # The prompt rides behind `--` (a leading-dash prompt is not an
+            # option — defect #9's fix), so the argv ends with the prompt.
+            assert argvs[0][-2:] == ["--", "do the work"]
+            assert routed == [app._session_name]
 
     _run(body)
 
@@ -1841,7 +1986,14 @@ def test_the_theme_a_user_picks_is_persisted_for_the_next_boot() -> None:
             await pilot.pause()
             # When: the theme is changed (what `Ctrl+P` → Theme does)
             app.theme = "gruvbox"
-            await pilot.pause()
+            # The persistence is a `config set --theme` child on a worker.
+            for _ in range(400):
+                if settings_store.load().theme == "gruvbox":
+                    break
+                await pilot.pause(0.05)
+            for _task in app._workers:
+                if _task.done() and _task.exception() is not None:  # pragma: no cover
+                    raise _task.exception()
             # Then: the choice is on disk, which is what the next boot reads
             assert settings_store.load().theme == "gruvbox"
 
@@ -1890,6 +2042,40 @@ def dialect_provider(settings_home: str, monkeypatch: pytest.MonkeyPatch) -> str
     return "catalog-gateway"
 
 
+def _stub_compatibility_write(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Stub ``provider edit --compatibility`` for a fixture catalog provider.
+
+    The write is a CLI child that re-resolves the dialect's mapping from the
+    REAL modelslist catalog; a fixture provider (`catalog-gateway`) is not in
+    it, so the child would refuse. The stub applies the option the popup's
+    own in-process read already resolved — the same facts the picker showed.
+    """
+
+    applied: list[tuple[str, str]] = []
+
+    def fake_edit(name: str, dialect: str) -> tuple[bool, str]:
+        from miniouto.core.providers import catalog_compatibility as compat
+
+        record = provider_store.get(name)
+        provider = tui_module.catalog_api.find_provider_by_slug(name, record.base_url)
+        option = next(
+            candidate for candidate in compat(provider) if candidate.dialect == dialect
+        )
+        provider_store.upsert(
+            replace(
+                record,
+                api_format=option.api_format,
+                base_url=option.base_url,
+                catalog_dialect=option.dialect,
+            )
+        )
+        applied.append((name, dialect))
+        return True, ""
+
+    monkeypatch.setattr(tui_module.bridge, "provider_edit_compatibility", fake_edit)
+    return applied
+
+
 def _compatibility_labels(app: ChatTUI) -> list[str]:
     """The picker's rows, marker stripped, in the order the popup offered them."""
 
@@ -1919,8 +2105,10 @@ def test_catalog_provider_has_a_compatibility_row_with_the_saved_dialect(
 
 
 def test_compatibility_picker_changes_format_and_url_without_touching_the_trio(
-    dialect_provider: str,
+    dialect_provider: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    applied = _stub_compatibility_write(monkeypatch)
+
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -1951,7 +2139,15 @@ def test_compatibility_picker_changes_format_and_url_without_touching_the_trio(
             selected = next(label for label in labels if label.startswith("anthropic "))
             app.screen.dismiss(selected)
             await _settle(pilot)
+            # The write lands on a worker BEHIND the popup's on_resume refresh
+            # (itself a `config show` child), so the wait is on the RECORD.
+            for _ in range(400):
+                record_now = provider_store.get(dialect_provider)
+                if record_now is not None and record_now.catalog_dialect == "anthropic":
+                    break
+                await pilot.pause(0.05)
 
+            assert applied == [(dialect_provider, "anthropic")]
             record = provider_store.get(dialect_provider)
             assert record.catalog_dialect == "anthropic"
             assert record.api_format == "anthropic"
@@ -1963,8 +2159,9 @@ def test_compatibility_picker_changes_format_and_url_without_touching_the_trio(
 
 
 def test_inherited_subagent_popup_edits_the_effective_outo_compatibility(
-    dialect_provider: str,
+    dialect_provider: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    applied = _stub_compatibility_write(monkeypatch)
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -1998,7 +2195,12 @@ def test_inherited_subagent_popup_edits_the_effective_outo_compatibility(
             )
             app.screen.dismiss(selected)
             await _settle(pilot)
+            for _ in range(400):  # the write is a child on a worker
+                if applied:
+                    break
+                await pilot.pause(0.05)
 
+            assert applied == [(dialect_provider, "openai-responses")]
             record = provider_store.get(dialect_provider)
             assert record.catalog_dialect == "openai-responses"
             assert record.api_format == "openai-response"
@@ -2011,13 +2213,46 @@ def test_inherited_subagent_popup_edits_the_effective_outo_compatibility(
 def _stub_catalog_add(
     monkeypatch: pytest.MonkeyPatch, catalog_provider: dict[str, Any]
 ) -> None:
-    """Make the add wizard see exactly one provider, with a one-model list."""
+    """Make the add wizard see exactly one provider, with a one-model list.
 
-    monkeypatch.setattr(tui_module.catalog_api, "list_providers", lambda: [catalog_provider])
+    The ADD is stubbed too: it is a CLI child that re-resolves the provider
+    from the real modelslist catalog, which a fixture name will never match.
+    The stub performs the same write the real `provider add` makes, from the
+    same catalog facts the wizard showed.
+    """
+
     monkeypatch.setattr(
-        tui_module.catalog_api, "list_models", lambda _provider: [{"id": "gateway-model"}]
+        tui_module.bridge,
+        "list_catalog_providers",
+        lambda: [
+            {
+                "name": catalog_provider["name"],
+                "slug": catalog_provider["slug"],
+                "format": "anthropic",
+                "base_url": "https://gateway.example/anthropic",
+                "compatibility": ["anthropic", "openai"],
+                "addable": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        tui_module.bridge, "list_catalog_models", lambda _provider: [{"id": "gateway-model"}]
     )
     monkeypatch.setattr(tui_module, "_get_reasoning_api", lambda: None)
+
+    def fake_add(provider_name: str, *, api_key: str, default_model: str, reasoning: Any):
+        from miniouto.core.providers import add_provider_from_catalog
+
+        provider = add_provider_from_catalog(
+            catalog_provider,
+            api_key=api_key,
+            default_model=default_model,
+            reasoning_effort=reasoning,
+        )
+        provider_store.upsert(provider)
+        return True, ""
+
+    monkeypatch.setattr(tui_module.bridge, "provider_add", fake_add)
 
 
 def test_catalog_add_persists_the_catalog_format_and_exact_url(
@@ -2119,13 +2354,18 @@ def test_catalog_add_skips_a_provider_with_only_unhostable_formats(
     """`typesafe` alone is not addable — the wizard must not offer it."""
 
     monkeypatch.setattr(
-        tui_module.catalog_api,
-        "list_providers",
-        lambda: [{
-            "name": "Typesafe Only",
-            "slug": "typesafe-only",
-            "formats": [{"format": "typesafe", "baseUrl": "https://typesafe.example/v1"}],
-        }],
+        tui_module.bridge,
+        "list_catalog_providers",
+        lambda: [
+            {
+                "name": "Typesafe Only",
+                "slug": "typesafe-only",
+                "format": "",  # the CLI found no supported dialect
+                "base_url": "",
+                "compatibility": [],
+                "addable": False,
+            }
+        ],
     )
 
     async def body() -> None:
@@ -2180,9 +2420,11 @@ def test_compatibility_preserves_a_saved_dialect_missing_from_current_results(
 
 
 def test_a_legacy_lma_record_still_behaves_as_a_catalog_record(
-    dialect_provider: str,
+    dialect_provider: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Existing `source="lma"` records must keep the catalog rows and picker."""
+
+    applied = _stub_compatibility_write(monkeypatch)
 
     async def body() -> None:
         provider_store.upsert(
@@ -2218,6 +2460,11 @@ def test_a_legacy_lma_record_still_behaves_as_a_catalog_record(
                 next(label for label in labels if label.startswith("anthropic "))
             )
             await _settle(pilot)
+            for _ in range(400):  # the write is a child on a worker
+                if applied:
+                    break
+                await pilot.pause(0.05)
+            assert applied == [(dialect_provider, "anthropic")]
             record = provider_store.get(dialect_provider)
             assert record.catalog_dialect == "anthropic"
             assert record.api_format == "anthropic"
@@ -2228,8 +2475,9 @@ def test_a_legacy_lma_record_still_behaves_as_a_catalog_record(
 
 
 def test_a_picked_modelslist_format_persists_verbatim_and_survives_a_reopen(
-    dialect_provider: str,
+    dialect_provider: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    applied = _stub_compatibility_write(monkeypatch)
     """The stored dialect is modelslist's exact format id and its exact URL.
 
     Two things have to survive a round trip: the on-disk record, which core
@@ -2263,7 +2511,12 @@ def test_a_picked_modelslist_format_persists_verbatim_and_survives_a_reopen(
             assert picked.endswith("https://gateway.example/v1/responses")
             app.screen.dismiss(picked)
             await _settle(pilot)
+            for _ in range(400):  # the write is a child on a worker
+                if applied:
+                    break
+                await pilot.pause(0.05)
 
+            assert applied == [(dialect_provider, "openai-responses")]
             # Then: the persisted record carries the catalog's own ids, not a
             # locally-mapped variant (`openai-response`, `/v1`, …)
             stored = provider_store.get(dialect_provider)
@@ -2367,3 +2620,71 @@ def test_scrolling_into_the_load_zone_still_compensates() -> None:
     assert window.first == before - WINDOW_CHUNK_ROWS
     assert len(log.rows) == mounted + WINDOW_CHUNK_ROWS
     assert log.scroll_y == y + WINDOW_CHUNK_ROWS
+
+
+# ── reviewer defect 10: the minted session's seed (style + global default) ───
+
+
+def test_a_minted_session_inherits_the_style_pin_and_keeps_the_global_default(
+    monkeypatch: pytest.MonkeyPatch, settings_home: str
+) -> None:
+    """Defect 10 (major): the mint lost the style pin and rewrote the global.
+
+    ``_seed_minted_session`` copied only the provider trios through per-trio
+    ``config set`` calls — which also rewrote the installation's default on
+    every mint (invariant 12). The seed is one ``config seed`` child now:
+    the WHOLE pin including ``style``, and the global default never moves."""
+
+    async def body() -> None:
+        routed: list[str] = []
+        _stub_run_chat(monkeypatch, routed)
+        app = ChatTUI()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            # Given: a source session pinning a trio AND a style, plus a
+            # global default that differs from both
+            previous = _pin_test_session(app, "seed-style-src")
+            provider_store.upsert(
+                provider_store.Provider(name="pop-seed", default_model="seed-model")
+            )
+            provider_store.upsert(
+                provider_store.Provider(name="pop-other", default_model="other-model")
+            )
+            session_config.set_fields(
+                previous,
+                provider="pop-seed",
+                model="seed-model",
+                reasoning="low",
+                style="coding",
+            )
+            settings_store.save(
+                replace(
+                    settings_store.load(),
+                    provider="pop-other",
+                    model="other-model",
+                )
+            )
+            before = settings_store.load()
+
+            # When: "new session" mints a fresh name over it (the mint is a
+            # worker: it seeds through the CLI now)
+            app._new_session()
+            minted = await _await_mint(pilot, app, was=previous)
+            # The seed is a CLI child behind the mint: wait for the pin.
+            for _ in range(200):
+                if (session_config.read(minted) or session_config.EMPTY).style:
+                    break
+                await pilot.pause(0.02)
+
+            # Then: the minted session's pin carries the STYLE too, and the
+            # global default is byte-for-byte what it was
+            seeded = session_config.effective(minted)
+            assert (seeded.provider, seeded.model, seeded.reasoning) == (
+                "pop-seed",
+                "seed-model",
+                "low",
+            )
+            assert seeded.style == "coding", "the mint lost the style pin"
+            assert settings_store.load() == before, "the mint rewrote the global default"
+
+    _run(body)

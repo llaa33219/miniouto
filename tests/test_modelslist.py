@@ -242,14 +242,14 @@ def test_legacy_source_remains_a_valid_catalog_record() -> None:
     assert restored.source == SOURCE_LMA
 
 
-def test_cli_catalog_table_uses_modelslist_fields(monkeypatch: pytest.MonkeyPatch) -> None:
-    output = StringIO()
-    monkeypatch.setattr(provider_cli, "console", Console(file=output, width=240))
+def test_cli_catalog_listing_uses_modelslist_fields(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.setattr(provider_cli.catalog_api, "list_providers", lambda: CATALOG)
 
     provider_cli.providers_cmd()
 
-    rendered = output.getvalue()
+    rendered = capsys.readouterr().out
     assert "gateway-exact" in rendered
     assert "openai-responses" in rendered
     assert "https://gateway.example/v1/responses" in rendered

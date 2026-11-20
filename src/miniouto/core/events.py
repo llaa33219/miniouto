@@ -84,6 +84,14 @@ StreamKind = Literal["text", "thinking"]
 STREAM_TEXT: StreamKind = "text"
 STREAM_THINKING: StreamKind = "thinking"
 
+# Loop-event kinds that close a streamed message's boundary — the same set
+# the TUI treats as one (`cli/tui/app.py:_STREAM_BOUNDARY_KINDS`).
+# `ON_ITERATION` flushes `thinking` → `response` → `context` for a message
+# and a `tool` event follows; past any of these the next text delta belongs
+# to a NEW message, so the streamed-duplicate guard closes and the spinner
+# may legitimately return.
+_STREAM_BOUNDARY_KINDS = frozenset({"thinking", "response", "tool", "context"})
+
 
 class NullSink:
     def begin_working(self) -> None:
@@ -131,8 +139,22 @@ class ConsoleEventSink:
         self._stdout_lock = Lock()
         self._quiet = quiet
         self._emit_final = emit_final
+        self._stream_text: str | None = None
+        self._answer_stream: str | None = None
+        self._stream_line_open = False
+        # True while THIS message's deltas stopped a live spinner — the
+        # boundary event that closes the message re-ignites it, because
+        # the next LLM call / tool execution is spinner territory again.
+        self._stream_stopped_spinner = False
 
     def begin_working(self) -> None:
+        # While a message is mid-stream the TOKENS are the liveness signal:
+        # a spinner over freshly written text would overwrite the answer
+        # the user is reading (and a `Live` region re-entering on the same
+        # rows corrupts them). The spinner returns at the next message
+        # boundary — `emit_loop_event` closes the stream there.
+        if self._stream_text is not None or self._stream_line_open:
+            return
         if self._quiet or self._status is not None:
             return
         self._status = self._console.status(
@@ -163,6 +185,55 @@ class ConsoleEventSink:
         # to the pre-tool_result behavior.
         if event.kind == "tool_result":
             return
+        # The streamed-duplicate guard, keyed on the ITERATION flush order
+        # coreouto guarantees (`thinking` → `response` → `context`): the
+        # whole-text `response` event of the message that just streamed is
+        # suppressed when its text matches what the tokens already wrote,
+        # and the trailing `context` event — one per message, always last —
+        # closes the boundary: the message is complete, so the streamed
+        # text moves to `_answer_stream` (what the run's answer must not
+        # repeat) and the spinner may return.
+        # Those exact tokens already went out one by one: the stream was the
+        # rendering, so the line is NOT printed again — but the event is
+        # still a message boundary, and the bookkeeping below (closing the
+        # stream state, re-igniting the spinner) must run. (`thinking` is
+        # never suppressed: the CLI prints no thinking deltas, so the
+        # completed event is that text's one and only rendering.)
+        suppressed = (
+            event.kind == "response"
+            and self._stream_text is not None
+            and event.text == self._stream_text
+        )
+        if event.kind == "context":
+            # One `context` per message, always the LAST event of the flush:
+            # the message is complete. Its streamed text becomes the text
+            # the run's answer must not repeat (None when it did not
+            # stream — which also retires the PREVIOUS message's value).
+            self._answer_stream = self._stream_text
+            self._stream_text = None
+        elif event.kind == "tool":
+            # Defensive close: `context` normally precedes a tool event, but
+            # no later event may inherit a stale stream.
+            self._stream_text = None
+        # A raw delta write can leave stdout mid-line; a console.print from
+        # here on would glue onto the streamed answer text.
+        if self._stream_line_open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._stream_line_open = False
+        # The message is complete — if its deltas stopped the spinner, the
+        # next LLM call / tool execution is spinner territory again. The
+        # flag survives boundary events that arrive while the guard is
+        # still open (a suppressed `response` before its `context`), so it
+        # is spent exactly when the spinner can actually return.
+        if (
+            event.kind in _STREAM_BOUNDARY_KINDS
+            and self._stream_stopped_spinner
+            and self._stream_text is None
+            and not self._stream_line_open
+        ):
+            self._stream_stopped_spinner = False
+            self.begin_working()
         # Text.assemble avoids markup parsing entirely — the model/tool
         # text is stored as raw characters and styled by span, so stray
         # `[brackets]` in the payload can't crash Rich.
@@ -187,27 +258,91 @@ class ConsoleEventSink:
                 (f"{event.actor}:", "orange3"),
                 (f" {event.text}", "white"),
             )
-        self._console.print(line, highlight=False)
+        if not suppressed:
+            self._console.print(line, highlight=False)
 
     def emit_final_answer(self, content: str, session_name: str) -> None:
         if not self._emit_final:
             return
         with self._stdout_lock:
-            if not self._quiet:
-                sys.stdout.write("------finish------\n")
-            sys.stdout.write(content if content else "")
-            if not content or not content.endswith("\n"):
-                sys.stdout.write("\n")
-            sys.stdout.flush()
+            if self._answer_stream is not None and content == self._answer_stream:
+                # The answer already went out token by token: only the run's
+                # finish marker is owed — after one newline when the last
+                # delta left stdout mid-line (contract: the marker never
+                # shares a line with streamed answer text).
+                if self._stream_line_open:
+                    sys.stdout.write("\n")
+                if not self._quiet:
+                    sys.stdout.write("------finish------\n")
+                sys.stdout.flush()
+            else:
+                if not self._quiet:
+                    sys.stdout.write("------finish------\n")
+                sys.stdout.write(content if content else "")
+                if not content or not content.endswith("\n"):
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+            self.streamed_answer_consumed()
 
     def emit_stream_delta(self, kind: str, text: str) -> None:
-        """No-op: live streaming is a TUI feature only.
+        """Write one live fragment to stdout — display-only (invariant 8).
 
-        The CLI prints intermediate model text from the discrete
-        `response` loop event and the final answer from
-        `emit_final_answer`; rendering the same tokens twice (once
-        incrementally, once whole) would corrupt that output.
+        The CLI is pipe-friendly on purpose: a wrapper process reads the
+        token stream off stdout as it arrives, tty or not. `text` deltas
+        are written raw (no `actor:` prefix — the stream IS the message),
+        `thinking` stays silent as before (reasoning renders from its
+        completed event). `quiet` outputs nothing and touches no state:
+        `--answer-only` / `--with-session` promise byte-identical output.
         """
+
+        if self._quiet or not text or kind != STREAM_TEXT:
+            return
+        with self._stdout_lock:
+            if self._status is not None:
+                self.end_working()
+                self._stream_stopped_spinner = True
+            self._stream_text = (self._stream_text or "") + text
+            self._stream_line_open = not text.endswith("\n")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+    def streamed_answer(self) -> str | None:
+        """The text this sink already streamed for the LAST message, if any.
+
+        The chain layer (`cli/chat.py`) calls this before printing the
+        run's answer: content equal to it was already delivered token by
+        token, so only the finish marker is owed (the stream left stdout
+        mid-line, and the marker closes the line — contract point 4).
+        `None` means the answer did not stream (e.g. a synthesized
+        hand-off message), so the whole text is still owed.
+        """
+
+        return self._answer_stream
+
+    def begin_newline_if_stream_open(self) -> None:
+        """Close a raw stream line before a marker is written after it.
+
+        The chain layer calls this right before printing `------finish------`
+        (or a superseded intermediate answer): streamed deltas go out
+        unadorned, so the stream can leave stdout mid-line, and a marker
+        must never share a line with answer text.
+        """
+
+        if self._stream_line_open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._stream_line_open = False
+
+    def streamed_answer_consumed(self) -> None:
+        """Reset the streamed-answer state: the answer is fully delivered.
+
+        The finish marker (or a full re-print) settles the debt; anything
+        the next message streams accumulates from scratch.
+        """
+
+        self._answer_stream = None
+        self._stream_text = None
+        self._stream_line_open = False
 
     def remove_events(self, msg_refs: list[str]) -> None:
         """Note the removal — the console cannot unprint what it showed.

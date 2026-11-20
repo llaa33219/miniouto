@@ -4,7 +4,7 @@
 
 `miniouto` is a **thin orchestration layer** on top of the [`coreouto`](https://github.com/llaa33219/coreouto) agent library. It provides:
 
-1. A CLI (`miniouto`) and an optional `xnano`-backed TUI for interactive use.
+1. A CLI (`miniouto`) and an optional `xnano`-backed TUI for interactive use — the TUI is itself a **CLI wrapper** (an official example of what a third-party program can build on the CLI), not a second runtime.
 2. File-driven configuration (TOML for providers/settings, Markdown for styles, JSON for sessions).
 3. Bundled agent "style" templates (three personas: a minimal default and two orchestrators).
 4. A minimal tool surface (Bash + Image/Video/Audio media viewers, plus `Computer` when the platform supports it) and **delegation as a Bash command** — `miniouto chat "<brief>" --style <style> --role <tag>`, run by the model through `Bash`.
@@ -12,7 +12,7 @@
 6. Per-turn diagnostic output to stderr.
 7. A cross-process message inbox (`inbox/<session>/`) so a detached run can talk back to the session that launched it.
 
-The harness is **stateless across invocations except for what's persisted to `~/.miniouto/`**. No server, no daemon thread. Every CLI run is a fresh Python process (except TUI mode, which is one long-lived process), and **delegation is a second process, not a thread**: the model runs `miniouto chat "<brief>" --style <style> --role <tag>` through `Bash`, and that child builds its own runtime and runs its own turn (invariant 5). `--bg` detaches it into its own OS session with file stdio, so it survives the `Bash` tool's process-group kill.
+The harness is **stateless across invocations except for what's persisted to `~/.miniouto/`**. No server, no daemon thread. Every CLI run is a fresh Python process (except TUI mode, which is one long-lived process whose every agent action is itself a fresh CLI child — `[sys.executable, "-m", "miniouto", …]`, never the global PATH binary), and **delegation is a second process, not a thread**: the model runs `miniouto chat "<brief>" --style <style> --role <tag>` through `Bash`, and that child builds its own runtime and runs its own turn (invariant 5). `--bg` detaches it into its own OS session with file stdio, so it survives the `Bash` tool's process-group kill.
 
 ## Three principles
 
@@ -28,7 +28,8 @@ From `README.md`:
 src/miniouto/
 ├── __init__.py              # __version__ = "0.12.9"
 ├── paths_runtime.py         # INVOCATION_CWD: Path  (captured cwd at import)
-├── cli/                     # Typer commands + xnano TUI (cli/tui/ package)
+├── cli/                     # Typer commands + xnano TUI (cli/tui/ package — a CLI wrapper;
+│                            #   cli/tui/bridge.py is its one subprocess lane)
 ├── core/                    # Chat loop + runtime assembly + event sinks
 │   ├── __init__.py
 │   ├── chat.py
@@ -107,10 +108,18 @@ user input
   │
   ▼
 cli/__init__.py:app (Typer)
-  │ ── no subcommand ──► tui.run_tui() (xnano ChatTUI)
+  │ ── no subcommand ──► tui.run_tui() (xnano ChatTUI — a CLI WRAPPER)
   │                          │
   │                          ▼
-  │                      core.chat.run_chat(opts, sink)
+  │                      cli/tui/bridge.py: [sys.executable, "-m", "miniouto", …]
+  │                      (chat <prompt> --name S -c, config set/show, provider …,
+  │                       style set --session, message insert/list — never the
+  │                       global PATH binary; the TUI writes no storage itself)
+  │                          │  stdout: session markers, raw token deltas,
+  │                          │          hand-off markers, ------finish------
+  │                          │  files:   session JSON (incremental per event)
+  │                          ▼
+  │                      the SAME chat_cmd as below (a foreground child process)
   │
   ├── miniouto chat "..."
   │     └─► cli/chat.chat_cmd
@@ -153,14 +162,18 @@ cli/__init__.py:app (Typer)
    │     ├─► --bg → detach (start_new_session=True) + spawn-logs/<id>.log + <id>.json marker
    │     ├─► writes subagent-results/<id>-<ts>.md (the final answer, nothing else)
    │     └─► core.inbox.insert(alarm_session, alarm)   ← delivered next turn
+   ├─ miniouto config show/set ──► storage.{session_config,settings,providers} (the
+   │      invariant-12 trio write: pin + global default + record default_model, plus --theme / --active-session)
    ├─ miniouto message insert/list/clear ─► core.inbox + storage.settings
    ├─ miniouto computer show [PATH]     ─► tools.ascii_art.parse_art (renders a .art capture)
    ├─ miniouto provider providers/models/add ──► core.modelslist + storage.providers + settings.update
-  ├── miniouto provider custom add            ──► storage.providers + settings.update
-  ├── miniouto provider [list|remove|default] ──► storage.providers.* + settings.update
-  ├── miniouto style    [list|set|add|update|show] ──► storage.styles.* + settings.update
+  ├── miniouto provider custom add [--max-context-window|--max-output-tokens] ──► storage.providers
+  ├── miniouto provider [list|remove|default|edit] ──► storage.providers.* + settings.update
+  │      (edit: --default-model/--reasoning/--max-*-tokens/--base-url/--api-key; --compatibility rewrites
+  │       the record from the catalog's dialect mapping, catalog-source records only)
+  ├── miniouto style    [list|set|add|update|show] ──► storage.styles.* + settings.update (`set --session` pins one session)
   ├── miniouto skill    [list|show]           ──► storage.skills.*
-   ├─ miniouto subagent [show|set|clear]      ──► storage.providers + settings (what `chat --use-subagent-provider` reads)
+   ├─ miniouto subagent [show|set|clear]      ──► storage.providers + storage.settings (what `chat --use-subagent-provider` reads)
   └── miniouto status                          ──► read everything, print
 ```
 
@@ -222,19 +235,19 @@ Delegation is cross-process, so there is no in-process identity to attribute: th
 There are no dedicated Write/Edit/Delete tools — `tools/bash.py` covers all file work (`cat`/`grep`/`find`, heredocs/`tee`, `sed -i`, `rm`). The dedicated tools were removed (they were error-prone and the agent reached for Bash anyway). Do not reintroduce them without explicit discussion; to add any other tool, follow `docs/tools.md` § "Adding a new tool".
 
 ### 9. Async only where needed
-`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI uses `asyncio.to_thread(run_chat, opts, sink)` to call the sync `core.chat.run_chat` without blocking the asyncio event loop (the TUI's own loop, ~60 Hz draw).
+`tools/bash.py` is async (it spawns a subprocess). The media loaders are sync. The TUI runs its turn as a `chat` **subprocess** and pumps the child's stdout with asyncio streams on its own loop (the ~60 Hz draw); the blocking bridge calls (`run_sync`) ride `asyncio.to_thread` workers so a subprocess round-trip never freezes the UI thread.
 
 ### 10. Skill discovery lives outside `~/.miniouto/`
 `storage/skills.py` reads from two roots — the invocation directory's `./skills/<name>/SKILL.md` (project-local, FIRST) and `~/.agents/skills/<name>/SKILL.md` (the Anthropic-style convention) — NOT from `~/.miniouto/`. This is intentional: skills are a portable, project-shared concept, not a per-installation setting.
 
 ### 11. Stream deltas are display-only — never a record
-`EventSink.emit_stream_delta(kind, text)` carries the per-fragment payloads coreouto fires from `ON_STREAM_TEXT` / `ON_STREAM_THINKING`. All four sink implementations define it (hooks are global and there is no `__getattr__` delegation, so a missing method would raise `AttributeError` on the first delta of the first turn). `_RecordingSink` forwards to the wrapped sink and stops — it does not record, and it does not call the persister — so the session file never contains fragments; the whole message is stored once, when it completes. `ConsoleEventSink` is a no-op, keeping CLI output byte-identical. In the TUI the deltas land in one live `StreamRow` per message, coalesced to ~30 Hz. The repetition watchdog is deliberately **not** fed from deltas: they fragment mid-segment, and the whole-message counters already cover the same content.
+`EventSink.emit_stream_delta(kind, text)` carries the per-fragment payloads coreouto fires from `ON_STREAM_TEXT` / `ON_STREAM_THINKING`. All four sink implementations define it (hooks are global and there is no `__getattr__` delegation, so a missing method would raise `AttributeError` on the first delta of the first turn). `_RecordingSink` forwards to the wrapped sink and stops — it does not record, and it does not call the persister — so the session file never contains fragments; the whole message is stored once, when it completes. `ConsoleEventSink` writes `text` deltas straight to stdout (raw, no prefix, flushed per fragment — the stream a CLI wrapper like the TUI reads off a pipe); nothing persists them in either surface. In the TUI the deltas arrive through the chat child's stdout and land in one live `StreamRow` per message. The repetition watchdog is fed from the deltas (see AGENTS.md invariant 8) through the shared buffering splitter.
 
 ### 12. Alarm delivery: a real user message — append to live messages, or dispatch a turn
 A delegated run's completion alarm (and anything a human or script inserted) is a synthetic **user** message whose first line is exactly `[SYSTEM ALARM - THIS IS NOT A USER MESSAGE]` (`core/inbox.py:ALARM_HEADER`, shared with `core/repetition.py:alarm_text`). It must reach both the chat and the model, never sit on disk.
 
 - **Mid-turn** (the common case for a foreground chat): the `BEFORE_LLM_CALL` hook `core/runtime.py:_make_alarm_hook` calls `inbox.drain(session)`, joins the texts with a blank line, and appends ONE `co.Message(role="user")` to the LIVE list, so the very next provider call already carries it. `Agent.inject_user_message` is deliberately **not** used: its queue is drained at the top of the loop iteration, i.e. *before* this hook, so a message queued from there would land a full round-trip later — and it could never wake a turn that already ended. If the last message is already a user message the text is folded into it, because providers reject two consecutive user messages. There is **no depth gate**: the inbox is per-session, not per-actor.
-- **Idle** (the run already printed its answer and exited): the TUI polls the inbox every second and starts a turn whose prompt **is** the joined message text (recorded as that turn's `user`, so display, replay and model perception are the same string), and `miniouto chat --alarms -c [--name <s>]` does the same explicitly. Both consume exactly once because `drain` unlinks. A one-shot `chat` never waits: anything queued after its turn stays queued for the next wakeup.
+- **Idle** (the run already printed its answer and exited): the TUI polls the inbox every second (stat-gated — the inbox directory's `(mtime_ns, size)` decides whether a `message list` subprocess is worth spending) and, when something is queued, wakes the session with the `chat --alarms -c --name <s>` child — a turn whose prompt **is** the joined message text (recorded as that turn's `user`, so display, replay and model perception are the same string); `miniouto chat --alarms -c [--name <s>]` does the same explicitly for any script. Both consume exactly once because `drain` unlinks. A one-shot `chat` never waits: anything queued after its turn stays queued for the next wakeup.
 - Each drained message becomes one `LoopEvent(kind="alarm"|"user", detail="inbox:<id>")` for the record and the TUI.
 
 The queue is a **directory of files, not a deque** (invariant 20): one message = one atomically-renamed JSON file, so a writer racing a drainer is never lost, only deferred, and corrupt content is quarantined as `.bad` instead of raising. **One consumer per session, deliberately** — two live processes bound to one session would steal each other's messages; isolate them with a distinct `MINIOUTO_HOME` instead of adding a lock.
@@ -310,6 +323,7 @@ ChatOptions (CLI flags)
 | `pydantic` | `>=2.0` | Data models (used by coreouto) |
 | `httpx` | `>=0.27.0` | HTTP client (modelslist REST client + style repo fetcher) |
 | `tomli-w` | `>=1.0.0` | TOML serializer (paired with stdlib `tomllib`) |
+| `pyyaml` | `>=6.0` | The YAML emitter behind `cli/_yaml.py` (every listing command's machine-readable output) and the parser a CLI wrapper (the TUI's `bridge.py`) reads it back with |
 
 `coreouto` is the only non-trivial runtime dependency; everything else is a thin UI/storage layer.
 

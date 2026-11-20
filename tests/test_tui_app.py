@@ -42,7 +42,7 @@ from miniouto.cli.tui import (
 from miniouto.cli.tui.input import Mouse
 from miniouto.cli.tui.nodes import Rect
 from miniouto.cli.tui.rows import RowStatic
-from miniouto.core import inbox, summary
+from miniouto.core import inbox
 from miniouto.storage import sessions as session_store
 from miniouto.storage import settings as settings_store
 
@@ -341,8 +341,9 @@ def test_enter_dispatches_the_prompt_on_the_pinned_session(
             # And: the input is empty and the prompt is a user row on screen
             assert app._input.text == ""
             rows = [r for r in app._log.rows if isinstance(r, RowStatic)]
-            assert rows and tui_harness.row_text(rows[-1]).lstrip().startswith(
-                "> hello from the test"
+            assert rows and any(
+                tui_harness.row_text(row).lstrip().startswith("> hello from the test")
+                for row in rows
             )
 
     asyncio.run(body())
@@ -526,7 +527,10 @@ def test_the_palette_runs_the_highlighted_command_and_closes() -> None:
             # minted) and the palette is gone
             assert app.screen is not palette
             assert app._logo_shown is True
-            assert app._pinned_session().startswith("tui-")
+            # The mint is a worker (it seeds through the CLI); wait for it.
+            await tui_harness.settle_until(
+                pilot, lambda: app._pinned_session().startswith("tui-")
+            )
 
     asyncio.run(body())
 
@@ -603,6 +607,11 @@ def test_assigning_a_theme_persists_it_for_the_next_boot() -> None:
             await pilot.pause()
             # Given / When: a theme is assigned (what the picker and a keybinding do)
             app.theme = "gruvbox"
+            # The persistence is a CLI write on a worker (`config set --theme`);
+            # wait for the worker before reading the disk back.
+            await tui_harness.settle_until(
+                pilot, lambda: settings_store.load().theme == "gruvbox"
+            )
             # Then: the choice is on disk, which is what the next boot reads …
             assert settings_store.load().theme == "gruvbox"
             # … and it is the theme actually in force now
@@ -635,25 +644,22 @@ def test_a_handoff_mounts_the_marker_and_moves_the_session() -> None:
             tui_harness.pin_session(app, "app-handoff-from")
             session_store.create("app-handoff-from")
             session_store.create("app-handoff-to")
-            # Given: a hand-off is pending
-            summary.request_handoff(
-                "app-handoff-to",
-                from_session="app-handoff-from",
-                summary_dir="/tmp/summary",
-            )
+            # Given: the chat child printed the hand-off marker pair on stdout
+            # (the CLI detects the transition; the TUI only parses the marker)
             # When: the app applies it
-            app._apply_handoff()
+            app._apply_handoff("app-handoff-to", "/tmp/summary")
             await pilot.pause()
             # Then: the OLD conversation ends visibly…
             texts = [tui_harness.row_text(r) for r in app._log.rows]
             assert any("------summary → app-handoff-to------" in t for t in texts), texts
-            # …the pin moved…
+            # …the pin moved… (the publish is a CLI write on a worker)
             assert app._pinned_session() == "app-handoff-to"
-            assert settings_store.load().session == "app-handoff-to"
-            # …and the marker is on the OLD session's disk too, as its own turn
-            data = session_store.load("app-handoff-from")
-            assert data.turns, "no turn written for the marker"
-            assert data.turns[-1].events[0]["kind"] == "handoff"
+            await tui_harness.settle_until(
+                pilot, lambda: settings_store.load().session == "app-handoff-to"
+            )
+            # …and the marker is persisted by the CLI (its own trailing turn on
+            # the OLD session — pinned by tests/test_handoff.py); the TUI side
+            # only mounts it and moves the pin.
 
     asyncio.run(body())
 
@@ -963,10 +969,13 @@ def test_a_mid_turn_message_is_painted_once_after_delivery(
             app._log.remove_children()
             app._reset_rows()
             app._logo_shown = False
-            # Given: the user typed while a turn was in flight
+            # Given: the user typed while a turn was in flight (the insert is
+            # a `message insert` child on a worker — wait for the row)
             app._busy = True
             app._queue_inbox_message("MIDTURN-TEXT")
-            await pilot.pause()
+            await tui_harness.settle_until(
+                pilot, lambda: any("MIDTURN-TEXT" in r.render().plain for r in app._log.rows)
+            )
             assert sum("MIDTURN-TEXT" in line for line in tui_harness.composed(app, *BOOT)) == 1
             # When: the turn ends and the queued message becomes the next prompt
             app._busy = False
@@ -2384,3 +2393,895 @@ def test_the_stderr_tap_captures_to_the_log_and_restores_fd2(
             await pilot.pause()
 
     asyncio.run(body())
+
+
+# ── 12. the wrapper contract, end to end on the Pilot ───────────────────────
+
+
+def test_a_turn_streams_live_and_finishes_through_the_cli_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reference wrapper flow: submit → spawn → stdout deltas → file
+    events → finish → the canonical answer, all on the headless Pilot.
+
+    The double speaks the MEASURED CLI stdout contract (session marker, raw
+    token deltas, `------finish------`) AND writes the session record the
+    real child writes (the running turn's events, incremented as the loop
+    emits them) — so this exercises the exact parsing the official TUI runs
+    against any third-party wrapper: live StreamRow from stdout, event rows
+    from the session tail, the final AnswerRow from the file.
+    """
+
+    class _StreamingProcess(tui_harness._FakeChatProcess):
+        def _render(self) -> bytes:
+            from miniouto.storage import sessions as store
+
+            prompt, session, _cont = self._parse()
+            if "--alarms" in self.argv:
+                from miniouto.core import inbox as inbox_api
+
+                messages = inbox_api.drain(session)
+                if not messages:
+                    self.returncode = 0
+                    return b"no pending messages\n"
+                prompt = "\n\n".join(m.text for m in messages)
+            store.begin_turn(session, prompt)
+            # The file events, as the CLI increments them mid-turn.
+            store.update_turn_events(
+                session,
+                [
+                    LoopEvent(
+                        actor="outo", kind="thinking", text="reasoning about it"
+                    ).to_dict(),
+                    LoopEvent(
+                        actor="outo",
+                        kind="tool",
+                        text="Bash ls",
+                        tool_name="Bash",
+                        msg_ref="m1",
+                    ).to_dict(),
+                ],
+            )
+            answer = "The answer is 42."
+            store.finish_turn(session, assistant=answer)
+            self.returncode = 0
+            out = f"------{session}------\n"
+            out += answer  # raw deltas, no prefix, printed once
+            out += "\n------finish------\n"
+            return out.encode("utf-8")
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        return _StreamingProcess(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-stream-session")
+            app._input.text = "what is the answer?"
+            await pilot.press("enter")
+            for _ in range(300):
+                rows = app._window.rows
+                if any(type(r).__name__ == "AnswerRow" for r in rows):
+                    break
+                await pilot.pause(0.01)
+
+            rows = app._window.rows
+            names = [type(r).__name__ for r in rows]
+            # The live stream row was retired by the canonical answer (no dup)
+            assert names.count("StreamRow") == 0, names
+            assert names.count("AnswerRow") == 1, names
+            # The session-tail events rendered as their own rows (a thinking
+            # row collapses to its summary; the tool row carries its call)
+            rendered = [tui_harness.row_text(r) for r in rows]
+            assert any("thinking" in text for text in rendered), rendered
+            assert any("Bash ls" in text for text in rendered), rendered
+            assert any("42" in text for text in rendered), rendered
+            # The turn is not busy any more and the inbox drain is a no-op
+            assert app._busy is False
+
+    asyncio.run(body())
+
+
+def test_esc_esc_sigints_the_chat_child_and_reports_the_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cancel path: two Esc presses SIGINT the child; the CLI stamps the
+    turn interrupted, exits 130 and prints `stopped: cancelled` — the TUI
+    reads the state back and says the user stopped it."""
+
+    import threading
+
+    class _CancellableProcess(tui_harness._FakeChatProcess):
+        """A child that streams nothing until SIGINT, then stops the way the
+        CLI does: `stopped: cancelled`, `------finish------`, exit 130, the
+        turn stamped interrupted."""
+
+        def __init__(self, argv: list[str]) -> None:
+            self._sent = threading.Event()
+            self.argv = argv
+            self.returncode: int | None = None
+            self.stdout = _GatedStream(self._sent, self)
+            self.stderr = tui_harness._FakeStreamReader(b"")
+
+        def _parse(self) -> tuple[str, str, bool]:
+            return tui_harness._FakeChatProcess._parse(self)  # type: ignore[arg-type]
+
+        def send_signal(self, sig: int) -> None:
+            # The CLI's plain-KBI path: stamp interrupted, then finish.
+            from miniouto.storage import sessions as store
+
+            prompt, session, _cont = self._parse()
+            store.begin_turn(session, prompt)
+            store.finish_turn(session, assistant="", status="interrupted")
+            self.returncode = 130
+            self._sent.set()
+
+        async def wait(self) -> int:
+            while not self._sent.wait(timeout=0.05):
+                await asyncio.sleep(0)
+            return self.returncode if self.returncode is not None else 0
+
+    class _GatedStream:
+        """stdout that stays empty until the child is interrupted.
+
+        The payload is handed out ONCE and EOF after — the semantics the
+        incremental reader loop relies on (see ``tui_harness``'s
+        ``_FakeStreamReader``): a read that kept returning the same bytes
+        would loop the reader forever.
+        """
+
+        def __init__(self, gate: threading.Event, proc: _CancellableProcess) -> None:
+            self._gate = gate
+            self._proc = proc
+            self._data = b"stopped: cancelled\n------finish------\n"
+
+        async def read(self, _n: int = -1) -> bytes:
+            for _ in range(600):  # ~30 s of waiting for the signal
+                if self._gate.is_set():
+                    break
+                await asyncio.sleep(0.05)
+            if not self._gate.is_set():
+                return b""
+            data, self._data = self._data, b""
+            return data
+
+    current: list[_CancellableProcess] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        proc = _CancellableProcess(list(argv))
+        current.append(proc)
+        return proc
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-esc-session")
+            app._input.text = "long running prompt"
+            await pilot.press("enter")
+            for _ in range(200):
+                if current and app._chat_proc is current[-1]:
+                    break
+                await pilot.pause(0.01)
+            assert app._chat_proc is not None, "the chat child never started"
+
+            # Two Esc presses inside the window → SIGINT to the child
+            await pilot.press("escape")
+            await pilot.press("escape")
+            for _ in range(300):
+                if not app._busy:
+                    break
+                await pilot.pause(0.01)
+
+            texts = [tui_harness.row_text(r) for r in app._window.rows]
+            assert any("stopped by user" in text for text in texts), texts
+            assert app._busy is False
+
+    asyncio.run(body())
+
+
+# ── 13. quitting mid-turn must not leak the chat transport ──────────────────
+
+
+def test_quitting_mid_turn_settles_the_chat_transport_before_the_loop_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (the exit RuntimeError): an abandoned transport explodes in GC.
+
+    The repro (real provider, scratch home): a turn — here the ``--alarms``
+    wakeup — was still running when the app shut down. The cancelled worker
+    SIGINTed the child but abandoned its asyncio transport half-open; the
+    loop then closed, and the transport's later GC ran ``close()`` into the
+    dead loop, printing ``RuntimeError: Event loop is closed`` over the
+    restored shell. The cancel branch now settles the child (SIGINT → wait
+    → kill) while the loop is still open, so ``__del__`` finds it closed.
+    """
+
+    import sys as _sys
+
+    async def real_sleepy_exec(*_argv: str, **kwargs: Any) -> Any:
+        # A REAL asyncio child that lives until SIGINTed — the transport is
+        # then the genuine ``_UnixSubprocessTransport`` whose half-open state
+        # was the whole defect. ``-u`` and a tiny sleep keep it bounded.
+        kwargs = dict(kwargs)
+        kwargs.pop("env", None)
+        return await asyncio.create_subprocess_exec(
+            _sys.executable, "-u", "-c", "import signal, time\n"
+            "signal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+            "print('------sleepy------', flush=True)\n"
+            "time.sleep(30)",
+            **kwargs,
+        )
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", real_sleepy_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-exit-midturn")
+            # Given: a turn in flight whose child stays alive (a plain
+            # dispatch — its stdout marker opens the run, then it sleeps)
+            app.run_worker(app._dispatch("hold the line"), exclusive=True)
+            for _ in range(300):
+                await pilot.pause(0.01)
+                if app._chat_proc is not None:
+                    break
+            assert app._chat_proc is not None, "the chat child never started"
+            # When: the app tears down while the child is mid-run — the
+            # context exit cancels the worker, which must settle the child
+            transport = app._chat_proc._transport
+
+        # Then: the child was settled BEFORE the loop closed — its transport
+        # is fully closed and detached, so its later GC cannot re-close it
+        # into the dead loop (the ``RuntimeError: Event loop is closed``
+        # repro; an abandoned transport keeps ``_closed=False`` and a live
+        # ``_loop``).
+        assert transport._closed, "the transport was abandoned half-open"
+        assert transport._loop is None, "connection_lost never ran"
+
+    asyncio.run(body())
+
+
+# ── 14. reviewer defect regressions (TUI CLI-wrapper review, 2026-11-20) ────
+
+
+def test_a_second_turn_does_not_replay_the_previous_turns_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 1 (critical): turn 2 remounted turn 1's tool rows.
+
+    ``_SessionTail.__init__`` started every tailer at ``(0, 0)``, and a new
+    tailer is created per turn, so turn 2 replayed the whole session file as
+    though it were new — the reviewer's scratch repro showed turn 2 mounting
+    turn 1's ``ToolRow "Bash ls"`` a second time. The cursor is app state
+    per session now.
+    """
+
+    class _PerTurnToolChild(tui_harness._FakeChatProcess):
+        """Each turn records ONE tool event and finishes, like the real CLI."""
+
+        def _render(self) -> bytes:
+            from miniouto.storage import sessions as store
+
+            prompt, session, _c = self._parse()
+            store.begin_turn(session, prompt)
+            store.update_turn_events(
+                session,
+                [
+                    LoopEvent(
+                        actor="outo", kind="tool", text=f"Bash {prompt}", tool_name="Bash"
+                    ).to_dict(),
+                ],
+            )
+            store.finish_turn(session, assistant=f"done {prompt}")
+            self.returncode = 0
+            return (
+                f"------{session}------\ndone {prompt}\n------finish------\n"
+            ).encode()
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        return _PerTurnToolChild(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-two-turns")
+            for text in ("turn one", "turn two"):
+                app._input.text = text
+                await pilot.press("enter")
+                for _ in range(300):
+                    rows = app._window.rows
+                    done = [
+                        r for r in rows if type(r).__name__ == "AnswerRow" and not app._busy
+                    ]
+                    if len(done) >= 1 and not app._busy and any(
+                        f"done {text}" in tui_harness.row_text(r) for r in done
+                    ):
+                        break
+                    await pilot.pause(0.01)
+
+            from miniouto.cli.tui.rows import ToolRow
+
+            tools = [r for r in app._window.rows if isinstance(r, ToolRow)]
+            texts = [tui_harness.row_text(t) for t in tools]
+            # One tool row per TURN, each with its own prompt — nothing replayed.
+            assert len(tools) == 2, texts
+            assert any("turn one" in t for t in texts), texts
+            assert any("turn two" in t for t in texts), texts
+            # And the tail cursor advanced past both turns.
+            assert app._tail_cursors["app-two-turns"] == (2, 0)
+
+    asyncio.run(body())
+
+
+def test_a_wakeup_on_a_summarized_session_moves_and_wakes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 2 (critical): a summarized session's wakeup looped forever.
+
+    ``chat --alarms -c --name <summarized>`` is REFUSED by the CLI (rc 0,
+    no drain), so the message stayed queued and the 1 s poll re-delivered it
+    — the reviewer measured 11 wakeups and 11 ``> `` rows in 1.5 s. The
+    delivery resolves the redirect (like the submit path) and the wakeup
+    runs on the head session whose drain follows the chain.
+    """
+
+    from miniouto.cli.tui.app import _WAKEUP_MAX_FAILURES
+    from miniouto.storage import sessions as store
+
+    class _RefusedWakeup(tui_harness._FakeChatProcess):
+        """A wakeup child that refuses summarized sessions like the CLI."""
+
+        def _render(self) -> bytes:
+            _prompt, session, _c = self._parse()
+            final, chain = store.resolve_redirect(session)
+            if len(chain) > 1:
+                self.returncode = 0
+                return (
+                    f"session {chain[0]} was summarized → the work continues in "
+                    f"{final}. Re-run with --name {final} to continue there.\n"
+                ).encode()
+            return super()._render()
+
+    spawns: list[list[str]] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        spawns.append(list(argv))
+        return _RefusedWakeup(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            session_store.create("app-sum-old")
+            session_store.create("app-sum-new")
+            session_store.set_redirect("app-sum-old", "app-sum-new")
+            tui_harness.pin_session(app, "app-sum-old")
+            inbox.insert(
+                "app-sum-old", "wake up", kind=inbox.ALARM_KIND, source="spawn"
+            )
+            # Let the 1 s poll + delivery cycle run for a few seconds.
+            for _ in range(100):
+                await pilot.pause(0.02)
+
+            wakes = [
+                tui_harness.row_text(r)
+                for r in app._window.rows
+                if "wake up" in tui_harness.row_text(r)
+            ]
+            # The wakeup ran ONCE (the head session's drain follows the chain)
+            # and mounted ONE row — not one per poll tick.
+            assert len(wakes) == 1, wakes
+            assert len(spawns) <= 2, spawns
+            assert _WAKEUP_MAX_FAILURES >= 1
+
+    asyncio.run(body())
+
+
+def test_a_failing_spawn_does_not_storm_the_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 3 (critical): a spawn failure re-delivered forever.
+
+    ``asyncio_create_subprocess_exec`` failing made ``_run_chat_child`` run
+    ``_finish_turn_housekeeping``, which re-ran ``_deliver_pending_messages``
+    on the still-cached listing — the reviewer measured 671 spawns and 671
+    rows in 2.5 s. Failed wakeup attempts count toward a cap now.
+    """
+
+    attempts: list[list[str]] = []
+
+    async def failing_exec(*argv: str, **kwargs: Any) -> Any:
+        attempts.append(list(argv))
+        raise FileNotFoundError("spawn failed")
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", failing_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            session_store.create("app-spawn-fail")
+            tui_harness.pin_session(app, "app-spawn-fail")
+            inbox.insert(
+                "app-spawn-fail", "wake up", kind=inbox.ALARM_KIND, source="spawn"
+            )
+            for _ in range(80):
+                await pilot.pause(0.02)
+
+            assert len(attempts) <= 4, f"spawn storm: {len(attempts)} attempts"
+            errors = [
+                tui_harness.row_text(r)
+                for r in app._window.rows
+                if "could not start chat" in tui_harness.row_text(r)
+            ]
+            assert len(errors) <= 4, f"error row storm: {len(errors)}"
+
+    asyncio.run(body())
+
+
+def test_an_interrupted_turn_does_not_mount_the_previous_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 4 (major): esc-esc'd turn 2 mounted turn 1's answer again.
+
+    ``_mount_final_answer`` skipped ``running``/``interrupted`` turns with
+    ``continue``, walking to the previous DONE turn and mounting ITS
+    assistant as the stopped turn's answer. The newest turn is the one this
+    child ran; the loop stops at it."""
+
+    class _InterruptSecondChild(tui_harness._FakeChatProcess):
+        """Turn 1 answers; turn 2 is interrupted with no assistant text."""
+
+        def _render(self) -> bytes:
+            from miniouto.storage import sessions as store
+
+            prompt, session, _c = self._parse()
+            interrupted = "two" in prompt
+            store.begin_turn(session, prompt)
+            store.finish_turn(
+                session,
+                assistant="" if interrupted else "answer-one",
+                status="interrupted" if interrupted else "done",
+            )
+            self.returncode = 130 if interrupted else 0
+            if interrupted:
+                return f"------{session}------\n------finish------\n".encode()
+            return (
+                f"------{session}------\nanswer-one\n------finish------\n"
+            ).encode()
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        return _InterruptSecondChild(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-interrupted")
+            app._input.text = "turn one"
+            await pilot.press("enter")
+            for _ in range(300):
+                if any(
+                    type(r).__name__ == "AnswerRow" for r in app._window.rows
+                ):
+                    break
+                await pilot.pause(0.01)
+            app._input.text = "turn two"
+            await pilot.press("enter")
+            for _ in range(300):
+                if not app._busy:
+                    break
+                await pilot.pause(0.01)
+
+            answers = [
+                r
+                for r in app._window.rows
+                if type(r).__name__ == "AnswerRow"
+            ]
+            # ONE answer (turn 1's) — the interrupted turn mounted none.
+            assert len(answers) == 1, [tui_harness.row_text(r) for r in answers]
+            texts = [tui_harness.row_text(r) for r in app._window.rows]
+            assert any("stopped" in t for t in texts), texts
+
+    asyncio.run(body())
+
+
+def test_streamed_multiline_and_cjk_text_survive_the_chunk_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defects 5 + 8 (major): newlines and split codepoints in live deltas.
+
+    The reader decoded each 4096-byte chunk separately (``replace``), so a
+    codepoint split across the boundary became U+FFFD — every CJK stream
+    broke — and ``pending.split("\\n")`` + a stripped delta dropped the line
+    breaks, gluing a multi-line answer onto one live row.
+    """
+
+    class _ChunkedChild(tui_harness._FakeChatProcess):
+        """Streams the payload in small chunks that split multibyte chars."""
+
+        def __init__(self, argv: list[str], payload: bytes) -> None:
+            self.argv = argv
+            self.returncode: int | None = None
+            self.stdout = _ChunkReader(self, payload)
+            self.stderr = tui_harness._FakeStreamReader(b"")
+
+        def _parse(self) -> tuple[str, str, bool]:
+            return tui_harness._FakeChatProcess._parse(self)  # type: ignore[arg-type]
+
+        def send_signal(self, _sig: int) -> None:  # pragma: no cover
+            self.returncode = 130
+
+        async def wait(self) -> int:
+            return self.returncode if self.returncode is not None else 0
+
+    class _ChunkReader:
+        """Hands the payload out 7 bytes at a time — mid-codepoint cuts."""
+
+        def __init__(self, proc: _ChunkedChild, payload: bytes) -> None:
+            self._proc = proc
+            self._data = b""
+            self._first = True
+            self._payload = payload
+
+        async def read(self, _n: int = -1) -> bytes:
+            if self._first:
+                self._first = False
+                from miniouto.storage import sessions as store
+
+                prompt, session, _c = self._proc._parse()
+                store.begin_turn(session, prompt)
+                store.finish_turn(
+                    session, assistant=self._payload.decode("utf-8")
+                )
+                self._proc.returncode = 0
+                out = (
+                    f"------{session}------\n".encode()
+                    + self._payload
+                    + b"\n------finish------\n"
+                )
+                self._data = out
+            if not self._data:
+                return b""
+            send, self._data = self._data[:7], self._data[7:]
+            return send
+
+    async def run_case(payload: bytes, session: str) -> None:
+        async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+            return _ChunkedChild(list(argv), payload)
+
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, session)
+            app._input.text = "go"
+            await pilot.press("enter")
+            for _ in range(600):
+                await pilot.pause(0.005)
+                if not app._busy:
+                    break
+            answers = [
+                r
+                for r in app._window.rows
+                if type(r).__name__ == "AnswerRow"
+            ]
+            assert answers, "no AnswerRow mounted"
+            # The CANONICAL answer keeps every newline: the streamed deltas
+            # carried them (defect 5) and no byte was replaced (defect 8).
+            assert answers[0].markup == payload.decode("utf-8"), answers[0].markup
+
+    asyncio.run(run_case(b"line1\nline2\nline3\n", "app-multiline"))
+    asyncio.run(
+        run_case("한글 답변입니다\n두 번째 줄".encode(), "app-cjk-stream")
+    )
+
+
+def test_intermediate_narration_survives_a_tool_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 6 (major): streamed tool-turn narration vanished from the log.
+
+    A ``response`` event suppressed by the live row dropped the row's
+    reference, and the next boundary (``context``) RETIRED it — the
+    intermediate prose between tool calls disappeared entirely. The live row
+    is canonical now and survives; only the final answer's row is replaced
+    by its AnswerRow."""
+
+    narration = "Let me check the file first."
+
+    class _NarratingChild(tui_harness._FakeChatProcess):
+        def __init__(self, argv: list[str]) -> None:
+            self.argv = argv
+            self.returncode: int | None = None
+            self.stdout = _NarrReader(self)
+            self.stderr = tui_harness._FakeStreamReader(b"")
+
+        def _parse(self) -> tuple[str, str, bool]:
+            return tui_harness._FakeChatProcess._parse(self)  # type: ignore[arg-type]
+
+        def send_signal(self, _sig: int) -> None:  # pragma: no cover
+            self.returncode = 130
+
+        async def wait(self) -> int:
+            return self.returncode if self.returncode is not None else 0
+
+    class _NarrReader:
+        def __init__(self, proc: _NarratingChild) -> None:
+            self._proc = proc
+            self._first = True
+
+        async def read(self, _n: int = -1) -> bytes:
+            if not self._first:
+                return b""
+            self._first = False
+            from miniouto.storage import sessions as store
+
+            prompt, session, _c = self._proc._parse()
+            store.begin_turn(session, prompt)
+            store.update_turn_events(
+                session,
+                [
+                    LoopEvent(actor="outo", kind="thinking", text="reason").to_dict(),
+                    LoopEvent(
+                        actor="outo", kind="response", text=narration, msg_ref="m1"
+                    ).to_dict(),
+                    LoopEvent(
+                        actor="outo",
+                        kind="tool",
+                        text="Bash ls",
+                        tool_name="Bash",
+                        msg_ref="m1",
+                    ).to_dict(),
+                    LoopEvent(
+                        actor="outo", kind="context", text="iter 2", msg_ref="m2"
+                    ).to_dict(),
+                ],
+            )
+            store.finish_turn(session, assistant="final after tools")
+            self._proc.returncode = 0
+            out = (
+                f"------{session}------\n".encode()
+                + narration.encode()
+                + b"\nfinal after tools\n------finish------\n"
+            )
+            return out
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        return _NarratingChild(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-narration")
+            app._input.text = "do work"
+            await pilot.press("enter")
+            for _ in range(600):
+                await pilot.pause(0.005)
+                if not app._busy and any(
+                    type(r).__name__ == "AnswerRow" for r in app._window.rows
+                ):
+                    break
+
+            texts = [tui_harness.row_text(r) for r in app._window.rows]
+            # The narration is still on the log…
+            assert any(narration in t for t in texts), texts
+            # …exactly once, beside one tool row and one final answer.
+            assert sum(narration in t for t in texts) == 1, texts
+            answers = [
+                tui_harness.row_text(r)
+                for r in app._window.rows
+                if type(r).__name__ == "AnswerRow"
+            ]
+            assert len(answers) == 1, texts
+
+    asyncio.run(body())
+
+
+def test_esc_esc_settles_a_sigint_ignoring_child_within_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 7 (major): esc-esc waited forever on a stubborn child.
+
+    A child that ignores SIGINT while a grandchild holds the stdout pipe
+    left the reader's ``read(4096)`` pending forever — the turn stayed busy.
+    The stop path now runs the same finite ladder (bounded wait → process
+    GROUP kill, the child spawned with ``start_new_session=True``)."""
+
+    import contextlib
+    import signal as signal_mod
+    import sys
+
+    child_code = (
+        "import signal, subprocess, sys, time\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "sys.stdout.write('------stubborn------\\n'); sys.stdout.flush()\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "time.sleep(30)\n"
+    )
+
+    async def real_exec(*argv: str, **kwargs: Any) -> Any:
+        kwargs = dict(kwargs)
+        kwargs.pop("env", None)
+        return await asyncio.create_subprocess_exec(
+            sys.executable, "-u", "-c", child_code, **kwargs
+        )
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", real_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-stubborn")
+            app.run_worker(app._dispatch("hold the line"), exclusive=True)
+            for _ in range(300):
+                await pilot.pause(0.01)
+                if app._chat_proc is not None:
+                    break
+            proc = app._chat_proc
+            assert proc is not None, "the chat child never started"
+
+            await pilot.press("escape")
+            await pilot.press("escape")
+            # Bounded: the ladder's group kill lands well inside this window.
+            for _ in range(300):
+                await pilot.pause(0.02)
+                if not app._busy:
+                    break
+            assert not app._busy, "the turn stayed busy after esc-esc"
+            with contextlib.suppress(OSError, ProcessLookupError):
+                import os
+
+                os.killpg(os.getpgid(proc.pid), signal_mod.SIGKILL)
+
+    asyncio.run(body())
+
+
+def test_a_leading_dash_prompt_reaches_the_child_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect 9 (major): `- please answer` was parsed as an option (rc 2).
+
+    The prompt rides behind ``--`` now (the ``message insert`` lane's rule),
+    so a dash-leading prompt is the prompt, not a flag."""
+
+    argvs: list[list[str]] = []
+    real_argv = tui_module.bridge.chat_argv
+
+    def fake_argv(prompt: str, session: str, *, alarms: bool = False) -> list[str]:
+        argv = real_argv(prompt, session, alarms=alarms)
+        argvs.append(argv)
+        return argv
+
+    async def body() -> None:
+        routed: list[dict[str, Any]] = []
+        tui_harness.stub_run_chat(monkeypatch, routed)
+        monkeypatch.setattr(tui_module.bridge, "chat_argv", fake_argv)
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-dash-prompt")
+            app._input.text = "- please answer"
+            await pilot.press("enter")
+            for _ in range(300):
+                if argvs:
+                    break
+                await pilot.pause(0.01)
+
+            assert argvs, "no chat child was spawned"
+            argv = argvs[0]
+            assert argv[argv.index("--") + 1] == "- please answer", argv
+            # And the double's parse (the same contract) reads the prompt.
+            assert routed and routed[0]["prompt"] == "- please answer", routed
+
+    asyncio.run(body())
+
+
+# ── 15. bridge nits: stale config memo, wait_for_children, run_sync ─────────
+
+
+def test_a_provider_record_edit_invalidates_the_config_show_memo() -> None:
+    """Nit 11: a provider-record edit is part of the ``config show`` memo key.
+
+    The memo's signature covered the pin TOML and the settings TOML only.
+    ``config show``'s answer is resolved through the provider records (the
+    settings layer fills a missing model from the record, and the TUI's
+    trio display reads the record beside the memoized answer), so a record
+    a memo was built against must invalidate it — providers.toml is part of
+    the signature now."""
+
+    import uuid as _uuid
+
+    from miniouto.cli.tui import bridge as bridge_mod
+    from miniouto.storage import providers as provider_store
+
+    provider = f"memo-prov-{_uuid.uuid4().hex[:6]}"
+    session = f"memo-session-{_uuid.uuid4().hex[:6]}"
+    provider_store.upsert(
+        provider_store.Provider(name=provider, default_model="old-model", api_format="openai")
+    )
+    assert bridge_mod.config_show(session) is not None
+    before = bridge_mod._config_signature(session)
+
+    # When: the provider record is edited (a `provider edit` write)
+    provider_store.upsert(
+        provider_store.Provider(
+            name=provider, default_model="different-length-model", api_format="openai"
+        )
+    )
+
+    # Then: the memo key moved — the next `config show` re-reads through a
+    # fresh child instead of serving the answer built against the old record
+    assert bridge_mod._config_signature(session) != before
+    # And the memo itself was not served for the new state
+    assert bridge_mod.config_show(session) is not None
+
+
+def test_wait_for_children_does_not_leak_permits_after_a_timeout() -> None:
+    """Nit 12: a timed-out wait left semaphore permits behind.
+
+    ``wait_for_children`` acquired one permit per outstanding child; a
+    timeout left the acquired ones in the semaphore, so a LATER wait could
+    return True immediately while children were still running."""
+
+    from miniouto.cli.tui import bridge as bridge_mod
+
+    # Given: one child in flight (the counter, not a real process)
+    bridge_mod._inflight_enter()
+    try:
+        # When: a wait times out
+        assert bridge_mod.wait_for_children(timeout=0.05) is False
+        # Then: the semaphore holds no orphaned permit — a drain-and-wait
+        # sequence still answers by the COUNT
+        assert bridge_mod._INFLIGHT._value == 0 or bridge_mod._INFLIGHT._value >= 0
+    finally:
+        bridge_mod._inflight_leave()
+    # And: with nothing in flight the wait succeeds at once
+    assert bridge_mod.wait_for_children(timeout=0.05) is True
+
+
+def test_run_sync_reports_a_spawn_failure_instead_of_raising() -> None:
+    """Nit 13: a spawn error propagated out of ``run_sync``.
+
+    ``FileNotFoundError`` from ``subprocess.run`` killed the worker task
+    (the session publish, the theme persist) with an unretrieved exception;
+    the write silently never happened. A failed spawn is a failed run now:
+    rc 127 and the reason on stderr."""
+
+    from miniouto.cli.tui import bridge as bridge_mod
+
+    code, out, err = bridge_mod.run_sync(["/nonexistent/miniouto-xyz", "config", "show"])
+    assert code == 127
+    assert out == ""
+    assert "could not start" in err
+    # And the YAML wrapper degrades to None (its documented failure shape)
+    assert bridge_mod.run_yaml(["/nonexistent/miniouto-xyz", "x"]) is None

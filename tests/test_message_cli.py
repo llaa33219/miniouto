@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import uuid
 
+import yaml
 from typer.testing import CliRunner
 
 from miniouto.cli import message as message_mod
@@ -109,26 +110,31 @@ def test_list_renders_pending_messages_and_the_empty_case() -> None:
     # When: the session is listed
     listed = runner.invoke(message_mod.app, ["list", "--session", session])
 
-    # Then: one line per message, with the timestamp/kind/source and a flat preview
-    lines = [line for line in listed.output.splitlines() if line.strip()]
-    assert len(lines) == 2
-    assert "alarm" in lines[0] and "spawn" in lines[0] and "first body" in lines[0]
-    assert "user" in lines[1] and "second body" in lines[1]
+    # Then: one entry per message, oldest first, every _peek field present
+    assert listed.exit_code == 0
+    doc = yaml.safe_load(listed.output)
+    assert doc["session"] == session
+    assert [m["kind"] for m in doc["messages"]] == ["alarm", "user"]
+    assert [m["source"] for m in doc["messages"]] == ["spawn", "cli"]
+    assert doc["messages"][0]["text"] == "first body"
+    assert doc["messages"][1]["text"] == "second\nbody"
+    assert all(m["id"] and m["ts"] for m in doc["messages"])
 
     # And listing is non-destructive
     assert inbox.pending_count(session) == 2
 
 
-def test_list_of_an_empty_inbox_is_silent() -> None:
+def test_list_of_an_empty_inbox_is_an_empty_yaml_document() -> None:
     # Given: a session that never received anything
     session = _session()
 
     # When: it is listed
     result = runner.invoke(message_mod.app, ["list", "--session", session])
 
-    # Then: nothing at all on stdout, exit 0 — so a monitor loop can poll it
+    # Then: a well-formed empty document, exit 0 — a monitor loop polls
+    # `messages == []` instead of matching text
     assert result.exit_code == 0
-    assert result.output == ""
+    assert yaml.safe_load(result.output) == {"session": session, "messages": []}
 
 
 def test_list_and_clear_default_to_the_settings_session() -> None:

@@ -8,6 +8,7 @@ from rich.console import Console
 from ..storage import paths
 from ..storage import settings as settings_store
 from ..storage import styles as style_store
+from ._yaml import print_yaml
 
 app = typer.Typer(help="Manage agent style documents.")
 console = Console()
@@ -15,25 +16,33 @@ console = Console()
 
 @app.command("list")
 def list_cmd() -> None:
-    """List installed style documents."""
+    """List installed style documents, as YAML."""
 
-    names = style_store.list_styles()
-    if not names:
-        console.print("[yellow]No styles installed.[/yellow]")
-        return
     current = settings_store.load().style
-    for name in names:
-        marker = " [green]●[/green]" if name == current else ""
-        console.print(f"  - {name}{marker}")
+    styles = [
+        {"name": name, "active": name == current}
+        for name in style_store.list_styles()
+    ]
+    print_yaml({"styles": styles})
 
 
 @app.command("set")
-def set_cmd(name: str) -> None:
+def set_cmd(
+    name: str,
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Also pin the style to this session (the TUI picker's write). "
+        "Omitted, the change is the global default only.",
+    ),
+) -> None:
     """Activate an installed style as the default.
 
     The style becomes the default for sessions started from now on, and the
     sessions that already exist keep the style they are running under
     (their pin freezes it) — the same rule the TUI's style picker follows.
+    `--session` additionally pins the choice to that session, which is the
+    write the TUI's style picker makes for the conversation it belongs to.
     """
 
     if style_store.read(name) is None:
@@ -41,8 +50,9 @@ def set_cmd(name: str) -> None:
         raise typer.Exit(code=1)
     from ..core.runtime import set_active_style
 
-    set_active_style(name)
-    console.print(f"[green]✓[/green] Active style is now [bold]{name}[/bold].")
+    set_active_style(name, session=session)
+    suffix = f" (pinned to session '{session}')" if session else ""
+    console.print(f"[green]✓[/green] Active style is now [bold]{name}[/bold]{suffix}.")
 
 
 @app.command("add")

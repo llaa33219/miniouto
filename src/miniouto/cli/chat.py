@@ -58,7 +58,7 @@ import typer
 
 from ..core import inbox, spawn_state, summary
 from ..core.chat import ChatOptions, run_chat
-from ..core.events import ConsoleEventSink
+from ..core.events import ConsoleEventSink, LoopEvent
 from ..core.inbox import ALARM_HEADER
 from ..core.runtime import ChatOverrides, _resolve_subagent, default_provider_config
 from ..core.spawn_state import SpawnMarker, finish_marker, write_marker
@@ -103,7 +103,10 @@ _THIS_PROCESS = object()
 
 
 def run_turn_chain(
-    opts: ChatOptions, *, quiet: bool, state: ChainState | None = None,
+    opts: ChatOptions,
+    *,
+    quiet: bool,
+    state: ChainState | None = None,
     publish_session: bool = True,
 ) -> str:
     """Run the prompt's turn, then follow any summarization hand-off. Nothing else.
@@ -126,39 +129,69 @@ def run_turn_chain(
     post-step and immediately before the process exits.
     """
 
-    answer = _run_turn(opts, quiet=quiet)
+    answer = _run_turn(opts, quiet=quiet, state=state)
     if state is not None:
         state.session = opts.session
-    return _run_handoffs(
-        opts, quiet=quiet, state=state, last=answer, publish_session=publish_session
-    ) or answer
+    return (
+        _run_handoffs(opts, quiet=quiet, state=state, last=answer, publish_session=publish_session)
+        or answer
+    )
 
 
-def _run_turn(opts: ChatOptions, *, quiet: bool) -> str:
-    """One turn, with the answer block left for the chain (see `run_turn_chain`)."""
+def _run_turn(opts: ChatOptions, *, quiet: bool, state: ChainState | None = None) -> str:
+    """One turn, with the answer block left for the chain (see `run_turn_chain`).
 
-    return run_chat(opts, sink=ConsoleEventSink(quiet=quiet, emit_final=False))
+    The turn's sink is parked on `state` (`last_sink`): a streamed turn's
+    tokens already went out through it, and `_print_answer` asks it whether
+    the answer is already on stdout before re-printing the whole text.
+    """
+
+    sink = ConsoleEventSink(quiet=quiet, emit_final=False)
+    if state is not None:
+        state.last_sink = sink
+    return run_chat(opts, sink=sink)
 
 
-def _print_answer(answer: str, *, quiet: bool, finish: bool) -> None:
+def _print_answer(
+    answer: str, *, quiet: bool, finish: bool, sink: ConsoleEventSink | None = None
+) -> None:
     """Write one answer, optionally behind the run's single finish marker.
 
     Byte-for-byte what `ConsoleEventSink.emit_final_answer` wrote, moved here
     because the marker is a property of the RUN: `finish=True` is passed once,
     by the caller, after the post-step. An intermediate turn's answer is the
     same text with `finish=False` — no marker, because the run continues.
+
+    `sink` is the LAST turn's sink. When its tokens already streamed that
+    exact text to stdout, re-printing it would show the answer twice, so
+    only the marker line is written — preceded by one newline when the
+    stream left stdout mid-line (`------finish------` never shares a line
+    with answer text). A quiet sink has no stream state (deltas are
+    suppressed there), so `--answer-only` / `--with-session` output stays
+    byte-identical.
     """
 
+    streamed = sink.streamed_answer() if sink is not None else None
+    already_out = streamed is not None and streamed == answer and not quiet
+    if already_out and sink is not None:
+        sink.begin_newline_if_stream_open()
     if finish and not quiet:
         sys.stdout.write("------finish------\n")
-    sys.stdout.write(answer or "")
-    if not answer or not answer.endswith("\n"):
-        sys.stdout.write("\n")
+    if not already_out:
+        sys.stdout.write(answer or "")
+        if not answer or not answer.endswith("\n"):
+            sys.stdout.write("\n")
     sys.stdout.flush()
+    if sink is not None:
+        sink.streamed_answer_consumed()
 
 
 def _run_handoffs(
-    opts: ChatOptions, *, quiet: bool, state: ChainState | None = None, last: str = "",
+    opts: ChatOptions,
+    *,
+    quiet: bool,
+    state: ChainState | None = None,
+    last: str = "",
     publish_session: bool = True,
 ) -> str:
     """Continue the run in each session a summarization hand-off moves it to.
@@ -177,7 +210,10 @@ def _run_handoffs(
             )
             return ""
         # The previous answer is superseded: plain, no finish marker — the run
-        # continues below the transition.
+        # continues below the transition. Its turn's stream state is settled
+        # here (the text below replaces whatever the tokens carried).
+        if state is not None and state.last_sink is not None:
+            state.last_sink.streamed_answer_consumed()
         _print_answer(last, quiet=quiet, finish=False)
         transitions += 1
         summary.consume_handoff()
@@ -185,8 +221,11 @@ def _run_handoffs(
             opts, handoff, quiet=quiet, state=state, publish_session=publish_session
         )
         last = _run_turn(
-            replace(opts, prompt=_continuation_prompt(handoff, opts.session), continue_session=True),
+            replace(
+                opts, prompt=_continuation_prompt(handoff, opts.session), continue_session=True
+            ),
             quiet=quiet,
+            state=state,
         )
         if state is not None:
             state.session = opts.session
@@ -226,10 +265,16 @@ def _apply_handoff(
     The next turn carries `opts.session` into `ChatOverrides.session`, which
     selects its inbox, `{this_session}` and session pin directly. The run
     contract moves too, so a second hand-off summarizes the new session. Only
-    a plain run publishes the new active session for later `-c` wakeups; a
-    delegated guest never writes that shared setting.
+    a plain run publishes the new active session for later unnamed `-c` wakeups;
+    a delegated guest never writes that shared setting.
+
+    The OLD conversation is also closed ON DISK, before anything is printed:
+    one display turn holding the `handoff` event, so a reader that reloads
+    the file — the TUI, a wrapper, plain viewing — sees the transition where
+    it happened instead of a transcript that just stops mid-work.
     """
 
+    _persist_handoff_marker(opts.session, handoff)
     if not quiet:
         sys.stdout.write(f"{handoff_marker(handoff)}\n------{handoff.new_session}------\n")
         sys.stdout.flush()
@@ -254,6 +299,27 @@ def handoff_marker(handoff: summary.Handoff) -> str:
     return f"------summary → {handoff.new_session}------\nsummary: {handoff.summary_dir}"
 
 
+def _persist_handoff_marker(session: str, handoff: summary.Handoff) -> None:
+    """Close the OLD conversation with the hand-off marker, on disk.
+
+    A trailing turn holding one `handoff` event, so reopening the old session
+    replays the marker instead of showing a transcript that just stops
+    mid-work. It is appended as its own turn rather than merged into the last
+    one, because replay renders a turn's events BEFORE its answer — merged,
+    the marker would sit above the final message. The TUI wrote this record
+    until the CLI took it over; the shape is unchanged.
+    """
+
+    event = LoopEvent(actor="outo", kind="handoff", text=handoff_marker(handoff))
+    data = session_store.load(session)
+    data.turns.append(
+        session_store.TurnRecord(
+            user="", events=[event.to_dict()], status=session_store.STATUS_DONE
+        )
+    )
+    session_store.save(session, data)
+
+
 def _handoff_note(handoff: summary.Handoff) -> str:
     """The one line a receiver gets when the run moved sessions mid-work."""
 
@@ -274,6 +340,9 @@ class ChainState:
     session: str
     contract: dict[str, str] = field(default_factory=dict)
     transitions: list[summary.Handoff] = field(default_factory=list)
+    # The LAST turn's console sink, parked by `_run_turn`: `_print_answer`
+    # asks it whether the answer already went out as live tokens.
+    last_sink: ConsoleEventSink | None = None
 
 
 def _warn(message: str) -> None:
@@ -647,10 +716,18 @@ def _bg_argv(run: _Run) -> list[str]:
     """
 
     argv = [
-        sys.executable, "-m", "miniouto", "chat", run.prompt,
-        "--bg-child", "--job-id", run.job_id,
-        "--name", run.session,
-        "--style", run.style,
+        sys.executable,
+        "-m",
+        "miniouto",
+        "chat",
+        run.prompt,
+        "--bg-child",
+        "--job-id",
+        run.job_id,
+        "--name",
+        run.session,
+        "--style",
+        run.style,
     ]
     if run.role:
         argv += ["--role", run.role]
@@ -699,10 +776,13 @@ def chat_cmd(
         None, help="Prompt to send to the agent. Omit it only with --alarms."
     ),
     name: str | None = typer.Option(
-        None, "--name", help="Session name. Without --name and --continue, a fresh session is generated each call."
+        None,
+        "--name",
+        help="Session name. Without --name and --continue, a fresh session is generated each call.",
     ),
     pm: str | None = typer.Option(
-        None, "--pm",
+        None,
+        "--pm",
         help="Provider/model (and optional reasoning) for THIS call, as "
         "'PROVIDER/MODEL[:REASONING]' — e.g. 'minimax/MiniMax-M3.1:high'. "
         "A model name may contain '/'; the ':REASONING' suffix is optional "
@@ -712,25 +792,29 @@ def chat_cmd(
     ),
     style: str | None = typer.Option(None, "--style", help="Override the active style."),
     role: str | None = typer.Option(
-        None, "--role",
+        None,
+        "--role",
         help="Run as this style role's system prompt (a <tag>...</tag> body). "
         "Requires --style. Without it, the <outo> body runs. "
         "This is what makes the turn a delegated one.",
     ),
     use_subagent_provider: bool = typer.Option(
-        False, "--use-subagent-provider",
+        False,
+        "--use-subagent-provider",
         help="Resolve provider/model/reasoning from the subagent trio "
         "(this session's pin, else the settings default) instead of outo's. "
         "An explicit --pm still wins.",
     ),
     alarm_session: str | None = typer.Option(
-        None, "--alarm-session",
+        None,
+        "--alarm-session",
         help="Insert one completion alarm into THIS session's inbox. The value is "
         "required: a bare flag would resolve to whatever settings.session happens "
         "to be, which is not idempotent.",
     ),
     return_path: str | None = typer.Option(
-        None, "--return",
+        None,
+        "--return",
         help="Write the final answer as markdown to this path (a directory, or "
         "trailing '/', gets the generated filename). Given without a value, "
         f"{SUBAGENT_RESULTS_DIR} is used.",
@@ -739,14 +823,18 @@ def chat_cmd(
         False, "--bg", help="Detach the run into its own process and return immediately."
     ),
     alarms: bool = typer.Option(
-        False, "--alarms",
+        False,
+        "--alarms",
         help="Wake a session from its queued messages instead of from a prompt: "
         "the inbox is drained and the joined texts become the turn's user "
         "message. Requires --continue (a wakeup continues an existing session "
         "— history is never loaded implicitly) and takes no prompt.",
     ),
     bg_child: bool = typer.Option(
-        False, "--bg-child", hidden=True, help="Internal: re-entry of a --bg run. Runs the foreground path."
+        False,
+        "--bg-child",
+        hidden=True,
+        help="Internal: re-entry of a --bg run. Runs the foreground path.",
     ),
     job_id: str | None = typer.Option(
         None, "--job-id", hidden=True, help="Internal: adopt the parent --bg run's job id."
@@ -757,12 +845,15 @@ def chat_cmd(
         False, "--continue", "-c", help="Prepend the session's previous history."
     ),
     answer_only: bool = typer.Option(
-        False, "--answer-only", "-a",
+        False,
+        "--answer-only",
+        "-a",
         help="Print only the final answer. Suppresses the session marker, loop events, "
         "and the completion line on stdout — never the session file.",
     ),
     with_session: bool = typer.Option(
-        False, "--with-session",
+        False,
+        "--with-session",
         help="Print only the session marker and the final answer. Suppresses loop events and the finish marker.",
     ),
 ) -> None:
@@ -780,11 +871,7 @@ def chat_cmd(
             "make the run self-contained)."
         )
     guest = (
-        role is not None
-        or alarm_session is not None
-        or return_path is not None
-        or bg
-        or bg_child
+        role is not None or alarm_session is not None or return_path is not None or bg or bg_child
     )
     if guest and continue_session and not alarms and name is None:
         raise _fail(
@@ -811,9 +898,7 @@ def chat_cmd(
     model = override.model if override else None
     reasoning = override.reasoning if override and override.reasoning else None
 
-    session_name = _resolve_session(
-        name, continue_session=continue_session, bg=bg, s=s
-    )
+    session_name = _resolve_session(name, continue_session=continue_session, bg=bg, s=s)
     # An INTERACTIVE resume checks the summarization redirect: `-c` names a
     # conversation to rejoin, and a summarized one continues elsewhere. The
     # hand-over happens HERE — before any write, any inbox drain, any model
@@ -1007,14 +1092,54 @@ def _run_foreground(run: _Run) -> None:
 
     state = ChainState(session=run.session, contract=_register_run_contract(run))
     if not run.delegated:
-        _print_answer(
-            run_turn_chain(
-                _chat_options(run), quiet=quiet, state=state, publish_session=True
-            ), quiet=quiet, finish=True
-        )
+        try:
+            _print_answer(
+                run_turn_chain(_chat_options(run), quiet=quiet, state=state, publish_session=True),
+                quiet=quiet,
+                finish=True,
+                sink=state.last_sink,
+            )
+        except KeyboardInterrupt:
+            # Ctrl-C is a user stop, not a failure. `run_chat`'s handlers
+            # catch `Exception` only, so the interrupt lands HERE with the
+            # turn still `running` on disk — stamp it now rather than wait
+            # for some later `begin_turn` (possibly in another process) to
+            # reap the stale record.
+            _stamp_interrupted(state.session)
+            if not quiet:
+                if state.last_sink is not None:
+                    # A mid-stream interrupt leaves stdout mid-line; the
+                    # run's markers never share a line with answer text.
+                    state.last_sink.begin_newline_if_stream_open()
+                _print_answer(
+                    "stopped: cancelled",
+                    quiet=False,
+                    finish=True,
+                    sink=state.last_sink,
+                )
+            raise typer.Exit(code=130) from None
         return
 
     _run_delegated(run, state, quiet=quiet)
+
+
+def _stamp_interrupted(session: str) -> None:
+    """Stamp the session's running turn `interrupted` — a Ctrl-C reached the CLI.
+
+    `begin_turn` reaps a stale running turn only when some LATER turn starts,
+    which for an interrupted one-shot may be another process entirely; the
+    record should say "stopped" the moment it was. Only a turn still running
+    is stamped: `finish_turn` appends a synthetic turn when it finds none, and
+    a duplicate stop must not invent one.
+    """
+
+    try:
+        data = session_store.load(session)
+        if all(turn.status != session_store.STATUS_RUNNING for turn in data.turns):
+            return
+        session_store.finish_turn(session, assistant="", status=session_store.STATUS_INTERRUPTED)
+    except Exception:
+        pass  # the stop must not turn a disk error into a traceback
 
 
 def _run_delegated(run: _Run, state: ChainState, *, quiet: bool) -> None:
@@ -1023,9 +1148,7 @@ def _run_delegated(run: _Run, state: ChainState, *, quiet: bool) -> None:
     write_marker(_marker(run))
     status, answer = _STATUS_DONE, ""
     try:
-        answer = run_turn_chain(
-            _chat_options(run), quiet=quiet, state=state, publish_session=False
-        )
+        answer = run_turn_chain(_chat_options(run), quiet=quiet, state=state, publish_session=False)
     except KeyboardInterrupt:
         status, answer = _STATUS_STOPPED, "stopped: cancelled"
     except Exception as exc:
@@ -1045,6 +1168,6 @@ def _run_delegated(run: _Run, state: ChainState, *, quiet: bool) -> None:
     )
     # The run's ONE finish marker, printed after everything the run owes and
     # immediately before it returns: nothing may follow it.
-    _print_answer(answer, quiet=quiet, finish=True)
+    _print_answer(answer, quiet=quiet, finish=True, sink=state.last_sink)
     if status != _STATUS_DONE:
         raise typer.Exit(code=1)

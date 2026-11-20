@@ -48,7 +48,7 @@ from miniouto.storage import styles as style_store
 from miniouto.storage.providers import SOURCE_CUSTOM, is_catalog_source
 from miniouto.tools import ascii_art
 
-from . import pt
+from . import bridge, pt
 from .app import (
     _DEFAULT_SESSION,
     _ESC_DOUBLE_PRESS_WINDOW,
@@ -66,13 +66,23 @@ from .app import (
     Timer,
     TUIEventSink,
     Workers,
-    _persist_handoff_marker,
     _render_logo,
     _RowWindow,
     _StreamCoalescer,
     logo_columns,
     run_tui,
     tui_summary,
+)
+from .bridge import (
+    chat_argv,
+    child_env,
+    cli_argv,
+    config_set_active_session,
+    config_set_theme,
+    config_set_trio,
+    config_show,
+    message_insert,
+    message_list,
 )
 from .config import (
     CAPS_FIELD,
@@ -266,7 +276,6 @@ __all__ = [
     "_merged_config",
     "_model_defaults",
     "_parse_optional_int",
-    "_persist_handoff_marker",
     "_persist_trio",
     "_reasoning_chip_value",
     "_reasoning_choices",
@@ -280,8 +289,16 @@ __all__ = [
     "art_path_in_result",
     "ascii_art",
     "at_bottom",
+    "bridge",
     "catalog_api",
     "catalog_compatibility",
+    "chat_argv",
+    "child_env",
+    "cli_argv",
+    "config_set_active_session",
+    "config_set_theme",
+    "config_set_trio",
+    "config_show",
     "context_api",
     "default_provider_config",
     "default_system_commands",
@@ -292,6 +309,8 @@ __all__ = [
     "inbox",
     "is_catalog_source",
     "logo_columns",
+    "message_insert",
+    "message_list",
     "paths",
     "paths_runtime",
     "png_path_in_result",

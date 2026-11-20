@@ -11,36 +11,46 @@ This dispatches into the `app: typer.Typer` object defined in `src/miniouto/cli/
 
 ## Command tree
 
+Commands marked **YAML** below print exactly one `yaml.safe_load`-able document
+on stdout (all through `cli/_yaml.py`) — the official machine interface for
+third-party wrappers. Errors of those commands go to stderr with exit 1; every
+other command prints rich text.
+
 ```
 miniouto [--version]
    ├─ (no subcommand)            → TUI mode (cli/tui/app.py:run_tui)
-   ├─ status                     → show current configuration
+   ├─ status                     → show current configuration (YAML)
    ├─ chat <prompt> [options]    → one-shot chat turn (also the delegation door)
+   ├─ config
+   │    ├─ show --session NAME                → one session's pin + effective config (YAML)
+   │    └─ set [--session NAME] [--target outo|subagent --provider P --model M --reasoning R]
+   │                                          [--theme NAME] [--active-session NAME]
    ├─ provider
-   │    ├─ providers                          → list the modelslist catalog index
-   │    ├─ models <provider-name>             → list models for a catalog provider
+   │    ├─ providers                          → list the modelslist catalog index (YAML)
+   │    ├─ models <provider-name>             → list models for a catalog provider (YAML)
    │    ├─ add <provider-name> --api-key …    → add a provider from the catalog
    │    ├─ custom add  --name --format --base-url --api-key --default-model
-   │    ├─ list
+   │    │                        [--max-context-window N] [--max-output-tokens N]
+   │    ├─ list                               → list configured providers (YAML)
    │    ├─ remove <name>
-   │    └─ default <name>
+   │    ├─ default <name>
+   │    └─ edit <name> [--default-model M] [--reasoning R] [--max-context-window N]
+   │                 [--max-output-tokens N] [--base-url URL] [--api-key KEY]
+   │                 [--compatibility DIALECT]
    ├─ style
-   │    ├─ list
-   │    ├─ set <name>
+   │    ├─ list                               → list installed styles (YAML)
+   │    ├─ set <name> [--session NAME]
    │    ├─ add <repo_url> [--name NAME]
    │    ├─ update
    │    └─ show <name>
-   └─ skill
-   │    ├─ list
-   │    └─ show <name>
-└─ subagent
-       ├─ show
-       ├─ set [--provider NAME] [--model NAME] [--reasoning TEXT]
-       └─ clear
    ├─ message
    │    ├─ insert [TEXT ...] --session NAME [--kind alarm|user] [--source STR] [--stdin]
-   │    ├─ list [--session NAME]
+   │    ├─ list [--session NAME]              → peek pending messages (YAML)
    │    └─ clear [--session NAME] [--yes]
+   ├─ subagent
+   │    ├─ show                               → resolved + override provider/model/reasoning (YAML)
+   │    ├─ set [--provider NAME] [--model NAME] [--reasoning TEXT]
+   │    └─ clear
    └─ computer
         └─ show [PATH] [--plain] [--cols N] [--head N]
 ```
@@ -62,6 +72,14 @@ The root app is configured with `no_args_is_help=False` and `invoke_without_comm
 ## `miniouto` (no args) — TUI mode
 
 Delegates to `cli/tui/app.py:run_tui()`, which detects the terminal's graphics mode (invariant 15), constructs a `ChatTUI` and runs it on an asyncio loop until the user quits.
+
+**The TUI is a CLI wrapper.** It owns the screen (xnano canvas, rows, modals) and talks to the agent harness the way any third-party program must — by running the `miniouto` CLI as a subprocess and parsing its stdout plus the files the CLI writes. `cli/tui/bridge.py` is the whole subprocess surface, so every rule lives in one place:
+
+- **D7 — never the global `miniouto` on PATH.** Every argv starts with `[sys.executable, "-m", "miniouto", …]`: THIS interpreter's miniouto, never a possibly-stale installed snapshot. The env (`MINIOUTO_HOME`) and the cwd are inherited, so a child sees exactly the storage the TUI sees.
+- **The TUI writes nothing to storage itself.** Mutations (config trios, theme, active-session pointer, provider records, style pins, inbox inserts) are CLI commands; the reads that remain in-process are display reads of CLI-produced artifacts (session JSON, providers.toml, style listings).
+- **Machine output is YAML or one id.** Listing commands print YAML through `cli/_yaml.py`; `message insert` prints the message id. Errors go to stderr with a non-zero exit, so a wrapper never finds prose in the data lane.
+
+A turn is `chat <prompt> --name <session> -c` as a **foreground subprocess** (the session pin carries provider and style, so no model flags are needed); the idle alarm wakeup is the same child with `--alarms` instead of a prompt. Live display is **hybrid**: answer token deltas come from the child's stdout (the raw, unprefixed lane above), and every other live event (tool calls and results, completed thinking, context, drained alarms) comes from tailing the session JSON the CLI increments on every event. At `------finish------` the final answer is read from the session file — the file's `turn.assistant` is the canonical text. A hand-off is detected from the `------summary → X------` + `summary: <dir>` marker pair on stdout; the CLI persists the marker into the OLD session (so a reload replays it) and the TUI re-pins the new session.
 
 The substrate is **`xnano`** (a retained-mode canvas) with an immediate-mode frame builder on top, reached through a pyratatui-shaped compat shim. `cli/tui/pt.py` re-implements the exact `pt` surface the package uses (`Color`/`Style`/`Span`/`Line`/`Text`/`Paragraph`/`Rect`/`TextState`/`Terminal`) on `xnano` + `xnano-core`, so every call site reads `from . import pt` and nothing else about the layers changed. Each ~60 Hz tick composes a whole frame of styled lines and paints it one row at a time through `Terminal.draw` — each row is `canvas.write(..., height=1)` and the placement it returns is REUSED when the same cell/width is painted again, so only the text is replaced and xnano's diff can emit nothing when nothing changed; the canvas itself — the alt screen, the blit loop, the diff — is xnano's.
 
@@ -101,18 +119,28 @@ Tool rows start as a single `▶ <summary>` line whose toggle glyph highlights o
 
 ### Live token streaming
 
-While the provider is streaming, the TUI renders text and reasoning **as it arrives** (coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` fire once per token). Per-token hooks fire 100+/s, so `TUIEventSink` folds them through `_StreamCoalescer` into a single UI-thread update roughly every **33 ms (~30 Hz)** — fast enough to read as typing, cheap enough that a long answer repaints a few dozen times instead of hundreds. The final `< interval` window is drained when the turn's spinner stops, so no tail fragment is lost — and every message-boundary event (`thinking` / `response` / `tool` / `context`) flushes the buffer first, so a tail never rides the next message's live row.
+While the provider is streaming, **both surfaces render text as it arrives** (coreouto's `ON_STREAM_TEXT` / `ON_STREAM_THINKING` fire once per token).
 
-Deltas are **display-only**: they are never written to the session file (`_RecordingSink` forwards them to the wrapped sink without recording), so a reloaded session is byte-identical to a pre-streaming one. Nor are they fed to the repetition watchdog — that stays on whole-message boundaries to avoid counting each phrase twice.
+**The CLI streams tokens straight to stdout** — raw, no `outo:` prefix, flushed per fragment, on a tty AND on a pipe (the TUI-as-CLI-wrapper project reads the token stream off a piped stdout). The contract:
+
+- **Text deltas print as they arrive.** A delta first stops the spinner (`end_working`) if it is live: while a message is mid-stream the tokens themselves are the liveness signal, and the spinner is not re-lit until the message completes. Thinking deltas stay **silent** in the CLI — reasoning renders once, from its completed `thinking` event (dim `outo:thinking:` line), exactly as before.
+- **Completed messages are not printed twice.** The whole-text `response` event of a message whose tokens already went out is suppressed; a `response` from a non-streaming turn still renders as one line, exactly as before. The finished thinking event is never suppressed (its deltas never printed).
+- **The final answer is not reprinted when it streamed.** `cli/chat.py:_print_answer` asks the last turn's sink whether the answer text already went out as tokens; when it did, only the run's `------finish------` marker is written — preceded by one newline when the stream ended mid-line, so the marker never shares a line with answer text. An answer that did NOT stream (a synthesized hand-off message, or content that differs from the stream) prints in full as before.
+- **Message boundaries reset the state.** The `context` event of each iteration closes the message: the streamed text is retired into "already shown" state and the spinner may return for the next LLM call / tool execution.
+- **Quiet stays byte-identical.** `-a` / `--answer-only` / `--with-session` print no deltas at all (the sink's stream path is suppressed, spinner untouched), so their output contract — markers included — is unchanged.
+
+In the **TUI** the token lane is the child's stdout: `_read_chat_stdout` reads chunks as they arrive (never a single read-to-EOF, which would hold every token until the turn ended), lines that start with a marker or an actor prefix belong to the structured lane, and anything else is answer text that lands on the live `StreamRow` immediately. Ordering is safe by construction — stdout deltas arrive while the message is still streaming and the session file's completion events land after it — and `_add_event_row`'s existing suppression (a `response` event with a live stream row is dropped; a `thinking` event finalizes the live row) shows each message once.
+
+Deltas are **display-only** in both surfaces: they are never written to the session file (`_RecordingSink` forwards them to the wrapped sink without recording), so a reloaded session is byte-identical to a pre-streaming one. (The repetition watchdog IS fed from them — see invariant 8 in `AGENTS.md`.)
 
 Finalization avoids showing the same text twice: the live `StreamRow` is dropped and the Markdown `AnswerRow` takes its place for the final answer, the whole-text `thinking` event finalizes the live `ThinkingRow` in place, and the stashed `response` row is suppressed whenever deltas already showed that message (a non-streaming turn renders exactly as before).
 
 ### Messages (the inbox), width cap, and scrolling
 
-- **Mid-turn insertion.** Typing while a turn is running does not poke the live message list: it goes to `inbox.insert(session, text, kind="user", source="tui")`. One code path then serves human interjections, spawn alarms, and `chat --alarms` wakeups. The row renders optimistically, and when the drain later produces the matching loop event `ChatTUI._claim_inbox_event` matches `detail="inbox:<id>"` and drops the duplicate.
-- **Idle delivery.** No registry callback pushes messages any more (a detached process may write at any moment), so the TUI polls the inbox every `_INBOX_POLL_INTERVAL` (1 s) and at the tail of `_dispatch`: anything drained starts a turn whose prompt **is** the joined message text, recorded as that turn's `user` so display, replay, and model perception are the same string by construction.
+- **Mid-turn insertion.** Typing while a turn is running does not poke the live message list: it goes to `miniouto message insert --session S --kind user --source tui` (a bridge subprocess; the id it prints keys the optimistic row). One code path then serves human interjections, spawn alarms, and `chat --alarms` wakeups. The row renders optimistically, and when the drain later produces the matching loop event `ChatTUI._claim_inbox_event` matches `detail="inbox:<id>"` and drops the duplicate.
+- **Idle delivery.** No registry callback pushes messages any more (a detached process may write at any moment), so the TUI polls the inbox every `_INBOX_POLL_INTERVAL` (1 s) and at the tail of `_dispatch`. The poll is **stat-gated**: the inbox directory's `(mtime_ns, size)` is read first and only a CHANGE spends a subprocess on `message list --session S`; a changed listing starts a turn whose prompt **is** the joined message text (the `chat --alarms -c --name S` child), recorded as that turn's `user` so display, replay, and model perception are the same string by construction. While a turn is busy the child chat's own `BEFORE_LLM_CALL` hook drains the inbox mid-turn, exactly as before.
 - **Single consumer.** One session belongs to one live process; a second process bound to the same session would steal each other's messages (see `docs/core.md` § `core/inbox.py`). Before a TUI has chosen a session, it polls a unique `tui-pending-<hex>` queue, never the shared `default` or another process's published session.
-- **Summary hand-off.** If a turn ends because the model called `continue_session`, `ChatTUI._apply_handoff` appends the `------summary → <new>------` + `summary: <dir>` marker as a system row in the **old** conversation, persists it there for replay (`_persist_handoff_marker`), re-pins the new `cont-*` session, and lets the 1 s inbox poll auto-deliver the continuation message — so the transition needs no user action. The old conversation keeps its history: a hand-off is a session change, never a history edit. **Talking to a summarized session follows its redirect**: a submitted message resolves `resolve_redirect` of the pinned session first and, when the chain is longer than one hop, the TUI moves there (`_pin_session` + history reload + a `session <old> was summarized → redirected to <final> (via …). Continue here.` notice), and the typed text is restored to the input UNSENT (left for the operator to re-send) — it is for the live work, not the stopped transcript. Opening a session from the picker is plain viewing and never follows a redirect.
+- **Summary hand-off.** If a turn ends because the model called `continue_session`, `ChatTUI._apply_handoff` appends the `------summary → <new>------` + `summary: <dir>` marker as a system row in the **old** conversation, re-pins the new `cont-*` session, and lets the 1 s inbox poll auto-deliver the continuation message — so the transition needs no user action. The on-disk record of the marker in the OLD session is written by the CLI layer's `_persist_handoff_marker` (same event shape), so a TUI reload replays it. The old conversation keeps its history: a hand-off is a session change, never a history edit. **Talking to a summarized session follows its redirect**: a submitted message resolves `resolve_redirect` of the pinned session first and, when the chain is longer than one hop, the TUI moves there (`_pin_session` + history reload + a `session <old> was summarized → redirected to <final> (via …). Continue here.` notice), and the typed text is restored to the input UNSENT (left for the operator to re-send) — it is for the live work, not the stopped transcript. Opening a session from the picker is plain viewing and never follows a redirect.
 - **Width cap.** The log column is centered and capped at `CHAT_MAX_WIDTH = 150` cells (theme variable `$chat-max-width`), so wide terminals do not stretch the transcript. The header chips sit in two left/right-anchored pairs inside that column (`outo` / `style`, then `subagent` / `session`) and render their values whole — two chips a row is what keeps every value short enough not to truncate, so every picker stays clickable at any terminal width.
 - **Scrolling.** `PgUp` / `PgDn` / `Home` / `End` act **instantly**: the TUI takes them at the app level before the input sees them (they would otherwise move the caret), and no scroll is ever animated — animating through a long transcript's heights would lose the target. The wheel scrolls `WHEEL_LINES = 3` rows per detent. A windowed log (`_RowWindow`: a trailing window of rows is painted, older chunks load as the view nears the top, far-above rows evict) keeps a long session's per-frame cost flat, and a jump-to-bottom button sits under the log whenever the view is scrolled up.
 
@@ -127,11 +155,11 @@ Each `StatusChip` is a focusable node. Click it (or focus it with `Tab` and pres
 | `style` | `SelectionModal` — list of installed styles | writes `settings.style` |
 | `session` | `SelectionModal` with `sections=` — grouped by the session's creation directory, plus `+ new session…` | writes the session **pin** (`self._pinned_session`), which is what `_dispatch` and the inbox poll route on |
 
-**Every provider/model/reasoning edit goes through `_persist_trio`, which writes BOTH halves** (`docs/storage.md` § `session-config/`): the session pin at `session-config/<pinned session>.toml`, so the edit survives a later default change, and the global default, so other processes and the next session follow the most recently changed choice. For the **outo** trio the global half is the **paired** `settings.provider` + `settings.model` + `settings.reasoning` — written together as one choice, through `save` (not `update`, which skips empty strings, so an emptied model CLEARS instead of leaving the old one). The provider record's `default_model` still follows the pick (`dataclasses.replace` + `provider_store.upsert`), so the change is the new default for every process that reads the record — but its `reasoning_effort` is LEFT ALONE, because a subagent on the same provider resolves its effort from that record and rewriting it is what dragged the subagent along with every outo reasoning change. The settings trio is what the TUI's own rows read back, and it is kept SEPARATE from the record so that editing outo cannot move a subagent (a subagent resolves its model from its own key and its own provider record, never from outo's). For the **subagent** trio it is the three `settings.subagent_*` keys. **Provider and Model both reset Reasoning** — an effort level belongs to a model, so either pick lands on that model's default (the provider record's own preference, else modelslist's auto default); Reasoning is one more click away when that is not what you want. An empty value clears the pin key and hands it back to the global default.
+**Every provider/model/reasoning edit goes through the CLI** — the popup's `_persist_trio` (in `cli/tui/config.py`) issues `config set --target outo|subagent --session S --provider P --model M --reasoning R` (a bridge subprocess), and the CLI performs the whole invariant-12 write: **both halves** (`docs/storage.md` § `session-config/`) — the session pin at `session-config/<pinned session>.toml`, so the edit survives a later default change, and the global default, so other processes and the next session follow the most recently changed choice. For the **outo** trio the global half is the **paired** `settings.provider` + `settings.model` + `settings.reasoning` — written together as one choice, through `save` (not `update`, which skips empty strings, so an emptied model CLEARS instead of leaving the old one). The provider record's `default_model` still follows the pick, so the change is the new default for every process that reads the record — but its `reasoning_effort` is LEFT ALONE, because a subagent on the same provider resolves its effort from that record and rewriting it is what dragged the subagent along with every outo reasoning change. The settings trio is what the TUI's own rows read back, and it is kept SEPARATE from the record so that editing outo cannot move a subagent (a subagent resolves its model from its own key and its own provider record, never from outo's). For the **subagent** trio it is the three `settings.subagent_*` keys. **Provider and Model both reset Reasoning** — an effort level belongs to a model, so either pick lands on that model's default (the provider record's own preference, else modelslist's auto default); Reasoning is one more click away when that is not what you want. An empty value clears the pin key and hands it back to the global default.
 
 The catalog `Compatibility` row shows the saved modelslist format id (or `native SDK` for a legacy record). Its picker lists every hostable format with its exact base URL, plus the saved choice when the current catalog no longer reports it; selecting one persists `catalog_dialect`, `api_format`, and `base_url` on the provider record. Like `Caps`, this is provider-global, not part of the session trio. An inheriting subagent popup edits the effective outo provider.
 
-There is **no standalone provider or model editor any more** — the popup's rows replaced both, and so did the one that edited an existing provider's `max_context_window` / `max_output_tokens`. Those caps are set when the provider is added (the `+ add custom…` wizard asks for them) or by hand in `providers.toml`.
+The popup's `Caps` row (custom providers) and `Compatibility` row (catalog providers) edit the provider RECORD through the CLI: `provider edit <name> --max-context-window N --max-output-tokens N` and `provider edit <name> --compatibility <dialect>` (see the `provider edit` section above) — provider-global writes, not part of the session trio. A script can make the same edits without the TUI.
 
 There is **no** session chip — the session label in row 3 is a plain `Static`. To change sessions, use the command palette (`Ctrl+P`) → "Pick session" / "New session".
 
@@ -143,7 +171,7 @@ The popup's `Provider` row accepts two sentinels (rendered as `extra_options` ro
 - `+ add from catalog…` — runs `_catalog_add_flow`: fetches the modelslist root index, filters to entries whose `formats` yields a supported coreouto `api_format`, lets you pick one, prompts for the API key, then saves the provider with `source="modelslist"` (named after the catalog `slug`) and the first model of its catalog-owned list as `default_model`; when the model has reasoning options it also offers a picker and stores the result as `reasoning_effort`. See `core/modelslist.py` and `core/providers.py:DIALECT_TO_FORMAT`.
 - `+ add custom…` — runs `_open_custom_add_wizard`: a five-step wizard (name → api_format → base_url → api_key → default_model), saving with `source="custom"`.
 
-Modal results are persisted through `_persist_trio` (provider/model/reasoning — see above) or `storage.settings.update(...)` (style), and the chips repaint on the next frame. The active theme is persisted to `settings.theme` and restored on launch.
+Modal results are persisted through the CLI lane: the trio write is `config set` (see above), a style pick is `style set <name> --session S`, and the theme choice is `config set --theme <name>` — the TUI writes none of them itself. The chips repaint on the next frame, and the active theme is restored from `settings.theme` on launch.
 
 ### Theme
 
@@ -160,7 +188,7 @@ The answer layer is the only near-white in the palette, so the hierarchy reads a
 
 `boost`, `text_muted`, `text_disabled` and `text_answer` are real `TuiTheme` fields, not derived at paint time: Textual used to compute them (`boost` from `panel`, the ramp as `foreground` composited at 60% / 38% over the background), and `theme.py` reproduces that same arithmetic so the ported palettes look byte-identical to the Textual ones they replace — `panel` when a theme omits it is `surface` lerped 10% toward `primary`, `foreground` when omitted is the background's inverse, `boost` steps 8% toward white (or black on a light theme), and the ramp is alpha compositing rather than a darkening curve (reading "60%" the other way inverts the ladder). `AnswerRow` paints `text_answer` because its content is the Markdown answer; the near-black ink on the picker's solid-cyan selection bar comes from `render.auto_text` (the port of Textual's `auto 87%` — pinning it to the solid `foreground` drops that row to 1.08:1), while the transcript body paints the declared `foreground`. `get_css_variables()` still exposes the resolved palette under the old CSS names (that is what the theme tests read), and `$chat-max-width` is reported there from `CHAT_MAX_WIDTH` even though no CSS consumes it.
 
-`settings.theme` overrides the default at launch (`ChatTUI._boot_theme`); a name no build registers falls back to `miniouto` rather than failing the launch. `Ctrl+P` → Theme changes it at runtime and `watch_theme` writes the choice back to `settings.theme`. The picker order is `miniouto` first, then the stock themes re-derived as `TuiTheme`s (`textual-dark`, `textual-light`, `nord`, `gruvbox`, `catppuccin-*`, `dracula`, `tokyo-night`, `monokai`, `flexoki`, `solarized-*`, `atom-one-*`).
+`settings.theme` overrides the default at launch (`ChatTUI._boot_theme`); a name no build registers falls back to `miniouto` rather than failing the launch. `Ctrl+P` → Theme changes it at runtime, and the choice is written back through the CLI (`config set --theme <name>`, on a worker so the subprocess round-trip never freezes the UI thread). The picker order is `miniouto` first, then the stock themes re-derived as `TuiTheme`s (`textual-dark`, `textual-light`, `nord`, `gruvbox`, `catppuccin-*`, `dracula`, `tokyo-night`, `monokai`, `flexoki`, `solarized-*`, `atom-one-*`).
 
 ### Model resolution order
 
@@ -172,11 +200,11 @@ The answer layer is the only near-white in the palette, so the hierarchy reads a
 In the TUI, every row shows the **configured** value when there is one, else what it resolves to (the provider record's own default), else `-`.
 
 Keybindings (one app-level router in `ChatTUI._handle_key`: global keys first, then the modal on top, then the focused node):
-- App-level: `Ctrl+L` — clear log; `Ctrl+C` — quit; `Ctrl+Shift+C` — copy the selection; `Ctrl+P` — open (or dismiss) the command palette; `Esc Esc` (two presses within 2.0 s while the agent is busy) — force-stop the running turn. The stop is cooperative: a `threading.Event` is passed via `ChatOptions.cancel_event`, and the loop's cancel-guard hook raises `LoopCancelledError` at the next hook boundary (before the next LLM call / tool execution) — additionally, the stall watchdog's 5 s poll watches the same event and hard-cancels the turn task, so an in-flight LLM call IS interrupted promptly, and an in-flight **Bash** process IS killed (`tools/bash.py` polls the same event — Bash's 1-hour hard cap, `BASH_TIMEOUT_SECONDS`, is far too slow to serve as the stop mechanism). The TUI shows `[stopped by user (esc esc)]`; a single `Esc` while busy shows a persistent "press esc again to stop" hint in the spinner line (it survives spinner ticks for the full 2.0 s window; after a successful double-press, "stopping after the current step…" persists until the turn ends).
+- App-level: `Ctrl+L` — clear log; `Ctrl+C` — quit; `Ctrl+Shift+C` — copy the selection; `Ctrl+P` — open (or dismiss) the command palette; `Esc Esc` (two presses within 2.0 s while the agent is busy) — force-stop the running turn. The turn is a chat **subprocess**, so the stop is a **SIGINT to the child**: the CLI's plain-chat Ctrl-C path stamps the running turn `interrupted` on disk immediately, prints `------finish------` + `stopped: cancelled`, and exits **130** (see "Behavior" under `miniouto chat`). The TUI reads the outcome back — the child's exit code and the session file's turn status — and shows `stopped by user (esc esc)`; a single `Esc` while busy shows a persistent "press esc again to stop" hint in the spinner line (it survives spinner ticks for the full 2.0 s window; after a successful double-press, "stopping after the current step…" persists until the turn ends).
 - `Ctrl+P` — the command palette (`modals.py:CommandPalette` + `default_system_commands`, behind `get_system_commands`): a centred dialog titled **Menu** listing every command — new session, pick session, configure outo, configure subagent, pick style, theme, keys, quit. There is **no search input**: the list is unfiltered and scrolls (`Up`/`Down`/`Tab` move, `Enter` runs, `PageUp`/`PageDown` page, mouse clicks a row, `Esc` or a click outside closes). No numeric prefixes (`00`, `01`, … were Textual's alphabetical-sort workaround) and no clear-log / maximize / screenshot entries; `clear log` is still on `Ctrl+L`. The splash text on boot says "Press Ctrl+P for commands."
 - Node-level (inside modals / chips / the input): `Tab` / `Shift+Tab` — cycle focus; `Enter` — confirm; `Esc` — cancel.
 
-Submission flow: each submitted prompt is dispatched by `self.run_worker(self._dispatch(prompt), exclusive=True)`, which calls `core.chat.run_chat(opts, sink)` inside `asyncio.to_thread` so the asyncio loop (and the ~60 Hz draw) stays responsive. The busy flag (`self._busy`) prevents re-entrancy. Output becomes row objects (see "Chat log rows" above), composed into the next frame; errors/system messages render as `[…]` (e.g. `[error: {exc}]`) in theme warning.
+Submission flow: each submitted prompt is dispatched by `self.run_worker(self._dispatch(prompt), exclusive=True)`, which spawns the `chat` child subprocess and pumps its stdout on the asyncio loop (so the ~60 Hz draw stays responsive). The busy flag (`self._busy`) prevents re-entrancy. Output becomes row objects (see "Chat log rows" above), composed into the next frame; a refused child's first stderr line renders as `chat: …`, a non-zero exit as `chat exited with <code>`.
 
 `cli/tui/app.py:tui_summary() -> dict` is a programmatic snapshot helper (currently unused by the runtime) that returns `{provider, model, style, session, styles_available}`.
 
@@ -190,7 +218,7 @@ Prints `miniouto <version>` (from `miniouto.__version__`, currently `"0.12.9"`) 
 
 ## `miniouto status`
 
-File: `cli/__init__.py` (lines ~45–66).
+File: `cli/__init__.py`.
 
 Reads:
 - `storage.settings.load()` → active `provider`, `style`, `session`; `model` is derived from the active provider's `default_model` (or `'- (use chat --pm)'` when empty)
@@ -200,14 +228,85 @@ Reads:
 - `storage.skills.list_skills()` → all visible skill names (hidden skills excluded)
 - `storage.sessions.list_sessions_with_meta()` → `(name, cwd, mtime)` per session file, read by parsing the JSON directly (never through `load()`, which would write)
 
-Prints 11 rich-formatted key/value lines: `Default provider`, `Default model`, `Subagent`, `Active style`, `Session`, `Storage`, `Providers`, `Styles`, `Skills`, and the sessions split by directory. Always exits 0 (no error states). The last entry is two lines:
+Prints one YAML document (see `cli/_yaml.py`) — the official machine-readable snapshot, parsed by third-party wrappers with `yaml.safe_load`:
 
-```
-Sessions (this directory): default, tui-20260723-103412-a1b2c3
-Sessions (other):       old-thing
+```yaml
+provider: minimax
+model: MiniMax-M2.1
+subagent:
+  provider: minimax
+  model: same as outo (minimax/MiniMax-M2.1)
+style: coding-work
+session: default
+storage: /home/you/.miniouto
+providers:
+- minimax
+- local-llama
+styles:
+- coding
+- coding-work
+- default
+skills:
+- hf-cli
+- mojo-syntax
+sessions:
+  this_directory:
+  - default
+  - tui-20260723-103412-a1b2c3
+  other:
+  - old-thing
 ```
 
-A session's `cwd` is stamped from the launch directory on its **first** turn only, so the grouping means "the directory this session was created in", not "wherever it was last used". The `Subagent` line shows the resolved subagent `provider/model` when `settings.subagent_provider` or `settings.subagent_model` is set, or `same as outo (<provider>/<model>)` when it inherits. This trio is the **global default** a delegated run inherits — every `chat --role <tag>` run that carries no `--pm` and asks for the subagent profile (`--use-subagent-provider`) uses it.
+Always exits 0 (no error states). A session's `cwd` is stamped from the launch directory on its **first** turn only, so the grouping means "the directory this session was created in", not "wherever it was last used". The `subagent.model` value is the resolved subagent `provider/model` when `settings.subagent_provider` or `settings.subagent_model` is set, or `same as outo (<provider>/<model>)` when it inherits. This trio is the **global default** a delegated run inherits — every `chat --role <tag>` run that carries no `--pm` and asks for the subagent profile (`--use-subagent-provider`) uses it.
+
+---
+
+## `miniouto config ...`
+
+File: `cli/config.py`. Sub-app `app = typer.Typer(help="Show and edit provider, style and session configuration.")`.
+
+The **config lane of the trio writes** (invariant 12): the TUI settings popup's `_persist_trio` writes a provider trio through BOTH the session pin and the global default, and `config set` is that write's canonical CLI form — a script can make the same edit without opening the TUI. `config show` is the read side: it reproduces the TUI chips' merged interpretation and never freezes a pin (looking at a session's configuration must not pin it — freezing belongs to the turn).
+
+### `config show --session NAME`
+
+Prints one YAML document — the session's raw pin beside the effective configuration the runtime would apply:
+
+```yaml
+session: default
+pin:
+  provider: local
+  model: qwen3-32b
+  reasoning: high
+  subagent_provider: ''
+  subagent_model: ''
+  subagent_reasoning: ''
+  style: ''
+effective:
+  provider: local
+  model: qwen3-32b
+  reasoning: high
+  style: ''
+  subagent_provider: ''
+  subagent_model: ''
+  subagent_reasoning: ''
+```
+
+- `pin` is the RAW stored pin (`session_config.read`, `""` everywhere when the session has none). Read-only: showing never freezes a pin.
+- `effective` is the merged interpretation the TUI chips show (`_merged_config`): the pin is a set of overrides ON the default, so an empty **subagent** key is filled from the global `subagent_*` default. The **outo** trio is left as the pin has it — filling it from the default would show the default's reasoning beside the pin's model, a combination the runtime never produces.
+
+### `config set [--session NAME] [--target outo|subagent] [--provider P] [--model M] [--reasoning R] [--theme NAME] [--active-session NAME]`
+
+At least one of `--target`, `--theme`, `--active-session` is required — none given → red `✗ Pass at least one of --target, --theme, or --active-session.` + exit 1.
+
+**`--target` (the trio write).** Requires `--session` and all three of `--provider` / `--model` / `--reasoning` (an empty `--reasoning` clears it; `--provider/--model/--reasoning` without `--target` is an error, and an unknown `--target` is rejected). The provider must already be configured (`provider_store.get`) — `✗ Provider '<name>' is not configured.` + exit 1. The write is the whole invariant-12 edit:
+
+1. the **session pin** (`session_config.set_fields`) — what THIS session resolves, so the edit survives a later default change;
+2. the **global default** — the outo trio writes the PAIRED `settings.provider` + `model` + `reasoning` through `save` (never `update`, which skips empty strings, so an emptied value CLEARS the stored one); the subagent trio writes the three `settings.subagent_*` keys;
+3. the provider RECORD's `default_model` follows the outo pick (`dataclasses.replace` + `upsert`) — the ENDPOINT's default, what a fresh install resolves. The record's `reasoning_effort` is left alone: a subagent on the same provider resolves its effort from that record, and rewriting it is what dragged the subagent along with every outo reasoning change.
+
+On success: `✓ {target} trio → {provider or -}/{model or -}[:{reasoning}] (pin '<session>' + global default).`
+
+**`--theme NAME`** writes `settings.theme` (any name; the TUI falls back to `miniouto` at boot when no build registers it). **`--active-session NAME`** publishes the active-session pointer (`settings.session` — the value `chat -c` without `--name` resolves and `status` shows; need not exist yet, because a TUI pins its session before the first turn creates the file). The two combine with a trio write in one invocation; each names its own part in the ack.
 
 ---
 
@@ -357,7 +456,8 @@ Validation happens **first, ahead of every resolution**: `--answer-only` + `--wi
 2. Calls `settings.update(session=session_name)` — **only for a plain run** (`_is_plain_run`: not `--bg`, not `--bg-child`, no `--role`, no `--alarm-session`, no `--return`). A delegated run is a guest: it mints its own `chat-`/`spawn-` name and writes its transcript there, but never repoints the active session (otherwise the caller's conversation — and the TUI, which reads the active session — would jump onto the subagent's file). Plain `miniouto chat` still persists the active session, with or without `--name`. Every turn instead passes `ChatOptions.session` through `ChatOverrides.session` into `runtime.session`, so it drains its own inbox and expands `{this_session}` to its own name — never the caller's — without temporarily rewriting the shared active-session setting. A delegated `--continue` run must provide `--name SESSION` (it cannot inherit the caller's active session).
 3. Emits the `------{session_name}------` marker to stdout unless `--answer-only` was passed, then builds a `core.chat.ChatOptions` dataclass from the flags and dispatches to `core.chat.run_chat(opts, sink=ConsoleEventSink(quiet=answer_only or with_session))`. **Session persistence is unconditional** — `run_chat` builds its `_TurnPersister` before any branch on delegation, so every run (plain outo, a delegated `--role` run, and `--answer-only`/`-a`) writes its session file; `-a` suppresses stdout only, and the file on disk is identical either way.
 4. On exception: `run_chat` itself calls `_dump_failure_diagnostics` (appends `✗ {ExceptionType}: {msg}` + the last ≤5 tool calls + a full traceback to `logs/failure-<session>.log`, and prints the same to **stderr** — the CLI leaves `quiet_diagnostics` False, so this output is unchanged) and **re-raises**. Typer prints the traceback and exits 1. A *delegated* run catches it instead — see the post-step below.
-5. On success: `ConsoleEventSink` writes the reply as plain stdout; in verbose mode it is preceded by a `------finish------` marker and loop events (tool calls, intermediate responses) rendered in `orange3`. In quiet mode only the raw answer (and the session marker, for `--with-session`) reaches stdout.
+   **Ctrl-C (SIGINT) is not an exception to diagnose**: `run_chat`'s handlers catch `Exception` only, so the `KeyboardInterrupt` propagates to the plain branch of `_run_foreground`, which stamps the session's still-`running` turn `interrupted` immediately (`_stamp_interrupted` — it does not wait for a later `begin_turn`, possibly in another process, to reap the stale record), closes any open stream line, prints `------finish------` + `stopped: cancelled` (the delegated branch's own wording), and exits **130**. Quiet (`-a`) adds nothing to stdout but still stamps. A turn already finished is never re-stamped, and a run with no turn on disk invents none.
+5. On success: the reply reaches stdout — as a **live token stream** when the provider streamed (verbose mode only; see [Live token streaming](#live-token-streaming)), otherwise as the plain whole answer. In verbose mode the answer is preceded by a `------finish------` marker and loop events (tool calls, intermediate responses) rendered in `orange3`; when the answer already streamed, the marker follows the stream directly (plus one newline if the stream ended mid-line) instead of the text repeating. In quiet mode only the raw answer (and the session marker, for `--with-session`) reaches stdout — no deltas, markers unchanged.
 
 
 Loop-event notation in verbose CLI output keeps the `name:` prefix style:
@@ -392,6 +492,8 @@ summary: /home/luke/repo/.miniouto/summary/tui-20260723-103412-a1b2c3
 ```
 
 `handoff_marker` is two lines — `------summary → <new>------` then `summary: <dir>` — followed by the ordinary `------<new>------`, so a session transition reads exactly like the `------finish------` / `------{session}------` idiom around it. It is the same string the TUI mounts as a system row.
+
+The OLD conversation is also closed **on disk**: `_apply_handoff` calls `_persist_handoff_marker` just before printing, appending one display turn holding a single `kind="handoff"` event (the marker text, on outo's actor line) to the OLD session's `turns`. A reader that reloads the file — the TUI after a session reload, a wrapper, plain viewing — sees the transition where it happened instead of a transcript that just stops mid-work. It is its own turn rather than an event of the last one, because replay renders a turn's events before its answer; merged, the marker would sit above the final message. The CLI owns this record (the TUI wrote its own copy until its version was retired); the event shape is unchanged, so old files replay identically.
 
 What `_apply_handoff` moves: `opts.session` and the published run contract (re-registered under the new session). The next turn carries that session directly into runtime resolution. Only a plain run publishes the new active session for later unnamed `-c` wakeups; a delegated guest never does. The continuation message is already waiting in the new session's inbox, so the next drain turns it into the next prompt — no user action, no new command. `HANDOFF_MAX_TRANSITIONS = 5` bounds it (`summary → cont-1 → cont-2` …); past that it warns, naming the session and the summary folder, and stops. The continuation prompt is the drained inbox of the new session — a one-shot drain, rebuilt from `core.summary.build_continuation_message` (plus the run contract) if the drain came back empty.
 
@@ -477,7 +579,21 @@ git log --oneline -5 | miniouto message insert --stdin --kind alarm --source ci 
 
 ### `message list [--session NAME]`
 
-Shows the messages still waiting, oldest first, one line each: `<ts>  <kind>  <source>  <first 60 chars>`. `--session` defaults to `settings.session`; an empty session is an error, never a guess. It **peeks without consuming** — the payloads are read straight out of the inbox directory and nothing is unlinked, so `list` can never deliver a message by accident. An empty inbox prints **nothing** and exits 0, so the command doubles as a poll loop's emptiness test without any text matching.
+Shows the messages still waiting, oldest first, as one YAML document:
+
+```yaml
+session: default
+messages:
+- id: 20260723T103412-a1b2c3
+  ts: '2026-07-23T10:34:12'
+  kind: alarm
+  source: spawn
+  text: |
+    Delegated run 'editor' (id: a1b2c3) finished (status: done).
+    Session: default — /home/you/.miniouto/sessions/default.json
+```
+
+`--session` defaults to `settings.session`; an empty session is an error, never a guess. It **peeks without consuming** — the payloads are read straight out of the inbox directory and nothing is unlinked, so `list` can never deliver a message by accident. Every `_peek` field is preserved (`id`, `ts`, `kind`, `source`, `text`) and multiline bodies arrive as literal block scalars. An empty inbox is `messages: []` (exit 0), so a poll loop's emptiness test is `messages == []`, not a text match.
 
 ### `message clear [--session NAME] [--yes]`
 
@@ -508,11 +624,37 @@ The provider command has three groups: **catalog** browse/add (`providers`, `mod
 
 ### `provider providers`
 
-Calls `core.modelslist.list_providers()` (`GET https://modelslist.blp.sh/`). Prints a rich `Table` titled `Catalog providers (N)` with columns `Name | Slug | miniouto format | Selected base URL | Available compatibility | Addable?`. The selected format/URL comes from `resolve_catalog_dialect` — the first `formats` entry whose `format` maps through `DIALECT_TO_FORMAT`; `typesafe` is not an LLM wire protocol and is omitted. The "Addable?" column is `✓` when a hostable format exists (`✗` otherwise). N is whatever the curated index holds (17 when last observed) — never treat it as a fixed count. Empty result → yellow "No providers returned by the catalog." (exit 0). Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
+Calls `core.modelslist.list_providers()` (`GET https://modelslist.blp.sh/`). Prints one YAML document — the catalog index in machine-readable form:
+
+```yaml
+providers:
+- name: Z.AI Coding Plan
+  slug: zai-coding-plan
+  format: anthropic
+  base_url: https://api.z.ai/api/anthropic
+  compatibility:
+  - anthropic
+  - openai
+  - openai-responses
+  addable: true
+```
+
+`format`/`base_url` are the selected dialect — the first `formats` entry whose `format` maps through `DIALECT_TO_FORMAT`; `typesafe` is not an LLM wire protocol and never appears. An unhostable provider has `format: ''`, `base_url: ''`, `compatibility: []`, `addable: false`. An empty result is `providers: []` (exit 0). Transport failure → red `✗ Failed to reach catalog: {exc}` on **stderr** + exit 1 (stdout stays empty).
 
 ### `provider models <provider-name>`
 
-Positional argument; modelslist lookup is case-/whitespace-/punctuation-insensitive (`_normalize` strips spaces, `-`, `_`, `.`) and falls through slug → name → saved-endpoint match → fuzzy substring (the endpoint step outranks the fuzzy one, so a stored record is never redirected by a name that merely resembles another provider). Fetches the provider's `modelLists` entry with `source == "modelslist"` and reads its `data` array. Prints a `Table` titled `Catalog models for '<name>' (N)` with columns `ID | Name`. Empty result → yellow "No models returned for `<name>`." + exit 1. Transport failure → red `✗ Failed to reach catalog: {exc}` + exit 1.
+Positional argument; modelslist lookup is case-/whitespace-/punctuation-insensitive (`_normalize` strips spaces, `-`, `_`, `.`) and falls through slug → name → saved-endpoint match → fuzzy substring (the endpoint step outranks the fuzzy one, so a stored record is never redirected by a name that merely resembles another provider). Fetches the provider's `modelLists` entry with `source == "modelslist"` and reads its `data` array. Prints one YAML document headed by the resolved provider name:
+
+```yaml
+provider: Anthropic
+models:
+- id: claude-sonnet-4-5
+  name: Claude Sonnet 4.5
+- id: claude-opus-4-1
+  name: Claude Opus 4.1
+```
+
+Empty result → yellow "No models returned for `<name>`." on **stderr** + exit 1. Transport failure → red `✗ Failed to reach catalog: {exc}` on stderr + exit 1.
 
 ### `provider add <provider-name> --api-key <key> [--default-model <id>] [--reasoning <v>]`
 
@@ -533,29 +675,47 @@ Manual add via a nested sub-app (`custom_app`). Flags:
 
 ```
 add_custom(
-    --name           TEXT  # required
-    --format         TEXT  # default "openai"; one of SUPPORTED_FORMATS:
-                           #   openai, openai-response, anthropic, google
-    --base-url       TEXT  # default ""
-    --api-key        TEXT  # default "" (omit to read from env at call time)
-    --default-model  TEXT  # default "" (used when neither chat --pm nor the session pin names a model)
-    --reasoning      TEXT  # default None (stored verbatim as reasoning_effort)
+    --name               TEXT  # required
+    --format             TEXT  # default "openai"; one of SUPPORTED_FORMATS:
+                               #   openai, openai-response, anthropic, google
+    --base-url           TEXT  # default ""
+    --api-key            TEXT  # default "" (omit to read from env at call time)
+    --default-model      TEXT  # default "" (used when neither chat --pm nor the session pin names a model)
+    --reasoning          TEXT  # default None (stored verbatim as reasoning_effort)
+    --max-context-window INT   # default 0 = follow modelslist (invariant 4)
+    --max-output-tokens  INT   # default 0 = follow modelslist (the 16K floor applies)
 )
 ```
 
 - Validates `--format` against `core.providers.SUPPORTED_FORMATS = ("openai", "openai-response", "anthropic", "google")`. Unknown → red `✗ Unknown format <fmt>. Supported: …` + exit 1.
-- Calls `storage.paths.ensure_dirs()`, builds a `storage.providers.Provider(...)` (with `source="custom"`), calls `storage.providers.upsert(provider)`.
+- Calls `storage.paths.ensure_dirs()`, builds a `storage.providers.Provider(...)` (with `source="custom"`; a non-zero caps flag becomes the record's override, `0`/omitted stays `None` = follow modelslist), calls `storage.providers.upsert(provider)`.
 - Prints `✓ Saved custom provider <name> (<api_format>, reasoning=<value or ->).`
 
 ### `provider list`
 
-Pretty-prints a `rich.table.Table` titled `Providers` with columns:
+Lists the configured providers as one YAML document:
 
-| Name | Type | Format | Compatibility | Base URL | Default Model | Reasoning | Default |
+```yaml
+providers:
+- name: minimax
+  source: catalog
+  format: openai-response
+  compatibility: openai-responses
+  base_url: https://api.minimax.io/v1/responses
+  default_model: MiniMax-M2.1
+  reasoning: high
+  default: true
+- name: local
+  source: custom
+  format: openai
+  compatibility: manual
+  base_url: http://127.0.0.1:8080/v1
+  default_model: qwen3-32b
+  reasoning: ''
+  default: false
+```
 
-The `Compatibility` column shows the saved `catalog_dialect`, `catalog` for a catalog source with no saved dialect, or `manual` for a custom provider. The `Type` column renders `custom` or `catalog` via `is_catalog_source` (`SOURCE_CUSTOM` → "custom"; `SOURCE_MODELSLIST` and the legacy `SOURCE_LMA` → "catalog"). The `Reasoning` column shows the provider's stored `reasoning_effort` (or `-`). The active provider (per `settings.toml`) is marked with a green ● in the Default column.
-
-If no providers are configured, prints yellow "No providers configured. Run `miniouto provider add <name>` or `miniouto provider custom add`."
+`compatibility` shows the saved `catalog_dialect`, `catalog` for a catalog source with no saved dialect, or `manual` for a custom provider. `source` is `custom` or `catalog` (via `is_catalog_source`; `SOURCE_MODELSLIST` and the legacy `SOURCE_LMA` both count as catalog). `reasoning` is the stored `reasoning_effort`, `''` when unset. `default` marks the active provider per `settings.toml`. No providers configured → `providers: []` (exit 0) — the same document shape, not a warning.
 
 ### `provider remove <name>`
 
@@ -565,6 +725,26 @@ Calls `storage.providers.remove(name)`. Prints `✓ Removed provider <name>.` on
 
 Validates via `storage.providers.get(name)`. If `None` → red `✗ Provider <name> is not configured.` + exit 1. Otherwise calls `settings.update(provider=name)` and prints `✓ Default provider is now <name>.`.
 
+### `provider edit <name> [flags]`
+
+Edits a stored provider record in place — only the flags you pass are written, everything else keeps its stored value (`provider_store.get` + `dataclasses.replace` + `upsert`). Missing name → red `✗ Provider <name> is not configured.` on **stderr** + exit 1.
+
+| Flag | Effect |
+|---|---|
+| `--default-model M` | Sets the endpoint's `default_model` (what a fresh install resolves) |
+| `--reasoning R` | Sets `reasoning_effort`; an explicit empty string (`--reasoning ""`) clears it to auto (`None`) |
+| `--max-context-window N` | Context-window override (invariant 4). **`0` clears the override** — back to "follow modelslist" |
+| `--max-output-tokens N` | Output-token override (sits above modelslist and the 16K floor; `chat --max-tokens` still outranks it). **`0` clears** |
+| `--base-url URL` | Sets the endpoint's base URL |
+| `--api-key KEY` | Sets the API key |
+| `--compatibility DIALECT` | Catalog-source records only — see below |
+
+`--compatibility` applies to **catalog** providers only (the same flow the TUI popup's `Compatibility` row runs): it resolves the record's catalog entry (`find_provider_by_slug`), picks the named dialect out of `catalog_compatibility`, and rewrites `api_format`, `base_url` AND `catalog_dialect` from that dialect's mapping in one write. A custom record is refused with `✗ --compatibility applies to catalog providers only; <name> is custom — edit --base-url here, or re-add it with 'provider custom add --format …' for a new format.` + exit 1 (there is no `--format` flag on `edit` — a custom provider's format is set at `custom add` time); a dialect the catalog does not offer is refused with the list of what IS available; no catalog metadata for the slug is refused too.
+
+A caps edit also drops `core.context`'s modelslist cache (`clear_model_cache`): the override is read from the record on every call, but the FALLBACK it hands back to is cached for the life of the process — without the drop this process would serve pre-edit caps until it exits.
+
+On success: `✓ Provider <name> updated.`
+
 ---
 
 ## `miniouto style ...`
@@ -573,11 +753,23 @@ File: `cli/style.py`. Sub-app `app = typer.Typer(help="Manage agent style docume
 
 ### `style list`
 
-Iterates `storage.styles.list_styles()`. Active style (per `settings.toml`) is marked with a green ●. Empty → yellow "No styles installed."
+Iterates `storage.styles.list_styles()` and prints one YAML document:
 
-### `style set <name>`
+```yaml
+styles:
+- name: coding
+  active: false
+- name: coding-work
+  active: true
+- name: default
+  active: false
+```
 
-Calls `storage.styles.read(name)`. If `None` → red `✗ ... is not installed.` + exit 1. Otherwise calls `settings.update(style=name)` and prints `✓ Active style is now <name>.`.
+`active` marks the style `settings.toml` names. An empty installation is `styles: []`.
+
+### `style set <name> [--session NAME]`
+
+Calls `storage.styles.read(name)`. If `None` → red `✗ ... is not installed.` + exit 1. Otherwise calls `core.runtime.set_active_style(name, session=…)`: the style becomes `settings.style` (the default for sessions started from now on) and every session that already exists FREEZES the style it is running under into its own pin (`session_config.freeze_style`) — the same rule the TUI's style picker follows, so existing conversations are never restyled underneath the user. `--session NAME` additionally pins the choice to that session (the write the TUI's picker makes for the conversation it belongs to): `✓ Active style is now <name> (pinned to session '<session>').` Without it the change is the global default only.
 
 ### `style add <repo_url> [--name NAME]`
 
@@ -616,7 +808,16 @@ File: `cli/skill.py`. Sub-app `app = typer.Typer(help="Manage agent skills.")`.
 
 ### `skill list`
 
-Iterates `storage.skills.list_skills()` with no argument, which searches **both** default roots (`./skills/` first, then `~/.agents/skills/`) and stamps each skill with the root it came from — **hidden skills are excluded** (the function filters `not skill.hidden`). Empty → yellow "No skills found." followed by both default roots. Otherwise prints a rich `Table` titled `Available Skills` with columns `Name | Description | Root` (root dimmed), truncating descriptions to 80 chars + "…"; a name installed under both roots lists twice, each row naming its own root.
+Iterates `storage.skills.list_skills()` with no argument, which searches **both** default roots (`./skills/` first, then `~/.agents/skills/`) and stamps each skill with the root it came from — **hidden skills are excluded** (the function filters `not skill.hidden`). Prints one YAML document:
+
+```yaml
+skills:
+- name: hf-cli
+  description: Hugging Face Hub CLI (`hf`) for downloading, uploading, and managing
+  directory: /home/you/project/skills
+```
+
+Descriptions arrive **whole** — no 80-char truncation. A name installed under both roots lists twice, each row naming its own root. No skills found → `skills: []`.
 
 ### `skill show <name>`
 
@@ -636,11 +837,23 @@ Iterates `storage.skills.list_skills()` with no argument, which searches **both*
 
 File: `cli/subagent.py`. Sub-app `app = typer.Typer(help="Manage the subagent's provider and model.")`.
 
-Manages the **global default** subagent provider/model/reasoning (`settings.subagent_provider` / `settings.subagent_model` / `settings.subagent_reasoning`). A delegated run started with `chat --use-subagent-provider` resolves its subagent trio pin-first against **its own** session, so it inherits *this* trio only when its session pin has no subagent keys; empty settings = the run uses outo's provider and model, and falls back to the resolved provider's `reasoning_effort`. (The TUI's `subagent` chip writes this trio **and** the session pin at once — `docs/usage.md`.) The command does not run anything itself; it only edits `settings.toml`.
+Manages the **global default** subagent provider/model/reasoning (`settings.subagent_provider` / `settings.subagent_model` / `settings.subagent_reasoning`). A delegated run started with `chat --use-subagent-provider` resolves its subagent trio pin-first against **its own** session, so it inherits *this* trio only when its session pin has no subagent keys; empty settings = the run uses outo's provider and model, and falls back to the resolved provider's `reasoning_effort`. (The TUI's `subagent` chip writes this trio **and** the session pin at once — through `config set --target subagent`, the CLI form of the same edit.) The command does not run anything itself; it only edits `settings.toml`.
 
 ### `subagent show`
 
-Prints three rich-formatted lines — `Subagent provider`, `Subagent model`, and `Subagent reasoning` — using the same resolution as the runtime: settings values first, then the subagent provider's `default_model`, then `same as outo (<provider>/<model>)` when no override is set. The reasoning line shows `settings.subagent_reasoning` if set, else the resolved subagent provider's `reasoning_effort` if set, else `auto`.
+Prints one YAML document — the resolution the runtime applies, beside the raw override keys that produced it:
+
+```yaml
+provider: local
+model: qwen3-32b
+reasoning: high
+overrides:
+  provider: ''
+  model: ''
+  reasoning: ''
+```
+
+The top three keys are the **effective** trio `runtime._effective_subagent_pm` resolves right now, per key: `settings.subagent_*`, then (for the model) the subagent provider's own record `default_model`, then — only when the subagent inherits outo's provider — outo's own trio (`settings.provider` / `model` / `reasoning`, with the provider record's defaults answering where nothing names a model). An unresolved key stays `""`: the honest answer for a machine interface, no `-` placeholder and no display sentence. The `overrides` block echoes the stored `settings.subagent_*` keys verbatim — empty strings mean "not overridden" (the inherited case above).
 
 ### `subagent set [--provider NAME] [--model NAME] [--reasoning TEXT]`
 
@@ -664,13 +877,19 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 |---|---|---|
 | Successful command | stdout output, no error | 0 |
 | Unhandled exception in `chat_cmd` / `run_chat` | `run_chat._dump_failure_diagnostics` appends `✗ {ExceptionType}: {msg}` + last ≤5 tool calls + traceback to `logs/failure-<session>.log` and prints the same to stderr, then re-raises; Typer prints the traceback | 1 |
+| Ctrl-C (SIGINT) on a plain `chat` | running turn stamped `interrupted` immediately; `------finish------` + `stopped: cancelled` on stdout (nothing in quiet mode); exit **130** — a stop, not an error | 130 |
+| `config set` with no flag | `✗ Pass at least one of --target, --theme, or --active-session.` + `typer.Exit(1)` | 1 |
+| `config set --target` without `--session`, or without all three trio flags | `✗ --target requires --session NAME (the pin it writes).` / `✗ --target writes the whole trio: pass --provider, --model and --reasoning (an empty --reasoning clears it).` + exit 1 | 1 |
+| `config set --target` naming an unconfigured provider | `✗ Provider '<name>' is not configured.` + exit 1 (on stderr — `config show`'s YAML lane stays clean) | 1 |
+| `provider edit` on a missing name | `✗ Provider <name> is not configured.` on stderr + `typer.Exit(1)` | 1 |
+| `provider edit --compatibility` on a custom record | `✗ --compatibility applies to catalog providers only; <name> is custom — edit --base-url here, or re-add it with 'provider custom add --format …' for a new format.` + exit 1 | 1 |
 | `provider custom add` with unknown `--format` | `✗ Unknown format <fmt>. Supported: …` + `typer.Exit(1)` | 1 |
 | `provider add` for an unknown catalog provider name | `✗ No catalog provider matched <name>. Run 'miniouto provider providers' to see the catalog.` + exit 1 | 1 |
 | `provider add` for a provider with no hostable format | `✗ {exc}` (ValueError from `add_provider_from_catalog`) + exit 1 | 1 |
 | `provider add` overwriting an existing provider | yellow `! Provider <name> already exists; overwriting.` | 0 |
-| `provider providers` / `provider models` network failure | `✗ Failed to reach catalog: {exc}` + exit 1 | 1 |
-| `provider models` empty result | yellow "No models returned for `<name>`." + exit 1 | 1 |
-| `provider providers` empty result | yellow "No providers returned by the catalog." (returns, exit 0) | 0 |
+| `provider providers` / `provider models` network failure | `✗ Failed to reach catalog: {exc}` on stderr (stdout empty) + exit 1 | 1 |
+| `provider models` empty result | yellow "No models returned for `<name>`." on stderr + exit 1 | 1 |
+| `provider providers` empty result | `providers: []` YAML document, exit 0 | 0 |
 | `provider remove` on missing name | `✗ Provider <name> does not exist.` + `typer.Exit(1)` | 1 |
 | `provider default` on unconfigured name | `✗ Provider <name> is not configured.` + `typer.Exit(1)` | 1 |
 | `style set` on missing style | `✗ ... is not installed.` + `typer.Exit(1)` | 1 |
@@ -693,27 +912,29 @@ The catalog commands (`provider providers`, `provider models`, `provider add`) a
 | `--version` | print version + `raise typer.Exit()` (no code → 0) | 0 |
 | Typer argument parsing errors | Typer default (red error to stderr) | 2 |
 
-**Pattern**: Storage / style / skill / catalog handlers catch exceptions explicitly and exit via `typer.Exit(code=1)`, preserving tracebacks via `from exc`. `chat_cmd` does **not** catch — `run_chat` does its own diagnostics and re-raises so the caller sees a real traceback. The TUI's `_dispatch` catches everything internally and writes `[error: {exc}]` into the log without crashing the app.
+**Pattern**: Storage / style / skill / catalog handlers catch exceptions explicitly and exit via `typer.Exit(code=1)`, preserving tracebacks via `from exc`. `chat_cmd` does **not** catch — `run_chat` does its own diagnostics and re-raises so the caller sees a real traceback. The TUI runs its turn as a `chat` **subprocess** (see "TUI mode"): a refused child surfaces its first stderr line as a `chat: …` system row, a non-zero exit as `chat exited with <code>`, and a 130 (Ctrl-C / esc-esc) as `stopped by user (esc esc)` — the app itself never crashes on a turn.
 
-## Rich output conventions
+## Output conventions
 
-- `✓` (green) — success
-- `✗` (red) — failure
-- `!` (yellow) — warnings (e.g. provider overwrite)
-- `orange3` — loop events in `ConsoleEventSink` (tool calls, intermediate responses). The final answer is written as plain stdout with a `------finish------` marker (no rich color).
-- rich `Table` — `provider list`, `provider providers`, `provider models`, `skill list`
+**Listing commands emit YAML.** `status`, `config show`, `provider providers/models/list`, `skill list`, `style list`, `subagent show`, and `message list` print exactly one YAML document on stdout and nothing else — no banner, no comment, no rich markup. That output is the **official machine interface**: third-party CLI wrappers (a TUI wrapper, a script) parse it with `yaml.safe_load`. All six go through one helper, `cli/_yaml.py:emit_yaml/print_yaml`, whose dump options are part of the contract — `allow_unicode=True`, `sort_keys=False` (the schema's key order stands), `default_flow_style=False` (block style), `width=100` (long text folds), and multiline strings as literal `|` block scalars. Errors of these commands go to **stderr** (rich ✗ text) with exit 1, so the stdout lane never carries anything but YAML.
+
+**Mutation commands keep their rich text.** `✓` (green) — success; `✗` (red) — failure; `!` (yellow) — warnings (e.g. provider overwrite); `orange3` — loop events in `ConsoleEventSink` (tool calls, intermediate responses). The final answer is written as plain stdout with a `------finish------` marker (no rich color). `message insert` keeps printing the bare message id (wrappers parse it), and `message clear` keeps its confirmation wording.
 
 ## Module dependency graph (CLI layer only)
 
 ```
-cli/__init__.py ──┬─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.modelslist, core.providers
-                  ├─→ cli/style.py    ─→ storage.paths, storage.settings, storage.styles
-                  ├─→ cli/skill.py    ─→ storage.skills
-                  ├─→ cli/subagent.py ─→ storage.providers, storage.settings
-                  ├─→ cli/message.py  ─→ core.inbox, storage.settings
+cli/__init__.py ──┬─→ cli/_yaml.py    ─→ yaml (the shared emitter: emit_yaml/print_yaml)
+                  ├─→ cli/config.py   ─→ storage.{session_config,settings,providers}, core.runtime.default_provider_config, cli/_yaml
+                  ├─→ cli/provider.py ─→ storage.paths, storage.providers, storage.settings, core.{modelslist,providers,context,reasoning}, cli/_yaml
+                  ├─→ cli/style.py    ─→ storage.paths, storage.settings, storage.styles, core.runtime.set_active_style, cli/_yaml
+                  ├─→ cli/skill.py    ─→ storage.skills, cli/_yaml
+                  ├─→ cli/subagent.py ─→ storage.providers, storage.settings, cli/_yaml
+                  ├─→ cli/message.py  ─→ core.inbox, storage.settings, cli/_yaml
                   ├─→ cli/computer.py ─→ storage.paths, tools.ascii_art
-                  ├─→ cli/tui/ (app)  ─→ core.{chat,events,inbox,modelslist}, core.providers, storage.{paths,providers,settings,styles,sessions}
-                   └─→ cli/chat.py     ─→ core.{chat,events,inbox,spawn_state,runtime}, storage.{paths,settings,styles}
+                  ├─→ cli/chat.py     ─→ core.{chat,events,inbox,spawn_state,runtime,summary}, storage.{paths,settings,styles,sessions,session_config}
+                  └─→ cli/tui/ (app)  ─→ cli/tui/bridge.py (the subprocess lane: [sys.executable, -m, miniouto] + YAML parsing),
+                                       display reads of core.{chat,events,inbox,modelslist}, core.providers,
+                                       storage.{paths,providers,settings,styles,sessions,session_config}
 ```
 
-External libs the CLI directly imports: `typer`, `rich.console`, `rich.table`, `rich.markdown`, `rich.text`, `rich.cells`, `rich.style`, `xnano` (+ `xnano.styles` — the canvas, styles and the placement API), `xnano_core` (`cell_grid_to_ansi`, the graphics lane's grid → ANSI writer) and `xnano_image` (`TerminalImage`, `TerminalGraphics`, `cell_grid_size` — imported lazily inside the graphics lane), `asyncio`, `threading`, `dataclasses.replace`. Note `rich` is not optional: the TUI measures with `rich.cells.cell_len`, and `render.py` (`style_from_rich`/`text_to_lines`) is the Rich → `pt` bridge — the port keeps its own bridge rather than xnano's `from_rich`.
+External libs the CLI directly imports: `typer`, `yaml` (via `cli/_yaml.py` and `cli/tui/bridge.py`, which parses the YAML the CLI itself emits), `rich.console`, `rich.markdown`, `rich.text`, `rich.cells`, `rich.style`, `xnano` (+ `xnano.styles` — the canvas, styles and the placement API), `xnano_core` (`cell_grid_to_ansi`, the graphics lane's grid → ANSI writer) and `xnano_image` (`TerminalImage`, `TerminalGraphics`, `cell_grid_size` — imported lazily inside the graphics lane), `asyncio`, `threading`, `dataclasses.replace`. Note `rich` is not optional: the TUI measures with `rich.cells.cell_len`, and `render.py` (`style_from_rich`/`text_to_lines`) is the Rich → `pt` bridge — the port keeps its own bridge rather than xnano's `from_rich`.

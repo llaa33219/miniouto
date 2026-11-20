@@ -18,6 +18,8 @@ import asyncio
 import contextlib
 import io
 import json
+import os
+import sys
 from typing import Any
 
 import pytest
@@ -683,36 +685,223 @@ def test_a_message_boundary_event_flushes_the_buffered_stream_tail() -> None:
     asyncio.run(body())
 
 
-# ── CLI stays byte-identical ────────────────────────────────────────────────
+# ── CLI live streaming ───────────────────────────────────────────────────────
 
 
-def _render_cli_turn(*, with_deltas: bool) -> str:
+def _render_cli_turn(
+    *,
+    with_deltas: bool,
+    quiet: bool = False,
+    answer: str = "final answer",
+    final: str | None = None,
+) -> str:
+    """One verbose CLI turn, in the order the loop really produces it.
+
+    A tool call ran in a PREVIOUS iteration; the current message's flush is
+    `thinking` → `response` → `context`, with the stream (if any) carrying
+    that same message's text before its `response` event lands. `final`
+    overrides what `emit_final_answer` receives (the exception-path case:
+    the answer the run reports differs from what streamed).
+    """
+
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        sink = ConsoleEventSink()
-        if with_deltas:
-            for char in "TOKENSTREAM":
-                sink.emit_stream_delta("text", char)
-            sink.emit_stream_delta("thinking", "hidden reasoning")
+        sink = ConsoleEventSink(quiet=quiet)
         sink.emit_loop_event(
             LoopEvent(actor="outo", kind="tool", text="Bash ls", tool_name="Bash")
         )
         sink.emit_loop_event(LoopEvent(actor="outo", kind="thinking", text="thinking out loud"))
+        if with_deltas:
+            for char in answer:
+                sink.emit_stream_delta("text", char)
+            sink.emit_stream_delta("thinking", "hidden reasoning")
+        sink.emit_loop_event(
+            LoopEvent(
+                actor="outo", kind="response", text=answer if with_deltas else "other"
+            )
+        )
         sink.emit_loop_event(
             LoopEvent(actor="outo", kind="context", text="iter 1 · 42 tokens")
         )
-        sink.emit_final_answer("final answer", "s")
+        sink.emit_final_answer(final if final is not None else answer, "s")
     return buf.getvalue()
 
 
-def test_console_output_is_unchanged_by_stream_deltas() -> None:
-    # Given: the same loop-event sequence with and without live deltas
-    # When: both are rendered through the CLI sink
-    with_deltas = _render_cli_turn(with_deltas=True)
-    without_deltas = _render_cli_turn(with_deltas=False)
+def test_console_streams_text_deltas_live() -> None:
+    # Given: a turn whose answer arrives as text deltas
+    # When: the CLI sink renders it
+    out = _render_cli_turn(with_deltas=True)
 
-    # Then: byte-identical — the CLI has no live-stream rendering at all
-    assert with_deltas == without_deltas
-    assert "TOKENSTREAM" not in with_deltas
-    assert "hidden reasoning" not in with_deltas
-    assert "final answer" in with_deltas
+    # Then: every token went out as it arrived (the wrapper process reads
+    # the token stream off stdout, tty or not), and the answer is NOT
+    # printed a second time — only the boundary line and the finish
+    # marker follow the stream, and nothing trails the marker.
+    assert out == (
+        "outo: Bash ls\n"
+        "outo:thinking: thinking out loud\n"
+        "final answer\n"
+        "outo: iter 1 · 42 tokens\n"
+        "------finish------\n"
+    )
+    # And: thinking deltas stay silent as before (contract 5) — the
+    # completed thinking event is that text's one and only rendering.
+    assert "hidden reasoning" not in out
+    assert "thinking out loud" in out
+
+
+def test_console_output_is_unchanged_without_deltas() -> None:
+    # Given: a turn from a non-streaming provider
+    # When: the CLI sink renders it
+    out = _render_cli_turn(with_deltas=False)
+
+    # Then: the whole message renders from its completed events, exactly
+    # as before streaming — the streamed path changed nothing here.
+    assert out == (
+        "outo: Bash ls\n"
+        "outo:thinking: thinking out loud\n"
+        "outo: other\n"
+        "outo: iter 1 · 42 tokens\n"
+        "------finish------\n"
+        "final answer\n"
+    )
+
+
+def test_quiet_console_outputs_no_deltas_and_stays_byte_identical() -> None:
+    # Given: the byte-identical output modes (-a / --with-session)
+    # When: the same turn renders quiet and verbose, deltas included
+    quiet = _render_cli_turn(with_deltas=True, quiet=True)
+    quiet_no_stream = _render_cli_turn(with_deltas=False, quiet=True)
+
+    # Then: no delta, no marker, no loop event — answer only, byte-identical
+    # whether the provider streamed or not.
+    assert quiet == "final answer\n"
+    assert quiet == quiet_no_stream
+
+
+def test_console_prints_the_full_answer_when_it_did_not_stream() -> None:
+    # Given: a turn whose tokens streamed a DIFFERENT text than the final
+    # answer (an exception path rewrote it)
+    # When: the CLI sink renders it
+    out = _render_cli_turn(with_deltas=True, answer="streamed text", final="final answer")
+
+    # Then: both render, each exactly once — the stream is not retracted,
+    # and the answer is not swallowed by the duplicate guard. The
+    # streamed message's own `response` event IS suppressed (its text
+    # matches the tokens), so between the stream and the boundary line
+    # only the newline the boundary added appears.
+    assert out == (
+        "outo: Bash ls\n"
+        "outo:thinking: thinking out loud\n"
+        "streamed text\n"
+        "outo: iter 1 · 42 tokens\n"
+        "------finish------\n"
+        "final answer\n"
+    )
+
+
+def test_console_streamed_response_event_is_suppressed() -> None:
+    # Given: a message that streamed and then completed
+    sink = ConsoleEventSink()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        sink.emit_stream_delta("text", "intermediate")
+        # The completed message's whole-text event — the same text
+        sink.emit_loop_event(
+            LoopEvent(actor="outo", kind="response", text="intermediate")
+        )
+        sink.emit_loop_event(LoopEvent(actor="outo", kind="context", text="iter 1"))
+
+    # Then: the response line is suppressed (its tokens already went out),
+    # while the context line — the boundary — still renders.
+    assert buf.getvalue() == "intermediate\nouto: iter 1\n"
+
+
+def test_console_stream_line_is_closed_before_the_next_line() -> None:
+    # Given: a stream that ends mid-line
+    sink = ConsoleEventSink()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        sink.emit_stream_delta("text", "partial line")
+        sink.emit_loop_event(
+            LoopEvent(actor="outo", kind="thinking", text="a reasoning line")
+        )
+
+    # Then: one newline separates the streamed text from the next line —
+    # no gluing, no blank line.
+    assert buf.getvalue() == "partial line\nouto:thinking: a reasoning line\n"
+
+
+def test_console_stream_stops_and_reignites_the_spinner_at_boundaries() -> None:
+    # Given: a verbose sink whose spinner is running
+    sink = ConsoleEventSink()
+    status_log: list[str] = []
+
+    class _Status:
+        def __init__(self, text: str) -> None:
+            self.text = text
+        def update(self, text: str) -> None:
+            status_log.append("update:" + text)
+        def __enter__(self) -> _Status:
+            status_log.append("enter")
+            return self
+        def __exit__(self, *_args: Any) -> None:
+            status_log.append("exit")
+
+    class _Console:
+        def status(self, text: str, **_kwargs: Any) -> _Status:
+            return _Status(text)
+        def print(self, *_a: Any, **_k: Any) -> None:
+            pass
+
+    sink._console = _Console()  # type: ignore[assignment]
+
+    # When: a delta arrives while the spinner is live, then the message
+    # completes (its boundary events fire)
+    sink.begin_working()
+    assert status_log == ["enter"]
+    sink.emit_stream_delta("text", "token")
+    assert status_log == ["enter", "exit"]  # stopped, not re-lit mid-stream
+    sink.emit_stream_delta("text", "s")
+    assert status_log == ["enter", "exit"]  # STILL stopped: tokens are life
+    # The suppressed `response` is a boundary but the guard is still open
+    # (its `context` has not fired), so the spinner stays down and the
+    # stop-flag survives for the event that actually closes the message.
+    sink.emit_loop_event(LoopEvent(actor="outo", kind="response", text="tokens"))
+    assert status_log == ["enter", "exit"]
+    sink.emit_loop_event(LoopEvent(actor="outo", kind="context", text="iter 1"))
+    assert status_log == ["enter", "exit", "enter"]  # boundary re-ignites it
+    sink.emit_stream_delta("text", "x")  # message 2 streams
+    assert status_log == ["enter", "exit", "enter", "exit"]
+    sink.emit_loop_event(LoopEvent(actor="outo", kind="context", text="iter 2"))
+    assert status_log == ["enter", "exit", "enter", "exit", "enter"]
+
+    # And quiet never touches the spinner: a quiet sink's deltas are no-ops
+    quiet = ConsoleEventSink(quiet=True)
+    quiet._console = _Console()  # type: ignore[assignment]
+    quiet.begin_working()
+    quiet.emit_stream_delta("text", "t")
+    assert status_log == ["enter", "exit", "enter", "exit", "enter"]
+
+
+def test_console_streaming_works_through_a_pipe() -> None:
+    # Given: stdout is a pipe, not a tty (the wrapper process's view)
+    r, w = os.pipe()
+    try:
+        old = sys.stdout
+        sys.stdout = os.fdopen(w, "w", closefd=False)
+        try:
+            sink = ConsoleEventSink()
+            sink.begin_working()  # spinner is a no-op rendering on a pipe
+            for char in "PIPE":
+                sink.emit_stream_delta("text", char)
+            sys.stdout.flush()
+        finally:
+            sys.stdout.close()
+            sys.stdout = old
+        data = os.read(r, 100)
+    finally:
+        os.close(r)
+        os.close(w)
+
+    # Then: the tokens are on the pipe as they arrived
+    assert data.decode() == "PIPE"

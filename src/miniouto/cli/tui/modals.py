@@ -50,7 +50,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Iterable, Sequence
-from dataclasses import replace
 from typing import Any, NamedTuple
 
 from rich.cells import cell_len
@@ -62,7 +61,7 @@ from ...core import modelslist as catalog_api
 from ...core.providers import CatalogDialect, catalog_compatibility
 from ...storage import providers as provider_store
 from ...storage.providers import SOURCE_CUSTOM, is_catalog_source
-from . import pt
+from . import bridge, pt
 from .config import (
     CAPS_FIELD,
     COMPATIBILITY_FIELD,
@@ -74,7 +73,6 @@ from .config import (
     _effective_config,
     _model_defaults,
     _parse_optional_int,
-    _persist_trio,
     _reasoning_choices,
     _reasoning_target,
     _record,
@@ -1637,9 +1635,27 @@ class ProviderSettingsPopup(Modal):
         return _trio(_effective_config(self._session), self._target.fields)
 
     def _apply(self, values: tuple[str, str, str]) -> None:
-        """Persist one edit through BOTH stores, then repaint the rows."""
+        """Persist one edit (``config set --target``), then repaint the rows.
 
-        _persist_trio(self._session, self._target, values)
+        The write is the CLI's; it runs on the app's worker because a
+        subprocess round-trip must not freeze the key handler that confirmed
+        the pick. The rows repaint when it lands, so what they show is what
+        storage now says — never a pre-write guess.
+        """
+
+        provider, model, reasoning = values
+        which = "subagent" if self._target.inherits else "outo"
+        self._run(self._apply_flow(provider, model, reasoning, which))
+
+    async def _apply_flow(
+        self, provider: str, model: str, reasoning: str, which: str
+    ) -> None:
+        ok, message = await asyncio.to_thread(
+            bridge.config_set_trio, self._session, which, provider, model, reasoning
+        )
+        if not ok:
+            self._report(message or "config set failed")
+            return
         self._report("")
         self.refresh_rows()
         self._on_change()
@@ -1715,8 +1731,10 @@ class ProviderSettingsPopup(Modal):
 
         options: list[str] = []
         try:
-            models = await asyncio.to_thread(catalog_api.list_models, provider)
-            # Preserve modelslist's curated / provider-native order.
+            models = await asyncio.to_thread(bridge.list_catalog_models, provider)
+            if models is None:
+                raise RuntimeError("provider models exited non-zero")
+            # Preserve the catalog's curated / provider-native order.
             options = [f"{model.get('id', '?')} — {model.get('name', '')}" for model in models]
         except Exception as exc:
             self._report(f"model list unavailable ({exc}); type the model id instead")
@@ -1856,16 +1874,26 @@ class ProviderSettingsPopup(Modal):
         )
         if option is None:
             return
-        provider_store.upsert(
-            replace(
-                latest,
-                api_format=option.api_format,
-                base_url=option.base_url,
-                catalog_dialect=option.dialect,
+
+        async def save_compatibility() -> None:
+            """``provider edit NAME --compatibility DIALECT``.
+
+            The CLI re-resolves the dialect's (format, base URL) mapping from
+            the catalog itself — the same lookup the in-process read above
+            used to build the labels, so the write cannot drift from what
+            the picker showed.
+            """
+
+            ok, message = await asyncio.to_thread(
+                bridge.provider_edit_compatibility, provider_name, option.dialect
             )
-        )
-        self._report("")
-        self.refresh_rows()
+            if not ok:
+                self._report(message or "provider edit failed")
+                return
+            self._report("")
+            self.refresh_rows()
+
+        self._run(save_compatibility())
 
     @staticmethod
     def _compatibility_label(option: CatalogDialect) -> str:
@@ -1929,20 +1957,33 @@ class ProviderSettingsPopup(Modal):
                 except ValueError:
                     self._report("max output tokens must be a positive number.")
                     return
-                provider_store.upsert(
-                    replace(
-                        record,
-                        max_context_window=context_window,
-                        max_output_tokens=output_tokens,
+
+                async def save_caps() -> None:
+                    """``provider edit --max-context-window/--max-output-tokens``.
+
+                    ``0`` (the cleared answer) is the CLI's documented
+                    "follow modelslist" spelling; ``None`` never reaches the
+                    argv, so an untouched cap keeps its stored value.
+                    """
+
+                    ok, message = await asyncio.to_thread(
+                        bridge.provider_edit_caps,
+                        record.name,
+                        max_context_window=context_window or 0,
+                        max_output_tokens=output_tokens or 0,
                     )
-                )
-                # The override itself re-reads the record on every call, but the
-                # modelslist FALLBACK it hands back to is cached for the life of
-                # the process — drop it or this TUI serves pre-edit caps until
-                # exit.
-                context_api.clear_model_cache()
-                self._report("")
-                self.refresh_rows()
+                    if not ok:
+                        self._report(message or "provider edit failed")
+                        return
+                    # The override itself re-reads the record on every call,
+                    # but the modelslist FALLBACK it hands back to is cached
+                    # for the life of this TUI process — drop it or this TUI
+                    # serves pre-edit caps until exit.
+                    context_api.clear_model_cache()
+                    self._report("")
+                    self.refresh_rows()
+
+                self._run(save_caps())
 
             self.app.push_screen(
                 TextInputModal(

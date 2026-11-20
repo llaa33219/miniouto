@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import contextlib
 import datetime
 import os
+import re
 import select
 import signal
 import threading
@@ -43,7 +45,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -56,23 +58,19 @@ from rich.cells import cell_len
 from rich.text import Text
 
 from ... import __version__, paths_runtime
-from ...core import inbox, runtime, summary, update_check
+from ...core import inbox, summary, update_check
 from ...core import modelslist as catalog_api
-from ...core.chat import ChatOptions, run_chat, shutdown_turn_loop
+from ...core.chat import run_chat, shutdown_turn_loop
 from ...core.events import STREAM_THINKING, LoopEvent
-from ...core.providers import SUPPORTED_FORMATS, add_provider_from_catalog, resolve_catalog_dialect
-from ...core.runtime import LoopCancelledError
+from ...core.providers import SUPPORTED_FORMATS
 from ...storage import paths, session_config
 from ...storage import providers as provider_store
 from ...storage import sessions as session_store
 from ...storage import settings as settings_store
 from ...storage import styles as style_store
-from ...storage.providers import SOURCE_CUSTOM
-from ..chat import handoff_marker
-from . import config as config_module
+from . import bridge, pt
 from . import graphics as graphics_module
 from . import nodes as nodes_module
-from . import pt
 from .config import (
     OUTO_TARGET,
     SUBAGENT_TARGET,
@@ -81,12 +79,10 @@ from .config import (
     _get_reasoning_api,
     _model_defaults,
     _parse_optional_int,
-    _persist_trio,
     _reasoning_chip_value,
     _record,
     _trio,
     _trio_display,
-    _with_reasoning_effort,
 )
 from .input import (
     Key,
@@ -95,7 +91,7 @@ from .input import (
     Resize,
     key_from_xnano,
     mouse_from_xnano,
-   scroll_from_xnano,
+    scroll_from_xnano,
     terminal_size,
 )
 from .modals import (
@@ -185,13 +181,50 @@ directory and may finish at any moment), so this poll is what turns a queued
 message into a turn.
 """
 
+_WAKEUP_MAX_FAILURES = 3
+"""Consecutive wakeup attempts allowed before the poll backs off (defect #2/#3).
+
+A wakeup child that drains nothing (a refused run, a spawn failure) leaves the
+message queued; without this cap the 1 s poll re-delivered it forever — one
+``> `` row and one child per second, hundreds per minute. The ledger clears
+the moment a wakeup drains (``pending_count == 0``), so a healthy inbox is
+never throttled.
+"""
+
 _INBOX_DETAIL_PREFIX = "inbox:"
 """``LoopEvent.detail`` prefix the core stamps on a drained inbox message."""
+
+
+_CHAT_EXIT_REAP_SECONDS = 10.0
+"""Exit grace for an in-flight chat child (``ChatTUI._reap_chat_child``).
+
+The turn child is an asyncio subprocess: closing the loop while its transport
+is still open leaves it half-torn-down, and the transport's later GC runs
+``close()`` into the dead loop — the ``RuntimeError: Event loop is closed``
+stderr noise a real quit printed. SIGINT, wait, then kill: the esc-esc ladder.
+"""
 
 _STREAM_FLUSH_INTERVAL = 0.033
 """Live token streaming gate: one UI update per ~33 ms (see ``_StreamCoalescer``)."""
 
 _STREAM_BOUNDARY_KINDS = frozenset({"thinking", "response", "tool", "context"})
+
+_CANONICAL_ATTR = "_mo_canonical"
+"""Marks a row the SESSION TAIL finalized: it IS its message's rendering.
+
+A live row (stdout deltas) is replaced by the AnswerRow at finish, so it
+must go; a tail-finalized ThinkingRow is the only rendering of that
+reasoning and must stay. Same flag on the plain tail-mounted copy.
+"""
+
+
+def _mark_canonical(row: Any) -> None:
+    setattr(row, _CANONICAL_ATTR, True)
+
+
+def _is_canonical(row: Any) -> bool:
+    return bool(getattr(row, _CANONICAL_ATTR, False))
+
 """Loop event kinds that close the current streamed message.
 
 The live row is retired for them, so any buffered tail must flush first.
@@ -582,27 +615,141 @@ class TUIEventSink:
         self._app.call_from_thread(self._app._remove_event_rows, msg_refs)
 
 
-# ─── the handoff marker (on disk) ────────────────────────────────────────────
+
+_FINISH_MARKER = "------finish------"
 
 
-def _persist_handoff_marker(session: str, handoff: summary.Handoff) -> None:
-    """Close the OLD conversation with the hand-off marker, on disk.
+def _is_session_marker(line: str) -> bool:
+    """``------<name>------``: the run's session open / post-handoff reopen."""
 
-    A trailing turn holding one ``handoff`` event, so reopening the old session
-    replays the marker through ``_add_event_row`` instead of showing a transcript
-    that just stops mid-work. It is appended as its own turn rather than merged
-    into the last one, because replay renders a turn's events BEFORE its answer —
-    merged, the marker would sit above the final message.
+    return line.startswith("------") and line.endswith("------") and len(line) > len(
+        _FINISH_MARKER
+    )
+
+
+def _parse_handoff_marker(line: str) -> tuple[str, str] | None:
+    """The hand-off marker line → ``(new_session, summary_dir)``.
+
+    The CLI prints the pair ``------summary → X------`` then
+    ``summary: <dir>``; the parser is fed the FIRST line and the dir comes
+    from the next, so this returns the session alone and the caller reads
+    the dir — see :meth:`_read_chat_stdout`, which pairs them by ordering.
     """
 
-    event = LoopEvent(actor="outo", kind="handoff", text=handoff_marker(handoff))
-    data = session_store.load(session)
-    data.turns.append(
-        session_store.TurnRecord(
-            user="", events=[event.to_dict()], status=session_store.STATUS_DONE
-        )
-    )
-    session_store.save(session, data)
+    if not line.startswith("------summary → ") or not line.endswith("------"):
+        return None
+    new_session = line[len("------summary → ") : -len("------")]
+    return (new_session, "") if new_session else None
+
+
+def _first_stderr_line(raw: str | bytes) -> str:
+    """The child's most useful stderr line, box-drawing frames skipped.
+
+    A refused run prints a rich traceback whose first lines are the frame
+    border; the message the operator needs is the last non-frame line (the
+    ``RuntimeError: …`` the CLI raised). Rich markup tags are stripped so a
+    ``[red]`` never reaches a row.
+    """
+
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    frames = ("╭", "│", "╰", "─", "╰─")
+    best = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(frames):
+            continue
+        best = stripped
+    return _RICH_TAG_RE.sub("", best)
+
+
+_RICH_TAG_RE = re.compile(r"\[/?[a-zA-Z0-9 #.:=,_-]*\]")
+
+
+def _inbox_signature(session: str) -> tuple[int, int] | None:
+    """The inbox directory's ``(mtime_ns, size)`` — None when it is absent.
+
+    A message insert REPLACES a file inside the directory, which updates
+    the directory's own mtime — that is the cheap change signal the 1 s
+    poll reads before ever spending a subprocess on ``message list``.
+    """
+
+    try:
+        stat = (paths.INBOX_DIR / session).stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+class _SessionTail:
+    """Incremental reader of the session JSON the chat child writes.
+
+    The CLI persists every loop event as it happens
+    (``storage/sessions.py: update_turn_events``), so polling the file's
+    ``(mtime_ns, size)`` and replaying the RUNNING turn's not-yet-seen
+    events is a live feed of everything stdout does not carry: tool calls
+    and results, completed thinking, context, drained alarms. Everything
+    goes through ``_add_event_row``, whose existing suppression keeps a
+    message the stdout deltas already rendered from doubling.
+    """
+
+    _POLL_INTERVAL = 0.12
+
+    def __init__(self, app: ChatTUI, session: str) -> None:
+        self._app = app
+        self._session = session
+        self._signature: tuple[int, int] | None = None
+        # (turn index, event index) of the next event to replay. The cursor
+        # lives on the APP, keyed per session: a tailer is created per turn,
+        # and one that started at (0, 0) replayed every PREVIOUS turn's
+        # events as though they were new (turn 2 remounted turn 1's tool
+        # rows). Advancing the app's cursor is what makes each turn's
+        # tailer resume where the last one stopped.
+        self._cursor = app._tail_cursors.setdefault(session, (0, 0))
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+
+    def session_data(self) -> Any:
+        """A fresh read of the session file (display read)."""
+
+        return session_store.load(self._session)
+
+    def pump(self) -> None:
+        """Replay newly written events once (called after each stdout chunk).
+
+        Reading whole lines at chunk boundaries is what keeps stdout deltas
+        and file events interleaved correctly: the file is only consulted
+        when stdout produced something, so an idle child costs nothing.
+        """
+
+        if self._closed:
+            return
+        path = session_store.path_for(self._session)
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return
+        if signature == self._signature:
+            return
+        self._signature = signature
+        data = self.session_data()
+        turn_index, event_index = self._cursor
+        turns = data.turns if data else []
+        while turn_index < len(turns):
+            turn = turns[turn_index]
+            events = turn.events or []
+            while event_index < len(events):
+                self._app._add_event_row(LoopEvent.from_dict(events[event_index]))
+                event_index += 1
+            turn_index += 1
+            event_index = 0
+        # Persist the advanced cursor back to the app: the NEXT turn's
+        # tailer (a fresh _SessionTail on the same session) starts here,
+        # not at (0, 0) — see __init__.
+        self._cursor = (turn_index, event_index)
+        self._app._tail_cursors[self._session] = self._cursor
 
 
 # ─── monkeypatch seams ───────────────────────────────────────────────────────
@@ -687,6 +834,8 @@ class ChatTUI:
 
         # ── chat state (the old names, deliberately) ───────────────────────
         self._busy = False
+        self._delivery_in_flight = False
+        """Claimed for the whole wakeup dispatch (busy is only set in `_dispatch`)."""
         self._logo_shown = False
         self._chat_started = False
         self._session_assigned = False
@@ -699,6 +848,27 @@ class ChatTUI:
         self._stream_text_row: StreamRow | None = None
         self._stream_thinking_row: ThinkingRow | None = None
         self._cancel_event: threading.Event | None = None
+        self._chat_proc: Any = None
+        self._chat_stop_pending = False
+        self._chat_reopened: str | None = None
+        self._pending_handoff_session: str = ""
+        self._tail_cursors: dict[str, tuple[int, int]] = {}
+        """Per-session (turn, event) cursor the session tail resumes from.
+
+        A tailer is created per TURN; without a session-persistent cursor a
+        new one replayed the whole session file as though it were new
+        (defect: turn 2 remounted turn 1's tool/thinking/response rows).
+        """
+        self._wakeup_failures: dict[str, int] = {}
+        """Consecutive wakeup turns that drained nothing, per session.
+
+        A wakeup child that exits without draining (a summarized session's
+        refusal, a spawn failure) leaves the message queued; without a cap
+        the 1 s poll re-delivered it forever — one row and one child per
+        second (invariant 16). Counted down on a successful drain.
+        """
+        self._inbox_signature: dict[str, tuple[int, int] | None] = {}
+        self._inbox_cache: dict[str, list[dict[str, Any]]] = {}
         self._last_escape = 0.0
         self._esc_hint: str | None = None
         self._esc_hint_until = 0.0
@@ -811,10 +981,30 @@ class ChatTUI:
         follow the theme it paints.
         """
 
-        settings_store.update(theme=self.theme)
+        # The write is the CLI's (``config set --theme``): the TUI never
+        # writes settings itself. It rides a worker — a subprocess
+        # round-trip must not freeze a repaint. With no loop (a headless
+        # construction assigning a theme, as the theme tests do), the write
+        # is made inline: there is no UI to freeze.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            bridge.config_set_theme(self.theme)
+            self._sync_screen_background()
+            if self._logo_shown:
+                self._show_logo()
+            return
+        self.run_worker(self._persist_theme_task(self.theme), exclusive=False)
         self._sync_screen_background()
         if self._logo_shown:
             self._show_logo()
+
+    async def _persist_theme_task(self, theme: str) -> None:
+        """``config set --theme`` on a worker (the theme setter's write)."""
+
+        await asyncio.to_thread(
+            bridge.config_set_theme, theme
+        )
 
     def get_css_variables(self) -> dict[str, str]:
         """The resolved palette, keyed the way the old CSS references named it.
@@ -1285,15 +1475,37 @@ class ChatTUI:
     def _pin_session(self, name: str) -> None:
         """Adopt ``name`` as this conversation's session and publish it.
 
-        The pin is what routing reads from here on; the
-        ``settings_store.update`` is the "active session" convention other
-        surfaces (and ``miniouto status``) read.
+        The pin is what routing reads from here on; the published pointer is
+        the "active session" convention other surfaces (and ``miniouto
+        status``) read. The write itself is the CLI's (``config set
+        --active-session``) — the TUI never writes storage directly.
         """
 
         self._session_name = name
         self._session_assigned = True
         self._chat_started = True
-        settings_store.update(session=name)
+        self._publish_session(name)
+
+    def _publish_session(self, name: str) -> None:
+        """Publish the active-session pointer through the CLI (a worker).
+
+        ``run_sync`` blocks for the child's lifetime, so the publish rides a
+        worker task when there is a loop to ride on — a pin (a picker pick, a
+        hand-off) must never freeze the UI thread for a subprocess round-trip.
+        ``_adopt_minted_session`` runs INSIDE ``to_thread`` (its seeding is
+        blocking CLI work), where no loop exists; from there the publish is
+        made inline, because the caller is already off the UI thread.
+        """
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            bridge.config_set_active_session(name)
+            return
+        self.run_worker(self._publish_session_task(name), exclusive=False)
+
+    async def _publish_session_task(self, name: str) -> None:
+        await asyncio.to_thread(bridge.config_set_active_session, name)
 
     def _adopt_minted_session(self) -> None:
         """Mint this TUI's own session name, then pin it.
@@ -1301,8 +1513,10 @@ class ChatTUI:
         A fresh name would otherwise start with NO provider config and freeze
         whatever the global default happened to be at its first turn, silently
         dropping the model the conversation the user just continued was
-        configured with. Seeding is copy-if-absent (``session_config``), so a
-        source without a pin seeds nothing.
+        configured with. The seed is copy-if-absent: the source pin is read
+        through the CLI (``config show``) and written to the minted session
+        through ``config set`` — an empty source pin seeds nothing, and the
+        write only happens when there is something to copy.
         """
 
         # The seed source is the published active session, read once here — it
@@ -1310,8 +1524,23 @@ class ChatTUI:
         # inbox drain) would adopt another process's session.
         source = settings_store.load().session or _DEFAULT_SESSION
         name = self._mint_session_name()
-        session_config.seed_from(name, source)
+        self._seed_minted_session(name, source)
         self._pin_session(name)
+
+    def _seed_minted_session(self, name: str, source: str) -> None:
+        """Copy ``source``'s pin onto the fresh ``name`` (CLI lane, blocking).
+
+        One ``config seed --source S --target T`` child (the CLI's
+        copy-if-absent form, ``session_config.seed_from``): the WHOLE pin —
+        provider trios AND the style key — with NO global-default write. The
+        per-trio ``config set`` calls this used to make dropped the style
+        and rewrote the installation's default on every mint (invariant 12:
+        a seed copies, it never rewrites the default).
+        """
+
+        if name == source:
+            return
+        bridge.config_seed(source, name)
 
     def _pinned_session(self) -> str:
         """The session this conversation routes on (see ``_session_name``).
@@ -1360,7 +1589,11 @@ class ChatTUI:
         self._log.anchor()
         saved = settings_store.load()
         if saved.theme and self.get_theme(saved.theme):
-            self.theme = saved.theme
+            # Stored directly, not through the setter: the value came FROM the
+            # store, so persisting it again would be a redundant `config set`
+            # child racing a genuine pick that lands right after boot (the
+            # slower of the two children wins, silently erasing the choice).
+            self._theme_name = saved.theme
         self._show_logo()
         self._set_focus(self._input)
         if self._inbox_timer is None:
@@ -1394,8 +1627,12 @@ class ChatTUI:
         self._messages.clear()
         self._screens = [self._base_screen]
         self._booted = False
-        # The loop is about to close: a stale binding would make the next
-        # `call_from_thread` raise into a worker instead of running inline.
+        # The loop is about to close: settle the chat child's asyncio
+        # transport first, or its GC later prints "Event loop is closed"
+        # into this test's captured stderr (see `_reap_chat_child`).
+        await self._reap_chat_child()
+        # A stale binding would make the next `call_from_thread` raise into
+        # a worker instead of running inline.
         self._loop = None
         self._loop_thread = 0
 
@@ -1558,6 +1795,22 @@ class ChatTUI:
             self._esc_hint = "stopping after the current step…"
             self._esc_hint_until = float("inf")
             self._cancel_event.set()
+            # The turn is a chat SUBPROCESS now: the in-process event would
+            # not reach it, so the stop is a SIGINT to the child (the CLI
+            # stamps the turn interrupted, prints `stopped: cancelled` and
+            # exits 130 — the TUI reads the state back off the child).
+            proc = self._chat_proc
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.send_signal(signal.SIGINT)
+                self._chat_stop_pending = True
+                # A child that ignores SIGINT (or a grandchild holding the
+                # stdout pipe) would leave the turn busy forever — the
+                # reader's `read(4096)` never returns without EOF. This
+                # watchdog runs the same FINITE ladder the cancel/exit paths
+                # use (bounded wait → PROCESS-GROUP kill), from the key
+                # handler that asked for the stop.
+                _spawn(self._settle_chat_child(proc, signal_first=False))
             self._spinner_status(self._esc_hint)
         else:
             self._last_escape = now
@@ -1768,11 +2021,33 @@ class ChatTUI:
             row.begin_stream()
         row.append(delta)
 
-    def _finalize_stream(self) -> None:
-        """Drop the live rows once the message's canonical form exists."""
+    def _retire_live_stream_rows(self) -> None:
+        """Drop the live stream rows and forget them (a message ended)."""
 
         for row in (self._stream_text_row, self._stream_thinking_row):
             if row is not None:
+                self._window.remove(row, self._log)
+        self._stream_text_row = None
+        self._stream_thinking_row = None
+
+    def _finalize_stream(self) -> None:
+        """Drop the live rows once the message's canonical form exists.
+
+        The sweep is over the MOUNTED rows, skipping the CANONICAL ones:
+        the session tail (`_add_event_row`) mounts ThinkingRows and
+        finalizes live ones into the message's canonical rendering, and
+        those are what the log keeps. Everything else still mounted of the
+        stream family — a live StreamRow whose reference a `response`
+        boundary already forgot, a still-streaming ThinkingRow — would sit
+        next to the AnswerRow as a duplicate and is retired here.
+        """
+
+        for row in list(self._window.rows):
+            if (
+                isinstance(row, (StreamRow, ThinkingRow))
+                and not _is_canonical(row)
+                and not isinstance(row, AnswerRow)
+            ):
                 self._window.remove(row, self._log)
         self._stream_text_row = None
         self._stream_thinking_row = None
@@ -1783,11 +2058,16 @@ class ChatTUI:
             self._stream_thinking_row = None
             if live is not None and live.is_attached:
                 # The streamed reasoning was this message's prefix; the
-                # whole-text event is the canonical copy.
+                # whole-text event is the canonical copy. The finalized row
+                # stays the message's rendering, so it must survive the
+                # finish-marker sweep — it is no longer a LIVE row.
                 live.finalize(event.text)
                 live.msg_ref = event.msg_ref
+                _mark_canonical(live)
                 return
-            self._mount_row(ThinkingRow(event.text), event.msg_ref)
+            row = ThinkingRow(event.text)
+            _mark_canonical(row)
+            self._mount_row(row, event.msg_ref)
             return
         if event.kind == "tool":
             row = ToolRow(
@@ -1821,7 +2101,15 @@ class ChatTUI:
             return
         if event.kind == "response" and self._stream_text_row is not None:
             # The deltas already rendered this message in the live row above; a
-            # second copy would duplicate the text.
+            # second copy would duplicate the text. The row is CANONICAL now:
+            # marked (`_mo_canonical`) it survives the finish-marker sweep,
+            # because for a MIDDLE message (tool narration between calls)
+            # nothing else ever renders that text — the old behavior of
+            # dropping the reference let the next boundary (`context`) RETIRE
+            # the row, and the narration vanished from the log entirely
+            # (defect #6). The final answer's live row is still replaced by
+            # its AnswerRow at the finish marker.
+            _mark_canonical(self._stream_text_row)
             self._stream_text_row = None
             return
         if event.kind == "alarm":
@@ -1836,9 +2124,11 @@ class ChatTUI:
             return
         if event.kind in ("response", "context"):
             # Message boundary: the next deltas belong to a new message and need
-            # their own live row.
-            self._stream_text_row = None
-            self._stream_thinking_row = None
+            # their own live row. The live rows are RETIRED here, not merely
+            # forgotten: the file-tail lane reaches a boundary with no
+            # `emit_final_answer` behind it, so a forgotten-but-mounted row
+            # would sit next to the canonical answer forever.
+            self._retire_live_stream_rows()
         plain: Any = EventRow(Text(event.text))
         if event.kind == "error":
             plain.add_class("-error")
@@ -1983,8 +2273,21 @@ class ChatTUI:
         self._logo_shown = True
 
     def _new_session(self) -> None:
-        self._adopt_minted_session()
-        session_store.create(self._pinned_session())
+        """Mint and pin a fresh session; the CLI creates its file on first use.
+
+        ``session_store.create`` is gone from here: the TUI never writes a
+        session file. A minted session has no file until its first turn —
+        the picker's listing simply will not show it yet, and loading one
+        renders "(empty session)" (``_load_session_history`` already treats
+        a missing file as empty).
+        """
+
+        self.run_worker(self._new_session_flow(), exclusive=False)
+
+    async def _new_session_flow(self) -> None:
+        """Mint on a worker, then repaint — the mint talks to the CLI."""
+
+        await asyncio.to_thread(self._adopt_minted_session)
         self._refresh_chips()
         self._show_logo()
 
@@ -2059,35 +2362,70 @@ class ChatTUI:
         )
 
     def _apply_provider(self, name: str) -> None:
-        """Adopt ``name`` as the active provider, through the pin and the default.
+        """Adopt ``name`` as the active provider (CLI lane, on a worker).
 
-        The pin write is what keeps a provider added mid-conversation from being
-        shadowed by the config this session already froze.
+        The trio write — the pin AND the global default — is
+        ``config set --target outo``, which is what keeps a provider added
+        mid-conversation from being shadowed by the config this session
+        already froze.
         """
 
-        _persist_trio(self._pinned_session(), OUTO_TARGET, (name, *_model_defaults(name)))
+        self.run_worker(self._apply_provider_async(name), exclusive=False)
+
+    async def _apply_provider_async(self, name: str) -> None:
+        """The worker half of :meth:`_apply_provider` (blocking CLI calls)."""
+
+        session = self._pinned_session()
+        model, reasoning = _model_defaults(name)
+        ok, message = await asyncio.to_thread(
+            bridge.config_set_trio,
+            session,
+            "outo",
+            name,
+            model,
+            reasoning,
+        )
+        if not ok:
+            self._post_system(f"config set failed: {message}")
         self._refresh_chips()
 
     async def _catalog_add_flow(self) -> None:
+        """Add a provider from the modelslist catalog, through the CLI.
+
+        The catalog listing and model list are CLI YAML reads
+        (``provider providers`` / ``provider models``); the add itself is
+        ``provider add NAME --api-key …``, which writes the record. Only
+        the reasoning LADDER stays an in-process modelslist read (there is
+        no CLI for it — it is display metadata, not storage).
+        """
+
         self._spinner_status("fetching catalog…", working=True)
         try:
-            all_providers = await asyncio.to_thread(catalog_api.list_providers)
+            all_providers = await asyncio.to_thread(
+                bridge.list_catalog_providers
+            )
         except Exception as exc:
             self._spinner_status(f"catalog error: {exc}")
+            return
+        if all_providers is None:
+            self._clear_spinner_status()
+            self._spinner_status("catalog error: provider providers failed")
             return
         self._clear_spinner_status()
 
         name_to_provider: dict[str, dict[str, Any]] = {}
         for provider in all_providers:
-            if resolve_catalog_dialect(provider) is not None:
-                name_to_provider[provider["name"]] = provider
+            # The CLI already resolved each entry's dialect; an entry is
+            # addable exactly when it carries one (``addable`` is true).
+            if provider.get("addable"):
+                name_to_provider[str(provider.get("name") or "?")] = provider
         if not name_to_provider:
             self._spinner_status("No catalog providers have a supported api_format.")
             return
 
         picked_name = await self.push_screen_wait(
             SelectionModal(
-                f"Add from catalog ({len(name_to_provider)} addable)",
+                f"Add from catalog ({len(name_to_provider)})",
                 sorted(name_to_provider.keys()),
                 allow_none=False,
             )
@@ -2096,7 +2434,7 @@ class ChatTUI:
             return
 
         catalog_provider = name_to_provider[picked_name]
-        our_name = str(catalog_provider["slug"])
+        our_name = str(catalog_provider.get("slug") or picked_name)
         if provider_store.get(our_name) is not None:
             choice = await self.push_screen_wait(
                 SelectionModal(
@@ -2121,9 +2459,12 @@ class ChatTUI:
         self._spinner_status("fetching model list…", working=True)
         default_model = ""
         try:
-            models = await asyncio.to_thread(catalog_api.list_models, picked_name)
+            models = await asyncio.to_thread(
+                bridge.list_catalog_models,
+                picked_name,
+            )
             if models:
-                default_model = models[0].get("id", "")
+                default_model = str(models[0].get("id") or "")
         except Exception as exc:
             self._spinner_status(f"catalog models error: {exc}")
 
@@ -2156,27 +2497,20 @@ class ChatTUI:
                 if picked:
                     reasoning_effort = picked
 
-        try:
-            provider = add_provider_from_catalog(
-                catalog_provider,
-                api_key=api_key.strip(),
-                default_model=default_model,
-                reasoning_effort=reasoning_effort,
-            )
-        except ValueError as exc:
-            self._spinner_status(f"add failed: {exc}")
+        self._spinner_status("adding provider…", working=True)
+        ok, message = await asyncio.to_thread(
+            bridge.provider_add,
+            picked_name,
+            api_key=api_key.strip(),
+            default_model=default_model,
+            reasoning=reasoning_effort,
+        )
+        if not ok:
+            self._clear_spinner_status()
+            self._spinner_status(f"add failed: {message}")
             return
-
-        paths.ensure_dirs()
-        provider_store.upsert(provider)
-        if reasoning_effort is not None:
-            stored = provider_store.get(our_name)
-            if stored is not None:
-                try:
-                    provider_store.upsert(replace(stored, reasoning_effort=reasoning_effort))
-                except TypeError:
-                    provider_store.upsert(_with_reasoning_effort(stored, reasoning_effort))
-        self._apply_provider(our_name)
+        self._clear_spinner_status()
+        await self._apply_provider_async(our_name)
         status_parts = [
             f"provider → {our_name} (added from catalog, default-model={default_model or '-'}"
         ]
@@ -2323,25 +2657,31 @@ class ChatTUI:
                     return
                 stored = result.strip() or None
                 state["reasoning"] = stored
-                paths.ensure_dirs()
-                provider_store.upsert(
-                    config_module._construct_provider_with_reasoning(
+
+                async def save_custom() -> None:
+                    """``provider custom add`` + the trio write, on a worker."""
+
+                    ok, message = await asyncio.to_thread(
+                        bridge.provider_custom_add,
                         name=state["name"],
                         api_format=state["api_format"],
                         base_url=state["base_url"],
                         api_key=state["api_key"],
                         default_model=model,
-                        source=SOURCE_CUSTOM,
+                        reasoning=stored,
                         max_context_window=ctx,
                         max_output_tokens=tokens,
-                        reasoning_effort=stored,
                     )
-                )
-                self._apply_provider(state["name"])
-                status = f"provider → {state['name']} (custom)"
-                if stored:
-                    status = f"{status} · reasoning={stored}"
-                self._spinner_status(status)
+                    if not ok:
+                        self._spinner_status(f"add failed: {message}")
+                        return
+                    await self._apply_provider_async(state["name"])
+                    status = f"provider → {state['name']} (custom)"
+                    if stored:
+                        status = f"{status} · reasoning={stored}"
+                    self._spinner_status(status)
+
+                self.run_worker(save_custom(), exclusive=False)
 
             self.push_screen(
                 TextInputModal(
@@ -2369,11 +2709,23 @@ class ChatTUI:
         def on_close(result: str | None) -> None:
             if not result:
                 return
-            # The choice becomes the DEFAULT and every session that already
-            # exists freezes the style it is running under.
-            runtime.set_active_style(result, session=session)
-            self._refresh_chips()
-            self._spinner_status(f"style → {result}")
+
+            async def set_style() -> None:
+                # ``style set NAME --session S`` is the whole invariant: the
+                # choice becomes the DEFAULT, every session that already
+                # exists freezes the style it is running under, and THIS
+                # session is pinned to it outright.
+                ok, message = await asyncio.to_thread(
+                    bridge.style_set, result, session
+                )
+                if not ok:
+                    self._post_system(f"style set failed: {message}")
+                self._refresh_chips()
+                self._spinner_status(f"style → {result}")
+
+            # A subprocess round-trip must not freeze the key handler that
+            # confirmed the pick.
+            self.run_worker(set_style(), exclusive=False)
 
         self.push_screen(
             SelectionModal("Select style", styles, current=current, allow_none=False),
@@ -2463,23 +2815,34 @@ class ChatTUI:
     def _queue_inbox_message(self, text: str) -> None:
         """Hand typed text to the running turn (mid-turn interjection).
 
-        Writing it to the inbox makes it an ordinary user message for the model:
-        the core's BEFORE_LLM_CALL hook drains it into the live history at the
-        next iteration, exactly like an alarm. The row is rendered here for
-        immediacy and remembered by id — when the real event arrives
-        ``_add_event_row`` suppresses its row, so the text is shown once.
+        ``message insert`` (a CLI subprocess) writes it to the session's
+        inbox, making it an ordinary user message for the model: the
+        child's BEFORE_LLM_CALL hook drains it into the live history at the
+        next iteration, exactly like an alarm. The command prints the
+        message id as its one stdout line — the optimistic row's key — so
+        when the real event arrives through the session-file tail
+        ``_add_event_row`` suppresses its row and the text shows once.
         """
 
-        try:
-            message_id = inbox.insert(
-                self._inbox_session(), text, kind=inbox.USER_KIND, source="tui"
+        session = self._inbox_session()
+
+        def insert() -> str | None:
+            return bridge.message_insert(
+                session, text, kind="user", source="tui"
             )
-        except (OSError, ValueError) as exc:
-            self._post_system(f"could not queue message: {exc}")
-            return
-        self._optimistic_rows[message_id] = self._user_row(text)
-        self._mount_row(self._optimistic_rows[message_id])
-        self._spinner_status("queued for the running turn")
+
+        # Spawned on a worker: a subprocess round-trip must not freeze the
+        # key handler that queued the message.
+        async def flow() -> None:
+            message_id = await asyncio.to_thread(insert)
+            if message_id is None:
+                self._post_system("could not queue message")
+                return
+            self._optimistic_rows[message_id] = self._user_row(text)
+            self._mount_row(self._optimistic_rows[message_id])
+            self._spinner_status("queued for the running turn")
+
+        self.run_worker(flow(), exclusive=False)
 
     def _claim_inbox_event(self, event: LoopEvent) -> bool:
         """False when this event's row is already on screen (optimistic row)."""
@@ -2496,59 +2859,258 @@ class ChatTUI:
     def _deliver_pending_messages(self) -> None:
         """Turn queued inbox messages into a real turn (UI thread).
 
-        The in-turn path (``runtime._make_alarm_hook``, on BEFORE_LLM_CALL) is
-        the only delivery a RUNNING turn needs — it wins while ``_busy``, so it
-        owns the queue and this must not double-deliver. Between turns no hook
-        runs and the message would sit invisible until the user typed something;
-        instead the text becomes the prompt of a turn, so ``turn.user``, the
-        chat row and the model's own view are the same string by construction.
-        Several messages coalesce into one prompt and one turn.
+        The in-turn path (the child chat's BEFORE_LLM_CALL hook) is the only
+        delivery a RUNNING turn needs — it wins while ``_busy``, so it owns
+        the queue and this must not double-deliver. Between turns no hook
+        runs and the message would sit invisible until the user typed
+        something; instead the TUI lists the inbox (a cheap directory stat
+        gates the CLI call) and wakes the session with ``chat --alarms -c
+        --name S`` — the CLI drains the queue, joins the texts into the
+        turn's user message and runs the turn. Several messages coalesce
+        into one prompt and one turn, and an empty inbox is a no-op.
         """
 
-        if self._busy:
+        # The busy check alone is NOT the re-entry guard. The wakeup is not
+        # `_dispatch`, so nothing sets `_busy` for it, and two callers (a
+        # `_refresh_inbox` worker completing its CLI listing, and the 1 s
+        # poll firing again on the now-cached answer) can BOTH reach
+        # `_post_user` before the wakeup child's drain unlinks the files —
+        # the message mounted twice, once per caller. `_delivery_in_flight`
+        # is claimed before the row is mounted and held for the WHOLE wakeup
+        # turn: `_finish_turn_housekeeping` releases it (as do the
+        # spawn-failure and cancelled-worker paths), so a second entry in
+        # that window is a no-op — one wakeup per message, the once-only
+        # delivery invariant 16 asks for.
+        if self._busy or self._delivery_in_flight:
             return
-        try:
-            messages = inbox.drain(self._inbox_session())
-        except (OSError, ValueError):
-            return
+        session = self._inbox_session()
+        # The SUBMIT path resolves the summarization redirect before doing
+        # anything (see `on_chat_input_submitted`); the wakeup path must too,
+        # or a wakeup child pointed at a summarized session is refused by the
+        # CLI ("Re-run with --name …", exit 0, NO drain) and the still-queued
+        # message is re-delivered by the next 1 s poll tick — forever, one
+        # row and one child per second. The redirect is only FOLLOWED when
+        # there is something to wake: a poll that moved the pin while its
+        # listing was still empty would strand a message sitting on the
+        # summarized session (the drain follows the chain from the HEAD,
+        # `core.inbox.drain`, so the wakeup below is spawned on the OLD name
+        # and drains across the whole chain).
+        messages = self._pending_inbox(session)
         if not messages:
             return
-        text = "\n\n".join(m.text for m in messages)
-        for message in messages:
-            # A message inserted mid-turn was already shown where the user typed
-            # it; retire that row so the prompt row below replaces it.
-            stale = self._optimistic_rows.pop(message.id, None)
-            if stale is not None:
-                self._window.remove(stale, self._log)
-        if self._logo_shown:
-            self._log.remove_children()
-            self._reset_rows()
-            self._logo_shown = False
-        self._post_user(text)
-        self._log.anchor()
-        self.run_worker(self._dispatch(text), exclusive=True)
+        final, chain = session_store.resolve_redirect(session)
+        if len(chain) > 1:
+            self._post_system(
+                f"session {chain[0]} was summarized → redirected to {final}. "
+                "Pending messages wake here."
+            )
+            self._pin_session(final)
+            self._load_session_history(final)
+            self._refresh_chips()
+        # A wakeup that failed to drain leaves the message queued; cap the
+        # consecutive retries (a spawn that keeps failing, a child that keeps
+        # refusing) or the 1 s poll re-delivers it forever — one row and one
+        # child per second (invariant 16: one wakeup per message).
+        if self._wakeup_failures.get(session, 0) >= _WAKEUP_MAX_FAILURES:
+            return
+        self._delivery_in_flight = True
+        try:
+            text = "\n\n".join(
+                str(message.get("text") or "") for message in messages
+            )
+            for message in messages:
+                # A message inserted mid-turn was already shown where the user
+                # typed it; retire that row so the prompt row below replaces it.
+                stale = self._optimistic_rows.pop(str(message.get("id")), None)
+                if stale is not None:
+                    self._window.remove(stale, self._log)
+            if self._logo_shown:
+                self._log.remove_children()
+                self._reset_rows()
+                self._logo_shown = False
+            self._post_user(text)
+            self._log.anchor()
+            # The wakeup IS a dispatch: same streaming child, the inbox drain
+            # as its prompt (`--alarms` swaps the prompt argument for the drain).
+            self.run_worker(self._dispatch_wakeup(session), exclusive=True)
+        except BaseException:
+            self._delivery_in_flight = False
+            raise
 
-    def _apply_handoff(self) -> None:
-        """Move the conversation into the session a summary hand-off opened.
+    async def _dispatch_wakeup(self, session: str) -> None:
+        """``chat --alarms -c --name S`` — the idle wakeup turn."""
 
-        The OLD conversation visibly ENDS with the marker (and keeps it on
-        disk), then the pin moves — which is what makes the
-        ``_deliver_pending_messages`` call after this drain the NEW session's
-        inbox, where the continuation message already is.
+        argv = bridge.chat_argv("", session, alarms=True)
+        try:
+            await self._run_chat_child(argv, session)
+        except asyncio.CancelledError:
+            # A typed prompt (`run_worker(…, exclusive=True)`) cancels the
+            # wakeup mid-child, skipping `_finish_turn_housekeeping` — the
+            # claim would stay held and block every later delivery.
+            self._delivery_in_flight = False
+            raise
+        # The child's own drain decides the retry ledger: `pending_count` is
+        # the on-disk truth (the CLI unlinks each message it delivers), so a
+        # count of zero means the wakeup worked and the ledger clears, while
+        # anything left counts as one failed attempt toward the cap.
+        remaining = inbox.pending_count(session)
+        if remaining:
+            self._wakeup_failures[session] = self._wakeup_failures.get(session, 0) + 1
+        else:
+            self._wakeup_failures.pop(session, None)
+
+    def _on_stdout_done(self, proc: Any) -> None:
+        """The stdout reader finished (EOF or kill): start the bounded reap.
+
+        Called from the reader task's done-callback so the NORMAL turn path
+        (no cancellation, no app exit) also settles a child that is still
+        alive after its output ended — the `proc.wait()` inside the reader
+        alone cannot see a grandchild holding the pipe, and without this the
+        turn worker stayed busy forever on a SIGINT-ignoring child.
         """
 
-        handoff = _summary_api().consume_handoff()
-        if handoff is None:
+        if getattr(proc, "returncode", None) is None:
+            _spawn(self._reap_if_alive(proc))
+
+    async def _reap_if_alive(self, proc: Any) -> None:
+        """Bounded [wait →] group-kill → wait for a child the reader left."""
+
+        with contextlib.suppress(Exception):
+            await self._settle_chat_child(proc, signal_first=False)
+
+    async def _settle_chat_child(self, proc: Any, *, signal_first: bool = True) -> None:
+        """Run one chat child to its grave: [SIGINT →] wait → kill → wait.
+
+        The turn child is an asyncio subprocess: closing the loop while its
+        transport is still open leaves it half-torn-down, and the
+        transport's later GC runs ``close()`` into the dead loop — the
+        ``RuntimeError: Event loop is closed`` stderr noise a real quit
+        printed. Settling while the loop is OPEN is the whole point, so this
+        only ever runs from a task on that loop. ``signal_first=False`` is
+        the cancel path, where ``_stop_chat_process`` already SIGINTed.
+
+        The final kill is a PROCESS-GROUP kill (the child was spawned with
+        ``start_new_session=True``): a child that ignores SIGINT (or has
+        already died leaving a grandchild on the pipe) needs its whole group
+        gone or the stdout reader never sees EOF.
+        """
+
+        if signal_first and getattr(proc, "returncode", None) is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.send_signal(signal.SIGINT)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_CHAT_EXIT_REAP_SECONDS)
             return
-        previous = self._pinned_session()
-        self._mount_row(EventRow(Text(handoff_marker(handoff))))
-        _persist_handoff_marker(previous, handoff)
-        self._pin_session(handoff.new_session)
+        except asyncio.TimeoutError:
+            pass
+        self._kill_process_group(proc)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_CHAT_EXIT_REAP_SECONDS)
+
+    def _kill_process_group(self, proc: Any) -> None:
+        """SIGKILL the child's whole process group, falling back to the pid."""
+
+        pid = getattr(proc, "pid", None)
+        if pid and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+
+    async def _reap_chat_child(self) -> None:
+        """Settle the in-flight chat child BEFORE the loop closes (exit path).
+
+        A no-op on the normal path — ``_chat_proc`` is cleared when a turn
+        settles — and the bounded esc-esc ladder when a quit interrupted a
+        running turn.
+        """
+
+        proc = self._chat_proc
+        if proc is None:
+            return
+        await self._settle_chat_child(proc)
+
+    def _pending_inbox(self, session: str) -> list[dict[str, Any]]:
+        """The session's pending inbox messages: stat-gated, cache-backed.
+
+        The 1 s poll only shells out when the inbox DIRECTORY changed on
+        disk (mtime_ns/size of the directory itself — an insert replaces a
+        file in it): an idle second costs one stat and returns the cached
+        (usually empty) list, never a subprocess. A CHANGE invalidates the
+        cache and returns a stale-empty marker, and the caller re-runs the
+        delivery from a worker with the fresh CLI listing.
+        """
+
+        signature = _inbox_signature(session)
+        if signature == self._inbox_signature.get(session):
+            return self._inbox_cache.get(session) or []
+        self._inbox_signature.pop(session, None)
+        self._inbox_cache.pop(session, None)
+        # Changed on disk: kick a worker to list through the CLI, then retry
+        # the delivery with the fresh answer.
+        self.run_worker(self._refresh_inbox(session), exclusive=False)
+        return []
+
+    async def _refresh_inbox(self, session: str) -> None:
+        """List the inbox through the CLI (a worker), then deliver."""
+
+        messages = await asyncio.to_thread(self._list_inbox_sync, session)
+        self._inbox_signature[session] = _inbox_signature(session)
+        self._inbox_cache[session] = messages
+        if messages:
+            self._deliver_pending_messages()
+
+    def _list_inbox_sync(self, session: str) -> list[dict[str, Any]]:
+        """``message list --session S`` (blocking; call from a worker)."""
+
+        return bridge.message_list(session)
+
+    def _apply_handoff(self, new_session: str, summary_dir: str) -> None:
+        """Move the conversation into the session a summary hand-off opened.
+
+        The hand-off is DETECTED on the chat child's stdout (the
+        ``------summary → X------`` + ``summary: <dir>`` marker pair the CLI
+        prints at the transition) and PERSISTED by the CLI itself (the old
+        session's file gets the marker as its own trailing turn). The TUI
+        mounts the marker row for the live log, pins the new session, and
+        reloads nothing here — the pin move is what makes the
+        ``_deliver_pending_messages`` call after the turn read the NEW
+        session's inbox, where the continuation message already is.
+        """
+
+        marker = f"------summary → {new_session}------\nsummary: {summary_dir}"
+        self._mount_row(EventRow(Text(marker)))
+        self._pin_session(new_session)
         self._refresh_chips()
-        self._spinner_status(f"handoff → {handoff.new_session}")
+        self._spinner_status(f"handoff → {new_session}")
 
     async def _dispatch(self, prompt: str) -> None:
-        """Run one turn (invariant 10: the sync driver goes to a thread)."""
+        """Run one turn as the ``miniouto chat`` CLI in a foreground subprocess.
+
+        The TUI is the reference CLI wrapper: the turn is
+        ``[sys.executable, -m, miniouto, chat, <prompt>, --name, <session>,
+        -c]`` (D7 — never the global PATH binary), whose session pin carries
+        provider/style so no model flags are needed. Live display is
+        HYBRID, exactly as the contract measured it:
+
+        * answer TOKEN DELTAS come from the child's stdout (raw, unprefixed,
+          printed once — invariant 8: never persisted);
+        * every other live event (tool, tool_result, completed thinking,
+          context, drained alarms) comes from TAILING the session JSON the
+          CLI increments on every event (``storage/sessions.py``);
+        * the FINAL ANSWER is read from the session file at the
+          ``------finish------`` marker — the file's ``turn.assistant`` is
+          the canonical text.
+
+        Ordering is safe by construction: stdout deltas arrive while the
+        message is still streaming and the file's completion events land
+        after it, so ``_add_event_row``'s existing suppression (a
+        ``response`` event with a live ``_stream_text_row`` is dropped; a
+        ``thinking`` event finalizes the live row) shows each message once.
+        """
 
         first_message = not self._chat_started
         self._chat_started = True
@@ -2559,49 +3121,296 @@ class ChatTUI:
             # Gated on `_session_assigned`, NOT on `_session_name is None`: the
             # one-shot adoption in `_pinned_session` sets the name alone, and
             # this TUI must still mint its own `tui-…` session over it.
-            self._adopt_minted_session()
+            await asyncio.to_thread(self._adopt_minted_session)
             self._refresh_chips()
-        s = settings_store.load()
-        # A TUI run is always plain, so identity is all it registers.
-        _summary_api().set_run_contract(session=self._pinned_session(), style=s.style or "")
-        sink = TUIEventSink(self)
+        session = self._pinned_session()
+        argv = self._chat_argv(prompt, session)
+        await self._run_chat_child(argv, session)
+
+    async def _run_chat_child(self, argv: list[str], session: str) -> None:
+        """Spawn one chat child, stream it, and settle its outcome.
+
+        Shared by the prompt dispatch and the ``--alarms`` wakeup: the
+        only difference between them is the argv.
+        """
+
         self._cancel_event = threading.Event()
         self._last_escape = 0.0
+        tailer = _SessionTail(self, session)
+        self._set_chat_working(True)
         try:
-            opts = ChatOptions(
-                prompt=prompt,
-                session=self._pinned_session(),
-                # NO model override: the session's PIN already carries the trio
-                # the settings popup wrote. An override here would outrank the pin
-                # and let a global `settings.model` from another process redirect
-                # a live conversation — the exact thing the pin exists to stop.
-                continue_session=True,
-                cancel_event=self._cancel_event,
-                # This TUI owns the terminal alternate screen: a failure
-                # traceback written to stderr would paint over the frame being
-                # composed. Diagnostics go to the failure log instead; the
-                # "[error: …]" row posted below is the user-facing surface.
-                quiet_diagnostics=True,
+            proc = await bridge.asyncio_create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=bridge.child_env(),
+                # Own process group (the `tools/bash.py` pattern): the CLI's
+                # tools spawn grandchildren that inherit the stdout pipe, and
+                # a SIGKILL to the child alone leaves a grandchild holding the
+                # pipe — the reader then blocks on `read(4096)` forever. The
+                # group kill in `_settle_chat_child` reaches them all.
+                start_new_session=True,
             )
-            await asyncio.to_thread(_chat_runner(), opts, sink)
-        except asyncio.CancelledError:
-            self._cancel_event = None
-            self._busy = False
-            raise
-        except LoopCancelledError:
-            self._post_system("stopped by user (esc esc)")
         except Exception as exc:
-            self._post_system(f"error: {exc}")
+            self._set_chat_working(False)
+            self._post_system(f"error: could not start chat: {exc}")
+            # A failed spawn is a failed wakeup attempt for the alarms lane:
+            # `_finish_turn_housekeeping` re-runs `_deliver_pending_messages`
+            # below, and a message still queued there would mount a row and
+            # spawn again — the storm (671 children in 2.5 s). Counting it
+            # here is what makes the cap in `_deliver_pending_messages` bite
+            # after `_WAKEUP_MAX_FAILURES` rows instead of never.
+            if "--alarms" in argv:
+                self._wakeup_failures[session] = (
+                    self._wakeup_failures.get(session, 0) + 1
+                )
+            self._finish_turn_housekeeping()
+            return
+        self._chat_proc = proc
+        # stderr is drained CONCURRENTLY: a refused run writes a rich
+        # traceback to it, and a full pipe buffer would block the child (and
+        # with it the stdout stream the live display reads) forever.
+        stderr_task = asyncio.ensure_future(proc.stderr.read())
+        stdout_task = asyncio.ensure_future(self._read_chat_stdout(proc, tailer, session))
+        try:
+            # The stop path (esc-esc → SIGINT) must not wait on the reader
+            # alone: a child that ignores SIGINT (or a grandchild holding the
+            # pipe) leaves `read(4096)` pending forever and the turn busy for
+            # good. The SAME finite ladder the cancel/exit paths use runs
+            # here — SIGINT was already sent by the stop, so this is the
+            # bounded wait → group kill half.
+            stdout_task.add_done_callback(lambda _t: self._on_stdout_done(proc))
+            await stdout_task
+            stderr = await stderr_task
+            if stderr.strip():
+                # The child refuses some runs (a summarized session, an
+                # unknown provider) with a message on stderr; show it.
+                self._post_system(f"chat: {_first_stderr_line(stderr)}")
+        except asyncio.CancelledError:
+            self._stop_chat_process(proc)
+            # Settle BEFORE the cancellation propagates: the cancelled
+            # worker must not abandon the transport half-open, because the
+            # loop is about to close under it (a test's `_shutdown_headless`
+            # or `asyncio.run`'s own task sweep) and the transport's later
+            # GC prints "RuntimeError: Event loop is closed". The loop is
+            # still open HERE — the one place the settle can complete.
+            with contextlib.suppress(Exception):
+                await self._settle_chat_child(proc, signal_first=False)
+            raise
+        finally:
+            self._chat_proc = None
+            # A cancelled turn never reaches `_finish_turn_housekeeping`,
+            # and the wakeup's claim must not outlive its worker: the next
+            # delivery (or the process exit reap) would find it held.
+            self._delivery_in_flight = False
+        code = proc.returncode if proc.returncode is not None else 0
+        tailer.close()
+        if self._chat_stop_pending:
+            self._post_system("stopped by user (esc esc)")
+            self._chat_stop_pending = False
+        elif code == 130:
+            self._post_system("stopped by user (esc esc)")
+        elif code != 0:
+            self._post_system(f"chat exited with {code}")
+        self._set_chat_working(False)
+        self._finish_turn_housekeeping()
+
+    def _finish_turn_housekeeping(self) -> None:
+        """The post-turn tail every dispatch ends with (order matters)."""
+
         self._cancel_event = None
         self._busy = False
+        # Released here, not in `_deliver_pending_messages`: the wakeup turn
+        # OWNS the claim from the row mount until this settle, or the 1 s
+        # poll re-entering on the not-yet-drained listing mounts a second
+        # row for the same message (and `run_worker`'s exclusive cancel can
+        # kill the wakeup before it spawned, which must release too).
+        self._delivery_in_flight = False
         self._esc_hint = None
         self._refresh_chips()
-        # A summary hand-off may have ended that turn; the session moves first so
-        # the delivery below reads the NEW session's inbox.
-        self._apply_handoff()
         # A message can land while the final answer is already streaming, after
         # the last BEFORE_LLM_CALL — nothing else will consume it.
         self._deliver_pending_messages()
+
+    def _chat_argv(self, prompt: str, session: str) -> list[str]:
+        """The turn's argv, through the package seam so a test can stub it."""
+
+        return bridge.chat_argv(prompt, session)
+
+    def _stop_chat_process(self, proc: Any) -> None:
+        """Cancel the running turn: SIGINT the child (esc esc)."""
+
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.send_signal(signal.SIGINT)
+        self._chat_stop_pending = True
+
+    async def _read_chat_stdout(
+        self, proc: Any, tailer: _SessionTail, session: str
+    ) -> None:
+        """Parse the child's stdout stream into live UI (UI thread).
+
+        The contract (measured): ``------<session>------`` opens the run, raw
+        answer deltas follow with no prefix, ``outo:thinking:`` /
+        ``outo: iter N · …`` lines are completed events, the hand-off marker
+        ``------summary → X------`` (+ ``summary: <dir>``) moves the session,
+        ``------<new>------`` re-opens after the move, and
+        ``------finish------`` terminates. The final answer is NOT reprinted
+        by the child — at finish the session file's ``turn.assistant`` is
+        the canonical text to mount.
+
+        Reads are INCREMENTAL (chunks as they arrive), because the whole
+        point of the delta lane is live display: a single ``read()`` to EOF
+        would hold every token until the turn ended.
+        """
+
+        assert proc.stdout is not None
+        # The buffer is BYTES, decoded per line: a 4096-byte read boundary
+        # can land mid-codepoint, and a per-chunk ``decode(..., "replace")``
+        # turned each split CJK character into U+FFFD (``한글`` → ``한□□글``).
+        # Splitting the byte buffer on ``b"\n"`` first means every piece
+        # decoded IS a whole number of codepoints — a line is never torn.
+        pending = b""
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            pending += chunk
+            *complete, pending = pending.split(b"\n")
+            for raw in complete:
+                # Newlines are CONTENT on the live lane: the delta that
+                # ended this line is ``text + "\n"``, so the StreamRow keeps
+                # the line break instead of gluing every line into one.
+                await self._consume_chat_line(
+                    decoder.decode(raw) + "\n", tailer, session
+                )
+                if self._chat_reopened is not None:
+                    tailer = _SessionTail(self, self._chat_reopened)
+                    self._chat_reopened = None
+            if pending and not self._line_buffered(pending.decode("utf-8", "replace")):
+                # Answer deltas carry no prefix and no newline discipline:
+                # they are the LIVE lane, so they are shown as they arrive
+                # rather than held for a line the child may never send. The
+                # partial line is fed through the SAME incremental decoder
+                # so a codepoint split across reads survives here too — the
+                # undecodable tail stays buffered inside it, not replaced.
+                self._apply_stream_text(decoder.decode(pending))
+                pending = b""
+        if pending:
+            await self._consume_chat_line(decoder.decode(pending), tailer, session)
+        await proc.wait()
+
+    _STRUCTURED_PREFIXES = (
+        "------",
+        "outo:",
+        "provider:",
+        "subagent:",
+        "watchdog:",
+        "summary: ",
+    )
+
+    def _line_buffered(self, text: str) -> bool:
+        """True while ``text`` may still grow into a marker/actor line.
+
+        ``------``/``outo:``/``provider:``/``summary:`` prefixes are the
+        structured lane; anything else is answer text and belongs on the
+        live row immediately. A PARTIAL prefix (``--``, ``out``, ``-----``)
+        is held too: a chunk boundary can split the marker itself, and a
+        partial flushed to the live row glues ``------finish------`` into
+        the answer text.
+        """
+
+        stripped = text.lstrip()
+        if not stripped:
+            return False
+        return any(
+            stripped.startswith(prefix) or prefix.startswith(stripped)
+            for prefix in self._STRUCTURED_PREFIXES
+        )
+
+    async def _consume_chat_line(
+        self, line: str, tailer: _SessionTail, session: str
+    ) -> None:
+        """One stdout line: marker, completed event, or a raw delta."""
+
+        finish_marker = "------finish------"
+        stripped = line.rstrip("\n")
+        if not stripped:
+            return
+        if stripped == finish_marker:
+            tailer.pump()
+            self._finalize_stream()
+            self._mount_final_answer(tailer)
+            return
+        handoff = _parse_handoff_marker(stripped)
+        if handoff is not None:
+            # The marker line is followed by `summary: <dir>`; the pair is
+            # what moves the session. Remember the transition, let the dir
+            # line complete it (it always follows immediately).
+            self._pending_handoff_session = handoff[0]
+            return
+        if self._pending_handoff_session and stripped.startswith("summary: "):
+            # The dir line completes the hand-off marker above it: show the
+            # CLI's events up to the transition, pin the new session, and
+            # re-open the tail on it.
+            new_session = self._pending_handoff_session
+            self._pending_handoff_session = ""
+            tailer.pump()
+            tailer.close()
+            self._apply_handoff(new_session, stripped[len("summary: "):])
+            self._chat_reopened = new_session
+            return
+        if _is_session_marker(stripped):
+            return
+        if stripped.startswith(("outo:", "provider:", "subagent:", "watchdog:")):
+            # A completed event line; the session file's richer record (with
+            # its kind and refs) renders it, so only pump the tail here.
+            tailer.pump()
+            return
+        # A live delta: raw text with no actor prefix. The newline (when the
+        # line carried one) is part of the delta — `rstrip` here was what
+        # collapsed a multi-line answer onto one live row (defect #5).
+        self._apply_stream_text(line if line.endswith("\n") else stripped)
+        tailer.pump()
+
+    def _mount_final_answer(self, tailer: _SessionTail) -> None:
+        """Mount the turn's canonical answer from the session file."""
+
+        data = tailer.session_data()
+        answer = ""
+        status = ""
+        for turn in reversed(data.turns if data else []):
+            if turn.status in ("running", "interrupted"):
+                # THIS turn — the newest one — has no answer to mount; a
+                # `continue` here walked on to the previous DONE turn and
+                # mounted ITS assistant as this turn's answer (turn 2
+                # esc-esc'd → answer-one mounted twice). The newest turn is
+                # the one this child ran; stop at it.
+                status = turn.status
+                break
+            answer = turn.assistant
+            status = turn.status
+            break
+        if answer:
+            # A streamed final answer left its live row behind as CANONICAL
+            # (`_add_event_row`'s response branch); the AnswerRow below IS
+            # that text's rendering, so the stream row is retired here — but
+            # only when it really is the same message (equal text), because a
+            # canonical stream row for a DIFFERENT (middle) message must stay.
+            for row in list(self._window.rows):
+                if (
+                    isinstance(row, StreamRow)
+                    and _is_canonical(row)
+                    and row.text == answer
+                ):
+                    self._window.remove(row, self._log)
+            self._mount_row(AnswerRow(answer))
+        elif status == "interrupted":
+            self._post_system("stopped: cancelled")
+        else:
+            self._mount_row(RowStatic(Text("(empty response)", style="dim")))
+        self._mount_row(RowStatic(Text("")))
 
     async def _check_for_updates(self) -> None:
         """Check PyPI without delaying startup or interrupting a chat worker."""
@@ -3064,6 +3873,14 @@ class ChatTUI:
                             loop.set_exception_handler(previous_handler)
         finally:
             self._running = False
+            # THE LOOP IS STILL OPEN HERE — the one place an in-flight chat
+            # child can be settled cleanly. `asyncio.run` closes the loop
+            # the moment this coroutine returns, and a chat transport whose
+            # pipes never reached EOF then explodes in GC with
+            # "RuntimeError: Event loop is closed" over the restored shell.
+            # SIGINT → wait → kill (the esc-esc ladder, bounded).
+            with contextlib.suppress(Exception):
+                await self._reap_chat_child()
             self._loop = None
             self._loop_thread = 0
             # `_alt_screen_entered` is NOT cleared here: `run_tui`'s finally reads
@@ -3666,6 +4483,13 @@ def run_tui() -> None:
         # shell (the repetition supervisor's Event.wait() waiter lives there).
         with contextlib.suppress(Exception):
             shutdown_turn_loop()
+        # The bridge lane (`subprocess.run` on a worker thread: config writes,
+        # `message insert`, inbox listings) can still have a CLI child in
+        # flight at quit — a cancelled worker's thread runs it to completion.
+        # Wait it out (bounded) so nothing it writes lands in storage after
+        # the process is gone and no zombie outlives the shell it came from.
+        with contextlib.suppress(Exception):
+            bridge.wait_for_children(timeout=_CHAT_EXIT_REAP_SECONDS)
 
 
 def tui_summary() -> dict[str, Any]:

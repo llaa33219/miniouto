@@ -33,6 +33,9 @@ dependencies = [
     "httpx>=0.27.0",
     "packaging>=23.0",
     "tomli-w>=1.0.0",
+    # Machine-readable list/status output: every listing command emits YAML
+    # through cli/_yaml.py (the official interface for third-party wrappers).
+    "pyyaml>=6.0",
     # Bundled-compositor wheel: installs anywhere (pure-Python packaging),
     # runs only on Linux x86_64 glibc — tools/computer.py probes the platform
     # at registration time and exposes the Computer tool only when supported.

@@ -172,7 +172,14 @@ def test_an_optimistic_user_row_suppresses_the_event_that_replaces_it() -> None:
             # Given: text typed while a turn was running, shown at once
             app._busy = True
             app._queue_inbox_message("actually, do plan B")
-            await pilot.pause()
+            # The insert is a `message insert` child on a worker — wait for
+            # the optimistic row it keys.
+            for _ in range(200):
+                await pilot.pause(0.02)
+                if any(
+                    _rendered(r).lstrip().startswith("> ") for r in app._window.rows
+                ):
+                    break
             shown = [r for r in app._window.rows if _rendered(r).lstrip().startswith("> ")]
             assert len(shown) == 1
             message_id = next(iter(app._optimistic_rows))

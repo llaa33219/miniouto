@@ -53,7 +53,17 @@ def _isolate_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset every module-level cache before each test."""
 
     from miniouto.cli.tui import ChatTUI
+    from miniouto.cli.tui import bridge as tui_bridge
     from miniouto.core import context, modelslist, providers, repetition
+
+    # The TUI's CLI-read memo is module state too: one test's `config show`
+    # answer must not serve the next test's storage.
+    tui_bridge._SHOW_CACHE.clear()
+    yield
+    # A cancelled worker's THREAD keeps its `subprocess.run` alive to
+    # completion; what that child writes must not land in the NEXT test's
+    # storage. Wait every bridge child out before the isolation ends.
+    tui_bridge.wait_for_children()
 
     # Booting ChatTUI starts a real update worker. Update tests opt back into
     # the real coroutine with a fake response; other tests never touch PyPI.

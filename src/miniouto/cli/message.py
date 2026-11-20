@@ -18,11 +18,10 @@ from rich.console import Console
 
 from ..core import inbox
 from ..storage import settings as settings_store
+from ._yaml import print_yaml
 
 app = typer.Typer(help="Insert and inspect pending session messages.")
 console = Console()
-
-_PREVIEW_CHARS = 60
 
 
 def _fail(message: str) -> typer.Exit:
@@ -76,19 +75,24 @@ def insert_cmd(
 def list_cmd(
     session: str | None = typer.Option(None, "--session", help="Session to inspect. Defaults to settings.session."),
 ) -> None:
-    """Show the messages still waiting in a session's inbox.
+    """Show the messages still waiting in a session's inbox, as YAML.
 
-    Silent on an empty inbox (exit 0), so it doubles as a poll loop's emptiness
-    test: `[ -n "$(miniouto message list --session S)" ]` needs no text match.
+    Always a full document (`messages: []` when the inbox is empty, exit 0),
+    so a poll loop's emptiness test is `messages == []`, not a text match.
     """
 
     name = _session_or_default(session)
-    messages = _peek(name)
-    for message in messages:
-        preview = " ".join(message["text"].split())[:_PREVIEW_CHARS]
-        console.print(
-            f"[dim]{message['ts']}[/dim]  {message['kind']}  {message['source']}  [dim]{preview}[/dim]"
-        )
+    messages = [
+        {
+            "id": message["id"],
+            "ts": message["ts"],
+            "kind": message["kind"],
+            "source": message["source"],
+            "text": message["text"],
+        }
+        for message in _peek(name)
+    ]
+    print_yaml({"session": name, "messages": messages})
 
 
 @app.command("clear")
@@ -137,4 +141,3 @@ def _peek(session: str) -> list[dict[str, str]]:
             continue  # corrupt content is the drainer's problem, never the lister's
     rows.sort(key=lambda row: row["id"])
     return rows
-

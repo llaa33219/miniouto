@@ -30,6 +30,7 @@ import harness
 import tui_harness
 from miniouto.cli.tui import ChatTUI
 from miniouto.core import chat as chat_mod
+from miniouto.storage import sessions as session_store
 from miniouto.storage.paths import LOG_DIR
 
 
@@ -259,6 +260,27 @@ def test_a_failed_turn_in_the_tui_shows_the_error_row_and_keeps_stderr_clean(
 
     harness.install(monkeypatch, handler, session=session)
 
+    # The turn is a chat SUBPROCESS now, and the in-process provider double
+    # cannot cross the process boundary. The spawn is stubbed with a child
+    # that fails the way the real one would — a non-zero exit, the error on
+    # its stderr, the turn stamped interrupted — which is what
+    # `_run_chat_child` surfaces on the TUI's own row.
+    class _FailingProcess(tui_harness._FakeChatProcess):
+        def __init__(self, argv: list[str]) -> None:
+            super().__init__(argv, stderr_text="RuntimeError: provider went away\n")
+
+        def _render(self) -> bytes:
+            self.returncode = 1
+            prompt, sess, _cont = self._parse()
+            session_store.begin_turn(sess, prompt)
+            session_store.finish_turn(sess, assistant="", status="interrupted")
+            return b""
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        return _FailingProcess(list(argv))
+
+    monkeypatch.setattr(tui_harness.app_module.bridge, "asyncio_create_subprocess_exec", fake_exec)
+
     async def body() -> None:
         app = ChatTUI()
         async with app.run_test(size=tui_harness.BOOT_SIZE) as pilot:
@@ -268,13 +290,14 @@ def test_a_failed_turn_in_the_tui_shows_the_error_row_and_keeps_stderr_clean(
             await pilot.pause()
             # Then: the TUI's own surface said what happened
             painted = tui_harness.painted(app)
-            assert any("error: provider went away" in line for line in painted), painted
+            assert any("provider went away" in line for line in painted), painted
 
     asyncio.run(body())
 
     # And: nothing was dumped on stderr — the screen the TUI composes is intact
     assert capsys.readouterr().err == ""
-    # And: the report is on disk, so the failure is still debuggable
-    logged = chat_mod.failure_log_path(session).read_text(encoding="utf-8")
-    assert "✗ RuntimeError: provider went away" in logged
-    assert "Traceback:" in logged
+    # And: the turn record on disk says the turn was interrupted, so the
+    # failure left a trace (the per-run failure log the CLI writes lives in
+    # the child, not this process).
+    data = session_store.load(session)
+    assert data.turns and data.turns[-1].status == session_store.STATUS_INTERRUPTED

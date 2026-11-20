@@ -12,7 +12,7 @@ import pytest
 import harness
 import miniouto.tools.continue_session as tool_mod
 from miniouto.cli import chat as chat_cli
-from miniouto.cli.tui import ChatInput, ChatTUI
+from miniouto.cli.tui import ChatTUI
 from miniouto.core import chat as chat_mod
 from miniouto.core import inbox, summary
 from miniouto.core.summary import Handoff
@@ -332,45 +332,82 @@ def test_the_continuation_reexpands_this_session_with_the_new_session_name(
     assert "Your current session is 'cont-token-new'" in continuation
 
 
-def test_a_tui_continuation_also_reexpands_this_session(
-    monkeypatch: pytest.MonkeyPatch, summary_folder: Path
-) -> None:
+def test_a_tui_continuation_follows_the_handoff_marker(monkeypatch) -> None:
+    """The TUI's continuation names the session the hand-off moved it to.
+
+    The token-expansion half ("the continued turn's prompt carries the NEW
+    session's `{this_session}`") lives with the CLI lane now: the turn runs
+    in the `miniouto chat` child, which expands the token itself and is
+    covered by `tests/test_prompt_tokens.py`. What the TUI owns is naming
+    that session — every turn after the hand-off runs `--name <new>`, which
+    is what the child (and therefore its expansion) resolves against.
+    """
+
     import asyncio
 
-    async def body() -> None:
-        async def handler(request: harness.Request) -> co.LLMResponse:
-            if request.index == 0:
-                return _tool_call_response(
-                    "call-1", "continue_session", summary_dir=str(summary_folder)
-                )
-            return co.LLMResponse(content="continued", tool_calls=[], raw=None)
+    import tui_harness
+    from miniouto.cli import tui as tui_module
+    from miniouto.cli.tui.widgets import ChatInput
+    from miniouto.core import inbox
+    from miniouto.core.summary import Handoff
+    from miniouto.storage import sessions as session_store
 
-        monkeypatch.setattr(tool_mod, "_mint_session", lambda: "cont-token-tui")
-        style = f"<outo>{harness.OUTO_TOKEN} --alarm-session {{this_session}}</outo>"
-        provider = harness.install(
-            monkeypatch, handler, session="tui-token-old", style=style
-        )
+    new_session = "cont-token-tui"
+    argvs: list[list[str]] = []
+    real_argv = tui_module.bridge.chat_argv
+
+    def fake_argv(prompt: str, session: str, *, alarms: bool = False) -> list[str]:
+        argv = real_argv(prompt, session, alarms=alarms)
+        argvs.append(argv)
+        return argv
+
+    class _HandoffProcess(tui_harness._FakeChatProcess):
+        def _render(self) -> bytes:
+            from miniouto.cli.chat import handoff_marker
+
+            _prompt, session, _c = self._parse()
+            if "--alarms" in self.argv:
+                drained = inbox.drain(session)
+                if not drained:
+                    self.returncode = 0
+                    return b"no pending messages\n"
+                "\n\n".join(m.text for m in drained)
+            if len(argvs) == 1:
+                handoff = Handoff(
+                    new_session=new_session, from_session=session, summary_dir="/tmp/x"
+                )
+                inbox.insert(new_session, "continue", kind="user", source="tool")
+                session_store.begin_turn(new_session, "")
+                session_store.finish_turn(new_session, assistant="")
+                return (
+                    f"------{session}------\n{handoff_marker(handoff)}\n"
+                    f"------{new_session}------\n------finish------\n"
+                ).encode()
+            self.returncode = 0
+            return super()._render()
+
+    async def fake_exec(*argv: str, **kwargs: object) -> object:
+        return _HandoffProcess(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(tui_module.bridge, "chat_argv", fake_argv)
+        monkeypatch.setattr(tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec)
         app = ChatTUI()
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             app.on_chat_input_submitted(ChatInput.Submitted("summarize"))
-            # The turn driver runs on a worker THREAD, so pumping the app is not
-            # enough: each pause also has to give that thread real wall-clock
-            # time, or the request would be checked before it was ever made.
-            for _ in range(120):
+            for _ in range(600):
                 await pilot.pause(0.01)
-                if len(provider.requests) == 2:
+                if len(argvs) >= 2:
                     break
-            systems = [
-                next(m.content for m in request.messages if m.role == "system")
-                for request in provider.requests
-            ]
-            assert len(systems) == 2
-            assert systems[1].endswith("cont-token-tui")
+
+            # Then: the conversation continued in the NEW session — every
+            # later turn (the wakeup included) is named for it.
+            assert app._session_name == new_session
+            assert len(argvs) >= 2
+            assert argvs[1][argvs[1].index("--name") + 1] == new_session
 
     asyncio.run(body())
-
-
 def test_a_delegated_continuation_reexpands_its_role_prompt(
     monkeypatch: pytest.MonkeyPatch, summary_folder: Path
 ) -> None:

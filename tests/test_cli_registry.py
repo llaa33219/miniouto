@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import yaml
 from typer.testing import CliRunner
 
 from miniouto.cli import app as root_app
@@ -102,11 +103,12 @@ def test_status_reports_no_spawn_defaults() -> None:
     # When: status is printed
     result = runner.invoke(root_app, ["status"])
 
-    # Then: the retired spawn lines are gone and the rest still reports
+    # Then: the retired spawn keys are gone and the rest still reports
     assert result.exit_code == 0
+    doc = yaml.safe_load(result.output)
     assert "Spawn return:" not in result.output
     assert "Alarm session:" not in result.output
-    assert "Subagent:" in result.output and "p/m" in result.output
+    assert doc["subagent"] == {"provider": "p", "model": "m"}
 
 
 # ── computer show ─────────────────────────────────────────────────────────────

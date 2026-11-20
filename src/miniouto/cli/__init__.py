@@ -10,12 +10,14 @@ from rich.console import Console
 from .. import paths_runtime
 from ..storage import paths
 from . import computer as computer_module
+from . import config as config_module
 from . import message as message_module
 from . import provider as provider_module
 from . import skill as skill_module
 from . import style as style_module
 from . import subagent as subagent_module
 from . import tui as tui_module
+from ._yaml import print_yaml
 from .chat import chat_cmd
 
 # `--return` is the ONE flag whose value is optional: `--return` alone means
@@ -69,6 +71,7 @@ app.add_typer(skill_module.app, name="skill")
 app.add_typer(subagent_module.app, name="subagent")
 app.add_typer(message_module.app, name="message")
 app.add_typer(computer_module.app, name="computer")
+app.add_typer(config_module.app, name="config")
 app.command("chat", help="Run a single chat turn.")(chat_cmd)
 
 console = Console()
@@ -91,7 +94,7 @@ def _root(
 
 @app.command("status")
 def status() -> None:
-    """Show current configuration."""
+    """Show current configuration, as YAML."""
 
     from ..storage import providers as provider_store
     from ..storage import sessions as session_store
@@ -102,28 +105,38 @@ def status() -> None:
     s = settings_store.load()
     active_provider = provider_store.get(s.provider) if s.provider else None
     default_model = active_provider.default_model if active_provider else ""
-    console.print(f"[bold]Default provider:[/bold] {s.provider or '-'}")
-    console.print(f"[bold]Default model:[/bold]    {default_model or '- (use chat --model)'}")
+
     if s.subagent_provider or s.subagent_model:
         sub_name = s.subagent_provider or s.provider
         sub = provider_store.get(sub_name) if sub_name else None
         sub_model = s.subagent_model or (sub.default_model if sub else "") or "-"
-        console.print(f"[bold]Subagent:[/bold]        {sub_name or '-'}/{sub_model}")
+        subagent = {"provider": sub_name or "-", "model": sub_model}
     else:
-        console.print(f"[bold]Subagent:[/bold]        same as outo ({s.provider or '-'}/{default_model or '-'})")
-    console.print(f"[bold]Active style:[/bold]    {s.style or '-'}")
-    console.print(f"[bold]Session:[/bold]         {s.session or '-'}")
-    console.print(f"[bold]Storage:[/bold]         {paths.ROOT}")
-    console.print(f"[bold]Providers:[/bold]       {', '.join(provider_store.load_all()) or '-'}")
-    console.print(f"[bold]Styles:[/bold]          {', '.join(style_store.list_styles()) or '-'}")
-    console.print(f"[bold]Skills:[/bold]          {', '.join(s.name for s in skill_store.list_skills()) or '-'}")
+        subagent = {
+            "provider": s.provider or "-",
+            "model": f"same as outo ({s.provider or '-'}/{default_model or '-'})",
+        }
+
     here = str(paths_runtime.INVOCATION_CWD)
     here_names: list[str] = []
     other_names: list[str] = []
     for name, cwd, _mtime in session_store.list_sessions_with_meta():
         (here_names if cwd == here else other_names).append(name)
-    console.print(f"[bold]Sessions (this directory):[/bold] {', '.join(here_names) or '-'}")
-    console.print(f"[bold]Sessions (other):[/bold]       {', '.join(other_names) or '-'}")
+
+    print_yaml(
+        {
+            "provider": s.provider or "-",
+            "model": default_model or "-",
+            "subagent": subagent,
+            "style": s.style or "-",
+            "session": s.session or "-",
+            "storage": str(paths.ROOT),
+            "providers": list(provider_store.load_all()),
+            "styles": style_store.list_styles(),
+            "skills": [skill.name for skill in skill_store.list_skills()],
+            "sessions": {"this_directory": here_names, "other": other_names},
+        }
+    )
 
 
 
