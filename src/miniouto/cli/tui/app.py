@@ -61,7 +61,7 @@ from ... import __version__, paths_runtime
 from ...core import inbox, summary, update_check
 from ...core import modelslist as catalog_api
 from ...core.chat import run_chat, shutdown_turn_loop
-from ...core.events import STREAM_THINKING, LoopEvent
+from ...core.events import STREAM_THINKING, THINKING_DELTA_PREFIX, LoopEvent
 from ...core.providers import SUPPORTED_FORMATS
 from ...storage import paths, session_config
 from ...storage import providers as provider_store
@@ -743,6 +743,13 @@ class _SessionTail:
             while event_index < len(events):
                 self._app._add_event_row(LoopEvent.from_dict(events[event_index]))
                 event_index += 1
+            if turn.status == session_store.STATUS_RUNNING and not events:
+                # The LIVE turn with no events yet: stop here instead of
+                # advancing past it. Its events are written as the loop
+                # flushes them (often seconds after the deltas that prompted
+                # this pump), and a cursor already past the turn would never
+                # see them — the turn's rows would never mount.
+                break
             turn_index += 1
             event_index = 0
         # Persist the advanced cursor back to the app: the NEXT turn's
@@ -847,6 +854,10 @@ class ChatTUI:
         self._bulk_loading = False
         self._stream_text_row: StreamRow | None = None
         self._stream_thinking_row: ThinkingRow | None = None
+        # True while the reader already showed part of a thinking delta
+        # line that a chunk boundary split: the remainder of that PHYSICAL
+        # line is thinking content when it arrives, whatever it looks like.
+        self._thinking_line_open = False
         self._cancel_event: threading.Event | None = None
         self._chat_proc: Any = None
         self._chat_stop_pending = False
@@ -3251,13 +3262,17 @@ class ChatTUI:
         """Parse the child's stdout stream into live UI (UI thread).
 
         The contract (measured): ``------<session>------`` opens the run, raw
-        answer deltas follow with no prefix, ``outo:thinking:`` /
-        ``outo: iter N · …`` lines are completed events, the hand-off marker
-        ``------summary → X------`` (+ ``summary: <dir>``) moves the session,
-        ``------<new>------`` re-opens after the move, and
-        ``------finish------`` terminates. The final answer is NOT reprinted
-        by the child — at finish the session file's ``turn.assistant`` is
-        the canonical text to mount.
+        answer deltas follow with no prefix, ``outo:thinking: <delta>`` lines
+        are live thinking fragments (one prefixed line per physical line of
+        the fragment — ``ConsoleEventSink.emit_stream_delta``), other
+        ``outo: …`` / ``provider:`` / ``watchdog:`` lines are completed
+        events, the hand-off marker ``------summary → X------`` (+
+        ``summary: <dir>``) moves the session, ``------<new>------``
+        re-opens after the move, and ``------finish------`` terminates. The
+        final answer is NOT reprinted by the child — at finish the session
+        file's ``turn.assistant`` is the canonical text to mount, and a
+        streamed reasoning is finalized in place by the session tail's
+        whole-text ``thinking`` event.
 
         Reads are INCREMENTAL (chunks as they arrive), because the whole
         point of the delta lane is live display: a single ``read()`` to EOF
@@ -3288,15 +3303,30 @@ class ChatTUI:
                 if self._chat_reopened is not None:
                     tailer = _SessionTail(self, self._chat_reopened)
                     self._chat_reopened = None
-            if pending and not self._line_buffered(pending.decode("utf-8", "replace")):
-                # Answer deltas carry no prefix and no newline discipline:
-                # they are the LIVE lane, so they are shown as they arrive
-                # rather than held for a line the child may never send. The
-                # partial line is fed through the SAME incremental decoder
+            if pending:
+                # A partial line (no newline yet). Raw answer deltas carry
+                # no prefix and no newline discipline: they are the LIVE
+                # lane, shown as they arrive rather than held for a line
+                # the child may never send. A partial THINKING delta line
+                # is shown just as immediately once its prefix is complete
+                # — the remainder of that physical line (which need not
+                # look prefixed) is continuation content, tracked by the
+                # open-line flag. Everything else that may still grow into
+                # a marker/actor prefix stays held (`_line_buffered`), as
+                # before. The SAME incremental decoder is used throughout
                 # so a codepoint split across reads survives here too — the
                 # undecodable tail stays buffered inside it, not replaced.
-                self._apply_stream_text(decoder.decode(pending))
-                pending = b""
+                partial = decoder.decode(pending)
+                if self._thinking_line_open:
+                    self._apply_stream_thinking(partial)
+                    pending = b""
+                elif partial.startswith(THINKING_DELTA_PREFIX):
+                    self._thinking_line_open = True
+                    self._apply_stream_thinking(partial[len(THINKING_DELTA_PREFIX):])
+                    pending = b""
+                elif not self._line_buffered(partial):
+                    self._apply_stream_text(partial)
+                    pending = b""
         if pending:
             await self._consume_chat_line(decoder.decode(pending), tailer, session)
         await proc.wait()
@@ -3336,6 +3366,16 @@ class ChatTUI:
 
         finish_marker = "------finish------"
         stripped = line.rstrip("\n")
+        if self._thinking_line_open:
+            # The continuation of a thinking delta line a chunk boundary
+            # split: the remainder is reasoning content whether or not it
+            # still looks prefixed (`outo:thinking: rea` + `soning`). Even
+            # an EMPTY remainder is content — its newline is the line break
+            # the fragment carried — so this runs before the blank-line
+            # early return below.
+            self._thinking_line_open = False
+            self._apply_stream_thinking(line if line.endswith("\n") else stripped)
+            return
         if not stripped:
             return
         if stripped == finish_marker:
@@ -3362,6 +3402,29 @@ class ChatTUI:
             self._chat_reopened = new_session
             return
         if _is_session_marker(stripped):
+            return
+        if stripped.startswith(THINKING_DELTA_PREFIX):
+            # A live thinking fragment. The child writes one prefixed
+            # physical line per line of the fragment
+            # (`ConsoleEventSink.emit_stream_delta`), so the newline that
+            # ended this line is content, exactly like a raw text delta.
+            # The whole-text `thinking` event from the session tail then
+            # finalizes the live row in place (no duplicate); the child
+            # never re-prints a thinking whose fragments already went out.
+            body = stripped[len(THINKING_DELTA_PREFIX):]
+            fresh = self._stream_thinking_row is None
+            self._apply_stream_thinking(body + "\n" if line.endswith("\n") else body)
+            # The tail is pumped AFTER the delta is applied, and only when
+            # this line MOUNTED the live row: a NON-streamed reasoning
+            # prints this same line as its completed event (the session
+            # file already holds it — the persister runs before the print),
+            # so the pump finalizes the row the delta just mounted instead
+            # of mounting a second one. A stream already in flight is left
+            # alone — the tail's whole-text event lands when the message
+            # completes, and pumping per fragment would otherwise advance
+            # the cursor past the turn before its events exist.
+            if fresh:
+                tailer.pump()
             return
         if stripped.startswith(("outo:", "provider:", "subagent:", "watchdog:")):
             # A completed event line; the session file's richer record (with

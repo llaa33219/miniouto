@@ -84,6 +84,13 @@ StreamKind = Literal["text", "thinking"]
 STREAM_TEXT: StreamKind = "text"
 STREAM_THINKING: StreamKind = "thinking"
 
+# The structured stdout lane for live thinking deltas: one prefixed
+# physical line per line of the fragment, so a wrapper reading the pipe
+# (the TUI) can tell reasoning fragments from raw answer tokens — a bare
+# continuation line would be indistinguishable from answer text. `outo`
+# is fixed: one actor per process, so every delta this sink sees is outo's.
+THINKING_DELTA_PREFIX = "outo:thinking: "
+
 # Loop-event kinds that close a streamed message's boundary — the same set
 # the TUI treats as one (`cli/tui/app.py:_STREAM_BOUNDARY_KINDS`).
 # `ON_ITERATION` flushes `thinking` → `response` → `context` for a message
@@ -146,14 +153,27 @@ class ConsoleEventSink:
         # boundary event that closes the message re-ignites it, because
         # the next LLM call / tool execution is spinner territory again.
         self._stream_stopped_spinner = False
+        # The thinking fragments already written to the structured
+        # `outo:thinking:` lane for THIS message. The completed `thinking`
+        # event whose text this equals is not printed again (the stream was
+        # the rendering); a thinking that never streamed still renders from
+        # its completed event, exactly as before. Reset at every message
+        # boundary, like `_stream_text`.
+        self._stream_thinking: str | None = None
 
     def begin_working(self) -> None:
         # While a message is mid-stream the TOKENS are the liveness signal:
         # a spinner over freshly written text would overwrite the answer
         # the user is reading (and a `Live` region re-entering on the same
         # rows corrupts them). The spinner returns at the next message
-        # boundary — `emit_loop_event` closes the stream there.
-        if self._stream_text is not None or self._stream_line_open:
+        # boundary — `emit_loop_event` closes the stream there. A thinking
+        # delta is liveness exactly like a text one, so the guard covers
+        # `_stream_thinking` too.
+        if (
+            self._stream_text is not None
+            or self._stream_thinking is not None
+            or self._stream_line_open
+        ):
             return
         if self._quiet or self._status is not None:
             return
@@ -196,13 +216,19 @@ class ConsoleEventSink:
         # Those exact tokens already went out one by one: the stream was the
         # rendering, so the line is NOT printed again — but the event is
         # still a message boundary, and the bookkeeping below (closing the
-        # stream state, re-igniting the spinner) must run. (`thinking` is
-        # never suppressed: the CLI prints no thinking deltas, so the
-        # completed event is that text's one and only rendering.)
+        # stream state, re-igniting the spinner) must run. A `thinking`
+        # event is suppressed the same way when its fragments already went
+        # out on the prefixed `outo:thinking:` lane; a thinking that never
+        # streamed still renders from its completed event, exactly as
+        # before.
         suppressed = (
             event.kind == "response"
             and self._stream_text is not None
             and event.text == self._stream_text
+        ) or (
+            event.kind == "thinking"
+            and self._stream_thinking is not None
+            and event.text == self._stream_thinking
         )
         if event.kind == "context":
             # One `context` per message, always the LAST event of the flush:
@@ -211,10 +237,17 @@ class ConsoleEventSink:
             # stream — which also retires the PREVIOUS message's value).
             self._answer_stream = self._stream_text
             self._stream_text = None
+            self._stream_thinking = None
         elif event.kind == "tool":
             # Defensive close: `context` normally precedes a tool event, but
             # no later event may inherit a stale stream.
             self._stream_text = None
+            self._stream_thinking = None
+        elif event.kind == "thinking":
+            # The completed thinking closes the thinking stream of THIS
+            # message (suppressed or not): the next thinking fragment
+            # belongs to the next message.
+            self._stream_thinking = None
         # A raw delta write can leave stdout mid-line; a console.print from
         # here on would glue onto the streamed answer text.
         if self._stream_line_open:
@@ -230,6 +263,7 @@ class ConsoleEventSink:
             event.kind in _STREAM_BOUNDARY_KINDS
             and self._stream_stopped_spinner
             and self._stream_text is None
+            and self._stream_thinking is None
             and not self._stream_line_open
         ):
             self._stream_stopped_spinner = False
@@ -289,21 +323,46 @@ class ConsoleEventSink:
 
         The CLI is pipe-friendly on purpose: a wrapper process reads the
         token stream off stdout as it arrives, tty or not. `text` deltas
-        are written raw (no `actor:` prefix — the stream IS the message),
-        `thinking` stays silent as before (reasoning renders from its
-        completed event). `quiet` outputs nothing and touches no state:
-        `--answer-only` / `--with-session` promise byte-identical output.
+        are written raw (no `actor:` prefix — the stream IS the message).
+        `thinking` deltas go out on the STRUCTURED lane: every physical
+        line carries the `outo:thinking:` prefix, because a bare reasoning
+        fragment would be indistinguishable from raw answer tokens on the
+        same pipe (the TUI mounts one live row per lane). A fragment with
+        embedded newlines becomes one prefixed physical line per line, so
+        the prefix can never sit mid-line; the reader rejoins them by
+        stripping one prefix per line and re-adding the newline each
+        non-final line carried. `quiet` outputs nothing and touches no
+        state: `--answer-only` / `--with-session` promise byte-identical
+        output.
         """
 
-        if self._quiet or not text or kind != STREAM_TEXT:
+        if self._quiet or not text:
             return
         with self._stdout_lock:
             if self._status is not None:
                 self.end_working()
                 self._stream_stopped_spinner = True
-            self._stream_text = (self._stream_text or "") + text
-            self._stream_line_open = not text.endswith("\n")
-            sys.stdout.write(text)
+            if kind == STREAM_TEXT:
+                self._stream_text = (self._stream_text or "") + text
+                self._stream_line_open = not text.endswith("\n")
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                return
+            if kind != STREAM_THINKING:
+                return
+            # The raw text lane can still be mid-line from an earlier
+            # fragment; a prefixed line must start at column 0 or the
+            # wrapper cannot recognize it.
+            if self._stream_line_open:
+                sys.stdout.write("\n")
+                self._stream_line_open = False
+            self._stream_thinking = (self._stream_thinking or "") + text
+            # One physical line per line of the fragment (a trailing
+            # newline in the fragment ends its last line; no phantom empty
+            # line follows it).
+            body = text[:-1] if text.endswith("\n") else text
+            for line in body.split("\n"):
+                sys.stdout.write(THINKING_DELTA_PREFIX + line + "\n")
             sys.stdout.flush()
 
     def streamed_answer(self) -> str | None:
@@ -342,6 +401,7 @@ class ConsoleEventSink:
 
         self._answer_stream = None
         self._stream_text = None
+        self._stream_thinking = None
         self._stream_line_open = False
 
     def remove_events(self, msg_refs: list[str]) -> None:

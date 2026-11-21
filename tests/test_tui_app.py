@@ -38,6 +38,7 @@ from miniouto.cli.tui import (
     CommandPalette,
     LoopEvent,
     ProviderSettingsPopup,
+    ThinkingRow,
 )
 from miniouto.cli.tui.input import Mouse
 from miniouto.cli.tui.nodes import Rect
@@ -2481,6 +2482,185 @@ def test_a_turn_streams_live_and_finishes_through_the_cli_child(
             assert any("Bash ls" in text for text in rendered), rendered
             assert any("42" in text for text in rendered), rendered
             # The turn is not busy any more and the inbox drain is a no-op
+            assert app._busy is False
+
+    asyncio.run(body())
+
+
+def test_thinking_deltas_render_live_and_finalize_without_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The thinking lane of the child's stdout contract.
+
+    The CLI writes each reasoning fragment as one ``outo:thinking:`` line
+    per physical line (``ConsoleEventSink.emit_stream_delta``). While the
+    child is still generating, the TUI must mount a live ``ThinkingRow``
+    carrying the ``●`` streaming marker; when the message completes, the
+    session tail's whole-text ``thinking`` event finalizes THAT row in
+    place — never a second row, never the text twice.
+    """
+
+    reasoning = "step one\nstep two is longer"
+
+    class _ThinkingChild(tui_harness._FakeChatProcess):
+        def __init__(self, argv: list[str]) -> None:
+            self.argv = argv
+            self.returncode: int | None = None
+            self.stdout = _ThinkingReader(self)
+            self.stderr = tui_harness._FakeStreamReader(b"")
+
+        def _parse(self) -> tuple[str, str, bool]:
+            return tui_harness._FakeChatProcess._parse(self)  # type: ignore[arg-type]
+
+        def send_signal(self, _sig: int) -> None:  # pragma: no cover
+            self.returncode = 130
+
+        async def wait(self) -> int:
+            return self.returncode if self.returncode is not None else 0
+
+    class _ThinkingReader:
+        """stdout of a thinking-streaming child, one read per flush.
+
+        The whole point of the delta lane is live display, so the reads hand
+        the fragments out as the child would: one ``read(4096)`` per write
+        the CLI flushed. The turn's TAIL is GATED on the test observing the
+        live ``●`` row first — otherwise the turn settles before the poll
+        can see the streaming state at all. Like the real CLI, the session
+        file is written BEFORE the matching stdout line prints (the
+        persister runs ahead of the printer), which is also what keeps the
+        tailer's cursor from running past the events.
+        """
+
+        def __init__(self, proc: _ThinkingChild) -> None:
+            self._proc = proc
+            self._reads: list[tuple[bytes, Any]] = []
+            self._i = 0
+            self._tail_open = asyncio.Event()
+
+        def release_tail(self) -> None:
+            self._tail_open.set()
+
+        def _finish_turn(self) -> None:
+            from miniouto.storage import sessions as store
+
+            _prompt, session, _c = self._proc._parse()
+            store.finish_turn(session, assistant="the final answer")
+            self._proc.returncode = 0
+            return None
+
+        async def read(self, _n: int = -1) -> bytes:
+            if not self._reads:
+                self._build()
+            if self._i >= len(self._reads):
+                return b""
+            data, before = self._reads[self._i]
+            if before is not None:
+                before()
+            if self._i == 4:
+                await self._tail_open.wait()
+            self._i += 1
+            return data
+
+        def _build(self) -> None:
+            from miniouto.core.events import THINKING_DELTA_PREFIX
+            from miniouto.storage import sessions as store
+
+            def write(events: list[LoopEvent]) -> None:
+                _prompt, session, _c = self._proc._parse()
+                store.update_turn_events(session, [e.to_dict() for e in events])
+
+            answer = "the final answer"
+            # Fragments as the provider fires them: a lone line, a BLANK
+            # line (content — the fragment carried its own line break), and
+            # a tail the child ends mid-line — exactly the shapes
+            # `emit_stream_delta` writes one prefixed physical line for.
+            self._reads = [
+                (
+                    f"------{self._proc._parse()[1]}------\n".encode(),
+                    lambda: store.begin_turn(self._proc._parse()[1], self._proc._parse()[0]),
+                ),
+                ((THINKING_DELTA_PREFIX + "step one\n").encode(), None),
+                ((THINKING_DELTA_PREFIX + "\n").encode(), None),
+                (
+                    (THINKING_DELTA_PREFIX + "step two is").encode(),
+                    lambda: write([LoopEvent(actor="outo", kind="thinking", text=reasoning)]),
+                ),
+                # --- gated tail: the message completes ---
+                (
+                    (THINKING_DELTA_PREFIX + " longer\n").encode(),
+                    lambda: write(
+                        [
+                            LoopEvent(actor="outo", kind="thinking", text=reasoning),
+                            LoopEvent(
+                                actor="outo",
+                                kind="response",
+                                text=answer,
+                                msg_ref="m1",
+                            ),
+                        ]
+                    ),
+                ),
+                (answer.encode() + b"\n------finish------\n", self._finish_turn),
+            ]
+
+    current: list[_ThinkingChild] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        child = _ThinkingChild(list(argv))
+        current.append(child)
+        return child
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            name = tui_harness.pin_session(app, "app-thinking-stream")
+            # A previous DONE turn, like every real TUI session: the tailer's
+            # cursor then sits before the RUNNING turn's index, so the file
+            # events the child writes mid-turn are replayed as they land.
+            session_store.begin_turn(name, "earlier work")
+            session_store.finish_turn(name, assistant="earlier answer")
+            app._input.text = "think it through"
+            await pilot.press("enter")
+            # While the child streams: a live ThinkingRow with the marker.
+            for _ in range(600):
+                await pilot.pause(0.005)
+                if any(
+                    isinstance(r, ThinkingRow) and r.streaming
+                    for r in app._window.rows
+                ):
+                    break
+            live = [r for r in app._window.rows if isinstance(r, ThinkingRow)]
+            assert live, "no live ThinkingRow while the reasoning streamed"
+            assert live[0].streaming is True
+            assert live[0].thinking == "step one\n\nstep two is"
+            assert tui_harness.row_text(live[0]).endswith("thinking ●")
+
+            # Release the gated tail (the message completes) and let the
+            # turn settle: the session file already holds the completed
+            # events — the persister runs before the printer, like the CLI.
+            assert current, "no child was spawned"
+            current[0].stdout.release_tail()
+            for _ in range(600):
+                await pilot.pause(0.005)
+                if not app._busy:
+                    break
+            rows = app._window.rows
+            thinking = [r for r in rows if isinstance(r, ThinkingRow)]
+            # Finalized in place: ONE thinking row, holding the whole text
+            # (the tail's whole-text event finalized it), streaming off.
+            assert len(thinking) == 1, [tui_harness.row_text(r) for r in rows]
+            assert thinking[0].streaming is False
+            assert thinking[0].thinking == reasoning
+            assert tui_harness.row_text(thinking[0]) == "▶ thinking"
+            # And the turn's answer rendered exactly once
+            answers = [
+                r for r in rows if type(r).__name__ == "AnswerRow"
+            ]
+            assert len(answers) == 1, [tui_harness.row_text(r) for r in rows]
             assert app._busy is False
 
     asyncio.run(body())

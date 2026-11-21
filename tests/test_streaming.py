@@ -694,14 +694,16 @@ def _render_cli_turn(
     quiet: bool = False,
     answer: str = "final answer",
     final: str | None = None,
+    thinking: str = "thinking out loud",
 ) -> str:
     """One verbose CLI turn, in the order the loop really produces it.
 
-    A tool call ran in a PREVIOUS iteration; the current message's flush is
-    `thinking` → `response` → `context`, with the stream (if any) carrying
-    that same message's text before its `response` event lands. `final`
-    overrides what `emit_final_answer` receives (the exception-path case:
-    the answer the run reports differs from what streamed).
+    A tool call ran in a PREVIOUS iteration; the current message's reasoning
+    streams first (`thinking` deltas), then its text (`text` deltas), and
+    ON_ITERATION flushes the completed message `thinking` → `response` →
+    `context`. `final` overrides what `emit_final_answer` receives (the
+    exception-path case: the answer the run reports differs from what
+    streamed).
     """
 
     buf = io.StringIO()
@@ -710,11 +712,11 @@ def _render_cli_turn(
         sink.emit_loop_event(
             LoopEvent(actor="outo", kind="tool", text="Bash ls", tool_name="Bash")
         )
-        sink.emit_loop_event(LoopEvent(actor="outo", kind="thinking", text="thinking out loud"))
         if with_deltas:
+            sink.emit_stream_delta("thinking", thinking)
             for char in answer:
                 sink.emit_stream_delta("text", char)
-            sink.emit_stream_delta("thinking", "hidden reasoning")
+        sink.emit_loop_event(LoopEvent(actor="outo", kind="thinking", text=thinking))
         sink.emit_loop_event(
             LoopEvent(
                 actor="outo", kind="response", text=answer if with_deltas else "other"
@@ -743,10 +745,11 @@ def test_console_streams_text_deltas_live() -> None:
         "outo: iter 1 · 42 tokens\n"
         "------finish------\n"
     )
-    # And: thinking deltas stay silent as before (contract 5) — the
-    # completed thinking event is that text's one and only rendering.
-    assert "hidden reasoning" not in out
-    assert "thinking out loud" in out
+    # And: the thinking fragments went out on their own prefixed lane
+    # (ONE physical line per line of the fragment) and the completed
+    # `thinking` event whose text they already wrote is NOT printed again
+    # — the stream was the rendering, exactly like the answer lane.
+    assert out.count("outo:thinking: thinking out loud") == 1
 
 
 def test_console_output_is_unchanged_without_deltas() -> None:
@@ -788,7 +791,8 @@ def test_console_prints_the_full_answer_when_it_did_not_stream() -> None:
     # and the answer is not swallowed by the duplicate guard. The
     # streamed message's own `response` event IS suppressed (its text
     # matches the tokens), so between the stream and the boundary line
-    # only the newline the boundary added appears.
+    # only the newline the boundary added appears. The thinking lane
+    # rendered once, from its stream.
     assert out == (
         "outo: Bash ls\n"
         "outo:thinking: thinking out loud\n"
@@ -905,3 +909,114 @@ def test_console_streaming_works_through_a_pipe() -> None:
 
     # Then: the tokens are on the pipe as they arrived
     assert data.decode() == "PIPE"
+
+
+def test_console_streams_thinking_deltas_on_the_prefixed_lane() -> None:
+    # Given: a message whose reasoning arrives as thinking deltas
+    sink = ConsoleEventSink()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        sink.emit_stream_delta("thinking", "plan the work")
+        sink.emit_stream_delta("thinking", "step one\nstep two\n")
+
+    # Then: every fragment went out as it arrived, one prefixed PHYSICAL
+    # line per line of the fragment (an embedded newline never puts the
+    # prefix mid-line, so the wrapper's line parser stays sound) — and no
+    # trailing phantom line follows a fragment that ended with a newline.
+    assert buf.getvalue() == (
+        "outo:thinking: plan the work\n"
+        "outo:thinking: step one\n"
+        "outo:thinking: step two\n"
+    )
+
+
+def test_console_streamed_thinking_event_is_not_printed_twice() -> None:
+    # Given: a message whose reasoning streamed, then completed
+    sink = ConsoleEventSink()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        sink.emit_stream_delta("thinking", "why")
+        sink.emit_stream_delta("thinking", " and wherefore")
+        sink.emit_loop_event(
+            LoopEvent(actor="outo", kind="thinking", text="why and wherefore")
+        )
+        # A DIFFERENT message's thinking never streamed: it still renders
+        # from its completed event, exactly as before.
+        sink.emit_loop_event(
+            LoopEvent(actor="outo", kind="thinking", text="one-shot reasoning")
+        )
+        sink.emit_loop_event(LoopEvent(actor="outo", kind="context", text="iter 1"))
+
+    # Then: the streamed reasoning's completed event is suppressed (the
+    # fragments were the rendering) and the next message's thinking is
+    # printed in full — the boundary reset the duplicate guard.
+    assert buf.getvalue() == (
+        "outo:thinking: why\n"
+        "outo:thinking:  and wherefore\n"
+        "outo:thinking: one-shot reasoning\n"
+        "outo: iter 1\n"
+    )
+
+
+def test_console_thinking_delta_closes_a_raw_text_line_first() -> None:
+    # Given: an answer fragment left stdout mid-line
+    sink = ConsoleEventSink()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        sink.emit_stream_delta("text", "partial answer")
+        sink.emit_stream_delta("thinking", "meanwhile, thinking")
+
+    # Then: the prefixed lane starts at column 0 — a wrapper reading the
+    # pipe can only recognize the prefix on a line start.
+    assert buf.getvalue() == (
+        "partial answer\nouto:thinking: meanwhile, thinking\n"
+    )
+
+
+def test_console_thinking_deltas_also_stop_and_reignite_the_spinner() -> None:
+    # Given: a verbose sink whose spinner is running
+    sink = ConsoleEventSink()
+    status_log: list[str] = []
+
+    class _Status:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def update(self, text: str) -> None:
+            status_log.append("update:" + text)
+
+        def __enter__(self) -> _Status:
+            status_log.append("enter")
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            status_log.append("exit")
+
+    class _Console:
+        def status(self, text: str, **_kwargs: Any) -> _Status:
+            return _Status(text)
+
+        def print(self, *_a: Any, **_k: Any) -> None:
+            pass
+
+    sink._console = _Console()  # type: ignore[assignment]
+
+    # When: a thinking delta arrives while the spinner is live
+    sink.begin_working()
+    sink.emit_stream_delta("thinking", "hmm")
+    assert status_log == ["enter", "exit"]  # tokens are the liveness signal
+    sink.emit_stream_delta("thinking", " more")
+    assert status_log == ["enter", "exit"]  # still stopped mid-stream
+    sink.begin_working()
+    assert status_log == ["enter", "exit"]  # and it cannot be re-lit yet
+
+    # And: the message's boundary events return it
+    sink.emit_loop_event(LoopEvent(actor="outo", kind="thinking", text="hmm more"))
+    assert status_log == ["enter", "exit", "enter"]
+
+    # And quiet never touches the spinner through the thinking lane either
+    quiet = ConsoleEventSink(quiet=True)
+    quiet._console = _Console()  # type: ignore[assignment]
+    quiet.begin_working()
+    quiet.emit_stream_delta("thinking", "t")
+    assert status_log == ["enter", "exit", "enter"]
