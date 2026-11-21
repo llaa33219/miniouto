@@ -1252,6 +1252,26 @@ class ChatScroll(Node):
 
         self._set_scroll(self.scroll_y + lines)
 
+    def compensate(self, lines: int) -> None:
+        """Shift the viewport by the exact height of rows added/removed above.
+
+        Scroll compensation is geometry bookkeeping, not navigation: it must
+        never touch the follow pin the way a user scroll that LANDS on the
+        tail does (``_set_scroll`` re-pins on ``new == max_scroll_y``). A
+        compensated view is by definition NOT at the tail — it is holding the
+        row it was already showing while older chunks mount above it. Routing
+        the correction through ``scroll_to`` re-pinned exactly when a stale
+        ``max_scroll_y`` clamped the target down to the OLD tail, and the next
+        mount's ``check_anchor`` then yanked the view to the new tail: a jump
+        of a whole chunk away from the row being read.
+        """
+
+        old = self.scroll_y
+        new = max(0, min(old + lines, self.max_scroll_y))
+        self.scroll_y = new
+        if new != old and self.on_scroll is not None:
+            self.on_scroll(new)
+
     def at_bottom(self) -> bool:
         return at_bottom(self)
 
@@ -1278,6 +1298,11 @@ class ChatScroll(Node):
             self._mounted.insert(index, row)
             if row not in self.children:
                 self.children.append(row)
+        # The app's content-height override describes the LAST painted
+        # frame; the mounted set just changed, so drop it. Geometry must
+        # reflect the rows mounted NOW: the scroll compensation for this very
+        # mount otherwise clamps against the stale tail of the previous frame.
+        self._content_height = None
         self.check_anchor()
         return _awaitable_none()
 
@@ -1287,6 +1312,7 @@ class ChatScroll(Node):
         if row in self.children:
             self.children.remove(row)
         row.parent = None
+        self._content_height = None
         self.check_anchor()
 
     def remove_children(self) -> Any:
@@ -1579,14 +1605,16 @@ class _RowWindow:
             else:
                 log.mount(row, before=anchor)
             added += self._height(row, log)
-        if added:
-            # Compensate the shift the new chunk put above the viewport — but
-            # only for a view that was scrolled INTO the load zone. At scroll_y
-            # == 0 the user asked for the very top (Home), and compensating
-            # there walks the viewport DOWN by a chunk on every press, so the
-            # top of the log is never actually reached.
-            target = 0 if log.scroll_y <= 0 else log.scroll_y + added
-            log.scroll_to(y=target, animate=False)
+        # Compensate the shift the new chunk put above the viewport — but only
+        # for a view that was scrolled INTO the load zone. At scroll_y == 0 the
+        # user asked for the very top (Home), and compensating there walks the
+        # viewport DOWN by a chunk on every press, so the top of the log is
+        # never actually reached. The correction goes through `compensate`,
+        # never `scroll_to`: it is geometry bookkeeping, not navigation, and
+        # must not touch the follow pin (a target clamped down to the stale
+        # tail re-pinned it, and the next mount yanked the view to the bottom).
+        if added and log.scroll_y > 0:
+            log.compensate(added)
 
     def evict(self, log: ChatScroll) -> None:
         excess = (len(self.rows) - self.first) - WINDOW_MAX_ROWS
@@ -1611,7 +1639,7 @@ class _RowWindow:
         # At the bottom the anchor re-pins to the tail, so only an up-scrolled view
         # needs the shift compensated.
         if removed_height and log.scroll_y < log.max_scroll_y - 1:
-            log.scroll_to(y=max(0, log.scroll_y - removed_height), animate=False)
+            log.compensate(-removed_height)
 
     def _height(self, row: Node, log: ChatScroll) -> int:
         return log._row_height(row)

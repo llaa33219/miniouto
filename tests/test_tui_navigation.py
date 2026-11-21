@@ -2714,6 +2714,80 @@ def test_a_session_load_still_mounts_only_the_tail() -> None:
     asyncio.run(body())
 
 
+def test_wheel_up_through_a_chunk_load_keeps_the_row_on_screen() -> None:
+    """Regression: a load mid-wheel yanked the view to the tail of the log.
+
+    Wheel-scrolling up through the load zone (scroll_y <= TOP_LOAD_LINES but
+    > 0) mounts older chunks above the viewport. The compensation used to go
+    through ``scroll_to`` while the log still carried the PREVIOUS frame's
+    ``content_height``, so a freshly-loaded session (only the trailing 100
+    rows mounted) clamped the compensated target to the stale tail — which
+    re-engaged the follow pin — and the next frame's ``check_anchor`` jumped
+    the view to the new tail, 66 rows past the row being read. The whole-app
+    version of the widget regression: the wheel path, the paint that refreshes
+    geometry, and the mount chain, wired together.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            app._bulk_loading = True
+            try:
+                for index in range(900):
+                    app._mount_row(RowStatic(f"r{index}"))
+            finally:
+                app._bulk_loading = False
+            app._mount_tail_window()
+            await pilot.pause()
+            assert app._window.first == 800, "the bulk fill mounted only the tail"
+
+            # When: the wheel walks the view up into the load zone — one
+            # detent at a time, the way the terminal reports them — through
+            # several chunk loads, while the paint between detents refreshes
+            # the log geometry the compensation depends on.
+            from miniouto.cli.tui.input import Mouse as _Mouse
+
+            for _ in range(1200):
+                if app._window.first == 0:
+                    break
+                # The row the viewport's top line is showing before the detent
+                app.compose(100, 30)
+                top_y = app._log_rect.y
+                before = next(row for row in app._log.rows if row.region.y == top_y)
+                before_offset = _row_offset(app, before) - app._log.scroll_y
+                app._handle_event(_Mouse("wheel_up", 10, 5))
+                await pilot.pause()
+                # Then: that row is still on screen, exactly one wheel-step
+                # (WHEEL_LINES) lower — never gone, never past the viewport.
+                offset = _row_offset(app, before)
+                if offset is None:  # evicted far above the view: acceptable
+                    continue
+                position = offset - app._log.scroll_y
+                assert position == before_offset + 3, (
+                    f"the viewed row moved from {before_offset} to {position}"
+                )
+
+            # And: the walk reached the true top of the session
+            assert app._window.first == 0
+
+    asyncio.run(body())
+
+
+def _row_offset(app: ChatTUI, row: Any) -> int | None:
+    """The row's offset from the top of the mounted window (None if evicted)."""
+
+    offset = 0
+    for candidate in app._log.rows:
+        if candidate is row:
+            return offset
+        offset += max(1, app._log._row_height(candidate))
+    return None
+
+
 # ── reviewer defect 10: the minted session's seed (style + global default) ───
 
 

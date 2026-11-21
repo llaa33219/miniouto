@@ -923,6 +923,122 @@ def test_evicted_rows_reload_when_the_view_returns_to_the_top() -> None:
     assert log.rows[0] is window.rows[0]
 
 
+def test_a_top_edge_load_keeps_the_row_the_view_was_showing() -> None:
+    """Regression: a chunk load mid-scroll yanked the view to the tail.
+
+    ``_load_older`` compensated through ``scroll_to`` while the log still
+    reported the PREVIOUS frame's ``content_height`` (the app overrides it per
+    paint). The stale ``max_scroll_y`` clamped the compensated target to the
+    OLD tail, landing the view exactly on it — which re-engaged the follow
+    pin (``_set_scroll`` releases it only BELOW the tail) — and the next
+    mount's ``check_anchor`` then scrolled to the NEW tail. A user wheeling
+    up through the load zone saw the view jump a whole chunk DOWN, away from
+    the row they were reading.
+
+    The fix has two halves, both locked here: the mounted geometry is fresh
+    (mount/remove drop the stale override) and the correction goes through
+    ``compensate``, which moves the viewport without touching the pin.
+    """
+
+    log = ChatScroll()
+    log.theme = THEME
+    log.resize(80, 10)
+    window = _RowWindow()
+    for index in range(300):
+        window.append(log, EventRow(f"row {index}"), defer_mount=True)
+    window.mount_tail(log)
+    # The stale-override trap: the app paints a frame where only the trailing
+    # window is mounted, so content_height is the SMALL pre-load number.
+    log.content_height = log.content_height
+    # 100 mounted rows of height 1, viewport 10: the stale tail is 90, well
+    # BELOW the compensated target the load is about to compute.
+    assert log.max_scroll_y == 90, "the bulk fill mounted only the tail"
+    # Given: the view is scrolled into the load zone (not at 0 — that is Home)
+    log.release_anchor()
+    log.scroll_to(y=TOP_LOAD_LINES)
+    watched = log.rows[log.scroll_y]
+    # When: the top edge loads a batch of older chunks
+    window.maybe_load_older(log, log.scroll_y)
+    # Then: the watched row holds its place in the viewport — scroll_y moved
+    # by exactly the height of the rows mounted above it, no clamping against
+    # the stale tail and no re-pin to the new one.
+    offset = 0
+    for row in log.rows:
+        if row is watched:
+            break
+        offset += max(1, log._row_height(row))
+    assert offset == log.scroll_y, "the viewed row is no longer the top row"
+    assert log.scroll_y == TOP_LOAD_LINES + WINDOW_CHUNK_ROWS * WINDOW_LOAD_CHUNKS_PER_FRAME
+    assert log.scroll_y < log.max_scroll_y
+    assert log._anchor_released is True, "the load re-pinned the follow anchor"
+    log.check_anchor()
+    assert log.scroll_y == TOP_LOAD_LINES + WINDOW_CHUNK_ROWS * WINDOW_LOAD_CHUNKS_PER_FRAME
+    # And the mounted window really did grow by the batch, from the true top
+    # of the session downward.
+    assert window.first == 200 - WINDOW_CHUNK_ROWS * WINDOW_LOAD_CHUNKS_PER_FRAME
+    assert log.rows[0] is window.rows[window.first]
+
+
+def test_a_home_pinned_load_still_skips_the_compensation() -> None:
+    """The other half: at scroll_y == 0 the compensation stays SKIPPED.
+
+    Home means the very top of the session; compensating there would walk the
+    viewport DOWN by a chunk per load and the top would never be reached.
+    """
+
+    log = ChatScroll()
+    log.theme = THEME
+    log.resize(80, 10)
+    window = _RowWindow()
+    for index in range(300):
+        window.append(log, EventRow(f"row {index}"), defer_mount=True)
+    window.mount_tail(log)
+    log.scroll_home(animate=False)
+    for _ in range(4):  # 2 chunks per trigger: 200 older rows to walk through
+        window.maybe_load_older(log, log.scroll_y)
+        assert log.scroll_y == 0
+    assert window.first == 0, "Home never reached the top of the session"
+    assert log.rows[0] is window.rows[0]
+
+
+def test_an_evicted_reload_keeps_the_row_the_view_was_showing() -> None:
+    """Regression: the same defect through the evict path.
+
+    Evicting rows ABOVE the viewport shifts the content up, compensated by the
+    same ``compensate`` path — and a subsequent top-edge reload of those rows
+    must put the viewed row back where it was, not at the tail.
+    """
+
+    log = ChatScroll()
+    log.theme = THEME
+    log.resize(80, 10)
+    window = _RowWindow()
+    for index in range(WINDOW_MAX_ROWS + 150):
+        window.append(log, EventRow(f"row {index}"), defer_mount=True)
+    window.mount_tail(log)
+    # Scroll up into the loaded zone so a chunk batch mounts, then far enough
+    # back down that evict has room to drop rows above the viewport.
+    log.release_anchor()
+    log.scroll_to(y=TOP_LOAD_LINES)
+    window.maybe_load_older(log, log.scroll_y)
+    assert log.scroll_y > 0
+    for _ in range(60):
+        log.scroll_page_down(animate=False)
+    log.content_height = None
+    window.evict(log)
+    assert window.first > 0, "nothing was evicted: the test is vacuous"
+    # The scroll back up remounts the evicted rows; the viewed row must hold.
+    log.scroll_to(y=TOP_LOAD_LINES)
+    watched = log.rows[log.scroll_y]
+    window.maybe_load_older(log, log.scroll_y)
+    offset = 0
+    for row in log.rows:
+        if row is watched:
+            break
+        offset += max(1, log._row_height(row))
+    assert offset == log.scroll_y, "the viewed row is no longer the top row"
+
+
 def test_removing_a_row_keeps_first_aligned() -> None:
     log = ChatScroll()
     log.theme = THEME
