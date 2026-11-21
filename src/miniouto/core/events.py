@@ -89,7 +89,20 @@ STREAM_THINKING: StreamKind = "thinking"
 # (the TUI) can tell reasoning fragments from raw answer tokens — a bare
 # continuation line would be indistinguishable from answer text. `outo`
 # is fixed: one actor per process, so every delta this sink sees is outo's.
+#
+# The two prefixes tell the reader whether the newline ending a physical
+# line is CONTENT (the fragment carried it) or mere FRAMING. A physical
+# line always ends in a newline, so without the mark a fragment boundary
+# is indistinguishable from a line break inside the fragment — and a
+# reader re-adding one newline per line turned every fragment boundary
+# into one (`"The"` + `" user asks:"` reassembled as `"The\n user asks:"`).
+# Every line of a fragment but its last is followed by a content newline,
+# so it prints on the plain prefix; the LAST line uses the plain prefix
+# when the fragment ends in a newline (its trailing empty line's newline
+# IS the content) and the unclosed mark when it does not (that line's
+# newline is framing only).
 THINKING_DELTA_PREFIX = "outo:thinking: "
+THINKING_DELTA_PREFIX_UNCLOSED = "outo:thinking| "
 
 # Loop-event kinds that close a streamed message's boundary — the same set
 # the TUI treats as one (`cli/tui/app.py:_STREAM_BOUNDARY_KINDS`).
@@ -325,13 +338,15 @@ class ConsoleEventSink:
         token stream off stdout as it arrives, tty or not. `text` deltas
         are written raw (no `actor:` prefix — the stream IS the message).
         `thinking` deltas go out on the STRUCTURED lane: every physical
-        line carries the `outo:thinking:` prefix, because a bare reasoning
-        fragment would be indistinguishable from raw answer tokens on the
-        same pipe (the TUI mounts one live row per lane). A fragment with
-        embedded newlines becomes one prefixed physical line per line, so
-        the prefix can never sit mid-line; the reader rejoins them by
-        stripping one prefix per line and re-adding the newline each
-        non-final line carried. `quiet` outputs nothing and touches no
+        line carries the `outo:thinking:`/`outo:thinking|` prefix, because
+        a bare reasoning fragment would be indistinguishable from raw
+        answer tokens on the same pipe (the TUI mounts one live row per
+        lane). A fragment with embedded newlines becomes one prefixed
+        physical line per line, so the prefix can never sit mid-line; each
+        line's prefix says whether the newline ending it is content (`:`)
+        or framing (`|`, only ever the fragment's last line), so the
+        reader rejoins the lines into EXACTLY the original fragment — see
+        `THINKING_DELTA_PREFIX`. `quiet` outputs nothing and touches no
         state: `--answer-only` / `--with-session` promise byte-identical
         output.
         """
@@ -357,12 +372,21 @@ class ConsoleEventSink:
                 sys.stdout.write("\n")
                 self._stream_line_open = False
             self._stream_thinking = (self._stream_thinking or "") + text
-            # One physical line per line of the fragment (a trailing
-            # newline in the fragment ends its last line; no phantom empty
-            # line follows it).
-            body = text[:-1] if text.endswith("\n") else text
-            for line in body.split("\n"):
+            # One physical line per line of the fragment, each line's
+            # prefix marking the newline ending it CONTENT (`:`) or
+            # FRAMING (`|`). Every line the fragment breaks after carries
+            # a content newline, so it prints on the plain prefix; a
+            # fragment NOT ending in a newline prints its final line on
+            # the unclosed mark (that line's newline is framing only),
+            # while one ending in a newline needs no extra line — its
+            # final content line's newline IS the content. The reader
+            # reassembles the fragment byte for byte.
+            lines = text.split("\n")
+            last = lines.pop()
+            for line in lines:
                 sys.stdout.write(THINKING_DELTA_PREFIX + line + "\n")
+            if not text.endswith("\n"):
+                sys.stdout.write(THINKING_DELTA_PREFIX_UNCLOSED + last + "\n")
             sys.stdout.flush()
 
     def streamed_answer(self) -> str | None:

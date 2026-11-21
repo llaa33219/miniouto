@@ -740,16 +740,18 @@ def test_console_streams_text_deltas_live() -> None:
     # marker follow the stream, and nothing trails the marker.
     assert out == (
         "outo: Bash ls\n"
-        "outo:thinking: thinking out loud\n"
+        "outo:thinking| thinking out loud\n"
         "final answer\n"
         "outo: iter 1 · 42 tokens\n"
         "------finish------\n"
     )
     # And: the thinking fragments went out on their own prefixed lane
-    # (ONE physical line per line of the fragment) and the completed
-    # `thinking` event whose text they already wrote is NOT printed again
-    # — the stream was the rendering, exactly like the answer lane.
-    assert out.count("outo:thinking: thinking out loud") == 1
+    # (ONE physical line per line of the fragment; the fragment carries
+    # no trailing newline, so its line ends on the unclosed mark) and the
+    # completed `thinking` event whose text they already wrote is NOT
+    # printed again — the stream was the rendering, exactly like the
+    # answer lane.
+    assert out.count("outo:thinking| thinking out loud") == 1
 
 
 def test_console_output_is_unchanged_without_deltas() -> None:
@@ -795,7 +797,7 @@ def test_console_prints_the_full_answer_when_it_did_not_stream() -> None:
     # rendered once, from its stream.
     assert out == (
         "outo: Bash ls\n"
-        "outo:thinking: thinking out loud\n"
+        "outo:thinking| thinking out loud\n"
         "streamed text\n"
         "outo: iter 1 · 42 tokens\n"
         "------finish------\n"
@@ -923,11 +925,74 @@ def test_console_streams_thinking_deltas_on_the_prefixed_lane() -> None:
     # line per line of the fragment (an embedded newline never puts the
     # prefix mid-line, so the wrapper's line parser stays sound) — and no
     # trailing phantom line follows a fragment that ended with a newline.
+    # The newline-less fragments end on the unclosed mark (their line's
+    # newline is framing), so a reader reassembles EXACTLY the fragments.
     assert buf.getvalue() == (
-        "outo:thinking: plan the work\n"
+        "outo:thinking| plan the work\n"
         "outo:thinking: step one\n"
         "outo:thinking: step two\n"
     )
+
+
+def test_console_thinking_framing_round_trips_byte_for_byte() -> None:
+    # Given: arbitrary reasoning — newlines inside fragments, fragments
+    # that end mid-word, blank lines, CJK, a fragment that IS the prefix —
+    # cut into fragments at arbitrary boundaries (the shapes providers
+    # really fire ON_STREAM_THINKING with)
+    import random
+
+    from miniouto.core.events import (
+        THINKING_DELTA_PREFIX,
+        THINKING_DELTA_PREFIX_UNCLOSED,
+    )
+
+    texts = [
+        "The user asks: \"Think briefly about 2+2, then answer.\"",
+        "step one\nstep two is longer",
+        "trailing newline\n",
+        "blank line\n\nnext\n",
+        "한글 생각을\n스트리밍합니다",
+        "no newline at the end",
+        "\n",
+        "outo:thinking: the prefix itself as content",
+        "outo:thinking| and the unclosed mark as content",
+    ]
+    rng = random.Random(20260121)
+    cases: list[list[str]] = [[t] for t in texts]
+    for text in texts:
+        for _ in range(6):
+            cuts = sorted(
+                rng.sample(range(1, len(text) + 1), min(5, len(text)))
+            )
+            fragments, prev = [], 0
+            for cut in cuts:
+                fragments.append(text[prev:cut])
+                prev = cut
+            fragments.append(text[prev:])
+            cases.append([f for f in fragments if f])
+
+    for fragments in cases:
+        sink = ConsoleEventSink()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            for fragment in fragments:
+                sink.emit_stream_delta("thinking", fragment)
+
+        # When: a wrapper reassembles the lane — strip one prefix per
+        # physical line; the plain prefix's newline is content, the
+        # unclosed mark's is framing and is not re-added
+        parts: list[str] = []
+        for line in buf.getvalue().split("\n")[:-1]:
+            if line.startswith(THINKING_DELTA_PREFIX):
+                parts.append(line[len(THINKING_DELTA_PREFIX):] + "\n")
+            elif line.startswith(THINKING_DELTA_PREFIX_UNCLOSED):
+                parts.append(line[len(THINKING_DELTA_PREFIX_UNCLOSED):])
+            else:  # pragma: no cover - the sink never writes anything else
+                raise AssertionError(f"unframed line {line!r}")
+
+        # Then: the reassembly is the original reasoning byte for byte —
+        # no newline the framing invented, none it swallowed.
+        assert "".join(parts) == "".join(fragments), fragments
 
 
 def test_console_streamed_thinking_event_is_not_printed_twice() -> None:
@@ -951,8 +1016,8 @@ def test_console_streamed_thinking_event_is_not_printed_twice() -> None:
     # fragments were the rendering) and the next message's thinking is
     # printed in full — the boundary reset the duplicate guard.
     assert buf.getvalue() == (
-        "outo:thinking: why\n"
-        "outo:thinking:  and wherefore\n"
+        "outo:thinking| why\n"
+        "outo:thinking|  and wherefore\n"
         "outo:thinking: one-shot reasoning\n"
         "outo: iter 1\n"
     )
@@ -969,7 +1034,7 @@ def test_console_thinking_delta_closes_a_raw_text_line_first() -> None:
     # Then: the prefixed lane starts at column 0 — a wrapper reading the
     # pipe can only recognize the prefix on a line start.
     assert buf.getvalue() == (
-        "partial answer\nouto:thinking: meanwhile, thinking\n"
+        "partial answer\nouto:thinking| meanwhile, thinking\n"
     )
 
 

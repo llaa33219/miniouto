@@ -61,7 +61,12 @@ from ... import __version__, paths_runtime
 from ...core import inbox, summary, update_check
 from ...core import modelslist as catalog_api
 from ...core.chat import run_chat, shutdown_turn_loop
-from ...core.events import STREAM_THINKING, THINKING_DELTA_PREFIX, LoopEvent
+from ...core.events import (
+    STREAM_THINKING,
+    THINKING_DELTA_PREFIX,
+    THINKING_DELTA_PREFIX_UNCLOSED,
+    LoopEvent,
+)
 from ...core.providers import SUPPORTED_FORMATS
 from ...storage import paths, session_config
 from ...storage import providers as provider_store
@@ -743,12 +748,17 @@ class _SessionTail:
             while event_index < len(events):
                 self._app._add_event_row(LoopEvent.from_dict(events[event_index]))
                 event_index += 1
-            if turn.status == session_store.STATUS_RUNNING and not events:
-                # The LIVE turn with no events yet: stop here instead of
-                # advancing past it. Its events are written as the loop
-                # flushes them (often seconds after the deltas that prompted
-                # this pump), and a cursor already past the turn would never
-                # see them — the turn's rows would never mount.
+            if turn.status == session_store.STATUS_RUNNING:
+                # The LIVE turn: replay what it holds so far and STAY on
+                # it — the cursor advances only through its events, never
+                # past the turn. Its events are written as the loop
+                # flushes them, one message at a time (a tool turn writes
+                # thinking → response → context → tool, then the NEXT
+                # message's thinking seconds later); a cursor that left the
+                # turn as soon as it had one event never saw the later
+                # ones, so a second streamed reasoning lost its whole-text
+                # event (never finalized, swept as a live duplicate) — or
+                # duplicated, depending on timing.
                 break
             turn_index += 1
             event_index = 0
@@ -858,6 +868,13 @@ class ChatTUI:
         # line that a chunk boundary split: the remainder of that PHYSICAL
         # line is thinking content when it arrives, whatever it looks like.
         self._thinking_line_open = False
+        # The framing mark of the physical line `_thinking_line_open`
+        # tracks: True when its prefix was `outo:thinking: ` (the newline
+        # ending the line is CONTENT) and False when it was the unclosed
+        # mark `outo:thinking| ` (the newline is framing only) — the
+        # reassembled reasoning carries exactly the fragment's own
+        # newlines and none the framing invented.
+        self._thinking_line_nl = False
         self._cancel_event: threading.Event | None = None
         self._chat_proc: Any = None
         self._chat_stop_pending = False
@@ -3322,7 +3339,18 @@ class ChatTUI:
                     pending = b""
                 elif partial.startswith(THINKING_DELTA_PREFIX):
                     self._thinking_line_open = True
+                    self._thinking_line_nl = True
                     self._apply_stream_thinking(partial[len(THINKING_DELTA_PREFIX):])
+                    pending = b""
+                elif partial.startswith(THINKING_DELTA_PREFIX_UNCLOSED):
+                    # The unclosed mark: this line's eventual newline is
+                    # FRAMING, not content — remembered so the line's
+                    # completion adds no fake break to the reasoning.
+                    self._thinking_line_open = True
+                    self._thinking_line_nl = False
+                    self._apply_stream_thinking(
+                        partial[len(THINKING_DELTA_PREFIX_UNCLOSED):]
+                    )
                     pending = b""
                 elif not self._line_buffered(partial):
                     self._apply_stream_text(partial)
@@ -3370,11 +3398,17 @@ class ChatTUI:
             # The continuation of a thinking delta line a chunk boundary
             # split: the remainder is reasoning content whether or not it
             # still looks prefixed (`outo:thinking: rea` + `soning`). Even
-            # an EMPTY remainder is content — its newline is the line break
-            # the fragment carried — so this runs before the blank-line
-            # early return below.
+            # an EMPTY remainder is content — and its newline is a line
+            # break only when the split line's prefix was the plain one
+            # (`_thinking_line_nl`); the unclosed mark's newline is framing
+            # and is NOT re-added (a fake break at every fragment boundary)
+            # — so this runs before the blank-line early return below.
             self._thinking_line_open = False
-            self._apply_stream_thinking(line if line.endswith("\n") else stripped)
+            self._apply_stream_thinking(
+                (line if self._thinking_line_nl else stripped)
+                if line.endswith("\n")
+                else stripped
+            )
             return
         if not stripped:
             return
@@ -3403,17 +3437,25 @@ class ChatTUI:
             return
         if _is_session_marker(stripped):
             return
-        if stripped.startswith(THINKING_DELTA_PREFIX):
+        if stripped.startswith((THINKING_DELTA_PREFIX, THINKING_DELTA_PREFIX_UNCLOSED)):
             # A live thinking fragment. The child writes one prefixed
             # physical line per line of the fragment
-            # (`ConsoleEventSink.emit_stream_delta`), so the newline that
-            # ended this line is content, exactly like a raw text delta.
+            # (`ConsoleEventSink.emit_stream_delta`), and the line's prefix
+            # says whether its newline is CONTENT (plain `outo:thinking: `,
+            # like a raw text delta) or mere framing (the unclosed mark
+            # `outo:thinking| `: the fragment did not end in a newline, so
+            # none is re-added — reassembling the reasoning byte for byte).
             # The whole-text `thinking` event from the session tail then
             # finalizes the live row in place (no duplicate); the child
             # never re-prints a thinking whose fragments already went out.
-            body = stripped[len(THINKING_DELTA_PREFIX):]
+            unclosed = stripped.startswith(THINKING_DELTA_PREFIX_UNCLOSED)
+            body = stripped[
+                len(THINKING_DELTA_PREFIX_UNCLOSED if unclosed else THINKING_DELTA_PREFIX):
+            ]
             fresh = self._stream_thinking_row is None
-            self._apply_stream_thinking(body + "\n" if line.endswith("\n") else body)
+            self._apply_stream_thinking(
+                body if unclosed or not line.endswith("\n") else body + "\n"
+            )
             # The tail is pumped AFTER the delta is applied, and only when
             # this line MOUNTED the live row: a NON-streamed reasoning
             # prints this same line as its completed event (the session

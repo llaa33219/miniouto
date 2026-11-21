@@ -2562,7 +2562,10 @@ def test_thinking_deltas_render_live_and_finalize_without_duplicates(
             return data
 
         def _build(self) -> None:
-            from miniouto.core.events import THINKING_DELTA_PREFIX
+            from miniouto.core.events import (
+                THINKING_DELTA_PREFIX,
+                THINKING_DELTA_PREFIX_UNCLOSED,
+            )
             from miniouto.storage import sessions as store
 
             def write(events: list[LoopEvent]) -> None:
@@ -2572,8 +2575,9 @@ def test_thinking_deltas_render_live_and_finalize_without_duplicates(
             answer = "the final answer"
             # Fragments as the provider fires them: a lone line, a BLANK
             # line (content — the fragment carried its own line break), and
-            # a tail the child ends mid-line — exactly the shapes
-            # `emit_stream_delta` writes one prefixed physical line for.
+            # fragments with no newline of their own — framed exactly the
+            # way `emit_stream_delta` writes them (a newline-less fragment
+            # ends on the unclosed mark, so the reader re-adds no newline).
             self._reads = [
                 (
                     f"------{self._proc._parse()[1]}------\n".encode(),
@@ -2582,12 +2586,12 @@ def test_thinking_deltas_render_live_and_finalize_without_duplicates(
                 ((THINKING_DELTA_PREFIX + "step one\n").encode(), None),
                 ((THINKING_DELTA_PREFIX + "\n").encode(), None),
                 (
-                    (THINKING_DELTA_PREFIX + "step two is").encode(),
+                    (THINKING_DELTA_PREFIX_UNCLOSED + "step two is\n").encode(),
                     lambda: write([LoopEvent(actor="outo", kind="thinking", text=reasoning)]),
                 ),
                 # --- gated tail: the message completes ---
                 (
-                    (THINKING_DELTA_PREFIX + " longer\n").encode(),
+                    (THINKING_DELTA_PREFIX_UNCLOSED + " longer\n").encode(),
                     lambda: write(
                         [
                             LoopEvent(actor="outo", kind="thinking", text=reasoning),
@@ -2662,6 +2666,381 @@ def test_thinking_deltas_render_live_and_finalize_without_duplicates(
             ]
             assert len(answers) == 1, [tui_harness.row_text(r) for r in rows]
             assert app._busy is False
+
+    asyncio.run(body())
+
+
+def test_live_thinking_reassembles_fragments_without_fake_newlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect (early line breaks): fragment boundaries became newlines.
+
+    The old framing wrote every fragment as `outo:thinking: <line>\n` —
+    one prefixed physical line per line of the fragment — and the reader
+    re-added a newline per physical line, so EVERY fragment boundary turned
+    into a line break (`"The"` + `" user asks:"` reassembled as
+    `"The\n user asks:"`): the live ThinkingRow wrapped mid-word while the
+    model was still generating, then snapped correct at the finalize. The
+    newline a newline-less fragment ends on is the unclosed mark now, so
+    the live row holds byte-for-byte the reasoning the fragments carried.
+    """
+
+    reasoning = (
+        'The user asks: "Think briefly about 2+2, then answer." '
+        "한글 reasoning 스트리밍 중간에 끊김 없이"
+    )
+
+    class _FramedChild(tui_harness._FakeChatProcess):
+        def __init__(self, argv: list[str]) -> None:
+            self.argv = argv
+            self.returncode: int | None = None
+            self.stdout = _FramedReader(self)
+            self.stderr = tui_harness._FakeStreamReader(b"")
+
+        def _parse(self) -> tuple[str, str, bool]:
+            return tui_harness._FakeChatProcess._parse(self)  # type: ignore[arg-type]
+
+        def send_signal(self, _sig: int) -> None:  # pragma: no cover
+            self.returncode = 130
+
+        async def wait(self) -> int:
+            return self.returncode if self.returncode is not None else 0
+
+    class _FramedReader:
+        """One read per fragment the REAL sink flushed, gated mid-stream.
+
+        The fragments are fed through `ConsoleEventSink.emit_stream_delta`
+        itself — the test then pins the reader against exactly what the
+        child writes — one flush per read, like the pipe the wrapper owns.
+        The stream is GATED after the last fragment: the live row is then
+        observed BEFORE the whole-text event finalizes it, which is the
+        state where the fake newlines showed.
+        """
+
+        _FRAGMENTS = (
+            "The user asks: \"Think",
+            " briefly about 2+2, then answer.\" ",
+            "한글 reasoning ",
+            "스트리밍 중",
+            "간에 끊김 없이",
+        )
+
+        def __init__(self, proc: _FramedChild) -> None:
+            self._proc = proc
+            self._sink: Any = None
+            self._i = -1
+            self._tail_open = asyncio.Event()
+
+        def release_tail(self) -> None:
+            self._tail_open.set()
+
+        def _emit(self, *calls: Any) -> bytes:
+            import io as _io
+            from contextlib import redirect_stdout as _redirect
+
+            buf = _io.StringIO()
+            with _redirect(buf):
+                for call in calls:
+                    call()
+            return buf.getvalue().encode()
+
+        async def read(self, _n: int = -1) -> bytes:
+            from miniouto.core.events import ConsoleEventSink
+            from miniouto.storage import sessions as store
+
+            self._i += 1
+            prompt, session, _c = self._proc._parse()
+            if self._i == 0:
+                store.begin_turn(session, prompt)
+                self._sink = ConsoleEventSink()
+                return f"------{session}------\n".encode()
+            if self._i <= len(self._FRAGMENTS):
+                fragment = self._FRAGMENTS[self._i - 1]
+                return self._emit(
+                    lambda: self._sink.emit_stream_delta("thinking", fragment)
+                )
+            if self._i == len(self._FRAGMENTS) + 1:
+                await self._tail_open.wait()
+                store.update_turn_events(
+                    session,
+                    [LoopEvent(actor="outo", kind="thinking", text=reasoning).to_dict()],
+                )
+                return self._emit(
+                    lambda: self._sink.emit_loop_event(
+                        LoopEvent(actor="outo", kind="thinking", text=reasoning)
+                    )
+                )
+            store.finish_turn(session, assistant="done")
+            self._proc.returncode = 0
+            return b"done\n------finish------\n"
+
+    current: list[_FramedChild] = []
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        child = _FramedChild(list(argv))
+        current.append(child)
+        return child
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-thinking-roundtrip")
+            app._input.text = "think"
+            await pilot.press("enter")
+            # While the reasoning is still streaming (the gate holds the
+            # completion): the live row holds EXACTLY the fragments'
+            # concatenation — no newline the framing invented, none it
+            # swallowed — and it is still in its live state.
+            for _ in range(600):
+                await pilot.pause(0.005)
+                live = [
+                    r
+                    for r in app._window.rows
+                    if isinstance(r, ThinkingRow) and r.streaming
+                ]
+                if live and live[0].thinking == reasoning:
+                    break
+            live = [r for r in app._window.rows if isinstance(r, ThinkingRow)]
+            assert live, "no live ThinkingRow while the reasoning streamed"
+            assert live[0].streaming is True
+            assert live[0].thinking == reasoning, repr(live[0].thinking)
+
+            # Release the gated tail (the message completes) and settle:
+            # ONE finalized row, still byte for byte the reasoning.
+            assert current, "no child was spawned"
+            current[0].stdout.release_tail()
+            for _ in range(600):
+                await pilot.pause(0.005)
+                if not app._busy:
+                    break
+            rows = [r for r in app._window.rows if isinstance(r, ThinkingRow)]
+            assert len(rows) == 1, [tui_harness.row_text(r) for r in app._window.rows]
+            assert rows[0].thinking == reasoning
+
+    asyncio.run(body())
+
+
+def test_a_tool_turn_keeps_every_messages_thinking_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect (lost/duplicated rows): the tail cursor left the running turn.
+
+    A tool turn is TWO messages — reasoning, a tool call, then reasoning
+    again — and the session file's running turn gains the second message's
+    events seconds after the first. The old pump guard only stopped on a
+    running turn with NO events yet, so the first pump advanced the cursor
+    past the turn; the second streamed reasoning's whole-text `thinking`
+    event was never delivered, its live row never finalized, and the
+    finish sweep deleted it (or it duplicated, by timing). The cursor stays
+    ON the running turn now — advancing only through its events — so each
+    message's ThinkingRow is finalized in place.
+    """
+
+    first_reasoning = "first message reasoning"
+    second_reasoning = "second message reasoning after the tool"
+    tool_call = "Bash ls"
+
+    class _ToolTurnChild(tui_harness._FakeChatProcess):
+        def __init__(self, argv: list[str]) -> None:
+            self.argv = argv
+            self.returncode: int | None = None
+            self.stdout = _ToolTurnReader(self)
+            self.stderr = tui_harness._FakeStreamReader(b"")
+
+        def _parse(self) -> tuple[str, str, bool]:
+            return tui_harness._FakeChatProcess._parse(self)  # type: ignore[arg-type]
+
+        def send_signal(self, _sig: int) -> None:  # pragma: no cover
+            self.returncode = 130
+
+        async def wait(self) -> int:
+            return self.returncode if self.returncode is not None else 0
+
+    class _ToolTurnReader:
+        """A tool turn as the CLI writes it: one read per flush.
+
+        Like the real child, the session file is updated BEFORE the stdout
+        line that mirrors it prints (the persister runs ahead of the
+        printer), and the turn keeps `running` until the run ends.
+        """
+
+        def __init__(self, proc: _ToolTurnChild) -> None:
+            self._proc = proc
+            self._reads: list[tuple[bytes, Any]] = []
+            self._i = 0
+            self._gate = asyncio.Event()
+            self._gate.set()
+
+        def _build(self) -> None:
+            from miniouto.core.events import THINKING_DELTA_PREFIX_UNCLOSED
+            from miniouto.storage import sessions as store
+
+            def write(events: list[LoopEvent]) -> None:
+                _p, session, _c = self._proc._parse()
+                store.update_turn_events(session, [e.to_dict() for e in events])
+
+            _p, session, _c = self._proc._parse()
+            marker = f"------{session}------\n".encode()
+            answer = "the answer after the tool"
+            self._reads = [
+                (marker, lambda: store.begin_turn(session, self._proc._parse()[0])),
+                # Message 1: its reasoning streams live…
+                (
+                    (THINKING_DELTA_PREFIX_UNCLOSED + first_reasoning + "\n").encode(),
+                    lambda: write(
+                        [LoopEvent(actor="outo", kind="thinking", text=first_reasoning)]
+                    ),
+                ),
+                # …the loop flushes it and calls the tool (more events land
+                # on the SAME running turn — the second read's write).
+                (
+                    (THINKING_DELTA_PREFIX_UNCLOSED + " tool now\n").encode(),
+                    lambda: write(
+                        [
+                            LoopEvent(actor="outo", kind="thinking", text=first_reasoning),
+                            LoopEvent(
+                                actor="outo",
+                                kind="response",
+                                text="tool narration",
+                                msg_ref="m1",
+                            ),
+                            LoopEvent(actor="outo", kind="context", text="iter 1", msg_ref="m1"),
+                            LoopEvent(
+                                actor="outo",
+                                kind="tool",
+                                text=tool_call,
+                                tool_name="Bash",
+                                msg_ref="m1",
+                            ),
+                        ]
+                    ),
+                ),
+                # Message 2: the tool returned, the model reasons again —
+                # a live row mounts and the file gains its events next.
+                (
+                    (THINKING_DELTA_PREFIX_UNCLOSED + second_reasoning + "\n").encode(),
+                    lambda: write(
+                        [
+                            LoopEvent(actor="outo", kind="thinking", text=first_reasoning),
+                            LoopEvent(
+                                actor="outo",
+                                kind="response",
+                                text="tool narration",
+                                msg_ref="m1",
+                            ),
+                            LoopEvent(actor="outo", kind="context", text="iter 1", msg_ref="m1"),
+                            LoopEvent(
+                                actor="outo",
+                                kind="tool",
+                                text=tool_call,
+                                tool_name="Bash",
+                                msg_ref="m1",
+                            ),
+                            LoopEvent(
+                                actor="outo",
+                                kind="tool_result",
+                                text="ok",
+                                msg_ref="m1",
+                            ),
+                            LoopEvent(
+                                actor="outo",
+                                kind="thinking",
+                                text=second_reasoning,
+                                msg_ref="m2",
+                            ),
+                        ]
+                    ),
+                ),
+                # The turn completes: the final message's events + done.
+                (
+                    answer.encode() + b"\n------finish------\n",
+                    lambda: (
+                        write(
+                            [
+                                LoopEvent(actor="outo", kind="thinking", text=first_reasoning),
+                                LoopEvent(
+                                    actor="outo",
+                                    kind="response",
+                                    text="tool narration",
+                                    msg_ref="m1",
+                                ),
+                                LoopEvent(actor="outo", kind="context", text="iter 1", msg_ref="m1"),
+                                LoopEvent(
+                                    actor="outo",
+                                    kind="tool",
+                                    text=tool_call,
+                                    tool_name="Bash",
+                                    msg_ref="m1",
+                                ),
+                                LoopEvent(
+                                    actor="outo",
+                                    kind="tool_result",
+                                    text="ok",
+                                    msg_ref="m1",
+                                ),
+                                LoopEvent(
+                                    actor="outo",
+                                    kind="thinking",
+                                    text=second_reasoning,
+                                    msg_ref="m2",
+                                ),
+                                LoopEvent(
+                                    actor="outo",
+                                    kind="response",
+                                    text=answer,
+                                    msg_ref="m2",
+                                ),
+                                LoopEvent(actor="outo", kind="context", text="iter 2", msg_ref="m2"),
+                            ]
+                        ),
+                        store.finish_turn(session, assistant=answer),
+                    ),
+                ),
+            ]
+
+        async def read(self, _n: int = -1) -> bytes:
+            if not self._reads:
+                self._build()
+            if self._i >= len(self._reads):
+                return b""
+            data, before = self._reads[self._i]
+            if before is not None:
+                before()
+            self._i += 1
+            return data
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> Any:
+        return _ToolTurnChild(list(argv))
+
+    async def body() -> None:
+        monkeypatch.setattr(
+            tui_module.bridge, "asyncio_create_subprocess_exec", fake_exec
+        )
+        app = ChatTUI()
+        async with app.run_test(size=BOOT) as pilot:
+            await pilot.pause()
+            tui_harness.pin_session(app, "app-tool-turn-thinking")
+            app._input.text = "use the tool"
+            await pilot.press("enter")
+            for _ in range(600):
+                await pilot.pause(0.005)
+                if not app._busy:
+                    break
+
+            rows = app._window.rows
+            thinking = [r for r in rows if isinstance(r, ThinkingRow)]
+            texts = [t.thinking for t in thinking]
+            # BOTH messages' reasonings survived — one ThinkingRow each,
+            # finalized in place, none lost to the sweep nor duplicated.
+            assert len(thinking) == 2, [tui_harness.row_text(r) for r in rows]
+            assert texts == [first_reasoning, second_reasoning], texts
+            assert all(not t.streaming for t in thinking)
+            # And the cursor never left the running turn before it closed.
+            assert app._tail_cursors["app-tool-turn-thinking"] == (1, 0)
 
     asyncio.run(body())
 
