@@ -36,6 +36,7 @@ from miniouto.cli.tui.widgets import (
     TOP_LOAD_LINES,
     WINDOW_CHUNK_ROWS,
     WINDOW_INITIAL_ROWS,
+    WINDOW_LOAD_CHUNKS_PER_FRAME,
     WINDOW_MAX_ROWS,
     BottomPanel,
     ChatInput,
@@ -837,7 +838,7 @@ def test_a_bulk_fill_mounts_only_the_trailing_window() -> None:
     assert window.first == 50
 
 
-def test_scrolling_to_the_top_loads_a_chunk_of_older_rows() -> None:
+def test_scrolling_to_the_top_loads_a_batch_of_older_rows() -> None:
     log = ChatScroll()
     log.theme = THEME
     log.resize(80, 10)
@@ -845,11 +846,14 @@ def test_scrolling_to_the_top_loads_a_chunk_of_older_rows() -> None:
     for index in range(200):
         window.append(log, EventRow(f"row {index}"), defer_mount=True)
     window.mount_tail(log)
-    mounted = len(log.rows)
     window.maybe_load_older(log, TOP_LOAD_LINES)
-    assert len(log.rows) == mounted + WINDOW_CHUNK_ROWS
-    assert window.first == 50
+    # One trigger loads a bounded BATCH (a single chunk left a Home-pinned
+    # view stuck: no scroll CHANGE ever fired the next load), capped so a
+    # trigger never mounts the whole history at once.
+    assert window.first == 0
+    assert len(log.rows) == 200
     # Above the threshold nothing loads
+    window.first = 50
     window.maybe_load_older(log, TOP_LOAD_LINES + 1)
     assert window.first == 50
 
@@ -864,6 +868,59 @@ def test_the_window_evicts_rows_far_above_the_viewport() -> None:
         window.append(log, EventRow(f"row {index}"))
     assert window.first > 0, "nothing was evicted from the top"
     assert len(window.rows) - window.first <= WINDOW_MAX_ROWS
+
+
+def test_one_top_edge_trigger_loads_a_bounded_batch() -> None:
+    """Regression: a single-chunk load left a Home-pinned view stalled.
+
+    ``_set_scroll`` only reports CHANGES and a top-edge load keeps the view at
+    ``scroll_y == 0``, so nothing fired the next load — the true top of the
+    session was unreachable no matter how many times the user hit Home. One
+    trigger now loads a capped BATCH, so the top is reached in a few triggers
+    without ever mounting the whole history in one frame.
+    """
+
+    log = ChatScroll()
+    log.theme = THEME
+    log.resize(80, 10)
+    window = _RowWindow()
+    for index in range(WINDOW_INITIAL_ROWS + 5 * WINDOW_CHUNK_ROWS):
+        window.append(log, EventRow(f"row {index}"), defer_mount=True)
+    window.mount_tail(log)
+    mounted = len(log.rows)
+    window.maybe_load_older(log, 0)
+    loaded = mounted + WINDOW_CHUNK_ROWS * WINDOW_LOAD_CHUNKS_PER_FRAME
+    assert len(log.rows) == loaded
+    # The batch is capped: 5 chunks remained, but only the batch loaded.
+    assert window.first == 3 * WINDOW_CHUNK_ROWS
+    # Repeating the trigger walks the rest of the way to the true top.
+    for _ in range(WINDOW_LOAD_CHUNKS_PER_FRAME + 1):
+        window.maybe_load_older(log, 0)
+    assert window.first == 0
+    assert len(log.rows) == len(window.rows)
+
+
+def test_evicted_rows_reload_when_the_view_returns_to_the_top() -> None:
+    """Regression: after an evict, scrolling back up must remount the rows."""
+
+    log = ChatScroll()
+    log.theme = THEME
+    log.resize(80, 10)
+    log.anchor()
+    window = _RowWindow()
+    for index in range(WINDOW_MAX_ROWS + 100):
+        window.append(log, EventRow(f"row {index}"))
+    assert window.first > 0, "nothing was evicted: the test is vacuous"
+    log.scroll_home(animate=False)
+    window.maybe_load_older(log, log.scroll_y)
+    for _ in range(10):
+        if window.first == 0:
+            break
+        window.maybe_load_older(log, log.scroll_y)
+    assert window.first == 0
+    assert len(log.rows) == len(window.rows)
+    # And the first row of the session is the first mounted row again.
+    assert log.rows[0] is window.rows[0]
 
 
 def test_removing_a_row_keeps_first_aligned() -> None:

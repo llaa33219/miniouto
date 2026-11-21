@@ -908,6 +908,8 @@ class ChatTUI:
         self._wizard_working = False
         self._update_notice: str | None = None
         self._inbox_timer: Timer | None = None
+        self._top_load_timer: Timer | None = None
+        """Keeps a top-pinned view loading older chunks until first == 0."""
 
         # ── runtime plumbing ──────────────────────────────────────────────
         self._timers: list[Timer] = []
@@ -1649,6 +1651,7 @@ class ChatTUI:
             timer.stop()
         self._timers.clear()
         self._inbox_timer = None
+        self._top_load_timer = None
         self._spin_timer = None
         self._workers.cancel_all()
         await asyncio.gather(*list(self._workers), return_exceptions=True)
@@ -1937,11 +1940,15 @@ class ChatTUI:
 
     def action_page_up(self) -> None:
         self._log.scroll_page_up(animate=False)
+        self._keep_top_load_pumping()
 
     def action_page_down(self) -> None:
         self._log.scroll_page_down(animate=False)
 
     def action_scroll_home(self) -> None:
+        # Home means THE TOP of the session, not the top of the mounted window:
+        # arm the pump that keeps loading older chunks while the pin holds.
+        self._arm_top_load_pump()
         self._log.scroll_home(animate=False)
 
     def action_scroll_end(self) -> None:
@@ -1950,6 +1957,8 @@ class ChatTUI:
     def scroll_wheel(self, lines: int) -> None:
         """Wheel scrolling: negative scrolls up (one detent = WHEEL_LINES)."""
         self._log.scroll_by(lines)
+        if lines < 0:
+            self._keep_top_load_pumping()
 
     def _route_wheel(self, event: Mouse) -> bool:
         """A wheel detent: the modal on top owns it, else the log scrolls.
@@ -1967,11 +1976,68 @@ class ChatTUI:
 
     def _on_log_scroll(self, scroll_y: float) -> None:
         self._window.maybe_load_older(self._log, scroll_y)
+        # A scroll back toward the tail releases rows far above the viewport:
+        # evict ran only on append before, so a Home that loaded the whole
+        # history kept every row mounted after the view returned to the tail.
+        self._window.evict(self._log)
         self._sync_jump_button()
+        # A load that keeps the view AT 0 (the Home/wheel-up pin) leaves nothing
+        # for the next scroll event to change, so the chain above would stop
+        # after one batch: arm the per-frame pump while the pin holds.
+        if scroll_y <= 0 and self._window.first > 0:
+            self._arm_top_load_pump()
+
 
     def _sync_jump_button(self) -> None:
         """Show the jump button exactly when the log is away from the tail."""
         self._jump.sync()
+
+    def _arm_top_load_pump(self) -> None:
+        """Start the per-frame chunk pump for a view pinned at the log's top.
+
+        Home (and a wheel-up that lands at ``scroll_y == 0``) means the top of
+        the SESSION, but the windowed log only mounts the trailing window: the
+        first batch of older chunks loads on the scroll event itself, and each
+        later batch needs a nudge — ``_set_scroll`` reports changes only, and
+        the loads keep the view AT 0, so no further event ever fires. The pump
+        fires once per frame, loading another bounded batch until ``first == 0``
+        (or the user scrolls away, which disarms it).
+        """
+
+        if self._top_load_timer is not None:
+            return
+        self._top_load_timer = self.set_interval(
+            _REDRAW_SECONDS, self._pump_top_load
+        )
+
+    def _pump_top_load(self) -> None:
+        window = self._window
+        log = self._log
+        # Disarm the moment the pin stops holding: the view scrolled away, the
+        # log was cleared, or the true top is mounted and the job is done.
+        if log.scroll_y > 0 or window.first <= 0:
+            self._disarm_top_load_pump()
+            return
+        window.maybe_load_older(log, log.scroll_y)
+        self._sync_jump_button()
+        self._invalidate()
+
+    def _disarm_top_load_pump(self) -> None:
+        if self._top_load_timer is not None:
+            self._top_load_timer.stop()
+            self._top_load_timer = None
+
+    def _keep_top_load_pumping(self) -> None:
+        """Arm the chunk pump when an up-scroll pinned the view at the top.
+
+        ``_set_scroll`` reports CHANGES only, so a wheel detent (or a PageUp)
+        that clamps at ``scroll_y == 0`` fires no scroll event at all: without
+        this nudge the pinned view sits at the top of the MOUNTED window
+        forever, however hard the user scrolls.
+        """
+
+        if self._log.scroll_y <= 0 and self._window.first > 0:
+            self._arm_top_load_pump()
 
     # ── rows ──────────────────────────────────────────────────────────────
     def _reset_rows(self) -> None:

@@ -53,7 +53,7 @@ import tui_harness
 from miniouto.cli import tui as tui_module
 from miniouto.cli.tui import (
     CHAT_MAX_WIDTH,
-    WINDOW_CHUNK_ROWS,
+    WINDOW_INITIAL_ROWS,
     ChatInput,
     ChatScroll,
     ChatTUI,
@@ -2569,6 +2569,12 @@ def test_home_reaches_the_top_and_stays_there_while_chunks_load() -> None:
     viewport unconditionally — but at ``scroll_y == 0`` the user has already asked
     for the very top, so each press shifted the view by another 50 rows and the
     top of the log was unreachable.
+
+    The later half of the same defect: the true top was more than ONE chunk away,
+    but a load keeps the view at ``scroll_y == 0`` and ``_set_scroll`` only
+    reports CHANGES, so nothing ever fired the next load — Home stalled at the
+    top of the MOUNTED window. The pump keeps loading until ``first == 0``:
+    Home means the top of the SESSION.
     """
 
     async def body() -> None:
@@ -2583,19 +2589,25 @@ def test_home_reaches_the_top_and_stays_there_while_chunks_load() -> None:
             await pilot.pause()
             app._input.focus()
             assert app._window.first > 0, "nothing left to load: the test is vacuous"
-            # When: Home is pressed repeatedly, each time inside the load zone
-            for _ in range(4):
-                await pilot.press("home")
+            # When: Home is pressed once
+            await pilot.press("home")
+            await pilot.pause()
+            # Then: the view stays pinned at the very top while the pump loads
+            # every remaining chunk (400 rows - 100 mounted = 6 chunks of 50)
+            for _ in range(12):
                 await pilot.pause()
-                # Then: the view stays pinned at the very top
                 assert app._log.scroll_y == 0
-            # And: the first row of the window is painted on the top log line
+                if app._window.first == 0:
+                    break
+            assert app._window.first == 0, "Home never reached the top of the session"
+            assert app._log.scroll_y == 0
+            # And: the FIRST row of the session is painted on the top log line
             app.compose(100, 30)
             top = [
                 row for row in app._log.rows if row.region.y == app._log_rect.y
             ]
             assert top, "nothing is painted on the top log line"
-            assert "r50" in top[0].build_lines(100, app.current_theme)[0][0][0]
+            assert "r0" in top[0].build_lines(100, app.current_theme)[0][0][0]
 
     asyncio.run(body())
 
@@ -2610,16 +2622,96 @@ def test_scrolling_into_the_load_zone_still_compensates() -> None:
     for index in range(200):
         window.append(log, RowStatic(f"row {index}"), defer_mount=True)
     window.mount_tail(log)
-    mounted = len(log.rows)
     # Given: the view is scrolled a little into the top-load zone, not at 0
     before = window.first
     y = 5.0
     log.scroll_to(y=y)
     window.maybe_load_older(log, y)
-    # Then: the chunk loaded AND the viewed content did not move
-    assert window.first == before - WINDOW_CHUNK_ROWS
-    assert len(log.rows) == mounted + WINDOW_CHUNK_ROWS
-    assert log.scroll_y == y + WINDOW_CHUNK_ROWS
+    # Then: the batch loaded AND the viewed content did not move — every chunk
+    # of the batch is compensated for, so the viewport is not pushed down
+    assert window.first == 0
+    assert len(log.rows) == 200
+    assert log.scroll_y == y + before
+
+
+def test_wheel_up_reaches_the_previous_turns_by_chained_loads() -> None:
+    """Regression: wheel-scrolling to the top stalled after one chunk.
+
+    A wheel-up that lands at ``scroll_y == 0`` pins the view: the load keeps it
+    there and ``_set_scroll`` reports changes only, so further detents produced
+    no scroll event and no further chunk. The pump keeps loading while the pin
+    holds, so turning the wheel up through the load zone walks back into the
+    earlier turns of the session.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            for index in range(600):
+                app._mount_row(RowStatic(f"r{index}"))
+            await pilot.pause()
+            assert app._window.first > 0, "nothing left to load: the test is vacuous"
+
+            # When: the wheel is turned UP far past the top of the mount
+            # (the window holds 300 rows at 3 lines per detent, so this is
+            # several screens of wheel travel, detents batched per frame the
+            # way a fast flick coalesces them)
+            from miniouto.cli.tui.input import Mouse as _Mouse
+
+            for _ in range(20):
+                for _ in range(10):
+                    app._handle_event(_Mouse("wheel_up", 10, 5))
+                await pilot.pause()
+            # Then: the earlier turns are reachable — the window has loaded
+            # chunks down to the true top of the session
+            assert app._log.scroll_y >= 0
+            assert app._window.first == 0, "wheel-up never reached the previous turns"
+            # And the very first row of the session is on screen
+            app.compose(100, 30)
+            top = [row for row in app._log.rows if row.region.y == app._log_rect.y]
+            assert top, "nothing is painted on the top log line"
+            assert "r0" in top[0].build_lines(100, app.current_theme)[0][0][0]
+
+    asyncio.run(body())
+
+
+def test_a_session_load_still_mounts_only_the_tail() -> None:
+    """The windowing win the pump must not cost: the bulk load stays cheap.
+
+    A long session mounts only the trailing ``WINDOW_INITIAL_ROWS`` on load;
+    loading older chunks happens solely as the user scrolls to the top. The
+    pump adds no eager mounting of its own.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            # The session-load path: rows collected with mounting deferred,
+            # then one trailing window mounted (`_load_session_history`).
+            app._bulk_loading = True
+            try:
+                for index in range(900):
+                    app._mount_row(RowStatic(f"r{index}"))
+            finally:
+                app._bulk_loading = False
+            app._mount_tail_window()
+            await pilot.pause()
+            # Only the trailing WINDOW_INITIAL_ROWS are mounted; the older 800
+            # exist as row objects and mount solely on top-edge loads.
+            assert app._window.first == 900 - WINDOW_INITIAL_ROWS
+            assert len(app._log.rows) == WINDOW_INITIAL_ROWS
+            # And the pump did not arm itself: nothing pinned the view at 0.
+            assert app._top_load_timer is None
+
+    asyncio.run(body())
 
 
 # ── reviewer defect 10: the minted session's seed (style + global default) ───

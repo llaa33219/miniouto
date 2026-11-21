@@ -63,6 +63,7 @@ __all__ = [
     "TOP_LOAD_LINES",
     "WINDOW_CHUNK_ROWS",
     "WINDOW_INITIAL_ROWS",
+    "WINDOW_LOAD_CHUNKS_PER_FRAME",
     "WINDOW_MAX_ROWS",
     "_EVICT_MARGIN_LINES",
     "_TOP_LOAD_LINES",
@@ -1438,6 +1439,15 @@ TOP_LOAD_LINES = 10
 EVICT_MARGIN_LINES = 60
 """Rows this close above the viewport are kept (they may be scrolled into)."""
 
+WINDOW_LOAD_CHUNKS_PER_FRAME = 2
+"""Chunk loads one top-edge trigger may chain before yielding a frame.
+
+A single load leaves the view stuck at ``scroll_y == 0`` with older chunks still
+unmounted: ``_set_scroll`` only reports a CHANGE, so nothing fires the next
+``maybe_load_older``. Chaining a bounded batch per trigger closes the gap while
+keeping the per-frame mount cost at a couple of chunks, not the whole history.
+"""
+
 # The old module spelled these with a leading underscore and the ported tests
 # import them that way, so the public names above keep a private alias rather than
 # forcing every caller to learn the rename.
@@ -1533,7 +1543,22 @@ class _RowWindow:
         log.scroll_end(animate=False)
 
     def maybe_load_older(self, log: ChatScroll, scroll_y: float) -> None:
-        if scroll_y <= TOP_LOAD_LINES and self.first > 0:
+        """Load older chunks when the view is at the top edge.
+
+        One trigger loads a bounded BATCH of chunks, not a single one: the load
+        keeps a Home/wheel-pinned view at ``scroll_y == 0``, and ``_set_scroll``
+        only reports CHANGES, so a single-chunk load left the chain broken —
+        the view pinned at the top of the mounted window with the true top of
+        the session (``first == 0``) unreachable. The batch is capped so a
+        trigger stays cheap; whatever remains loads on the next trigger (the
+        app pumps a stuck-at-top view once per frame until it arrives).
+        """
+
+        if scroll_y > TOP_LOAD_LINES:
+            return
+        for _ in range(WINDOW_LOAD_CHUNKS_PER_FRAME):
+            if self.first <= 0:
+                return
             self._load_older(log)
 
     def _load_older(self, log: ChatScroll) -> None:
