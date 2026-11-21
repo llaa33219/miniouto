@@ -26,7 +26,7 @@ From `README.md`:
 
 ```
 src/miniouto/
-├── __init__.py              # __version__ = "0.12.9"
+├── __init__.py              # __version__ = "0.13.0"
 ├── paths_runtime.py         # INVOCATION_CWD: Path  (captured cwd at import)
 ├── cli/                     # Typer commands + xnano TUI (cli/tui/ package — a CLI wrapper;
 │                            #   cli/tui/bridge.py is its one subprocess lane)
