@@ -980,7 +980,7 @@ def test_a_top_edge_load_keeps_the_row_the_view_was_showing() -> None:
 
 
 def test_a_home_pinned_load_still_skips_the_compensation() -> None:
-    """The other half: at scroll_y == 0 the compensation stays SKIPPED.
+    """The other half: a PINNED load at scroll_y == 0 stays SKIPPED.
 
     Home means the very top of the session; compensating there would walk the
     viewport DOWN by a chunk per load and the top would never be reached.
@@ -999,6 +999,76 @@ def test_a_home_pinned_load_still_skips_the_compensation() -> None:
         assert log.scroll_y == 0
     assert window.first == 0, "Home never reached the top of the session"
     assert log.rows[0] is window.rows[0]
+
+
+def test_a_clamped_page_up_load_compensates_at_scroll_y_zero() -> None:
+    """Regression: a PageUp clamped at scroll_y == 0 lost the viewed row.
+
+    A page-up clamps at the ceiling of the MOUNTED window, which lands the
+    view at ``scroll_y == 0`` — the same number Home lands on. The load's
+    compensation used to be gated on ``scroll_y > 0``, so a clamped press
+    skipped it: every older chunk mounted ABOVE the view dragged the
+    viewport (and the pump, armed by the same ``scroll_y <= 0`` test) to
+    the very top of the session. The gate is the Home PIN now, not the
+    position: without it, a clamped load compensates like any other.
+    """
+
+    log = ChatScroll()
+    log.theme = THEME
+    log.resize(80, 10)
+    window = _RowWindow()
+    for index in range(300):
+        window.append(log, EventRow(f"row {index}"), defer_mount=True)
+    window.mount_tail(log)
+    # Given: the view was pushed onto the ceiling by a page-up CLAMP —
+    # scroll_y == 0, but Home was never pressed (pin_to_top is False)
+    log.release_anchor()
+    log.scroll_to(y=0)
+    assert log.scroll_y == 0 and log.pin_to_top is False
+    watched = log.rows[0]
+    # When: the top-edge trigger loads a batch of older chunks
+    window.maybe_load_older(log, log.scroll_y)
+    # Then: the viewed row holds its place — the load compensated, so the
+    # chunks mounting above pushed the viewport down by exactly their height
+    offset = 0
+    for row in log.rows:
+        if row is watched:
+            break
+        offset += max(1, log._row_height(row))
+    assert offset == log.scroll_y, "the clamped load dragged the view to the top"
+    assert log.scroll_y == WINDOW_CHUNK_ROWS * WINDOW_LOAD_CHUNKS_PER_FRAME
+    assert window.first == 200 - WINDOW_CHUNK_ROWS * WINDOW_LOAD_CHUNKS_PER_FRAME
+
+
+def test_only_scroll_home_pins_the_top() -> None:
+    """Home is the one navigation that means the very top of the session.
+
+    ``scroll_y == 0`` is also where a PageUp or wheel-up CLAMPS, so the
+    position alone cannot carry the intent: the pin is set by scroll_home
+    alone and dropped by every other navigation — including the ones that
+    merely land on 0.
+    """
+
+    log = ChatScroll()
+    log.theme = THEME
+    log.resize(80, 10)
+    for index in range(40):
+        log._mounted.append(EventRow(f"row {index}"))
+    assert log.pin_to_top is False
+    log.scroll_home(animate=False)
+    assert log.pin_to_top is True
+    # Every other navigation drops the pin, at 0 or anywhere else…
+    log.scroll_page_up(animate=False)
+    assert log.pin_to_top is False
+    log.scroll_home(animate=False)
+    log.scroll_page_down(animate=False)
+    assert log.pin_to_top is False
+    log.scroll_home(animate=False)
+    log.scroll_by(-3)
+    assert log.pin_to_top is False
+    log.scroll_home(animate=False)
+    log.scroll_end(animate=False)
+    assert log.pin_to_top is False
 
 
 def test_an_evicted_reload_keeps_the_row_the_view_was_showing() -> None:

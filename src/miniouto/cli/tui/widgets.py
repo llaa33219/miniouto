@@ -1162,6 +1162,14 @@ class ChatScroll(Node):
         self.content_width = DEFAULT_WIDTH
         self.on_scroll: Any = None
         """``_on_log_scroll(y)`` hook, wired by the app."""
+        # Set only by `scroll_home` and cleared by every other navigation:
+        # ``scroll_y == 0`` alone cannot say whether the user ASKED for the
+        # very top (Home) or a PageUp/wheel-up CLAMPED onto the ceiling of the
+        # mounted window. `_RowWindow._load_older` reads it to decide whether
+        # a chunk mounting above the view is Home's arrival (no compensation
+        # — the top must be reached) or a shift to counter (the row being
+        # read holds its place).
+        self.pin_to_top = False
         self._mounted: list[Node] = []
 
     # ── geometry ──────────────────────────────────────────────────────────
@@ -1231,25 +1239,38 @@ class ChatScroll(Node):
             self.scroll_y = self.max_scroll_y
 
     def scroll_to(self, x: float | None = None, y: float | None = None, **_: Any) -> None:
+        self.pin_to_top = False
         if x is not None:
             self.scroll_x = max(0, int(x))
         self._set_scroll(self.scroll_y if y is None else y)
 
     def scroll_end(self, animate: bool = False, **_: Any) -> None:
+        self.pin_to_top = False
         self._set_scroll(self.max_scroll_y)
 
     def scroll_home(self, animate: bool = False, **_: Any) -> None:
+        """THE very top, explicitly — the one navigation that pins it.
+
+        Only Home means the top of the session; a PageUp or a wheel-up that
+        CLAMPS at ``scroll_y == 0`` means one page UP through older content,
+        not the beginning. The pin is what ``_load_older`` reads to skip the
+        compensation, so the top actually arrives.
+        """
+
+        self.pin_to_top = True
         self._set_scroll(0)
 
     def scroll_page_up(self, animate: bool = False, **_: Any) -> None:
+        self.pin_to_top = False
         self._set_scroll(self.scroll_y - max(1, self.viewport_height))
 
     def scroll_page_down(self, animate: bool = False, **_: Any) -> None:
+        self.pin_to_top = False
         self._set_scroll(self.scroll_y + max(1, self.viewport_height))
 
     def scroll_by(self, lines: int) -> None:
         """Wheel scrolling: ``lines`` rows (three per detent, per the app)."""
-
+        self.pin_to_top = False
         self._set_scroll(self.scroll_y + lines)
 
     def compensate(self, lines: int) -> None:
@@ -1572,7 +1593,7 @@ class _RowWindow:
         """Load older chunks when the view is at the top edge.
 
         One trigger loads a bounded BATCH of chunks, not a single one: the load
-        keeps a Home/wheel-pinned view at ``scroll_y == 0``, and ``_set_scroll``
+        keeps a HOME-PINNED view at ``scroll_y == 0``, and ``_set_scroll``
         only reports CHANGES, so a single-chunk load left the chain broken —
         the view pinned at the top of the mounted window with the true top of
         the session (``first == 0``) unreachable. The batch is capped so a
@@ -1605,15 +1626,18 @@ class _RowWindow:
             else:
                 log.mount(row, before=anchor)
             added += self._height(row, log)
-        # Compensate the shift the new chunk put above the viewport — but only
-        # for a view that was scrolled INTO the load zone. At scroll_y == 0 the
-        # user asked for the very top (Home), and compensating there walks the
-        # viewport DOWN by a chunk on every press, so the top of the log is
+        # Compensate the shift the new chunk put above the viewport — for
+        # every load except an explicit Home. At ``scroll_y == 0`` WITHOUT
+        # the pin the view was pushed onto the ceiling by a PageUp/wheel
+        # clamp, and the rows mounting above must not drag the row being
+        # read along: compensate, or the view jumps a whole chunk per
+        # press. With the pin held (Home), compensating would walk the
+        # viewport DOWN by a chunk on every load, so the top of the log is
         # never actually reached. The correction goes through `compensate`,
         # never `scroll_to`: it is geometry bookkeeping, not navigation, and
         # must not touch the follow pin (a target clamped down to the stale
         # tail re-pinned it, and the next mount yanked the view to the bottom).
-        if added and log.scroll_y > 0:
+        if added and not log.pin_to_top:
             log.compensate(added)
 
     def evict(self, log: ChatScroll) -> None:

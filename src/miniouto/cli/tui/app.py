@@ -1939,7 +1939,14 @@ class ChatTUI:
             self.clear_selection()
 
     def action_page_up(self) -> None:
+        before = self._log.scroll_y
         self._log.scroll_page_up(animate=False)
+        # A press that clamps at the ceiling of the MOUNTED window has moved
+        # the view short of a page — and the clamp-triggered load just
+        # mounted older rows above the view, compensated so the viewed
+        # content held still. Finish the page through that new content:
+        # PgUp means `one page up`, never Home's very top.
+        self._hop_clamped_up(before, max(1, self._log.viewport_height))
         self._keep_top_load_pumping()
 
     def action_page_down(self) -> None:
@@ -1956,9 +1963,32 @@ class ChatTUI:
 
     def scroll_wheel(self, lines: int) -> None:
         """Wheel scrolling: negative scrolls up (one detent = WHEEL_LINES)."""
+        before = self._log.scroll_y if lines < 0 else 0
         self._log.scroll_by(lines)
         if lines < 0:
+            # Same as PageUp: a detent that clamps at the mounted window's
+            # ceiling must still travel its rows — through the chunk the
+            # clamp just loaded, compensated, above the view.
+            self._hop_clamped_up(before, WHEEL_LINES)
             self._keep_top_load_pumping()
+
+    def _hop_clamped_up(self, before: float, step: int) -> None:
+        """Finish an up-scroll step that clamped at the mounted window's top.
+
+        `before` is the scroll position the step started from. A clamp means
+        the step travelled less than its full distance (`min(before, step)`
+        rows): the load it triggered mounted older rows ABOVE the view and
+        compensated, so the content on screen held still — the missing
+        distance is right there, newly mounted. Walk it, and an up-scroll
+        always means `one step through older content`, not `the very top`:
+        that is Home alone, which pins (`scroll_home`) and whose loads are
+        never compensated nor hopped.
+        """
+
+        travelled = min(before, step)
+        if travelled >= step:
+            return
+        self._log.scroll_by(-(step - int(travelled)))
 
     def _route_wheel(self, event: Mouse) -> bool:
         """A wheel detent: the modal on top owns it, else the log scrolls.
@@ -1981,10 +2011,10 @@ class ChatTUI:
         # history kept every row mounted after the view returned to the tail.
         self._window.evict(self._log)
         self._sync_jump_button()
-        # A load that keeps the view AT 0 (the Home/wheel-up pin) leaves nothing
-        # for the next scroll event to change, so the chain above would stop
-        # after one batch: arm the per-frame pump while the pin holds.
-        if scroll_y <= 0 and self._window.first > 0:
+        # A Home load that keeps the view AT 0 leaves nothing for the next
+        # scroll event to change, so the chain above would stop after one
+        # batch: arm the per-frame pump while the pin holds.
+        if scroll_y <= 0 and self._log.pin_to_top and self._window.first > 0:
             self._arm_top_load_pump()
 
 
@@ -1995,13 +2025,13 @@ class ChatTUI:
     def _arm_top_load_pump(self) -> None:
         """Start the per-frame chunk pump for a view pinned at the log's top.
 
-        Home (and a wheel-up that lands at ``scroll_y == 0``) means the top of
-        the SESSION, but the windowed log only mounts the trailing window: the
-        first batch of older chunks loads on the scroll event itself, and each
-        later batch needs a nudge — ``_set_scroll`` reports changes only, and
-        the loads keep the view AT 0, so no further event ever fires. The pump
-        fires once per frame, loading another bounded batch until ``first == 0``
-        (or the user scrolls away, which disarms it).
+        Home means the top of the SESSION, but the windowed log only mounts
+        the trailing window: the first batch of older chunks loads on the
+        scroll event itself, and each later batch needs a nudge —
+        ``_set_scroll`` reports changes only, and the Home-pinned loads keep
+        the view AT 0, so no further event ever fires. The pump fires once
+        per frame, loading another bounded batch until ``first == 0`` (or the
+        pin drops, which disarms it).
         """
 
         if self._top_load_timer is not None:
@@ -2030,13 +2060,13 @@ class ChatTUI:
     def _keep_top_load_pumping(self) -> None:
         """Arm the chunk pump when an up-scroll pinned the view at the top.
 
-        ``_set_scroll`` reports CHANGES only, so a wheel detent (or a PageUp)
-        that clamps at ``scroll_y == 0`` fires no scroll event at all: without
-        this nudge the pinned view sits at the top of the MOUNTED window
-        forever, however hard the user scrolls.
+        ``_set_scroll`` reports CHANGES only, and a Home-pinned load keeps
+        the view at ``scroll_y == 0``, so no further event ever fires: the
+        pump is the nudge. An up-scroll that merely CLAMPED at 0 (PgUp,
+        wheel) never arms it — its loads compensate instead.
         """
 
-        if self._log.scroll_y <= 0 and self._window.first > 0:
+        if self._log.pin_to_top and self._log.scroll_y <= 0 and self._window.first > 0:
             self._arm_top_load_pump()
 
     # ── rows ──────────────────────────────────────────────────────────────

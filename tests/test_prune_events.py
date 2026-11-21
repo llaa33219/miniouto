@@ -586,6 +586,8 @@ class _FakeLog:
         self.mounted: list[Any] = []
         self.scroll_y = 0.0
         self.max_scroll_y = 0.0
+        # The harness log's top pin: False, because no Home pressed here.
+        self.pin_to_top = False
 
     def mount(self, widget: Any, before: Any = None) -> None:
         self.mounted.append(widget)
@@ -601,6 +603,10 @@ class _FakeLog:
 
     def scroll_to(self, y: float, animate: bool = False) -> None:
         self.scroll_y = y
+
+    def compensate(self, lines: int) -> None:
+        # The harness log's clamp: a shift that lands below 0 stays at 0.
+        self.scroll_y = max(0.0, self.scroll_y + lines)
 
     def scroll_end(self, animate: bool = False) -> None:
         self.scroll_y = 0.0

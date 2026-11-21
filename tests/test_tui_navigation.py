@@ -2777,6 +2777,74 @@ def test_wheel_up_through_a_chunk_load_keeps_the_row_on_screen() -> None:
     asyncio.run(body())
 
 
+def test_page_up_walks_back_through_the_turns_one_page_at_a_time() -> None:
+    """Regression: a PageUp that clamped at scroll_y == 0 jumped to the top.
+
+    PageUp clamps at the ceiling of the MOUNTED window, landing on
+    ``scroll_y == 0`` — the number Home pins. The load's compensation
+    was gated on ``scroll_y > 0``, so the clamped press skipped it and
+    every older chunk mounted above the view dragged the read row away
+    (measured: q272 → a133); the pump, armed by the same test, then
+    hauled the view to the very top of the session. A clamped press
+    compensates and finishes its page now, so each PageUp moves the view
+    EXACTLY one viewport up — Home alone still reaches ``first == 0``.
+    """
+
+    async def body() -> None:
+        app = ChatTUI()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app._log.remove_children()
+            app._reset_rows()
+            app._logo_shown = False
+            app._bulk_loading = True
+            try:
+                for index in range(900):
+                    app._mount_row(RowStatic(f"r{index}"))
+            finally:
+                app._bulk_loading = False
+            app._mount_tail_window()
+            await pilot.pause()
+            app._input.focus()
+            page = app._log_rect.height
+
+            # When: PageUp is pressed repeatedly through many chunk loads
+            for press in range(1, 61):
+                app.compose(app.size.width, app.size.height)
+                top_y = app._log_rect.y
+                before = next(r for r in app._log.rows if r.region.y == top_y)
+                before_index = app._window.rows.index(before)
+                await pilot.press("pageup")
+                await pilot.pause()
+                # Then: exactly ONE page up per press, never a chunk jump
+                app.compose(app.size.width, app.size.height)
+                after = next(r for r in app._log.rows if r.region.y == top_y)
+                moved = before_index - app._window.rows.index(after)
+                at_top = app._window.first == 0 and app._log.scroll_y == 0
+                assert moved == page or (at_top and moved < page), (
+                    f"press {press}: moved {moved}, not {page}"
+                )
+                if at_top:
+                    break
+            # And: the walk reached the true top of the session, one page
+            # per press — PgUp, like the wheel, can still get there.
+            assert app._window.first == 0, "PageUp never reached the previous turns"
+
+            # And: Home still means the very top — pinned, pump-driven
+            app._log.scroll_end(animate=False)
+            await pilot.pause()
+            await pilot.press("home")
+            for _ in range(14):
+                await pilot.pause()
+                assert app._log.scroll_y == 0
+                if app._window.first == 0:
+                    break
+            assert app._log.scroll_y == 0
+            assert app._window.first == 0, "Home lost the top of the session"
+
+    asyncio.run(body())
+
+
 def _row_offset(app: ChatTUI, row: Any) -> int | None:
     """The row's offset from the top of the mounted window (None if evicted)."""
 
