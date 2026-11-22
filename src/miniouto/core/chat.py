@@ -680,6 +680,10 @@ async def _run_with_watchdog(
 
 _MEDIA_BLOCK_TYPES = ("image", "video", "audio", "document")
 
+# openai-response's tool-result wire block spellings (anthropic's are the
+# plain names above); flattened with the same text/media semantics.
+_WIRE_TEXT_BLOCK_TYPES = ("input_text", "input_image", "input_file")
+
 
 def _flatten_media_blocks(blocks: list[Any]) -> str:
     """Flatten content blocks to plain text, replacing media with placeholders.
@@ -705,10 +709,85 @@ def _flatten_media_blocks(blocks: list[Any]) -> str:
             source = b.get("source") or {}
             mime = b.get("mime_type") or source.get("media_type") or "unknown"
             parts.append(f"[{t} omitted from restored history: {mime}]")
+        elif t in _WIRE_TEXT_BLOCK_TYPES:
+            # openai-response spells its tool-result blocks `input_text` /
+            # `input_image` (image_url) / `input_file` (file_data) — the
+            # same semantics as the anthropic spellings above, so the wire
+            # path flattens them instead of silently dropping the text.
+            if t == "input_text":
+                text = b.get("text")
+                if text:
+                    parts.append(text)
+            elif t == "input_image":
+                url = b.get("image_url") or ""
+                mime = url[5:].split(";", 1)[0] if url.startswith("data:") else "unknown"
+                parts.append(f"[image omitted from restored history: {mime}]")
+            else:
+                parts.append("[document omitted from restored history: unknown]")
     return "\n".join(parts)
 
 
+def _has_wire_dicts(entries: Any) -> bool:
+    """True when `entries` is a list holding raw dicts (validation-bypassed).
+
+    The `Message.model_construct` shapes built by coreouto's anthropic and
+    openai-response providers carry provider WIRE dicts in `content` (and
+    hand-parsed dicts in `tool_calls`); `Message.content`'s schema is
+    `str | list[ContentBlock | ToolCall]`, so a raw dict matches neither
+    and pydantic's serializer emits `PydanticSerializationUnexpectedValue`
+    UserWarnings for every dump. Agnostic to key spellings on purpose:
+    any dict entry means the message was built outside validation.
+    """
+
+    return isinstance(entries, list) and any(isinstance(e, dict) for e in entries)
+
+
+def _dump_wire_tool_calls(tcs: list[Any]) -> list[Any]:
+    """Dump a validation-bypassed `tool_calls` list without serializer warnings.
+
+    Dict entries (raw wire/parse output) are COPIED as-is — pydantic warns
+    `Expected ToolCall` serializing them, so the message itself must never
+    reach `model_dump`; model entries dump normally. Non-dict `arguments`
+    are coerced to `{}` exactly like `_coerce_dumped_tool_args`.
+    """
+
+    out: list[Any] = []
+    for tc in tcs:
+        if isinstance(tc, dict):
+            d = dict(tc)
+            if not isinstance(d.get("arguments"), dict):
+                d["arguments"] = {}
+            out.append(d)
+        else:
+            with suppress(Exception):
+                out.append(tc.model_dump(mode="json"))
+    return out
+
+
 def _dump_message(m: Any) -> dict[str, Any]:
+    content = m.content
+    tool_calls = m.tool_calls
+    if _has_wire_dicts(content) or _has_wire_dicts(tool_calls):
+        # Validation-bypassed shape (coreouto's anthropic / openai-response
+        # providers build multimodal tool results via
+        # `Message.model_construct(content=<provider WIRE dicts>)`): pydantic's
+        # serializer prints `PydanticSerializationUnexpectedValue` UserWarnings
+        # for every mismatched entry, and this dump runs on EVERY history
+        # snapshot — so the record is assembled by hand and never reaches
+        # `model_dump`. Field set/order mirror the model_dump path below
+        # (unset fields are None there because `model_construct` pads them
+        # with their defaults).
+        d: dict[str, Any] = {
+            "role": m.role,
+            "content": _flatten_media_blocks(content)
+            if isinstance(content, list)
+            else content,
+            "tool_calls": _dump_wire_tool_calls(tool_calls) if tool_calls else tool_calls,
+            "tool_call_id": m.tool_call_id,
+            "name": m.name,
+        }
+        _coerce_dumped_tool_args(d)
+        return d
     try:
         dumped = m.model_dump(mode="json")
     except Exception:
