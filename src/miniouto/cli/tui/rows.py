@@ -1430,9 +1430,11 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
 
         The header carries its FULL text here (the one-line cut is a layout
         decision that needs a width, and ``render().plain`` is what a copy
-        wants), and an expanded row carries the command and result as PLAIN
-        text lines — the box chrome needs a width, so ``build_lines`` paints
-        it and this surface carries the payload without chrome.
+        wants) — except that an EXPANDED Bash header is the badge alone,
+        mirroring ``build_lines``. An expanded row carries the command and
+        result as PLAIN text lines — the box chrome needs a width, so
+        ``build_lines`` paints it and this surface carries the payload
+        without chrome.
         """
 
         if not self._expanded:
@@ -1468,7 +1470,14 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
             if self._badge
             else self._glyph_piece(glyph, theme, accent=True)
         )
-        pieces: list[tuple[str, RichStyle | str]] = [lead, (self._header, "")]
+        # An EXPANDED Bash header is the badge (plus the error suffix) alone:
+        # the command below is the same text verbatim, so repeating it in the
+        # header would duplicate the box. Collapsed keeps the preview, and
+        # every other tool keeps badge+preview (its box holds only the result).
+        text = self._header
+        if self._expanded and self._badge == TOOL_BADGES["Bash"]:
+            text = ""
+        pieces: list[tuple[str, RichStyle | str]] = [lead, (text, "")]
         if self._is_error:
             pieces.append((" ✗", RichStyle(bold=True, color=theme.error)))
         return pieces
@@ -1624,6 +1633,11 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
         if self._tool_name != "Computer":
             return None
         if self._screen_ready:
+            # A cached image caption must re-arm the visibility a collapse
+            # cleared, or the PNG lane stays lost once the row re-expands (the
+            # caption is the image's exactly when a placement survived).
+            if self.image is not None:
+                self.image_visible = True
             return self._screen_text
         self._screen_ready = True
         self.image_visible = False

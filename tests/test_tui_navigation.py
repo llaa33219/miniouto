@@ -1142,6 +1142,110 @@ def test_a_double_click_selects_no_whole_row_and_toggles_once() -> None:
     _in_app(body)
 
 
+def _char_at_cell(line: str, x: int) -> int:
+    """The CHARACTER index whose cell range holds content cell ``x``."""
+
+    from rich.cells import cell_len
+
+    cells = 0
+    for index, char in enumerate(line):
+        width = cell_len(char)
+        if cells + width > x:
+            return index
+        cells += width
+    return len(line)
+
+
+def _content_line(row: Any) -> str:
+    return "".join(text for text, _style in row._content_lines_cached()[0]).rstrip()
+
+
+def _drag_content_cells(app: Any, row: Any, c0: int, c1: int) -> None:
+    """Drag between two CONTENT cells of the row's first painted line."""
+
+    from miniouto.cli.tui.input import Mouse
+
+    gutter = row._gutter_width
+    base_y = row.region.y
+    app.inject_mouse(Mouse("down", row.region.x + gutter + c0, base_y, button=0))
+    app.inject_mouse(Mouse("drag", row.region.x + gutter + c1, base_y, button=0))
+    app.inject_mouse(Mouse("up", row.region.x + gutter + c1, base_y, button=0))
+
+
+def test_a_drag_on_a_zero_width_badge_selects_the_painted_cells() -> None:
+    """The Audio badge's U+FE0E is 1 char but 0 cells — a drag must stay put.
+
+    Before the app converted the mouse CELL to a CHARACTER offset, a drag over
+    content cells 4..12 of `[♫︎] Audio /tmp/x.wav` extracted ' Audio /' while
+    the painted cells read 'Audio /t' — every zero-width character had shifted
+    the selection one character left. The painted line is the authority.
+    """
+
+    async def body(app: Any, pilot: Any) -> None:
+        row = ToolRow("Audio /tmp/x.wav", tool_name="Audio")
+        await app._log.mount(row)
+        await pilot.pause()
+        line = _content_line(row)
+        assert line == "[♫︎] Audio /tmp/x.wav"
+        # When: the pointer drags over content cells 4..12
+        _drag_content_cells(app, row, 4, 12)
+        await pilot.pause()
+        # Then: the extraction is the PAINTED substring — cells 4..12 plus the
+        # character the end-extension of `_set_selection` lands on
+        start, end = _char_at_cell(line, 4), _char_at_cell(line, 12)
+        selected = _selected_text(app, row)
+        assert selected == line[start : end + 1]
+
+    _in_app(body)
+
+
+def test_a_drag_on_a_cjk_header_selects_the_painted_cells() -> None:
+    """A CJK glyph is 1 char but 2 cells — the walk, not char==cell, decides."""
+
+    async def body(app: Any, pilot: Any) -> None:
+        row = ToolRow("Bash 한글 명령어 테스트입니다", tool_name="Bash")
+        await app._log.mount(row)
+        await pilot.pause()
+        line = _content_line(row)
+        assert line == "[>_] Bash 한글 명령어 테스트입니다"
+        # When: the pointer drags over content cells 10..16 (the painted
+        # cells there read '한글 명' — the CJK glyphs are 2 cells each, so
+        # cells 5..11 would be a no-op identity on this line)
+        _drag_content_cells(app, row, 10, 16)
+        await pilot.pause()
+        start, end = _char_at_cell(line, 10), _char_at_cell(line, 16)
+        selected = _selected_text(app, row)
+        # Then: the extraction matches the painted cells' characters (with the
+        # one-character end extension), NOT the char-index slice 'Bash 한'
+        assert selected == line[start : end + 1]
+        assert selected == "한글 명"
+        # And: a drag further right stays cell-accurate too (cells 12..20)
+        _drag_content_cells(app, row, 12, 20)
+        await pilot.pause()
+        start, end = _char_at_cell(line, 12), _char_at_cell(line, 20)
+        assert _selected_text(app, row) == line[start : end + 1]
+
+    _in_app(body)
+
+
+def test_an_ascii_drag_is_unchanged_where_cell_equals_char() -> None:
+    """The conversion is a no-op on ASCII — cell index == character index."""
+
+    async def body(app: Any, pilot: Any) -> None:
+        row = ToolRow("Bash ls -la /tmp", tool_name="Bash")
+        await app._log.mount(row)
+        await pilot.pause()
+        line = _content_line(row)
+        assert line == "[>_] Bash ls -la /tmp"
+        _drag_content_cells(app, row, 3, 10)
+        await pilot.pause()
+        start, end = _char_at_cell(line, 3), _char_at_cell(line, 10)
+        assert _selected_text(app, row) == line[start : end + 1]
+        assert _selected_text(app, row) == "] Bash l"
+
+    _in_app(body)
+
+
 def test_a_triple_click_never_toggles_the_row() -> None:
     async def body(app: Any, pilot: Any) -> None:
         # Given: a mounted tool row, counting every toggle it receives

@@ -1198,7 +1198,7 @@ def test_an_expanded_bash_row_boxes_the_command_and_the_result() -> None:
     assert text.count("╭") == 2
     assert text.count("╯") == 2
     lines = text.split("\n")
-    assert lines[0] == "┃ [>_] Bash heredoc"
+    assert lines[0] == "┃ [>_]"
     assert any(line.startswith("┃ │ cat <<'EOF'") for line in lines), lines
     assert any(line.startswith("┃ │ one") for line in lines), lines
     assert any(line.startswith("┃ │ two") for line in lines), lines
@@ -1235,6 +1235,74 @@ def test_the_bash_command_box_falls_back_to_the_header_without_detail() -> None:
     # Then: the command box carries the header minus the `Bash ` prefix
     assert text.count("╭") == 2
     assert "│ echo one && echo two" in text
+
+
+def test_an_expanded_bash_header_is_the_badge_alone() -> None:
+    # Given: an expanded Bash row (with a result, errored and not)
+    row = ToolRow("Bash heredoc", detail="cat <<'EOF'\nEOF", tool_name="Bash")
+    row.set_result("out")
+    row._toggle()
+    # When: it paints
+    text = rendered(row)
+    lines = text.split("\n")
+    # Then: the header line is the badge ONLY — the verbatim command lives in
+    # the box below, so repeating it in the header would duplicate that box
+    assert lines[0] == "┃ [>_]"
+    assert "Bash heredoc" not in text
+    assert "cat <<'EOF'" in text  # the command box carries it instead
+    # And: the width-less render mirrors the painted header
+    assert row.render().plain.split("\n")[0] == "[>_] "
+    # And: a COLLAPSED Bash row keeps the one-line preview untouched
+    collapsed = ToolRow("Bash ls -la", tool_name="Bash")
+    assert plain_of(collapsed.build_lines(WIDTH, THEME)[0]) == "┃ [>_] Bash ls -la"
+    assert collapsed.render().plain == "[>_] Bash ls -la"
+    # And: an errored expanded Bash row still shows the ✗ suffix
+    failed = ToolRow("Bash bad", detail="bad", tool_name="Bash")
+    failed.set_result("error: nope", is_error=True)
+    failed._toggle()
+    failed_lines = rendered(failed).split("\n")
+    assert failed_lines[0] == "┃ [>_]  ✗"
+    assert failed.render().plain.split("\n")[0] == "[>_]  ✗"
+
+
+def test_an_expanded_other_tool_keeps_badge_and_preview() -> None:
+    # Given: an expanded Audio row (its box holds only the result)
+    row = ToolRow("Audio /tmp/x.wav", tool_name="Audio")
+    row.set_result("played")
+    row._toggle()
+    # When/Then: the header keeps badge + preview, exactly as before
+    assert plain_of(row.build_lines(WIDTH, THEME)[0]) == "┃ [♫︎] Audio /tmp/x.wav"
+    assert row.render().plain.split("\n")[0] == "[♫︎] Audio /tmp/x.wav"
+
+
+def test_a_screenshot_row_re_expands_with_its_png_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Given: an expanded Computer row with a live placement (graphics mode on)
+    from miniouto.cli.tui import graphics
+
+    png = _png(tmp_path)
+    monkeypatch.setattr(graphics, "_GRAPHICS_MODE", graphics.GRAPHICS_MODE_TGP)
+    row = ToolRow("Computer screenshot", tool_name="Computer")
+    row.set_result(_screenshot(png))
+    row._toggle()
+    lines = row.build_lines(WIDTH, THEME)
+    assert row.image is not None and row.image_visible is True
+    assert len(row.image_placements()) == 1
+    first_line, first_height = row.image_line, len(lines)
+    # When: it collapses (the caption lane clears, the latch with it) …
+    row._toggle()
+    row.build_lines(WIDTH, THEME)
+    assert row.image_visible is False
+    assert row.image_placements() == []
+    # … and re-expands: the cached caption must re-arm the image lane, so the
+    # rect is reserved again at the same line
+    row._toggle()
+    lines = row.build_lines(WIDTH, THEME)
+    assert row.image_visible is True
+    assert len(row.image_placements()) == 1
+    assert row.image_line == first_line
+    assert len(lines) == first_height
 
 
 def test_a_drag_across_a_boxed_content_line_extracts_the_right_characters() -> None:

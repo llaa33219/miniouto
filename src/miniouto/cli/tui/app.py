@@ -118,6 +118,7 @@ from .nodes import (
     pt_style_text,
 )
 from .rows import (
+    DEFAULT_WIDTH,
     AnswerRow,
     EventRow,
     RowStatic,
@@ -1879,17 +1880,22 @@ class ChatTUI:
     def _row_mouse(self, row: Any, mouse: Mouse, chain: int = 1) -> bool:
         """Selection first (it is the gesture's evidence), then the row's own logic.
 
-        Offsets are CONTENT cells — the row's own text after its border/padding
-        gutter — which is the space ``Selection.get_span`` and every ported drag
-        assertion speak (a press on the collapsed header's glyph is offset 0, not
-        2). The mouse report carries OUTER cells, so the gutter is subtracted
-        here, and the row shifts the span back by the same amount when it paints.
+        Offsets are CONTENT CHARACTERS — the row's own text after its
+        border/padding gutter — which is the space ``Selection.get_span`` and
+        every ported drag assertion speak (a press on the collapsed header's
+        glyph is offset 0, not 2). The mouse report carries OUTER cells, so
+        the gutter is subtracted here and the CELL x is converted to a
+        character offset against the painted content line (CJK glyphs are 1
+        char but 2 cells; a U+FE0E variation selector is 1 char but 0 cells),
+        and the row shifts the span back by the same amount when it paints.
         """
 
         rel_x = mouse.x - row.region.x
         rel_y = mouse.y - row.region.y
         gutter = getattr(row, "_gutter_width", 0)
-        here = Offset(max(0, rel_x - gutter), rel_y)
+        here = Offset(
+            self._cell_to_char(row, max(0, rel_x - gutter), rel_y), rel_y
+        )
         if mouse.kind == "down":
             self._select_anchor = (row, here)
             self._select_dragged = False
@@ -1907,6 +1913,51 @@ class ChatTUI:
             self._select_anchor = None
         row.handle_mouse(mouse, rel_x, rel_y, self, chain=chain)
         return True
+
+    def _cell_to_char(self, row: Any, x_cell: int, y_line: int) -> int:
+        """A CONTENT cell column as a CHARACTER offset on the painted line.
+
+        The selection space is CHARACTER-based (ported Textual semantics) while
+        the mouse report and the painted line are CELLS, and the two diverge
+        wherever a glyph is not exactly one cell: a CJK character is one char
+        but two cells, a U+FE0E variation selector one char and zero. The
+        painted CONTENT line is the authority: the walk accumulates ``cell_len``
+        per character and returns the index whose cell range holds ``x_cell``,
+        a zero-width character attaching to the FOLLOWING one, past the end
+        clamped to ``len(line)``. The row's own ``handle_mouse`` keeps CELLS —
+        only the selection offsets are converted.
+        """
+
+        painted = getattr(row, "_painted", None)
+        if painted is None:
+            with contextlib.suppress(Exception):
+                row.build_lines(
+                    int(getattr(row, "_build_width", 0) or row.region.width or 0)
+                    or DEFAULT_WIDTH,
+                    getattr(row, "_cache_theme", lambda: MINIOUTO_THEME)(),
+                )
+        content = getattr(row, "_content_lines_cached", None)
+        if content is None:
+            return x_cell
+        try:
+            painted = content()
+        except Exception:
+            return x_cell
+        if not painted or y_line < 0 or y_line >= len(painted):
+            # A line the pointer is below/above: clamp to the first/last
+            # line's walk rather than guessing char==cell (the brief pins
+            # out-of-range to the clamped line, defaulting to 0).
+            y_line = max(0, min(y_line, len(painted) - 1))
+        line = "".join(text for text, _style in painted[y_line])
+        if not line:
+            return 0
+        cells = 0
+        for index, char in enumerate(line):
+            width = cell_len(char)
+            if cells + width > x_cell:
+                return index
+            cells += width
+        return len(line)
 
     def _set_selection(self, row: Any, selection: Selection) -> None:
         """Record a selection, extending the end over the cell dragged onto."""
