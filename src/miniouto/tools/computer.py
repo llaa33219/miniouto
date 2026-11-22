@@ -662,14 +662,22 @@ def _write_art_best_effort(
 def _prune_captures() -> None:
     """Keep only the newest `MAX_CAPTURE_FILES` capture files in the screens dir.
 
-    `.art` and `.png` are one pool: they share a stem, so pruning oldest-first
-    by name (the timestamp is in the name) retires a capture's two siblings
-    together. Best effort like the writes themselves — an unlink failure is
-    skipped, never raised into a tool call.
+    Oldest-first by MTIME, never by name: the name is `<screen-id>-<ts>`, so
+    a name sort orders by SCREEN ID first — once the directory was full, a
+    fresh capture from a screen whose id sorts early (`tui-…` vs `vw-…`)
+    was pruned the instant it was written and the TUI row had no file left
+    to render. `.art` and `.png` siblings share a write second, so an mtime
+    sort retires a pair together in practice; a same-second boundary split
+    costs at most one unmatched file, same as before. Best effort like the
+    writes themselves — an unlink/stat failure is skipped, never raised
+    into a tool call.
     """
 
     try:
-        files = sorted(COMPUTER_SCREENS_DIR.glob("*.*"))
+        files = sorted(
+            COMPUTER_SCREENS_DIR.glob("*.*"),
+            key=lambda p: p.stat().st_mtime_ns,
+        )
         doomed = files[: max(len(files) - MAX_CAPTURE_FILES, 0)]
         for path in doomed:
             try:

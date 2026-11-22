@@ -447,3 +447,39 @@ def test_a_queued_action_refuses_once_the_turn_is_cancelled(cleared_cancel, one_
         computer("screenshot")
     # The compositor was never touched — the refusal is pre-dispatch.
     assert one_screen.screenshots == 0
+
+
+# ── capture pruning is mtime-ordered, never name-ordered ─────────────────────
+
+
+def test_prune_keeps_a_fresh_capture_from_an_early_sorting_screen(
+    isolated_screens_dir, monkeypatch
+) -> None:
+    """The bug: names are `<screen-id>-<ts>`, so a NAME sort prunes by screen id.
+
+    With the directory full, a fresh `aaa-…` capture sorted before every old
+    `zzz-…` file and was unlinked the instant it was written — the TUI row then
+    had no PNG/.art left to render. Mtime ordering keeps the newest captures
+    regardless of their screen id's alphabetics.
+    """
+    import os
+
+    target = isolated_screens_dir
+    target.mkdir(parents=True, exist_ok=True)
+    # Fill the pool with OLD captures whose names sort LAST.
+    for i in range(computer_mod.MAX_CAPTURE_FILES):
+        f = target / f"zzz-old-{i:03d}.art"
+        f.write_text("old", encoding="utf-8")
+        os.utime(f, (1_000_000 + i, 1_000_000 + i))
+    # One FRESH capture whose name sorts FIRST.
+    fresh_png = target / "aaa-fresh-2026-01-01-00-00-00.png"
+    fresh_art = target / "aaa-fresh-2026-01-01-00-00-00.art"
+    fresh_png.write_bytes(b"png")
+    fresh_art.write_text("art", encoding="utf-8")
+
+    computer_mod._prune_captures()
+
+    # Then: the fresh pair survives; the pool is capped; the oldest zzz file went.
+    assert fresh_png.exists() and fresh_art.exists()
+    assert len(list(target.glob("*.*"))) == computer_mod.MAX_CAPTURE_FILES
+    assert not (target / "zzz-old-000.art").exists()
