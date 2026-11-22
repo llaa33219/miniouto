@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from miniouto.cli.tui import art_path_in_result
+from miniouto.cli.tui import art_path_in_result, png_path_in_result
 from miniouto.storage.paths import COMPUTER_SCREENS_DIR
 from miniouto.tools import computer as computer_mod
 from miniouto.tools.ascii_art import (
@@ -186,11 +186,14 @@ def test_screen_chars_are_clamped_to_the_allowed_range(
     assert all(len(line) == expected for line in art.body.split("\n"))
 
 
-def test_screen_returns_a_str_so_it_bypasses_the_screenshot_gate(monkeypatch) -> None:
+def test_screen_returns_a_str_so_it_bypasses_the_screenshot_gate(
+    monkeypatch, isolated_screens_dir
+) -> None:
     # Given: a handler whose screenshot gate is CLOSED (the openai chat-
     # completions degradation path) and a screen that is up
+    comp = FakeCompositor(_flat_png(64, 48), 64, 48)
     monkeypatch.setattr(
-        computer_mod, "_resolve_screen", lambda screen, *, autospawn: ("wl-1", FakeCompositor(_flat_png(64, 48), 64, 48))
+        computer_mod, "_resolve_screen", lambda screen, *, autospawn: ("wl-1", comp)
     )
     monkeypatch.setattr("miniouto.tools.registry._SCREENSHOTS_SUPPORTED", False)
 
@@ -201,8 +204,31 @@ def test_screen_returns_a_str_so_it_bypasses_the_screenshot_gate(monkeypatch) ->
     assert isinstance(result, str)
     assert "Saved to: " in result
 
-    # And: the closed gate still refuses the screenshot action itself
-    assert "unavailable RIGHT NOW" in _computer_handler(action="screenshot", screen="wl-1")
+    # And: the closed gate no longer refuses the screenshot BEFORE capturing —
+    # the capture happens, both siblings land on disk (what the TUI renders
+    # from), and the result is a TextBlock-only list whose text carries the
+    # caption, the two saved-file lines, and the notice for the model
+    comp.screenshots = 0
+    blocks = _computer_handler(action="screenshot", screen="wl-1")
+    assert comp.screenshots == 1
+    assert isinstance(blocks, list) and len(blocks) == 1
+    assert not [b for b in blocks if type(b).__name__ == "ImageBlock"]
+    text = blocks[0].text
+    assert "Image saved to: " in text
+    assert text.splitlines()[-2].startswith("Saved to: ") or any(
+        line.startswith("Saved to: ") for line in text.splitlines()
+    )
+    png_line = next(x for x in text.splitlines() if x.startswith("Image saved to: "))
+    art_line = next(x for x in text.splitlines() if x.startswith("Saved to: "))
+    assert png_line.split(".png", 1)[0] + ".png" in text
+    png_path = Path(png_line.split("Image saved to: ", 1)[1])
+    art_path = Path(art_line.split("Saved to: ", 1)[1])
+    assert png_path.exists() and png_path.read_bytes() == comp._image.png_bytes
+    assert art_path.exists() and art_path.suffix == ".art"
+    # the notice rides the text and keeps its guidance
+    assert "Screenshot TAKEN and SAVED" in text
+    assert "Do NOT switch to the `screen` action" in text
+    assert "unavailable RIGHT NOW" not in text
 
 
 def test_screen_action_respects_the_screen_registry_selection() -> None:
@@ -252,6 +278,79 @@ def test_screenshot_tool_result_carries_the_saved_to_line(one_screen, monkeypatc
         text.split("Saved to: ", 1)[1].splitlines()[-1]
     ).as_posix()
     assert "Image saved to: " in text
+
+
+def test_the_closed_gate_still_captures_and_writes_both_siblings(
+    one_screen, monkeypatch, isolated_screens_dir
+) -> None:
+    """The FIX: on openai (Chat Completions) the screenshot USED to be refused
+    BEFORE the capture, so no PNG/.art were written and the TUI row had nothing
+    to render. Now the capture always happens; the gate decides only whether
+    the MODEL receives the pixels.
+    """
+
+    # Given: the openai chat-completions degradation gate, closed at call time
+    monkeypatch.setattr("miniouto.tools.registry._SCREENSHOTS_SUPPORTED", False)
+
+    # When: the registered handler runs the screenshot action
+    blocks = _computer_handler(action="screenshot", screen="wl-1")
+
+    # Then: the result is TEXT ONLY — no ImageBlock rides it
+    assert isinstance(blocks, list) and len(blocks) == 1
+    assert not [b for b in blocks if type(b).__name__ == "ImageBlock"]
+    text = blocks[0].text
+
+    # And: both saved-file lines are present in the shapes the TUI parses
+    assert png_path_in_result(text) is not None
+    assert art_path_in_result(text) is not None
+    png_path = Path(png_path_in_result(text))
+    art_path = Path(art_path_in_result(text))
+
+    # And: both siblings exist on disk, the PNG holding the raw frame bytes
+    assert png_path.exists() and png_path.read_bytes() == one_screen._image.png_bytes
+    assert art_path.exists() and art_path.suffix == ".art"
+    assert parse_art(art_path.read_text(encoding="utf-8")).meta["screen"] == "wl-1"
+
+    # And: the caption comes first, the notice rides after it, keeping the
+    # capture-was-taken fact and the no-`screen`-workaround guidance
+    assert text.startswith("Screenshot of the virtual display (1280x720 pixels).")
+    assert "Screenshot TAKEN and SAVED" in text
+    assert "Do NOT switch to the `screen` action" in text
+
+
+def test_a_wrapped_refusing_provider_still_gets_a_text_tool_result() -> None:
+    """`wrap_provider` is the wire-level half of the degradation.
+
+    The openai provider raises from `format_tool_result` when a tool result
+    carries an ImageBlock; the wrap turns that into a text tool Message so
+    the turn survives. With the gate now returning no ImageBlock on openai
+    the wrap is defence in depth for any OTHER image-bearing result.
+    """
+
+    import coreouto as co
+
+    from miniouto.tools import multimodal
+
+    class _Refuses:
+        def format_tool_result(self, tool_call, result):
+            if result.blocks is not None:
+                raise ValueError(
+                    "OpenAI Chat Completions does not support multimodal "
+                    "tool results (image block detected)."
+                )
+            return co.Message(role="tool", tool_call_id=tool_call.id, content="")
+
+    provider = _Refuses()
+    multimodal.wrap_provider(provider)
+    tool_call = co.ToolCall(id="c1", name="Computer", arguments={})
+    result = co.ToolResult(
+        tool_call_id="c1",
+        blocks=[co.TextBlock(text="caption"), co.ImageBlock(data=b"png", mime_type="image/png")],
+    )
+
+    message = provider.format_tool_result(tool_call, result)
+    assert message.role == "tool"
+    assert "could not return the screenshot" in message.content
 
 
 def test_screenshot_art_failure_costs_only_the_saved_to_line(one_screen, monkeypatch) -> None:

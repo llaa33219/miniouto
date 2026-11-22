@@ -3847,3 +3847,124 @@ def test_run_sync_reports_a_spawn_failure_instead_of_raising() -> None:
     assert "could not start" in err
     # And the YAML wrapper degrades to None (its documented failure shape)
     assert bridge_mod.run_yaml(["/nonexistent/miniouto-xyz", "x"]) is None
+
+
+# ── 16. the stderr picker: a message line, never a source echo ───────────────
+
+
+class TestFirstStderrLine:
+    """``_first_stderr_line`` posts ONE line as ``chat: …`` for a failed child.
+
+    The picker used to take the LAST non-frame line, so a pydantic serializer
+    ``UserWarning`` — whose warnings-machinery block ends with an indented echo
+    of the warned-about SOURCE line (``return
+    self.__pydantic_serializer__.to_python(``) — was posted as though it were
+    the message. The fix prefers the last MESSAGE-shaped line and, in the
+    fallback, skips obvious source echoes.
+    """
+
+    def test_a_pydantic_serializer_warning_posts_its_header_not_the_echo(self) -> None:
+        """The bug itself: the exact stderr shape ``model_dump(warnings="warn")``
+        prints (reproduced against real pydantic below, verbatim here so the
+        test never depends on the installed pydantic's file path)."""
+
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        raw = (
+            "/venv/lib/python3.12/site-packages/pydantic/main.py:475: "
+            "UserWarning: Pydantic serializer warnings:\n"
+            "  PydanticSerializationUnexpectedValue(Expected `int` - serialized "
+            "value may not be as expected [field_name='x', input_value='oops', "
+            "input_type=str])\n"
+            "  return self.__pydantic_serializer__.to_python(\n"
+        )
+        assert _first_stderr_line(raw) == (
+            "/venv/lib/python3.12/site-packages/pydantic/main.py:475: "
+            "UserWarning: Pydantic serializer warnings:"
+        )
+
+    def test_the_real_pydantic_warning_block_is_picked_by_its_header(self) -> None:
+        """End to end against the installed pydantic: whatever the file path,
+        the header (the line carrying the message) wins over the source echo."""
+
+        import warnings
+
+        from pydantic import BaseModel
+
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        class Model(BaseModel):
+            x: int
+
+        # pytest's warnings capture owns showwarning, so the block is
+        # rebuilt the way the machinery prints it: header + source echo.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            Model.model_construct(x="oops").model_dump(warnings="warn")
+        raw = "".join(
+            warnings.formatwarning(w.message, w.category, w.filename, w.lineno)
+            for w in caught
+        )
+        assert "__pydantic_serializer__" in raw  # the echo really is in there
+
+        picked = _first_stderr_line(raw)
+        assert picked.endswith("UserWarning: Pydantic serializer warnings:")
+        assert "__pydantic_serializer__" not in picked
+
+    def test_a_rich_traceback_still_posts_the_exception_line(self) -> None:
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        assert _first_stderr_line(
+            "╭────────────────────╮\n"
+            "│ Traceback (most recent call last):\n"
+            "╰────────────────────╯\n"
+            "RuntimeError: provider xyz is not configured\n"
+        ) == "RuntimeError: provider xyz is not configured"
+
+    def test_a_dotted_exception_class_is_a_message_line(self) -> None:
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        assert _first_stderr_line(
+            "some noise\nminiouto.core.errors.ConfigError: pin points nowhere\n"
+        ) == "miniouto.core.errors.ConfigError: pin points nowhere"
+
+    def test_a_refusal_line_is_a_message_line(self) -> None:
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        assert _first_stderr_line(
+            "spew\n✗ nothing to wake: session 'zzz' does not exist\n"
+        ) == "✗ nothing to wake: session 'zzz' does not exist"
+
+    def test_the_fallback_skips_indented_source_echoes(self) -> None:
+        """No message-shaped line at all: the last non-frame line stands in,
+        but a python source echo never wins it."""
+
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        assert _first_stderr_line(
+            "loading things\n  return self.__pydantic_serializer__.to_python(\n"
+        ) == "loading things"
+
+    def test_the_fallback_takes_the_last_plain_line_when_one_exists(self) -> None:
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        assert _first_stderr_line(
+            "raise ValueError('nope')\nplain epilogue line\n"
+        ) == "plain epilogue line"
+
+    def test_frames_blank_and_bytes_input_are_untouched_behaviour(self) -> None:
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        # bytes decode with replacement; frame/blank lines never win
+        assert _first_stderr_line(b"\xe2\x95\xad\xef\x80\x80 noise\nall quiet\n") == (
+            "all quiet"
+        )
+        # empty input stays empty
+        assert _first_stderr_line("") == ""
+
+    def test_rich_markup_tags_are_stripped_from_the_pick(self) -> None:
+        from miniouto.cli.tui.app import _first_stderr_line
+
+        assert _first_stderr_line("[red]RuntimeError: boom[/red]\n") == (
+            "RuntimeError: boom"
+        )

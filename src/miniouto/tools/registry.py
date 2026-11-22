@@ -29,10 +29,12 @@ def register_all(api_format: str | None = None) -> None:
     `_SCREENSHOTS_SUPPORTED`, which this function refreshes on every
     invocation (build_runtime runs per turn — including after a mid-session
     provider switch in the long-lived TUI): on openai (Chat Completions),
-    which cannot carry multimodal tool results, `screenshot` returns the
-    explanatory notice instead of an image; every other action is a text
-    result and works unchanged; anthropic / openai-response / google return
-    the image as always.
+    which cannot carry multimodal tool results, `screenshot` still captures
+    and names its saved PNG/.art siblings (the TUI renders the screen from
+    those lines) but returns the text caption plus an explanatory notice
+    INSTEAD of the image block; every other action is a text result and
+    works unchanged; anthropic / openai-response / google return the image
+    as always.
     """
     global _SCREENSHOTS_SUPPORTED
     _SCREENSHOTS_SUPPORTED = api_format != "openai"
@@ -245,14 +247,17 @@ _SCREENSHOTS_SUPPORTED = True
 
 
 _SCREENSHOT_UNSUPPORTED = (
-    "Screenshot unavailable RIGHT NOW: the CURRENT provider uses the openai "
-    "chat-completions format, which cannot receive image tool results. "
-    "Relay to the user: on this provider the agent cannot view the screen "
-    "(GUI control actions — launch / click / type / scroll — still work); "
-    "seeing screenshots needs a provider whose api_format carries image "
-    "tool results (anthropic, openai-response, or google). This is a "
-    "property of the CURRENT provider only — if the provider has been "
-    "switched since, call screenshot again and it will work.\n"
+    "Screenshot TAKEN and SAVED — but the model cannot receive it: the "
+    "CURRENT provider uses the openai chat-completions format, which "
+    "cannot carry image tool results. The capture IS on disk (the "
+    "`Image saved to:` / `Saved to:` lines above name it) and the USER's "
+    "terminal displays it from those lines — only the MODEL cannot see "
+    "the pixels on this provider. GUI control actions — launch / click / "
+    "type / scroll — still work exactly as before; seeing screenshots "
+    "needs a provider whose api_format carries image tool results "
+    "(anthropic, openai-response, or google). This is a property of the "
+    "CURRENT provider only — if the provider has been switched since, "
+    "call screenshot again and the image will come through.\n"
     "Do NOT switch to the `screen` action to work around this: `screen` "
     "returns a COARSE TEXT RENDERING of the screen (Unicode block art), "
     "not an image. It can show that a window exists and roughly what it "
@@ -260,7 +265,7 @@ _SCREENSHOT_UNSUPPORTED = (
     "unreadable, and its coordinates are an approximation, not the exact "
     "pixels a click needs. Use it only if you must know WHAT is on screen "
     "and no image can be delivered; otherwise tell the user that the "
-    "provider cannot deliver screenshots."
+    "provider cannot deliver screenshots to you."
 )
 
 
@@ -284,8 +289,6 @@ def _computer_handler(
     color: bool = True,
     glyph: GlyphStyle = GLYPH_MIX,
 ) -> str | list:
-    if action == "screenshot" and not _SCREENSHOTS_SUPPORTED:
-        return _SCREENSHOT_UNSUPPORTED
     result = computer(
         action,
         coordinate=coordinate,
@@ -311,16 +314,23 @@ def _computer_handler(
         # TUI keys on, and an art line after the png line keeps the pair
         # readable top-down (raw image first, then the text render).
         saved = f"\nSaved to: {result.art_path}" if result.art_path else ""
+        caption = (
+            f"Screenshot of the virtual display "
+            f"({result.width}x{result.height} pixels). "
+            "Click coordinates for the next action refer to this "
+            "image; (0, 0) is the top-left corner."
+            f"{png}{saved}"
+        )
+        # The capture ALWAYS happens and its PNG/.art siblings are ALWAYS
+        # named: the TUI renders the screen from those two lines, so the user
+        # sees the capture on every provider. The gate decides only whether
+        # the MODEL receives the pixels — openai (Chat Completions) cannot
+        # carry an ImageBlock, so there the result is the caption plus a
+        # notice, and no image block (decided at call time: invariant 15).
+        if not _SCREENSHOTS_SUPPORTED:
+            return [co.TextBlock(text=f"{caption}\n{_SCREENSHOT_UNSUPPORTED}")]
         return [
-            co.TextBlock(
-                text=(
-                    f"Screenshot of the virtual display "
-                    f"({result.width}x{result.height} pixels). "
-                    "Click coordinates for the next action refer to this "
-                    "image; (0, 0) is the top-left corner."
-                    f"{png}{saved}"
-                )
-            ),
+            co.TextBlock(text=caption),
             co.ImageBlock(data=result.data, mime_type=result.mime_type),
         ]
     return result
@@ -333,8 +343,9 @@ def _computer_description() -> str:
         "(default 1280x720) and shared across calls. "
         "Core loop: `launch` an app, then repeat screenshot -> act -> "
         "screenshot. On providers whose format cannot carry image tool "
-        "results, `screenshot` returns an explanatory notice instead of "
-        "an image; all other actions are unaffected. ALWAYS take a screenshot before clicking anything — "
+        "results, `screenshot` is still taken and saved, but you receive a "
+        "text notice in place of the image (the user still sees it); all "
+        "other actions are unaffected. ALWAYS take a screenshot before clicking anything — "
         "click coordinates come from the latest screenshot; (0, 0) is the "
         "top-left corner, units are screen pixels, positions are clamped "
         "to the screen. After any action that changes the screen, "

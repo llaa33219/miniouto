@@ -652,23 +652,55 @@ def _first_stderr_line(raw: str | bytes) -> str:
     """The child's most useful stderr line, box-drawing frames skipped.
 
     A refused run prints a rich traceback whose first lines are the frame
-    border; the message the operator needs is the last non-frame line (the
-    ``RuntimeError: …`` the CLI raised). Rich markup tags are stripped so a
-    ``[red]`` never reaches a row.
+    border; the line the operator needs is the LAST one shaped like a real
+    message — an exception line (``RuntimeError: …`` /
+    ``module.SomeError: …``), a Python warnings HEADER
+    (``path:line: UserWarning: text`` — the header carries the actual
+    message; the indented detail lines under it do not), or the CLI's own
+    ``✗ …`` refusal line. A pydantic serializer warning ends with an
+    indented echo of the warned-about SOURCE line (``return
+    self.__pydantic_serializer__.to_python(``), which must never be posted
+    as though it were the message. Only when no message-shaped line exists
+    does the last non-frame line stand in, and that fallback skips lines
+    that are clearly python source echoes. Rich markup tags are stripped so
+    a ``[red]`` never reaches a row.
     """
 
     text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
     frames = ("╭", "│", "╰", "─", "╰─")
     best = ""
+    fallback = ""
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith(frames):
             continue
-        best = stripped
-    return _RICH_TAG_RE.sub("", best)
-
+        if _STDERR_SOURCE_ECHO_RE.search(stripped):
+            continue
+        if _STDERR_MESSAGE_RE.search(stripped):
+            best = stripped
+        fallback = stripped
+    return _RICH_TAG_RE.sub("", best or fallback)
 
 _RICH_TAG_RE = re.compile(r"\[/?[a-zA-Z0-9 #.:=,_-]*\]")
+
+#: A stderr line that IS the message: an exception line (``SomeError: …`` /
+#: ``module.SomeError: …``), a bare warning line (``UserWarning: …``), a
+#: Python warnings header (``path:line: UserWarning: text``), or the CLI's
+#: own ``✗ …`` refusal line.
+_STDERR_MESSAGE_RE = re.compile(
+    r"(?:^[A-Za-z_][\w.]*(?:Error|Exception|Warning)\b: "
+    r"|^\S+:\d+: [A-Za-z_][\w.]*Warning\b: "
+    r"|^✗)"
+)
+
+#: A stderr line that is a python SOURCE ECHO — the warnings machinery
+#: prints the warned-about source line indented under the header, so a
+#: pydantic serializer warning ends with
+#: ``return self.__pydantic_serializer__.to_python(`` and that code
+#: fragment must never win over the header line above it.
+_STDERR_SOURCE_ECHO_RE = re.compile(
+    r"^(?:return |raise |def |self\.)|__pydantic_serializer__"
+)
 
 
 def _inbox_signature(session: str) -> tuple[int, int] | None:
