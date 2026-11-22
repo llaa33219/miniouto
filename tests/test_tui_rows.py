@@ -9,7 +9,7 @@ those tests locked, and must stay locked:
 1. **The whole row is the button.** A plain click toggles it wherever it lands —
    glyph, header text, expanded body, attached result — while a drag that took text
    never does, and a double/triple click toggles at most once.
-2. **Hover is scoped to the glyph.** Only the ``▶``/``▼`` cell reverses; the header
+2. **Hover is scoped to the glyph.** Only the ``▶``/``▼`` cell dims; the header
    text beside it and the body below keep their resting style.
 3. **Screen art is lazy, capped and truecolour.** A Computer row renders the
    ``.art`` it saved only while expanded, at most ``_ART_MAX_ROWS`` of it, with a
@@ -404,11 +404,13 @@ def test_hovering_the_glyph_highlights_only_the_glyph() -> None:
     resting = glyph_style(row)
     # When: the pointer sits on the glyph cell
     move(row, row._glyph_column, 0)
-    # Then: the glyph itself goes reverse-video
+    # Then: the glyph itself dims — no reverse modifier, its resting accent
+    # composited 60% over the background (the house dim, as on the alarm border)
     assert row.hover_glyph is True
     highlighted = glyph_style(row)
-    assert "REVERSED" in repr(highlighted)
     assert repr(highlighted) != repr(resting)
+    assert "REVERSED" not in repr(highlighted)
+    assert rgb(blend(THEME.accent, THEME.background, 0.60)) in repr(highlighted)
     # And: the header text beside it keeps its resting style
     assert "REVERSED" not in repr(header_style(row))
 
@@ -456,11 +458,19 @@ def test_leaving_the_row_reverts_the_glyph_highlight() -> None:
 
 def test_a_thinking_row_highlights_its_glyph_on_hover() -> None:
     row = ThinkingRow("reasoning")
+    # The resting glyph inherits the row's muted ink, so it paints merged with
+    # the header text as ONE run — that run's style is the glyph's resting style
+    resting = row.build_lines(WIDTH, THEME)[0][2][1]
     move(row, row._glyph_column, 0)
     assert row.hover_glyph is True
-    assert "REVERSED" in repr(glyph_style(row))
-    # And: the `thinking` label beside it is untouched
-    assert "REVERSED" not in repr(header_style(row))
+    hovered = glyph_style(row)
+    # The glyph dims from that muted ink toward the background — an EXPLICIT
+    # colour, since the resting piece has none of its own
+    assert repr(hovered) != repr(resting)
+    assert "REVERSED" not in repr(hovered)
+    assert rgb(blend(THEME.text_muted, THEME.background, 0.60)) in repr(hovered)
+    # And: the `thinking` label beside it keeps its resting style
+    assert repr(header_style(row)) == repr(resting)
 
 
 def test_hovering_the_same_cell_twice_does_not_rebuild_the_row() -> None:
@@ -1134,10 +1144,14 @@ def test_hover_covers_the_whole_badge_and_stops_at_its_edge() -> None:
         assert row.hover_glyph is True, x
     move(row, row._glyph_column + span, 0)
     assert row.hover_glyph is False
-    # And: the badge paints reverse-video while hovered, the header does not
+    # And: the badge dims while hovered, the header does not
     move(row, row._glyph_column, 0)
-    assert "REVERSED" in repr(row.build_lines(WIDTH, THEME)[0][2][1])
-    assert "REVERSED" not in repr(row.build_lines(WIDTH, THEME)[0][3][1])
+    assert rgb(blend(THEME.accent, THEME.background, 0.60)) in repr(
+        row.build_lines(WIDTH, THEME)[0][2][1]
+    )
+    assert repr(row.build_lines(WIDTH, THEME)[0][3][1]) == repr(
+        ToolRow("Bash ls -la", tool_name="Bash").build_lines(WIDTH, THEME)[0][3][1]
+    )
 
 
 def test_a_collapsed_bash_row_paints_exactly_one_header_line() -> None:

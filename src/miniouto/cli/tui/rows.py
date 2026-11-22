@@ -707,19 +707,22 @@ class ToggleGlyphHover:
         return y == 0 and self._glyph_column <= x < self._glyph_column + self._hover_span()
 
     def _glyph_style(self, theme: TuiTheme, *, accent: bool) -> RichStyle:
-        """The glyph's Rich style: resting, or reverse-video while hovered.
+        """The glyph's Rich style: resting, or dimmed toward the background while hovered.
 
         ``accent`` is the glyph's resting colour — ToolRow paints its toggle with
         the theme accent, ThinkingRow leaves it to the row's own colour. The hover
-        style adds the accent regardless, so the highlight is visible on both and
-        it is the ONLY piece that changes.
+        style composites that resting family 60% over the theme background — the
+        house dim, the same blend the alarm border uses — instead of reversing
+        video, so the feedback reads as a subtle darkening while staying the ONLY
+        piece that changes.
         """
 
         style = RichStyle()
         if accent:
             style += RichStyle(bold=True, color=theme.accent)
         if self.hover_glyph:
-            style += RichStyle(bold=True, reverse=True, color=theme.accent)
+            resting = theme.accent if accent else theme.text_muted
+            style += RichStyle(bold=True, color=blend(resting, theme.background, 0.60))
         return style
 
     def _glyph_piece(
