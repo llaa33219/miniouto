@@ -372,12 +372,14 @@ def test_thinking_deltas_extend_the_live_reasoning_row() -> None:
             app._apply_stream_thinking("second")
             await pilot.pause()
 
-            # Then: one collapsed row with a live marker
+            # Then: one collapsed row with a live marker and the reasoning's
+            # last words as a one-line tail beside it
             assert len(app._window.rows) == 1
             row = app._window.rows[0]
             assert isinstance(row, ThinkingRow)
             assert row._thinking == "first second"
-            assert _rendered(row) == "▶ thinking ●"
+            assert _rendered(row).startswith("▶ thinking ●")
+            assert _rendered(row).endswith("first second")
 
             # And: the completed message replaces the streamed text in place
             app._add_event_row(LoopEvent(actor="outo", kind="thinking", text="first second (full)"))

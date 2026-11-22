@@ -37,6 +37,7 @@ from miniouto.cli.tui.rows import (
     EXPANDED_GLYPH,
     GLYPH_CELLS,
     LEFT_MOUSE_BUTTON,
+    TOOL_BADGES,
     AnswerRow,
     EventRow,
     RowMouseEvent,
@@ -497,10 +498,13 @@ def test_thinking_deltas_extend_the_live_reasoning_row() -> None:
     row.begin_stream()
     row.append("first ")
     row.append("second")
-    # One collapsed row with the live marker, never one row per fragment
+    # One collapsed row with the live marker plus its reasoning tail, never
+    # one row per fragment
     assert row._thinking == "first second"
-    assert row.render().plain == f"{COLLAPSED_GLYPH} thinking ●"
-    # And: the completed message replaces the streamed text in place
+    assert row.render().plain.startswith(f"{COLLAPSED_GLYPH} thinking ●")
+    assert row.render().plain.endswith("first second")
+    # And: the completed message replaces the streamed text in place — the
+    # settled row is exactly `▶ thinking`, marker and tail both gone
     row.finalize("first second (full)")
     assert row._thinking == "first second (full)"
     assert row.render().plain == f"{COLLAPSED_GLYPH} thinking"
@@ -1079,6 +1083,295 @@ def test_a_screen_action_result_never_engages_the_image_lane(
     assert row.image is None
     assert row.image_visible is False
     assert row.image_placements() == []
+
+
+# ─── per-tool badges ─────────────────────────────────────────────────────────
+#
+# A badged tool row replaces the ▶/▼ glyph with the tool's mark; a collapsed
+# Bash row paints exactly ONE header line; an expanded Bash row boxes the
+# command and the result, an expanded other-tool row boxes the result only.
+
+
+def test_every_badged_tool_paints_its_measured_badge() -> None:
+    # Given: one row per badged tool (Image/Video share a badge)
+    cases = [
+        ("Bash", "[>_]"),
+        ("Computer", "[⮜]"),
+        ("Image", "[⣏⣹]"),
+        ("Video", "[⣏⣹]"),
+        ("Audio", "[♫\ufe0e]"),
+    ]
+    for tool, badge in cases:
+        assert TOOL_BADGES[tool] == badge
+        row = ToolRow(f"{tool} preview", tool_name=tool)
+        # Then: the badge is prepended to the verbatim header text
+        assert row.render().plain == f"{badge} {tool} preview"
+        # And: its width is MEASURED, not assumed (the audio badge is 4 chars
+        # but 3 cells — `♫` carries a U+FE0E variation selector)
+        assert row._hover_span() == cell_len(badge)
+        # And: the glyph pair is gone from a badged header
+        assert COLLAPSED_GLYPH not in row.render().plain
+
+
+def test_a_row_without_a_badge_keeps_the_triangle_pair() -> None:
+    # Given: a continue_session row and one built with no tool name at all
+    cont = ToolRow("continue_session /s", tool_name="continue_session")
+    plain = ToolRow("Bash ls -la")
+    # Then: both keep ▶/▼ exactly as before
+    assert cont.render().plain == f"{COLLAPSED_GLYPH} continue_session /s"
+    assert cont._hover_span() == GLYPH_CELLS
+    assert plain.render().plain == f"{COLLAPSED_GLYPH} Bash ls -la"
+    assert plain._hover_span() == GLYPH_CELLS
+
+
+def test_hover_covers_the_whole_badge_and_stops_at_its_edge() -> None:
+    # Given: a badged Bash row
+    row = ToolRow("Bash ls -la", tool_name="Bash")
+    span = cell_len("[>_]")
+    # Then: every badge cell highlights, and the first cell past it does not
+    for x in range(row._glyph_column, row._glyph_column + span):
+        move(row, x, 0)
+        assert row.hover_glyph is True, x
+    move(row, row._glyph_column + span, 0)
+    assert row.hover_glyph is False
+    # And: the badge paints reverse-video while hovered, the header does not
+    move(row, row._glyph_column, 0)
+    assert "REVERSED" in repr(row.build_lines(WIDTH, THEME)[0][2][1])
+    assert "REVERSED" not in repr(row.build_lines(WIDTH, THEME)[0][3][1])
+
+
+def test_a_collapsed_bash_row_paints_exactly_one_header_line() -> None:
+    # Given: a Bash header long enough to wrap several times at WIDTH
+    row = ToolRow("Bash " + "echo line1 && echo line2 && " * 10, tool_name="Bash")
+    # When: it renders collapsed
+    lines = row.build_lines(WIDTH, THEME)
+    # Then: ONE line, cell-cut, ending in `…` — never a wrapped wall
+    assert len(lines) == 1
+    text = plain_of(lines[0])
+    assert text.startswith("┃ [>_] Bash ")
+    assert text.endswith("…")
+    assert cells_of(lines[0]) <= WIDTH
+    # And: a short header that fits keeps its whole text with no ellipsis
+    short = ToolRow("Bash ls -la", tool_name="Bash")
+    short_lines = short.build_lines(WIDTH, THEME)
+    assert len(short_lines) == 1
+    assert plain_of(short_lines[0]) == "┃ [>_] Bash ls -la"
+
+
+def test_a_collapsed_bash_header_that_exactly_fits_is_kept_whole() -> None:
+    # Given: a Bash header whose first wrapped line is EXACTLY the content
+    # width (width 18, minus the 2-cell gutter, = 16 cells; the badge is 5)
+    row = ToolRow("Bash " + "a" * 6, tool_name="Bash")
+    # When: it paints at width 18
+    lines = row.build_lines(18, THEME)
+    # Then: the header is kept WHOLE — an exact fit is a fit, not a cut, so
+    # the last `a` survives and no `…` is glued on
+    assert len(lines) == 1
+    assert plain_of(lines[0]) == "┃ [>_] Bash aaaaaa"
+    assert cells_of(lines[0]) == 18
+
+
+def test_a_collapsed_bash_header_one_cell_over_is_cut_with_an_ellipsis() -> None:
+    # Given: the SAME header one cell wider than the content width — the
+    # extra `b` wraps, so the row is one line cut by `truncate_to`
+    row = ToolRow("Bash " + "a" * 6 + " b", tool_name="Bash")
+    # When: it paints at width 18
+    lines = row.build_lines(18, THEME)
+    # Then: ONE line, `…`-terminated, never wrapped
+    assert len(lines) == 1
+    text = plain_of(lines[0])
+    assert text.endswith("…")
+    # And: the cut first line keeps every cell it can — `width - 1` plus the
+    # ellipsis fills the row exactly
+    assert cells_of(lines[0]) == 18
+
+
+def test_an_expanded_bash_row_boxes_the_command_and_the_result() -> None:
+    # Given: an expanded Bash row with a verbatim multi-line command and a
+    # multi-line result
+    row = ToolRow("Bash heredoc", detail="cat <<'EOF'\none\ntwo\nEOF", tool_name="Bash")
+    row.set_result("out line 1\nout line 2")
+    row._toggle()
+    # When: it paints
+    text = rendered(row)
+    # Then: TWO boxes — the command first, the result below
+    assert text.count("╭") == 2
+    assert text.count("╯") == 2
+    lines = text.split("\n")
+    assert lines[0] == "┃ [>_] Bash heredoc"
+    assert any(line.startswith("┃ │ cat <<'EOF'") for line in lines), lines
+    assert any(line.startswith("┃ │ one") for line in lines), lines
+    assert any(line.startswith("┃ │ two") for line in lines), lines
+    assert any(line.startswith("┃ │ EOF") for line in lines), lines
+    assert any(line.startswith("┃ │ out line 1") for line in lines), lines
+    assert any(line.startswith("┃ │ out line 2") for line in lines), lines
+    # And: every box line is exactly the content width (56 at WIDTH 60)
+    for line in row.build_lines(WIDTH, THEME):
+        assert cells_of(line) <= WIDTH
+
+
+def test_an_expanded_other_tool_row_boxes_the_result_only() -> None:
+    # Given: expanded media and Computer rows (no detail, a result attached)
+    for tool in ("Image", "Audio", "Computer"):
+        row = ToolRow(f"{tool} preview", tool_name=tool)
+        row.set_result("result line")
+        row._toggle()
+        # When: they paint
+        text = rendered(row)
+        # Then: ONE box — their call preview already is the header
+        assert text.count("╭") == 1, tool
+        assert "│ result line" in text
+        assert f"{TOOL_BADGES[tool]} {tool} preview" in text
+
+
+def test_the_bash_command_box_falls_back_to_the_header_without_detail() -> None:
+    # Given: a row from an OLD session event — no detail, the header still
+    # leads with the flattened command
+    row = ToolRow("Bash echo one && echo two", tool_name="Bash")
+    row.set_result("ok")
+    row._toggle()
+    # When: it expands
+    text = rendered(row)
+    # Then: the command box carries the header minus the `Bash ` prefix
+    assert text.count("╭") == 2
+    assert "│ echo one && echo two" in text
+
+
+def test_a_drag_across_a_boxed_content_line_extracts_the_right_characters() -> None:
+    # Given: an expanded Bash row holding a command box
+    row = ToolRow("Bash ls", detail="abcdef", tool_name="Bash")
+    row.set_result("output")
+    row._toggle()
+    row.build_lines(WIDTH, THEME)
+    # The command text sits on the row's 3rd line, inside the box's content
+    # area (`│ ` is 2 cells of chrome in front of it)
+    row.on_mouse_down(RowMouseEvent((4, 2), LEFT_MOUSE_BUTTON, 1))
+    row.on_mouse_move(RowMouseEvent((7, 2), LEFT_MOUSE_BUTTON, 1))
+    row.selection = Selection({2: (2, 5)})
+    row.on_click(RowMouseEvent((7, 2), LEFT_MOUSE_BUTTON, 1))
+    # Then: the drag took exactly the command characters — boxes are CONTENT,
+    # so the selection keeps addressing them (and never toggled the row)
+    assert row._expanded is True
+    assert row.get_selection(row.selection)[0] == "abc"
+
+
+# ─── the live thinking tail ─────────────────────────────────────────────────
+
+
+def test_a_streaming_thinking_row_carries_a_one_line_tail() -> None:
+    # Given: a live row whose reasoning is longer than one header
+    row = ThinkingRow()
+    row.begin_stream()
+    row.append("alpha beta gamma " * 6 + "the final words")
+    # When: it paints at width 80
+    lines = row.build_lines(80, THEME)
+    # Then: ONE line, marker kept, whitespace-collapsed tail showing the LAST
+    # words — never a second wrapped line
+    assert len(lines) == 1
+    text = plain_of(lines[0])
+    assert text.startswith("┃ ▶ thinking ●")
+    assert text.endswith("the final words")
+    assert cells_of(lines[0]) <= 80
+
+
+def test_a_narrow_width_prefixes_the_cut_tail_with_an_ellipsis() -> None:
+    # Given: the same live row at a narrow width
+    row = ThinkingRow()
+    row.begin_stream()
+    row.append("one two three four five six seven eight nine ten")
+    # When: it paints at width 30
+    text = plain_of(row.build_lines(30, THEME)[0])
+    # Then: the head was cut, so the tail is `…`-prefixed and still ends with
+    # the newest words
+    assert text.startswith("┃ ▶ thinking ● …")
+    assert text.endswith("nine ten")
+    assert cell_len(text) <= 30
+
+
+def test_the_tail_disappears_on_finalize_and_while_expanded() -> None:
+    # Given: a live row with a tail on screen
+    row = ThinkingRow()
+    row.begin_stream()
+    row.append("still reasoning about the thing")
+    assert plain_of(row.build_lines(80, THEME)[0]).endswith("the thing")
+    # When: the row expands
+    row._toggle()
+    # Then: the header is the plain marker line — no tail on it
+    assert plain_of(row.build_lines(80, THEME)[0]) == "┃ ▼ thinking ●"
+    row._toggle()
+    # And when the message completes, the settled row is byte-identical to a
+    # row that never streamed: exactly `▶ thinking`
+    row.finalize("still reasoning about the thing")
+    assert rendered(row) == f"┃ {COLLAPSED_GLYPH} thinking"
+    assert row.render().plain == f"{COLLAPSED_GLYPH} thinking"
+
+
+def test_the_tail_updates_on_every_append() -> None:
+    # Given: a live row
+    row = ThinkingRow()
+    row.begin_stream()
+    # When: two deltas land
+    row.append("first words")
+    one = plain_of(row.build_lines(80, THEME)[0])
+    row.append(" and then later words")
+    two = plain_of(row.build_lines(80, THEME)[0])
+    # Then: the tail moved with the reasoning
+    assert one.endswith("first words")
+    assert two.endswith("and then later words")
+    assert two != one
+
+
+def test_the_tail_of_a_huge_reasoning_still_shows_the_final_words() -> None:
+    # Given: a live row holding a 200k-char reasoning that ends with known
+    # words — the tail must cost the same as a short one, never a full scan
+    row = ThinkingRow()
+    row.begin_stream()
+    row.append("word " * 40_000 + "the very final words")
+    # When: it paints at width 80
+    lines = row.build_lines(80, THEME)
+    # Then: ONE line whose tail carries the final words, `…`-prefixed
+    assert len(lines) == 1
+    text = plain_of(lines[0])
+    assert text.startswith("┃ ▶ thinking ● …")
+    assert text.endswith("the very final words")
+    assert cells_of(lines[0]) <= 80
+
+
+def test_the_tail_matches_the_full_scan_on_short_and_medium_texts() -> None:
+    # Given: the reference implementation — collapse the WHOLE reasoning,
+    # exactly the pre-window shape
+    def reference(thinking: str, width: int) -> str:
+        from miniouto.cli.tui.rows import _STREAMING_HEADER_CELLS, _tail_cells
+
+        budget = width - _STREAMING_HEADER_CELLS - 1
+        if budget < 4:
+            return ""
+        text = " ".join(thinking.split())
+        if not text or cell_len(text) <= budget:
+            return text
+        return "…" + _tail_cells(text, budget - 1)
+
+    cases = [
+        "",
+        "   ",
+        "one",
+        "still reasoning about the thing",
+        "one two three four five six seven eight nine ten",
+        "alpha beta gamma " * 6 + "the final words",
+        "word " * 500,
+        "中" * 100 + " tail words here",
+        "  \n \n  spaced    out \n\n  runs  " + "x " * 200,
+        "a" * 1000,
+    ]
+    # When/Then: the windowed tail equals the full scan at every width where
+    # a tail exists at all — the collapsed form fits the budget or the `…`
+    # rule cuts it, identically
+    for width in (30, 40, 60, 80, 120):
+        for text in cases:
+            row = ThinkingRow()
+            row.begin_stream()
+            row.append(text)
+            assert row._thinking_tail(width) == reference(text, width), (width, text[:40])
 
 
 # ─── the markdown answer ────────────────────────────────────────────────────

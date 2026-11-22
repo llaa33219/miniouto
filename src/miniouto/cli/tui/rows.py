@@ -57,6 +57,7 @@ __all__ = [
     "EXPANDED_GLYPH",
     "GLYPH_CELLS",
     "LEFT_MOUSE_BUTTON",
+    "TOOL_BADGES",
     "AnswerRow",
     "ClickToToggle",
     "EventRow",
@@ -163,6 +164,25 @@ def truncate_to(pieces: StyledLine, target: int) -> StyledLine:
         if stop < len(text):
             break
     return out
+
+
+def _tail_cells(text: str, cells: int) -> str:
+    """The last ``cells`` terminal cells of ``text``, keeping whole characters.
+
+    The tail counterpart of :func:`truncate_to`: a wide glyph that would
+    straddle the cut moves out of the tail whole, so a clipped tail never
+    carries half a glyph.
+    """
+
+    kept: list[str] = []
+    used = 0
+    for char in reversed(text):
+        char_cells = cell_len(char)
+        if used + char_cells > cells:
+            break
+        kept.append(char)
+        used += char_cells
+    return "".join(reversed(kept))
 
 
 def place_at(line: StyledLine, x: int, pieces: StyledLine, style: pt.Style) -> StyledLine:
@@ -584,6 +604,27 @@ width assumption the terminal may not honour; the hover hit math and every test
 that reasons about the header read this instead.
 """
 
+TOOL_BADGES: dict[str, str] = {
+    "Bash": "[>_]",
+    "Computer": "[⮜]",
+    "Image": "[⣏⣹]",
+    "Video": "[⣏⣹]",
+    "Audio": "[♫\ufe0e]",
+}
+"""Per-tool header badge, painted where the ▶/▼ glyph would sit.
+
+A badged row reads its tool at a glance in a wall of collapsed rows. The badge
+REPLACES the toggle glyph (the whole row stays the click target, so nothing
+needs the triangle); tools without an entry — ``continue_session`` and rows
+built with no tool name — keep ▶/▼, as does :class:`ThinkingRow`. Every width
+that touches a badge is MEASURED with ``cell_len``, never assumed: the Audio
+badge is 4 characters but 3 cells, because ``♫`` (U+266B) carries a U+FE0E
+variation selector that paints inside its cell.
+"""
+
+_STREAMING_HEADER_CELLS = cell_len(f"{COLLAPSED_GLYPH} thinking ●")
+"""Cells the live streaming header (``▶ thinking ●``) spends."""
+
 
 # ─── gestures ────────────────────────────────────────────────────────────────
 
@@ -653,8 +694,17 @@ class ToggleGlyphHover:
     def on_leave(self, event: Any = None) -> None:
         self._set_hover(False)
 
+    def _hover_span(self) -> int:
+        """Cells the hover hit box covers — the toggle glyph by default.
+
+        A row whose glyph is a wider mark (:class:`ToolRow`'s per-tool badge)
+        overrides this so the WHOLE badge highlights, not just its first cell.
+        """
+
+        return GLYPH_CELLS
+
     def _pointer_on_glyph(self, x: int, y: int) -> bool:
-        return y == 0 and self._glyph_column <= x < self._glyph_column + GLYPH_CELLS
+        return y == 0 and self._glyph_column <= x < self._glyph_column + self._hover_span()
 
     def _glyph_style(self, theme: TuiTheme, *, accent: bool) -> RichStyle:
         """The glyph's Rich style: resting, or reverse-video while hovered.
@@ -808,9 +858,12 @@ class ThinkingRow(ToggleGlyphHover, ClickToToggle, EventRow):
     it opening under the pointer.
 
     While the model is still streaming its reasoning the collapsed header carries
-    a ``●`` marker, so a live row is distinguishable from a settled one.
-    ``finalize`` swaps the streamed prefix for the message's canonical text (the
-    stream IS a prefix of it, so keeping both would duplicate).
+    a ``●`` marker and a ONE-LINE dim tail of the reasoning so far —
+    whitespace-collapsed, anchored to the newest words, ``…``-prefixed when the
+    head was cut — so a live row reads at a glance. ``finalize`` drops the
+    marker AND the tail and swaps the streamed prefix for the message's
+    canonical text (the stream IS a prefix of it, so keeping both would
+    duplicate): a settled collapsed row renders exactly ``▶ thinking``.
     """
 
     can_focus = True
@@ -857,7 +910,65 @@ class ThinkingRow(ToggleGlyphHover, ClickToToggle, EventRow):
         if self._expanded:
             pieces.append(("\n", ""))
             pieces.append((self._thinking, ""))
+        else:
+            # ``render()`` has no width, so the tail it carries is the
+            # DEFAULT_WIDTH cut; ``_content_lines`` re-cuts it to the real one.
+            tail = self._thinking_tail(DEFAULT_WIDTH)
+            if tail:
+                pieces.append(
+                    (
+                        f" {tail}",
+                        RichStyle(color=theme.text_disabled, bgcolor=theme.background),
+                    )
+                )
         return Text.assemble(*pieces)
+
+    def _content_lines(
+        self, width: int, theme: TuiTheme, base: pt.Style
+    ) -> list[StyledLine]:
+        if not (self._streaming and not self._expanded):
+            return super()._content_lines(width, theme, base)
+        # The live header plus its ONE-LINE tail, built directly instead of
+        # wrapping ``_content_text`` (whose tail is cut at DEFAULT_WIDTH, not
+        # at this one), so the tail can never wrap onto a second line.
+        header = Text.assemble(
+            self._glyph_piece(COLLAPSED_GLYPH, theme), ("thinking ●", "")
+        )
+        lines = _wrap(_text_pieces(header, base), width)
+        tail = self._thinking_tail(width)
+        if tail:
+            dim = (
+                pt.Style()
+                .fg(theme.color(theme.text_disabled))
+                .bg(theme.color(theme.background))
+            )
+            lines = [[*lines[0], (" ", dim), (tail, dim)], *lines[1:]]
+        return lines
+
+    def _thinking_tail(self, width: int) -> str:
+        """The reasoning's last words, cut to what fits beside the live header.
+
+        Whitespace-collapsed (streamed fragments arrive as arbitrary ``"  \n"``
+        runs that would otherwise shove the header around), anchored to the END
+        — the newest words are the live ones — and prefixed ``…`` when the head
+        had to be cut. Empty unless the row is streaming, collapsed, and the
+        budget is worth having (under 4 cells a tail is noise, not a tail).
+
+        Only the reasoning's LAST ``(budget + 2) * 2 + 8`` characters are
+        collapsed: the tail never shows more than ``budget`` cells and a
+        character adds at most two of them, so the work stays bounded per
+        append instead of growing with the reasoning (a word cut at the window
+        boundary reads no worse than the ``…`` replacing the cut head).
+        """
+
+        budget = width - _STREAMING_HEADER_CELLS - 1
+        if not self._streaming or self._expanded or budget < 4:
+            return ""
+        window = (budget + 2) * 2 + 8
+        text = " ".join(self._thinking[-window:].split())
+        if not text or cell_len(text) <= budget:
+            return text
+        return "…" + _tail_cells(text, budget - 1)
 
 
 # ─── incremental stream wrap ─────────────────────────────────────────────
@@ -1217,13 +1328,20 @@ def _graphics_module() -> Any:
 
 
 class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
-    """Collapsible tool-call row: ``▶ <header>`` collapsed (default).
+    """Collapsible tool-call row: a badge (else ▶/▼) + header, collapsed.
 
-    A plain click anywhere on the row or ``Enter`` expands the full command +
-    result. The result is attached later via :meth:`set_result`; until then the box
-    is purely the call preview. A drag is never a toggle, so the command and its
-    output can be dragged out and copied without the row opening under the
-    pointer, and a double-click selects nothing.
+    The header leads with the row's per-tool badge (:data:`TOOL_BADGES`) when
+    the tool has one; rows without a badge (``continue_session``, or a row
+    built with no tool name) keep the ▶/▼ glyph, as before. A COLLAPSED Bash
+    row paints exactly ONE line — the header's first visual line, cell-cut with
+    a trailing ``…`` — never a wrapped wall. Expanded, a Bash row paints the
+    verbatim command and then the attached result in two bordered boxes; every
+    other badged tool paints ONE result box (its call preview already is the
+    header). A plain click anywhere on the row or ``Enter`` expands it. The
+    result is attached later via :meth:`set_result`; until then the expanded
+    row is header plus command box only. A drag is never a toggle, so the
+    command and its output can be dragged out and copied without the row
+    opening under the pointer, and a double-click selects nothing.
 
     When the result is an error (prefixed ``"error: "``) the row gains the
     ``-error`` class (muted → ``$error`` text and rule) and the header shows a
@@ -1257,6 +1375,7 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
         self._is_error = False
         self._expanded = False
         self._tool_name = tool_name
+        self._badge = TOOL_BADGES.get(tool_name or "")
         self._unbounded_result = unbounded_result
         self._image_failed = False
         self.image_visible = False
@@ -1307,6 +1426,15 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
 
     # ── content ───────────────────────────────────────────────────────────
     def _content_text(self, theme: TuiTheme) -> Text:
+        """The width-less Rich view ``render()`` returns.
+
+        The header carries its FULL text here (the one-line cut is a layout
+        decision that needs a width, and ``render().plain`` is what a copy
+        wants), and an expanded row carries the command and result as PLAIN
+        text lines — the box chrome needs a width, so ``build_lines`` paints
+        it and this surface carries the payload without chrome.
+        """
+
         if not self._expanded:
             self.image_visible = False
             return Text.assemble(*self._header_pieces(COLLAPSED_GLYPH, theme))
@@ -1321,7 +1449,9 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
         if self._result is None:
             self.image_visible = False
             return Text.assemble(*pieces)
-        pieces.append(("\n── output ──\n", "dim"))
+        # A badge-less row keeps the legacy `── output ──` label; a badged row
+        # carries plain lines only — its painted form separates the boxes.
+        pieces.append(("\n── output ──\n", "dim") if not self._badge else ("\n", ""))
         pieces.append((self._result_text(), ""))
         body = Text.assemble(*pieces)
         screen = self._screen_art()
@@ -1333,18 +1463,25 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
     def _header_pieces(
         self, glyph: str, theme: TuiTheme
     ) -> list[tuple[str, RichStyle | str]]:
-        pieces: list[tuple[str, RichStyle | str]] = [
-            self._glyph_piece(glyph, theme, accent=True),
-            (self._header, ""),
-        ]
+        lead: tuple[str, RichStyle | str] = (
+            (f"{self._badge} ", self._glyph_style(theme, accent=True))
+            if self._badge
+            else self._glyph_piece(glyph, theme, accent=True)
+        )
+        pieces: list[tuple[str, RichStyle | str]] = [lead, (self._header, "")]
         if self._is_error:
             pieces.append((" ✗", RichStyle(bold=True, color=theme.error)))
         return pieces
 
+    def _hover_span(self) -> int:
+        """The badge is the hover target when there is one — measured, not assumed."""
+
+        return cell_len(self._badge) if self._badge else GLYPH_CELLS
+
     def _content_lines(
         self, width: int, theme: TuiTheme, base: pt.Style
     ) -> list[StyledLine]:
-        lines = super()._content_lines(width, theme, base)
+        lines = self._body_lines(width, theme, base)
         placement = self.image
         if placement is not None and self.image_visible:
             rows = int(getattr(placement, "height_cells", 0) or 0)
@@ -1355,6 +1492,107 @@ class ToolRow(ToggleGlyphHover, ClickToToggle, EventRow):
                 self._image_line = len(lines)
                 lines = [*lines, *[[] for _ in range(rows)]]
         return lines
+
+    def _body_lines(
+        self, width: int, theme: TuiTheme, base: pt.Style
+    ) -> list[StyledLine]:
+        """The row's own lines, before the image lane reserves its cells.
+
+        A row WITHOUT a badge (``continue_session``, or one built with no tool
+        name) keeps the plain wrapping layout exactly as it was before badges
+        existed, so every legacy row renders byte-identically.
+        """
+
+        if not self._badge:
+            return super()._content_lines(width, theme, base)
+        glyph = EXPANDED_GLYPH if self._expanded else COLLAPSED_GLYPH
+        header = Text.assemble(*self._header_pieces(glyph, theme))
+        lines = _wrap(_text_pieces(header, base), width)
+        if not self._expanded:
+            self.image_visible = False
+            return self._collapsed_header(lines, width, base)
+        if self._badge == TOOL_BADGES["Bash"]:
+            # The verbatim command first: the header's flattened preview is
+            # the same text with its newlines gone.
+            lines = [
+                *lines,
+                *self._box_lines(self._command_text(), width, theme, base),
+            ]
+        if self._result is None:
+            self.image_visible = False
+            return lines
+        lines = [*lines, *self._box_lines(self._result_text(), width, theme, base)]
+        screen = self._screen_art()
+        if screen is not None:
+            lines = [*lines, *_wrap(_text_pieces(screen, base), width)]
+        return lines
+
+    def _collapsed_header(
+        self, lines: list[StyledLine], width: int, base: pt.Style
+    ) -> list[StyledLine]:
+        """A collapsed Bash row paints ONE line: the header's first, cell-cut.
+
+        The wrapped header of a long multi-line command would bury the log; its
+        first visual line plus a trailing ``…`` says the same thing in one row.
+        A first line that fits the content width — an EXACT fit included — is
+        kept whole, so the ``…`` only appears once a cell was really cut.
+        Every other tool keeps the wrapping header (its preview is one line by
+        construction — ``_short_arg_summary`` flattened it).
+        """
+
+        if self._badge != TOOL_BADGES["Bash"]:
+            return lines
+        first = lines[0]
+        if len(lines) > 1 or cells_of(first) > width:
+            one = [*truncate_to(first, width - 1), ("…", base)]
+            return [one]
+        return [first]
+
+    def _command_text(self) -> str:
+        """The verbatim command the expanded Bash box carries.
+
+        ``detail`` is the primary source (the core layer now stamps every
+        tool's primary argument there); an older session event carries none, so
+        its header minus the leading ``Bash `` prefix stands in — the header
+        was built as ``f"{name} {preview}"`` and the Bash preview is the
+        command with newlines flattened.
+        """
+
+        detail = self._detail
+        if not detail:
+            detail = self._header.removeprefix("Bash ")
+        if len(detail) > self._MAX_DETAIL_CHARS:
+            detail = detail[: self._MAX_DETAIL_CHARS] + "\n…(truncated)"
+        return detail
+
+    def _box_lines(
+        self, text: str, width: int, theme: TuiTheme, base: pt.Style
+    ) -> list[StyledLine]:
+        """A rounded box around ``text``, in CONTENT space (no gutter).
+
+        ``build_lines`` prepends the row's gutter after this returns, so a box
+        built here stays inside the selection's content coordinates — the same
+        space a drag addresses. The border paints ``text_disabled`` on the
+        theme background and the content keeps the row's own ink; a width too
+        narrow for the chrome (under 8 cells) degrades to plain wrapped lines
+        rather than a broken box.
+        """
+
+        if width < 8:
+            return _wrap(_text_pieces(Text(text), base), width)
+        border = (
+            pt.Style()
+            .fg(theme.color(theme.text_disabled))
+            .bg(theme.color(theme.background))
+        )
+        inner = width - 4
+        out: list[StyledLine] = [
+            [("╭", border), ("─" * (width - 2), border), ("╮", border)]
+        ]
+        for line in _wrap(_text_pieces(Text(text), base), inner):
+            out.append([("│ ", border), *pad_to(line, inner, base), (" │", border)])
+        out.append([("╰", border), ("─" * (width - 2), border), ("╯", border)])
+        return out
 
     # ── result rendering ──────────────────────────────────────────────────
     def _result_text(self) -> str:

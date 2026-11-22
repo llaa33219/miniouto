@@ -785,11 +785,10 @@ def _make_tool_call_dispatcher(sink: EventSink, refs: dict[str, str]):
 
         if name in _LOGGABLE_TOOL_NAMES:
             preview = _short_arg_summary(name, arguments)
-            # detail carries the FULL untruncated command for Bash (the
-            # preview flattens newlines; the TUI detail view wants the
-            # verbatim input). Media/Computer tools have no useful extra
-            # payload.
-            detail = arguments.get("command") if name == "Bash" else None
+            # detail carries the tool's PRIMARY argument, untruncated — the
+            # preview flattens/shortens it, and the TUI's expanded boxes want
+            # the verbatim input (Bash's multi-line command above all).
+            detail = _tool_detail(name, arguments)
             sink.emit_loop_event(
                 LoopEvent(
                     actor=actor,
@@ -804,6 +803,37 @@ def _make_tool_call_dispatcher(sink: EventSink, refs: dict[str, str]):
             sink.update_activity(actor if sid else name)
 
     return on_tool_call
+
+
+_TOOL_DETAIL_ARGS = {
+    "Bash": "command",
+    "Image": "file_path",
+    "Video": "file_path",
+    "Audio": "file_path",
+    "Computer": "action",
+}
+"""The argument each tool's `detail` carries — its primary input.
+
+``continue_session`` is deliberately absent: its header already names the
+summary dir, its row carries no badge, and the legacy expanded layout
+prints ``detail`` verbatim under that header — stamping it would print
+the dir twice.
+"""
+
+
+def _tool_detail(name: str, arguments: dict[str, Any]) -> str | None:
+    """The tool call's primary argument as a string, or None when absent.
+
+    The `tool` event's `text` keeps its ``<name> <preview>`` shape for the CLI
+    and the session record; `detail` is the display payload the TUI's expanded
+    boxes read (verbatim, newlines intact).
+    """
+
+    key = _TOOL_DETAIL_ARGS.get(name)
+    if key is None:
+        return None
+    value = arguments.get(key)
+    return value if isinstance(value, str) and value else None
 
 
 _TOOL_RESULT_NAMES = ("Bash", "Image", "Video", "Audio", "Computer", "continue_session")

@@ -2641,7 +2641,10 @@ def test_thinking_deltas_render_live_and_finalize_without_duplicates(
             assert live, "no live ThinkingRow while the reasoning streamed"
             assert live[0].streaming is True
             assert live[0].thinking == "step one\n\nstep two is"
-            assert tui_harness.row_text(live[0]).endswith("thinking ●")
+            # The live header carries the marker and its one-line reasoning
+            # tail (whitespace-collapsed) on the same line
+            assert tui_harness.row_text(live[0]).startswith("▶ thinking ●")
+            assert tui_harness.row_text(live[0]).endswith("step one step two is")
 
             # Release the gated tail (the message completes) and let the
             # turn settle: the session file already holds the completed
