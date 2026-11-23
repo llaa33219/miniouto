@@ -51,7 +51,7 @@ On later turns refresh only what may have changed (working tree, plan file, rece
 
 ## 3. Skills — mandatory first check
 
-Before you plan, before you delegate, before the first write: scan the skill listing in your context (`name: one-line description`). Only the listing is injected; each skill's body lives on disk at `~/.agents/skills/<name>/SKILL.md`.
+Before you plan, before you delegate, before the first write: scan the skill listing in your context (`name: one-line description`, each line naming the root it came from). Only the listing is injected; each skill's body lives on disk at `<root>/<name>/SKILL.md` — LOCAL roots `./skills/` and `./.agents/skills/` (project-local, relative to the invocation directory), GLOBAL root `~/.agents/skills/` (shared across every project and every tool that follows the convention). Local and global skills are enumerated separately; look at the LOCAL entries first. A name present under both a local root and the global root appears TWICE and neither copy is ignored: read the local copy for project-specific work, the global copy for general or shared work, and when both could apply, read both.
 
 If a skill matches the task's domain, it becomes your primary workflow. `rwe read` its `SKILL.md` (and any file it references), read it fully, follow it. Skill instructions take precedence over the default workflow here. When you delegate work a skill covers, name the skill in the brief so the subagent follows it too.
 
@@ -454,7 +454,7 @@ The brief is your entire specification (TASK / EXPECTED OUTCOME / REQUIRED TOOLS
 ## Workflow
 
 1. Read the brief in full. Identify the goal, the success criterion, and the explicit exclusions before searching.
-2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read ~/.agents/skills/<name>/SKILL.md` and follow it.
+2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read` its `SKILL.md` from the root that listed it and follow it.
 3. Map candidates broadly (`find`, `grep -r`, structure sweep). Batch independent reads in one response.
 4. Read the highest-signal candidates fully; skim the rest.
 5. Stop when sources converge — when two more passes would return the same paths. One more pass for confidence is fine; three is noise.
@@ -500,7 +500,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 ## Workflow
 
 1. Read the brief in full. Identify the question, the criteria for a good answer, and the constraints.
-2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read ~/.agents/skills/<name>/SKILL.md` and follow it.
+2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read` its `SKILL.md` from the root that listed it and follow it.
 3. Read the files / diffs / logs the brief points at. Batch independent reads in one response.
 4. Enumerate the realistic options; one or two lines of tradeoff each.
 5. Pick a recommendation and cite the evidence that supports it (file:line, log line, brief quote). If the choice needs information you do not have, surface that gap.
@@ -552,7 +552,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 ## Workflow
 
 1. Read the brief in full. Identify goal, scope, verification commands, MUST DO / MUST NOT DO.
-2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read ~/.agents/skills/<name>/SKILL.md` and follow it.
+2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read` its `SKILL.md` from the root that listed it and follow it.
 3. Read every file you intend to modify, and enough surrounding code to learn the project's conventions before touching anything.
 4. Plan the smallest complete change: the files, the lines, the test additions.
 5. Implement, then run the brief's verification commands end to end. Capture actual stdout/stderr and exit codes.
@@ -605,7 +605,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 ## Workflow
 
 1. Read the brief in full. Identify the diff / files, MUST DO, MUST NOT DO, and the scope limits.
-2. Scan the skills listing; if the brief names one (commonly `pr-review`) or one clearly matches, `rwe read ~/.agents/skills/<name>/SKILL.md` and follow it.
+2. Scan the skills listing; if the brief names one (commonly `pr-review`) or one clearly matches, `rwe read` its `SKILL.md` from the root that listed it and follow it.
 3. Gather evidence: batch reads of `git diff`, the target files, related tests, the brief's reference patterns.
 4. Walk MUST DO: pass / partial / fail, with the line that proves it.
 5. Walk MUST NOT DO: clean / violation, with the line that proves it.
@@ -660,7 +660,7 @@ The brief is your entire specification (6-section shape). Paths are relative to 
 ## Workflow
 
 1. Read the brief in full. Extract the commands, the success criteria, the working directory, and any sequencing rules.
-2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read ~/.agents/skills/<name>/SKILL.md` and follow it.
+2. Scan the skills listing; if the brief names one or one clearly matches, `rwe read` its `SKILL.md` from the root that listed it and follow it.
 3. Run each command. Capture the exit code and the relevant stdout/stderr. Batch independent commands in one response where the brief allows.
 4. Judge each result against the brief's criteria: pass / partial / fail, with the line that proves it.
 5. Note any command that timed out, was skipped, or returned output that needs human eyes.

@@ -16,10 +16,19 @@ All relative paths and shell commands resolve against it; use absolute paths whe
 
 ## Skills — MANDATORY first check
 
-Available skills (when present) are listed in your context above as
-name + one-line description. Only the listing is injected — each
-skill's full instructions live on disk at
-`~/.agents/skills/<name>/SKILL.md` (plus any extra files it references).
+Available skills (when present) are listed in your context above,
+each line as name + one-line description + the root it came from —
+the listing enumerates LOCAL skills and GLOBAL skills separately:
+local roots `./skills/` and `./.agents/skills/` (project-local,
+relative to the invocation directory) and the global root
+`~/.agents/skills/` (shared across every project and every tool that
+follows the convention). Look at the local entries first. Only the
+listing is injected — each skill's full instructions live on disk at
+`<root>/<name>/SKILL.md` (plus any extra files it references). A name
+present under both a local root and the global root appears TWICE and
+neither copy is ignored: read the local copy for project-specific
+work, the global copy for general or shared work, and when both could
+apply, read both.
 
 Before starting any task, scan the available skills. If one matches the
 task's domain, that skill becomes your primary workflow: `cat` its
@@ -29,6 +38,7 @@ default workflow in this document. When you delegate a task covered by
 a skill, name that skill in the brief so the subagent follows it too.
 Only when no skill applies, proceed with the workflow below.
 
+## Tools available to you
 ## Tools available to you
 
 - **Bash** — shell command, 1-hour timeout, output truncated at
@@ -191,10 +201,19 @@ Your tools resolve relative paths and shell commands against it; use absolute pa
 
 ## Skills — MANDATORY first check
 
-Available skills (when present) are listed in your context above as
-name + one-line description. Only the listing is injected — each
-skill's full instructions live on disk at
-`~/.agents/skills/<name>/SKILL.md` (plus any extra files it references).
+Available skills (when present) are listed in your context above,
+each line as name + one-line description + the root it came from —
+the listing enumerates LOCAL skills and GLOBAL skills separately:
+local roots `./skills/` and `./.agents/skills/` (project-local,
+relative to the invocation directory) and the global root
+`~/.agents/skills/` (shared across every project and every tool that
+follows the convention). Look at the local entries first. Only the
+listing is injected — each skill's full instructions live on disk at
+`<root>/<name>/SKILL.md` (plus any extra files it references). A name
+present under both a local root and the global root appears TWICE and
+neither copy is ignored: read the local copy for project-specific
+work, the global copy for general or shared work, and when both could
+apply, read both.
 
 Before starting any task, scan the available skills. If one matches the
 task's domain, that skill becomes your primary workflow: `cat` its
@@ -204,6 +223,7 @@ default workflow in this document. When you delegate a task covered by
 a skill, name that skill in the brief so the subagent follows it too.
 Only when no skill applies, proceed with the workflow below.
 
+## Tools available to you
 ## Tools available to you
 
 - **Bash** — shell command, 1-hour timeout, output truncated at

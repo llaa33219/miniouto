@@ -15,7 +15,7 @@ AGENTS.md (project-root instructions: description, rules, cautions) is embedded 
 
 ## Rules
 
-1. Skills: if a listed skill matches the task, read its SKILL.md from the root that listed it and follow it.
+1. Skills: if a listed skill matches the task, read its SKILL.md from the root that listed it and follow it — local roots are listed first, and a name under both a local and the global root is listed twice: read the local copy for project work, the global one for general work, both when both apply.
 2. Read before editing. Follow the project's existing conventions and instructions (AGENTS.md, README).
 3. Smallest change that satisfies the request. No unasked refactors, features, or scope expansion.
 4. Verify with real commands (build, lint, tests, execution) before claiming anything works. Never fabricate outputs — if you couldn't verify, say "not verified".
