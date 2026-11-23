@@ -245,8 +245,9 @@ The prompt is an ordered stack; each section answers one question:
   (repo root, `./.agents/`, `./docs/`, nested copies; re-check mtime on
   later turns), then scan the skills list. First contact runs one batched
   sweep; later turns refresh only what may have changed.
-- **Skills — first check**: same rule as `coding-pro.md`, with the explicit
-  root order for duplicate skill names (project-local beats global).
+- **Skills — first check**: same rule as `coding-pro.md` — local and global
+  skills enumerated separately (each line names its root), local entries
+  looked at first, a name under both roots listed twice with neither ignored.
 - **The size ladder**: T0 (trivial) → T1 (small) → T2 (medium) → T3 (large).
   Each rung sets the machinery AND the length of the reply — T0 gets one
   command and one line back; T3 gets a full report. The two failure modes
