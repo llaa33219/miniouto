@@ -1580,12 +1580,27 @@ class ChatTUI:
         through the CLI (``config show``) and written to the minted session
         through ``config set`` — an empty source pin seeds nothing, and the
         write only happens when there is something to copy.
+
+        A pre-mint edit is the one exception: a provider-settings change the
+        user made BEFORE the first message lands on this TUI's fallback pin
+        (``tui-pending-…``, what ``_pinned_session`` hands the popup), and
+        that pin — not some other session's stale one — is the user's LAST
+        choice for THIS conversation. It wins as the seed source whenever it
+        exists, so the mint freezes the model the user just picked instead
+        of the one the published active session froze.
         """
 
-        # The seed source is the published active session, read once here — it
-        # must NOT go through `_pinned_session`, or this TUI's routing (and its
-        # inbox drain) would adopt another process's session.
-        source = settings_store.load().session or _DEFAULT_SESSION
+        # The pending pin is checked by direct read (display-read usage, the
+        # same as the style read elsewhere in this module): only the WRITE
+        # stays on the CLI lane (``config seed``), per the TUI's
+        # no-direct-writes rule.
+        if session_config.read(self._unassigned_inbox) is not None:
+            source = self._unassigned_inbox
+        else:
+            # The seed source is the published active session, read once here —
+            # it must NOT go through `_pinned_session`, or this TUI's routing
+            # (and its inbox drain) would adopt another process's session.
+            source = settings_store.load().session or _DEFAULT_SESSION
         name = self._mint_session_name()
         self._seed_minted_session(name, source)
         self._pin_session(name)
